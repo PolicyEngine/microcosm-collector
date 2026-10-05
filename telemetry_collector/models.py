@@ -2,12 +2,33 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    RootModel,
+    field_validator,
+    model_validator,
+)
 
 SAFE_IDENTIFIER = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$"
+
+
+class PageCursor(RootModel[tuple[datetime, str]]):
+    """Typed contents of an opaque run-list pagination cursor."""
+
+    @model_validator(mode="after")
+    def validate_contents(self) -> PageCursor:
+        registered_at, run_id = self.root
+        if registered_at.tzinfo is None or registered_at.utcoffset() is None:
+            raise ValueError("cursor timestamp must include a timezone")
+        if not re.fullmatch(SAFE_IDENTIFIER, run_id):
+            raise ValueError("cursor run identifier is invalid")
+        return self
 
 
 class RunRegistration(BaseModel):

@@ -17,6 +17,7 @@ import jwt
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 from jwt import InvalidTokenError
+from pydantic import ValidationError
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from telemetry_collector.auth import (
@@ -27,6 +28,7 @@ from telemetry_collector.auth import (
 from telemetry_collector.models import (
     CollectorToken,
     EventBatch,
+    PageCursor,
     RunRegistration,
 )
 from telemetry_collector.repository import (
@@ -164,9 +166,9 @@ def _bearer_token(value: str | None) -> str:
     return token.strip()
 
 
-def _page_cursor(updated_at: datetime, run_id: str) -> str:
+def _page_cursor(registered_at: datetime, run_id: str) -> str:
     payload = json.dumps(
-        [updated_at.isoformat(), run_id], separators=(",", ":")
+        [registered_at.isoformat(), run_id], separators=(",", ":")
     ).encode()
     return base64.urlsafe_b64encode(payload).decode().rstrip("=")
 
@@ -176,26 +178,19 @@ def _parse_page_cursor(value: str | None) -> tuple[datetime, str] | None:
         return None
     try:
         padded = value + "=" * (-len(value) % 4)
-        decoded = json.loads(base64.urlsafe_b64decode(padded).decode())
-        timestamp = datetime.fromisoformat(decoded[0])
-        run_id = decoded[1]
+        raw = base64.b64decode(padded, altchars=b"-_", validate=True)
+        decoded = json.loads(raw.decode())
+        timestamp, run_id = PageCursor.model_validate(decoded).root
     except (
         ValueError,
         TypeError,
-        IndexError,
         UnicodeDecodeError,
         binascii.Error,
+        ValidationError,
     ) as error:
         raise HTTPException(
             status_code=422, detail="Pagination cursor is invalid."
         ) from error
-    if (
-        not isinstance(run_id, str)
-        or not run_id
-        or timestamp.tzinfo is None
-        or timestamp.utcoffset() is None
-    ):
-        raise HTTPException(status_code=422, detail="Pagination cursor is invalid.")
     return timestamp, run_id
 
 
@@ -371,7 +366,7 @@ def create_app(
             before=_parse_page_cursor(before),
         )
         next_before = (
-            _page_cursor(runs[-1]["updated_at"], runs[-1]["run_id"])
+            _page_cursor(runs[-1]["registered_at"], runs[-1]["run_id"])
             if len(runs) == limit
             else None
         )

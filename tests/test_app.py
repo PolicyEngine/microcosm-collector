@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import base64
+import json
 from datetime import UTC, datetime
 
+import pytest
 from fastapi.testclient import TestClient
 
 from telemetry_collector.app import CollectorSettings, create_app
 from telemetry_collector.auth import HuggingFacePrincipal
-from telemetry_collector.models import RunRegistration
+from telemetry_collector.models import RunRegistration, TelemetryEvent
 from tests.fakes import FakeTelemetryRepository
 
 
@@ -304,3 +307,94 @@ def test_run_pagination_does_not_skip_equal_timestamps(monkeypatch) -> None:
     assert len(run_ids) == 205
     assert len(set(run_ids)) == 205
     assert second.json()["next_before"] is None
+
+
+def test_run_pagination_is_stable_when_an_older_run_updates(monkeypatch) -> None:
+    timestamps = iter(datetime(2026, 10, day, tzinfo=UTC) for day in (1, 2, 3))
+    monkeypatch.setattr("telemetry_collector.repository._now", lambda: next(timestamps))
+    repository = FakeTelemetryRepository()
+    principal = HuggingFacePrincipal(
+        user_id="hf-user-1",
+        username="builder",
+        organizations=("policyengine",),
+    )
+    for run_id in ("old", "middle", "new"):
+        repository.register_run(
+            RunRegistration(
+                run_id=run_id,
+                producer_id="producer-1",
+                country_code="US",
+                pipeline="us-fiscal-refresh",
+            ),
+            principal,
+        )
+    client = TestClient(
+        create_app(
+            settings=settings(),
+            repository=repository,
+            huggingface_authenticator=StubHuggingFaceAuthenticator(),
+        )
+    )
+    headers = {"X-Telemetry-Read-Token": "dashboard-read-token"}
+
+    first = client.get("/v1/runs?country=US&limit=2", headers=headers)
+    repository.append_events(
+        "old",
+        [
+            TelemetryEvent(
+                schema_version=1,
+                event_id="old-updated",
+                run_id="old",
+                producer_id="producer-1",
+                sequence=1,
+                timestamp=datetime(2026, 10, 5, tzinfo=UTC),
+                event_type="heartbeat",
+                stage_id=None,
+                status="progress",
+                details={},
+            )
+        ],
+    )
+    second = client.get(
+        f"/v1/runs?country=US&limit=2&before={first.json()['next_before']}",
+        headers=headers,
+    )
+
+    assert [run["run_id"] for run in first.json()["runs"]] == ["new", "middle"]
+    assert [run["run_id"] for run in second.json()["runs"]] == ["old"]
+
+
+def _encoded_cursor(value: object) -> str:
+    return base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")
+
+
+@pytest.mark.parametrize(
+    "cursor",
+    [
+        "not-base64!",
+        _encoded_cursor({}),
+        _encoded_cursor("cursor"),
+        _encoded_cursor([]),
+        _encoded_cursor(["2026-10-01T00:00:00+00:00"]),
+        _encoded_cursor(["2026-10-01T00:00:00+00:00", "run", "extra"]),
+        _encoded_cursor(["not-a-timestamp", "run"]),
+        _encoded_cursor(["2026-10-01T00:00:00", "run"]),
+        _encoded_cursor(["2026-10-01T00:00:00+00:00", "bad run"]),
+    ],
+)
+def test_invalid_pagination_cursor_returns_422(cursor: str) -> None:
+    client = TestClient(
+        create_app(
+            settings=settings(),
+            repository=FakeTelemetryRepository(),
+            huggingface_authenticator=StubHuggingFaceAuthenticator(),
+        )
+    )
+
+    response = client.get(
+        f"/v1/runs?before={cursor}",
+        headers={"X-Telemetry-Read-Token": "dashboard-read-token"},
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "Pagination cursor is invalid."}
