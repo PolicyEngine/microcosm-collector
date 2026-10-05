@@ -3,6 +3,7 @@ import pytest
 
 from telemetry_collector.auth import (
     HuggingFaceAuthenticationError,
+    HuggingFaceAuthenticationUnavailableError,
     HuggingFaceAuthenticator,
 )
 
@@ -47,3 +48,14 @@ def test_invalid_hugging_face_token_is_not_echoed(monkeypatch) -> None:
         HuggingFaceAuthenticator().authenticate("hf-private-value", "policyengine")
 
     assert "hf-private-value" not in str(captured.value)
+
+
+def test_hugging_face_outage_is_distinct_from_an_invalid_token(monkeypatch) -> None:
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        lambda *args, **kwargs: httpx.Response(503, json={"error": "unavailable"}),
+    )
+
+    with pytest.raises(HuggingFaceAuthenticationUnavailableError):
+        HuggingFaceAuthenticator().authenticate("hf-private-value", "policyengine")

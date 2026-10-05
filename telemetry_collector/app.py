@@ -22,6 +22,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from telemetry_collector.auth import (
     HuggingFaceAuthenticationError,
+    HuggingFaceAuthenticationUnavailableError,
     HuggingFaceAuthenticator,
     HuggingFacePrincipal,
 )
@@ -46,7 +47,9 @@ class CollectorSettings:
     read_token: str
     required_huggingface_org: str = "policyengine"
     collector_issuer: str = "policyengine-telemetry"
-    run_token_ttl_seconds: int = 15 * 60
+    collector_audience: str = "microcosm-telemetry-collector"
+    session_token_ttl_seconds: int = 60 * 60
+    maintenance_mode: bool = False
 
     @classmethod
     def from_environment(cls) -> CollectorSettings:
@@ -67,19 +70,23 @@ class CollectorSettings:
             collector_issuer=os.environ.get(
                 "TELEMETRY_JWT_ISSUER", "policyengine-telemetry"
             ),
-            run_token_ttl_seconds=int(
-                os.environ.get("TELEMETRY_RUN_TOKEN_TTL_SECONDS", "900")
+            collector_audience=os.environ.get(
+                "TELEMETRY_JWT_AUDIENCE", "microcosm-telemetry-collector"
             ),
+            session_token_ttl_seconds=int(
+                os.environ.get("TELEMETRY_SESSION_TOKEN_TTL_SECONDS", "3600")
+            ),
+            maintenance_mode=os.environ.get("TELEMETRY_MAINTENANCE_MODE") == "1",
         )
 
 
 @dataclass(frozen=True)
-class RunTokenClaims:
-    """Authorization carried by a collector-issued run token."""
+class SessionTokenClaims:
+    """PolicyEngine identity carried by a short-lived collector token."""
 
     subject: str
-    run_id: str
-    producer_id: str
+    username: str
+    organizations: tuple[str, ...]
 
 
 class RequestBodyLimitMiddleware:
@@ -146,6 +153,29 @@ class RequestBodyLimitMiddleware:
         await response(scope, receive, send)
 
 
+class MaintenanceModeMiddleware:
+    """Keep health checks available while rejecting all data operations."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        if scope["type"] != "http" or scope.get("path") == "/health":
+            await self.app(scope, receive, send)
+            return
+        response = JSONResponse(
+            status_code=503,
+            content={"detail": "Telemetry service is temporarily unavailable."},
+            headers={"Retry-After": "60"},
+        )
+        await response(scope, receive, send)
+
+
 def _required_environment(name: str) -> str:
     value = os.environ.get(name, "").strip()
     if not value:
@@ -194,20 +224,20 @@ def _parse_page_cursor(value: str | None) -> tuple[datetime, str] | None:
     return timestamp, run_id
 
 
-def _issue_run_token(
+def _issue_session_token(
     settings: CollectorSettings,
-    registration: RunRegistration,
     principal: HuggingFacePrincipal,
 ) -> CollectorToken:
     now = datetime.now(UTC)
-    expires = now + timedelta(seconds=settings.run_token_ttl_seconds)
+    expires = now + timedelta(seconds=settings.session_token_ttl_seconds)
     encoded = jwt.encode(
         {
             "iss": settings.collector_issuer,
+            "aud": settings.collector_audience,
             "sub": principal.user_id,
+            "username": principal.username,
+            "organizations": list(principal.organizations),
             "scope": "telemetry:write",
-            "run_id": registration.run_id,
-            "producer_id": registration.producer_id,
             "iat": now,
             "exp": expires,
         },
@@ -216,41 +246,56 @@ def _issue_run_token(
     )
     return CollectorToken(
         access_token=encoded,
-        expires_in=settings.run_token_ttl_seconds,
+        expires_in=settings.session_token_ttl_seconds,
     )
 
 
-def _decode_run_token(
+def _decode_token(
     settings: CollectorSettings, authorization: str | None
-) -> RunTokenClaims:
+) -> dict[str, Any]:
     token = _bearer_token(authorization)
     try:
-        payload = jwt.decode(
+        return jwt.decode(
             token,
             settings.jwt_secret,
             algorithms=["HS256"],
             issuer=settings.collector_issuer,
-            options={"require": ["exp", "iat", "iss", "sub"]},
+            audience=settings.collector_audience,
+            options={"require": ["aud", "exp", "iat", "iss", "scope", "sub"]},
         )
     except InvalidTokenError as error:
         raise HTTPException(
-            status_code=401, detail="Run credential is invalid."
+            status_code=401, detail="Collector credential is invalid."
         ) from error
+
+
+def _decode_session_token(
+    settings: CollectorSettings, authorization: str | None
+) -> SessionTokenClaims:
+    payload = _decode_token(settings, authorization)
     if payload.get("scope") != "telemetry:write":
         raise HTTPException(
-            status_code=403, detail="Run credential cannot ingest telemetry."
+            status_code=403,
+            detail="Collector credential cannot write telemetry.",
         )
-    run_id = payload.get("run_id")
-    producer_id = payload.get("producer_id")
     subject = payload.get("sub")
-    if not all(
-        isinstance(value, str) and value for value in (run_id, producer_id, subject)
+    username = payload.get("username")
+    organizations = payload.get("organizations")
+    if (
+        not isinstance(subject, str)
+        or not subject
+        or not isinstance(username, str)
+        or not username
+        or not isinstance(organizations, list)
+        or not all(isinstance(item, str) and item for item in organizations)
     ):
-        raise HTTPException(status_code=401, detail="Run credential is incomplete.")
-    return RunTokenClaims(
+        raise HTTPException(
+            status_code=401, detail="Collector credential is incomplete."
+        )
+    return SessionTokenClaims(
         subject=subject,
-        run_id=run_id,
-        producer_id=producer_id,
+        username=username,
+        organizations=tuple(organizations),
     )
 
 
@@ -278,6 +323,8 @@ def create_app(
     )
 
     application.add_middleware(RequestBodyLimitMiddleware, max_bytes=1_048_576)
+    if settings.maintenance_mode:
+        application.add_middleware(MaintenanceModeMiddleware)
 
     def require_read_token(
         token: Annotated[str | None, Header(alias="X-Telemetry-Read-Token")] = None,
@@ -288,10 +335,10 @@ def create_app(
                 detail="A valid dashboard read credential is required.",
             )
 
-    def run_claims(
+    def session_claims(
         authorization: Annotated[str | None, Header()] = None,
-    ) -> RunTokenClaims:
-        return _decode_run_token(settings, authorization)
+    ) -> SessionTokenClaims:
+        return _decode_session_token(settings, authorization)
 
     @application.get("/health")
     def health() -> dict[str, str]:
@@ -311,7 +358,6 @@ def create_app(
         response_model=CollectorToken,
     )
     def exchange_huggingface_token(
-        registration: RunRegistration,
         authorization: Annotated[str | None, Header()] = None,
     ) -> CollectorToken:
         opaque_token = _bearer_token(authorization)
@@ -320,6 +366,8 @@ def create_app(
                 opaque_token,
                 settings.required_huggingface_org,
             )
+        except HuggingFaceAuthenticationUnavailableError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
         except HuggingFaceAuthenticationError as error:
             raise HTTPException(status_code=401, detail=str(error)) from error
         if settings.required_huggingface_org not in principal.organizations:
@@ -327,13 +375,25 @@ def create_app(
                 status_code=403,
                 detail="The Hugging Face user is not a PolicyEngine organization member.",
             )
+        return _issue_session_token(settings, principal)
+
+    @application.post("/v1/runs", status_code=status.HTTP_201_CREATED)
+    def register_run(
+        registration: RunRegistration,
+        claims: SessionTokenClaims = Depends(session_claims),
+    ) -> dict[str, bool]:
+        principal = HuggingFacePrincipal(
+            user_id=claims.subject,
+            username=claims.username,
+            organizations=claims.organizations,
+        )
         try:
             repository.register_run(registration, principal)
         except PermissionError as error:
             raise HTTPException(status_code=403, detail=str(error)) from error
         except RunRegistrationConflictError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
-        return _issue_run_token(settings, registration, principal)
+        return {"registered": True}
 
     @application.post(
         "/v1/runs/{run_id}/events",
@@ -342,21 +402,20 @@ def create_app(
     def ingest_events(
         run_id: str,
         batch: EventBatch,
-        claims: RunTokenClaims = Depends(run_claims),
+        claims: SessionTokenClaims = Depends(session_claims),
     ) -> dict[str, int]:
-        if claims.run_id != run_id:
-            raise HTTPException(
-                status_code=403,
-                detail="Run credential is bound to another run.",
-            )
         for event in batch.events:
-            if event.run_id != run_id or event.producer_id != claims.producer_id:
+            if event.run_id != run_id:
                 raise HTTPException(
                     status_code=403,
-                    detail="Event identity does not match the run credential.",
+                    detail="Event identity does not match the request path.",
                 )
         try:
-            accepted, duplicates = repository.append_events(run_id, batch.events)
+            accepted, duplicates = repository.append_events(
+                run_id, claims.subject, batch.events
+            )
+        except PermissionError as error:
+            raise HTTPException(status_code=403, detail=str(error)) from error
         except KeyError as error:
             raise HTTPException(
                 status_code=404, detail="Run is not registered."

@@ -11,6 +11,10 @@ class HuggingFaceAuthenticationError(RuntimeError):
     """The presented Hugging Face credential could not be authenticated."""
 
 
+class HuggingFaceAuthenticationUnavailableError(RuntimeError):
+    """Hugging Face could not currently verify a credential."""
+
+
 @dataclass(frozen=True)
 class HuggingFacePrincipal:
     """Identity returned by Hugging Face for one bearer credential."""
@@ -41,7 +45,7 @@ class HuggingFaceAuthenticator:
                 follow_redirects=False,
             )
         except httpx.HTTPError as error:
-            raise HuggingFaceAuthenticationError(
+            raise HuggingFaceAuthenticationUnavailableError(
                 "Hugging Face identity verification is unavailable."
             ) from error
         if response.status_code in {401, 403}:
@@ -49,27 +53,27 @@ class HuggingFaceAuthenticator:
                 "The Hugging Face credential is invalid or expired."
             )
         if response.status_code != 200:
-            raise HuggingFaceAuthenticationError(
+            raise HuggingFaceAuthenticationUnavailableError(
                 "Hugging Face identity verification failed."
             )
         try:
             payload = response.json()
         except ValueError as error:
-            raise HuggingFaceAuthenticationError(
+            raise HuggingFaceAuthenticationUnavailableError(
                 "Hugging Face returned an invalid identity response."
             ) from error
         if not isinstance(payload, dict):
-            raise HuggingFaceAuthenticationError(
+            raise HuggingFaceAuthenticationUnavailableError(
                 "Hugging Face returned an invalid identity response."
             )
         user_id = payload.get("id")
         username = payload.get("name")
         if not isinstance(user_id, str) or not user_id:
-            raise HuggingFaceAuthenticationError(
+            raise HuggingFaceAuthenticationUnavailableError(
                 "Hugging Face did not identify the credential owner."
             )
         if not isinstance(username, str) or not username:
-            raise HuggingFaceAuthenticationError(
+            raise HuggingFaceAuthenticationUnavailableError(
                 "Hugging Face did not identify the credential owner."
             )
         organizations = tuple(

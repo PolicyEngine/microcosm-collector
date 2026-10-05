@@ -40,7 +40,10 @@ class TelemetryRepository(Protocol):
     ) -> None: ...
 
     def append_events(
-        self, run_id: str, events: Iterable[TelemetryEvent]
+        self,
+        run_id: str,
+        owner_hf_id: str,
+        events: Iterable[TelemetryEvent],
     ) -> tuple[int, int]: ...
 
     def list_runs(
@@ -453,7 +456,10 @@ class PostgresTelemetryRepository:
         return [_event_mapping(event, registered_at) for event, registered_at in rows]
 
     def append_events(
-        self, run_id: str, events: Iterable[TelemetryEvent]
+        self,
+        run_id: str,
+        owner_hf_id: str,
+        events: Iterable[TelemetryEvent],
     ) -> tuple[int, int]:
         models = list(events)
         with self._sessions.begin() as session:
@@ -464,8 +470,23 @@ class PostgresTelemetryRepository:
             ).scalar_one_or_none()
             if run is None:
                 raise KeyError(run_id)
+            if run.owner_hf_id != owner_hf_id:
+                raise PermissionError("Run belongs to another Hugging Face user.")
             if not models:
                 return 0, 0
+            producer_ids = {model.producer_id for model in models}
+            registered_producer_ids = set(
+                session.execute(
+                    select(TelemetryProducer.producer_id).where(
+                        TelemetryProducer.run_id == run_id,
+                        TelemetryProducer.producer_id.in_(producer_ids),
+                    )
+                ).scalars()
+            )
+            if registered_producer_ids != producer_ids:
+                raise PermissionError(
+                    "Telemetry producer is not registered for this run."
+                )
             values = []
             for model in models:
                 event = model.model_dump(mode="python")

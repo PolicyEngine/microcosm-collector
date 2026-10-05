@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import base64
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 
+import jwt
 import pytest
 from fastapi.testclient import TestClient
 
 from telemetry_collector.app import CollectorSettings, create_app
-from telemetry_collector.auth import HuggingFacePrincipal
+from telemetry_collector.auth import (
+    HuggingFaceAuthenticationUnavailableError,
+    HuggingFacePrincipal,
+)
 from telemetry_collector.models import RunRegistration, TelemetryEvent
 from tests.fakes import FakeTelemetryRepository
 
@@ -33,26 +38,39 @@ def settings() -> CollectorSettings:
         read_token="dashboard-read-token",
         required_huggingface_org="policyengine",
         collector_issuer="test-collector",
-        run_token_ttl_seconds=900,
+        session_token_ttl_seconds=900,
     )
+
+
+def registration() -> dict[str, object]:
+    return {
+        "run_id": "route-a-1",
+        "producer_id": "producer-1",
+        "country_code": "US",
+        "pipeline": "us-fiscal-refresh",
+        "candidate_id": "candidate-1",
+        "release_id": None,
+        "run_kind": "build",
+    }
 
 
 def exchange(client: TestClient) -> str:
     response = client.post(
         "/v1/auth/huggingface/exchange",
         headers={"Authorization": "Bearer hf_example"},
-        json={
-            "run_id": "route-a-1",
-            "producer_id": "producer-1",
-            "country_code": "US",
-            "pipeline": "us-fiscal-refresh",
-            "candidate_id": "candidate-1",
-            "release_id": None,
-            "run_kind": "build",
-        },
     )
     assert response.status_code == 200
     return response.json()["access_token"]
+
+
+def register(client: TestClient, session_token: str) -> None:
+    response = client.post(
+        "/v1/runs",
+        headers={"Authorization": f"Bearer {session_token}"},
+        json=registration(),
+    )
+    assert response.status_code == 201
+    assert response.json() == {"registered": True}
 
 
 def test_exchange_ingest_and_read_run() -> None:
@@ -65,7 +83,8 @@ def test_exchange_ingest_and_read_run() -> None:
             huggingface_authenticator=authenticator,
         )
     )
-    token = exchange(client)
+    session_token = exchange(client)
+    register(client, session_token)
     timestamp = datetime.now(UTC).isoformat()
     event = {
         "schema_version": 1,
@@ -89,12 +108,12 @@ def test_exchange_ingest_and_read_run() -> None:
 
     first = client.post(
         "/v1/runs/route-a-1/events",
-        headers={"Authorization": f"Bearer {token}"},
+        headers={"Authorization": f"Bearer {session_token}"},
         json={"events": [event]},
     )
     duplicate = client.post(
         "/v1/runs/route-a-1/events",
-        headers={"Authorization": f"Bearer {token}"},
+        headers={"Authorization": f"Bearer {session_token}"},
         json={"events": [event]},
     )
 
@@ -103,6 +122,15 @@ def test_exchange_ingest_and_read_run() -> None:
     assert duplicate.status_code == 202
     assert duplicate.json() == {"accepted": 0, "duplicates": 1}
     assert authenticator.tokens == ["hf_example"]
+
+    session_claims = jwt.decode(
+        session_token,
+        settings().jwt_secret,
+        algorithms=["HS256"],
+        issuer=settings().collector_issuer,
+        audience="microcosm-telemetry-collector",
+    )
+    assert session_claims["scope"] == "telemetry:write"
 
     denied = client.get("/v1/runs?country=US")
     assert denied.status_code == 401
@@ -131,16 +159,53 @@ def test_non_member_cannot_exchange_token() -> None:
     response = client.post(
         "/v1/auth/huggingface/exchange",
         headers={"Authorization": "Bearer hf_outsider"},
-        json={
-            "run_id": "public-build",
-            "producer_id": "producer-1",
-            "country_code": "US",
-            "pipeline": "us-fiscal-refresh",
-            "candidate_id": "candidate-public",
-            "run_kind": "build",
-        },
     )
     assert response.status_code == 403
+
+
+def test_identity_provider_outage_is_retryable() -> None:
+    authenticator = StubHuggingFaceAuthenticator()
+
+    def unavailable(token: str, required_org: str) -> HuggingFacePrincipal:
+        raise HuggingFaceAuthenticationUnavailableError(
+            "Hugging Face identity verification is unavailable."
+        )
+
+    authenticator.authenticate = unavailable  # type: ignore[method-assign]
+    client = TestClient(
+        create_app(
+            settings=settings(),
+            repository=FakeTelemetryRepository(),
+            huggingface_authenticator=authenticator,
+        )
+    )
+
+    response = client.post(
+        "/v1/auth/huggingface/exchange",
+        headers={"Authorization": "Bearer hf_example"},
+    )
+
+    assert response.status_code == 503
+
+
+def test_run_registration_requires_collector_membership_token() -> None:
+    repository = FakeTelemetryRepository()
+    client = TestClient(
+        create_app(
+            settings=settings(),
+            repository=repository,
+            huggingface_authenticator=StubHuggingFaceAuthenticator(),
+        )
+    )
+
+    response = client.post(
+        "/v1/runs",
+        headers={"Authorization": "Bearer hf_raw_credential"},
+        json=registration(),
+    )
+
+    assert response.status_code == 401
+    assert repository.list_runs(country=None, limit=10, before=None) == []
 
 
 def test_run_identifier_cannot_be_reused_with_different_metadata() -> None:
@@ -152,11 +217,12 @@ def test_run_identifier_cannot_be_reused_with_different_metadata() -> None:
             huggingface_authenticator=StubHuggingFaceAuthenticator(),
         )
     )
-    exchange(client)
+    session_token = exchange(client)
+    register(client, session_token)
 
     response = client.post(
-        "/v1/auth/huggingface/exchange",
-        headers={"Authorization": "Bearer hf_example"},
+        "/v1/runs",
+        headers={"Authorization": f"Bearer {session_token}"},
         json={
             "run_id": "route-a-1",
             "producer_id": "producer-2",
@@ -174,11 +240,25 @@ def test_run_identifier_cannot_be_reused_with_different_metadata() -> None:
     )
 
 
-def test_run_token_is_bound_to_run_and_producer() -> None:
+def test_session_token_cannot_ingest_another_users_run() -> None:
+    repository = FakeTelemetryRepository()
+    repository.register_run(
+        RunRegistration(
+            run_id="another-run",
+            producer_id="another-producer",
+            country_code="US",
+            pipeline="us-fiscal-refresh",
+        ),
+        HuggingFacePrincipal(
+            user_id="another-owner",
+            username="another-builder",
+            organizations=("policyengine",),
+        ),
+    )
     client = TestClient(
         create_app(
             settings=settings(),
-            repository=FakeTelemetryRepository(),
+            repository=repository,
             huggingface_authenticator=StubHuggingFaceAuthenticator(),
         )
     )
@@ -186,7 +266,21 @@ def test_run_token_is_bound_to_run_and_producer() -> None:
     response = client.post(
         "/v1/runs/another-run/events",
         headers={"Authorization": f"Bearer {token}"},
-        json={"events": []},
+        json={
+            "events": [
+                {
+                    "schema_version": 1,
+                    "event_id": "other-event",
+                    "run_id": "another-run",
+                    "producer_id": "another-producer",
+                    "sequence": 1,
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    "event_type": "heartbeat",
+                    "status": "progress",
+                    "details": {},
+                }
+            ]
+        },
     )
     assert response.status_code == 403
 
@@ -201,6 +295,7 @@ def test_failed_validation_event_does_not_finish_the_run() -> None:
         )
     )
     token = exchange(client)
+    register(client, token)
     response = client.post(
         "/v1/runs/route-a-1/events",
         headers={"Authorization": f"Bearer {token}"},
@@ -243,6 +338,25 @@ def test_health_does_not_require_credentials() -> None:
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def test_maintenance_mode_keeps_health_available_and_rejects_data_requests() -> None:
+    client = TestClient(
+        create_app(
+            settings=replace(settings(), maintenance_mode=True),
+            repository=FakeTelemetryRepository(),
+            huggingface_authenticator=StubHuggingFaceAuthenticator(),
+        )
+    )
+
+    assert client.get("/health").status_code == 200
+    unavailable = client.post(
+        "/v1/auth/huggingface/exchange",
+        headers={"Authorization": "Bearer hf_example"},
+    )
+    assert unavailable.status_code == 503
+    assert unavailable.headers["Retry-After"] == "60"
+    assert client.get("/ready").status_code == 503
 
 
 def test_readiness_checks_repository_without_credentials() -> None:
@@ -360,6 +474,7 @@ def test_run_pagination_is_stable_when_an_older_run_updates(monkeypatch) -> None
     first = client.get("/v1/runs?country=US&limit=2", headers=headers)
     repository.append_events(
         "old",
+        "hf-user-1",
         [
             TelemetryEvent(
                 schema_version=1,

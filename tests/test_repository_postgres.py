@@ -75,9 +75,12 @@ def test_repository_is_idempotent_and_reduces_out_of_order_events(
         stage_id="failed",
     )
 
-    assert repository.append_events("run-1", [completed]) == (1, 0)
-    assert repository.append_events("run-1", [completed]) == (0, 1)
-    assert repository.append_events("run-1", [delayed_failure]) == (1, 0)
+    assert repository.append_events("run-1", "owner-1", [completed]) == (1, 0)
+    assert repository.append_events("run-1", "owner-1", [completed]) == (0, 1)
+    assert repository.append_events("run-1", "owner-1", [delayed_failure]) == (
+        1,
+        0,
+    )
 
     listed = repository.list_runs(country="US", limit=10, before=None)
     detail = repository.get_run("run-1")
@@ -107,6 +110,32 @@ def test_registration_rejects_owner_and_metadata_conflicts(
         repository.register_run(
             _registration(pipeline="another-pipeline"), _principal()
         )
+
+    repository.close()
+
+
+def test_event_ingestion_rejects_another_owner_and_unregistered_producer(
+    postgres_url: str,
+) -> None:
+    upgrade_database(postgres_url)
+    repository = PostgresTelemetryRepository(postgres_url)
+    repository.register_run(_registration(), _principal())
+    event = _event(
+        event_id="owned-event",
+        sequence=1,
+        timestamp=datetime.now(UTC),
+        status="progress",
+        stage_id="compile",
+    )
+
+    with pytest.raises(PermissionError, match="another Hugging Face user"):
+        repository.append_events("run-1", "owner-2", [event])
+
+    unregistered = event.model_copy(
+        update={"event_id": "unknown-producer", "producer_id": "producer-2"}
+    )
+    with pytest.raises(PermissionError, match="not registered"):
+        repository.append_events("run-1", "owner-1", [unregistered])
 
     repository.close()
 

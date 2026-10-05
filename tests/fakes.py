@@ -65,13 +65,18 @@ class FakeTelemetryRepository:
             )
 
     def append_events(
-        self, run_id: str, events: Iterable[TelemetryEvent]
+        self,
+        run_id: str,
+        owner_hf_id: str,
+        events: Iterable[TelemetryEvent],
     ) -> tuple[int, int]:
         accepted = 0
         duplicates = 0
         with self._lock:
             if run_id not in self._runs:
                 raise KeyError(run_id)
+            if self._runs[run_id]["owner_hf_id"] != owner_hf_id:
+                raise PermissionError("Run belongs to another Hugging Face user.")
             stored = self._events[run_id]
             for model in events:
                 event = model.model_dump(mode="python")
@@ -80,6 +85,10 @@ class FakeTelemetryRepository:
                     duplicates += 1
                     continue
                 producer_key = (run_id, event["producer_id"])
+                if producer_key not in self._producers:
+                    raise PermissionError(
+                        "Telemetry producer is not registered for this run."
+                    )
                 event["producer_registered_at"] = self._producers[producer_key]
                 stored[event["event_id"]] = event
                 self._sequences.add(sequence_key)
