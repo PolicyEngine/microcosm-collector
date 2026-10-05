@@ -1,6 +1,6 @@
-"""Represent the collector schema that predates Alembic.
+"""Create the SQLAlchemy ORM telemetry schema.
 
-Revision ID: 0001_legacy_schema
+Revision ID: 0001_initial_schema
 Revises: None
 """
 
@@ -10,14 +10,14 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0001_legacy_schema"
+revision: str = "0001_initial_schema"
 down_revision: str | Sequence[str] | None = None
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    """Create the exact schema originally installed by startup SQL."""
+    """Create the complete collector schema."""
 
     op.create_table(
         "telemetry_runs",
@@ -31,6 +31,12 @@ def upgrade() -> None:
         sa.Column("owner_hf_username", sa.Text(), nullable=False),
         sa.Column("status", sa.Text(), nullable=False),
         sa.Column("current_stage", sa.Text(), nullable=False),
+        sa.Column(
+            "registered_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.current_timestamp(),
+            nullable=False,
+        ),
         sa.Column("started_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("ended_at", sa.DateTime(timezone=True)),
@@ -38,12 +44,35 @@ def upgrade() -> None:
         sa.Column("resources", postgresql.JSONB()),
         sa.Column("work", postgresql.JSONB()),
         sa.Column("failure", postgresql.JSONB()),
-        sa.PrimaryKeyConstraint("run_id", name="telemetry_runs_pkey"),
+        sa.PrimaryKeyConstraint("run_id", name="pk_telemetry_runs"),
     )
     op.create_index(
-        "telemetry_runs_country_updated_idx",
+        "telemetry_runs_country_registered_idx",
         "telemetry_runs",
-        ["country_code", sa.column("updated_at").desc()],
+        ["country_code", sa.column("registered_at").desc(), sa.column("run_id").desc()],
+    )
+    op.create_table(
+        "telemetry_producers",
+        sa.Column("run_id", sa.Text(), nullable=False),
+        sa.Column("producer_id", sa.Text(), nullable=False),
+        sa.Column(
+            "registered_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.current_timestamp(),
+            nullable=False,
+        ),
+        sa.ForeignKeyConstraint(
+            ["run_id"],
+            ["telemetry_runs.run_id"],
+            name="fk_telemetry_producers_run_id_telemetry_runs",
+            ondelete="CASCADE",
+        ),
+        sa.PrimaryKeyConstraint("run_id", "producer_id", name="pk_telemetry_producers"),
+    )
+    op.create_index(
+        "telemetry_producers_run_registered_idx",
+        "telemetry_producers",
+        ["run_id", "registered_at", "producer_id"],
     )
     op.create_table(
         "telemetry_events",
@@ -62,15 +91,26 @@ def upgrade() -> None:
         sa.Column("stage_id", sa.Text()),
         sa.Column("status", sa.Text(), nullable=False),
         sa.Column("message", sa.Text()),
-        sa.Column("details", postgresql.JSONB(), server_default="{}", nullable=False),
+        sa.Column(
+            "details",
+            postgresql.JSONB(),
+            server_default="{}",
+            nullable=False,
+        ),
         sa.Column("resources", postgresql.JSONB()),
         sa.ForeignKeyConstraint(
             ["run_id"],
             ["telemetry_runs.run_id"],
-            name="telemetry_events_run_id_fkey",
+            name="fk_telemetry_events_run_id_telemetry_runs",
             ondelete="CASCADE",
         ),
-        sa.PrimaryKeyConstraint("event_id", name="telemetry_events_pkey"),
+        sa.ForeignKeyConstraint(
+            ["run_id", "producer_id"],
+            ["telemetry_producers.run_id", "telemetry_producers.producer_id"],
+            name="fk_telemetry_events_run_id_producer_id_telemetry_producers",
+            ondelete="CASCADE",
+        ),
+        sa.PrimaryKeyConstraint("event_id", name="pk_telemetry_events"),
         sa.UniqueConstraint(
             "run_id",
             "producer_id",
@@ -81,12 +121,13 @@ def upgrade() -> None:
     op.create_index(
         "telemetry_events_run_order_idx",
         "telemetry_events",
-        ["run_id", "emitted_at", "producer_id", "sequence"],
+        ["run_id", "producer_id", "sequence"],
     )
 
 
 def downgrade() -> None:
-    """Remove the legacy collector schema."""
+    """Remove the collector schema."""
 
     op.drop_table("telemetry_events")
+    op.drop_table("telemetry_producers")
     op.drop_table("telemetry_runs")

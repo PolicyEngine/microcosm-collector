@@ -35,13 +35,17 @@ def test_service_deployment_uses_oidc_and_verifies_before_promotion() -> None:
     assert '"${url}/ready"' in deploy_script
     assert '"${stable_url}/ready"' in deploy_script
     assert "--no-traffic" in deploy_script
+    assert "TELEMETRY_MAINTENANCE_MODE=1" in deploy_script
+    assert "TELEMETRY_MAINTENANCE_MODE=0" in deploy_script
+    assert '"${url}/health"' in deploy_script
+    assert '"${url}/v1/auth/huggingface/exchange"' in deploy_script
     assert workflow.index("Resolve and verify the candidate revision") < workflow.index(
         "Promote the verified revision"
     )
-    assert "Restore the previous revision after failed stable verification" in workflow
+    assert "Restore the previous revision" not in workflow
 
 
-def test_service_workflow_runs_postgres_tests_and_migrates_before_deploy() -> None:
+def test_service_workflow_hard_cuts_over_before_migration() -> None:
     workflow = WORKFLOW.read_text(encoding="utf-8")
     deploy_script = DEPLOY_SCRIPT.read_text(encoding="utf-8")
 
@@ -53,6 +57,12 @@ def test_service_workflow_runs_postgres_tests_and_migrates_before_deploy() -> No
     assert "--max-retries 0" in deploy_script
     assert "--wait" in deploy_script
     assert "--max 4" in deploy_script
+    assert workflow.index("Route traffic to maintenance mode") < workflow.index(
+        "Apply database migrations"
+    )
+    assert workflow.index("Wait for old requests to finish") < workflow.index(
+        "Apply database migrations"
+    )
     assert workflow.index("Apply database migrations") < workflow.index(
         "Deploy an isolated candidate revision"
     )
@@ -64,12 +74,14 @@ def test_service_workflow_has_no_multiline_run_blocks() -> None:
 
     assert "run: |" not in workflow
     assert "run: >" not in workflow
-    assert workflow.count("run: telemetry-service/scripts/deploy.sh") == 10
+    assert workflow.count("run: telemetry-service/scripts/deploy.sh") == 12
 
     for command in (
         "require-configuration",
         "build-and-push-image",
-        "capture-production-revision",
+        "deploy-maintenance",
+        "resolve-and-verify-maintenance",
+        "wait-for-cutover",
         "configure-migration-job",
         "apply-migrations",
         "deploy-candidate",

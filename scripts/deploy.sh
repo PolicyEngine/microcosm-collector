@@ -46,28 +46,6 @@ build_and_push_image() {
   printf 'uri=%s\n' "$image" >> "$GITHUB_OUTPUT"
 }
 
-capture_production_revision() {
-  require_variables SERVICE PROJECT_ID REGION GITHUB_OUTPUT
-
-  local revision
-  local service_json
-  service_json="$(
-    gcloud run services describe "$SERVICE" \
-      --project "$PROJECT_ID" \
-      --region "$REGION" \
-      --format=json
-  )"
-  revision="$(
-    jq -er '
-      [.status.traffic[]? | select((.percent // 0) == 100) | .revisionName]
-      | if length == 1 then .[0]
-        else error("expected exactly one production revision")
-        end
-    ' <<< "$service_json"
-  )"
-  printf 'revision=%s\n' "$revision" >> "$GITHUB_OUTPUT"
-}
-
 configure_migration_job() {
   require_variables \
     MIGRATION_JOB \
@@ -103,6 +81,83 @@ apply_migrations() {
     --quiet
 }
 
+deploy_maintenance() {
+  require_variables \
+    SERVICE \
+    PROJECT_ID \
+    REGION \
+    IMAGE_URI \
+    RUNTIME_SERVICE_ACCOUNT \
+    CLOUD_SQL_CONNECTION \
+    DATABASE_SECRET \
+    JWT_SECRET \
+    READ_SECRET
+
+  gcloud run deploy "$SERVICE" \
+    --project "$PROJECT_ID" \
+    --region "$REGION" \
+    --platform managed \
+    --image "$IMAGE_URI" \
+    --service-account "$RUNTIME_SERVICE_ACCOUNT" \
+    --add-cloudsql-instances "$CLOUD_SQL_CONNECTION" \
+    --set-secrets "DATABASE_URL=${DATABASE_SECRET}:latest,TELEMETRY_JWT_SECRET=${JWT_SECRET}:latest,TELEMETRY_READ_TOKEN=${READ_SECRET}:latest" \
+    --set-env-vars "TELEMETRY_MAINTENANCE_MODE=1" \
+    --min 1 \
+    --max 4 \
+    --cpu 1 \
+    --memory 512Mi \
+    --concurrency 40 \
+    --timeout 30 \
+    --allow-unauthenticated \
+    --default-url \
+    --startup-probe "httpGet.path=/health,httpGet.port=8080,timeoutSeconds=10,periodSeconds=10,failureThreshold=12" \
+    --no-traffic \
+    --tag maintenance \
+    --quiet
+}
+
+resolve_and_verify_maintenance() {
+  require_variables SERVICE PROJECT_ID REGION GITHUB_OUTPUT
+
+  local revision
+  local service_json
+  local status_code
+  local url
+  service_json="$(
+    gcloud run services describe "$SERVICE" \
+      --project "$PROJECT_ID" \
+      --region "$REGION" \
+      --format=json
+  )"
+  revision="$(jq -er '.status.latestCreatedRevisionName' <<< "$service_json")"
+  url="$(
+    jq -er '
+      .status.traffic[]
+      | select(.tag == "maintenance")
+      | .url
+    ' <<< "$service_json"
+  )"
+  curl --fail --show-error --silent \
+    --retry 12 --retry-all-errors --retry-delay 5 \
+    "${url}/health"
+  status_code="$(
+    curl --show-error --silent \
+      --output /dev/null \
+      --write-out '%{http_code}' \
+      --request POST \
+      "${url}/v1/auth/huggingface/exchange"
+  )"
+  if [[ "$status_code" != "503" ]]; then
+    echo "Maintenance revision accepted a data request with HTTP ${status_code}." >&2
+    return 1
+  fi
+  printf 'revision=%s\n' "$revision" >> "$GITHUB_OUTPUT"
+}
+
+wait_for_cutover() {
+  sleep 35
+}
+
 deploy_candidate() {
   require_variables \
     SERVICE \
@@ -123,6 +178,7 @@ deploy_candidate() {
     --service-account "$RUNTIME_SERVICE_ACCOUNT" \
     --add-cloudsql-instances "$CLOUD_SQL_CONNECTION" \
     --set-secrets "DATABASE_URL=${DATABASE_SECRET}:latest,TELEMETRY_JWT_SECRET=${JWT_SECRET}:latest,TELEMETRY_READ_TOKEN=${READ_SECRET}:latest" \
+    --set-env-vars "TELEMETRY_MAINTENANCE_MODE=0" \
     --min 1 \
     --max 4 \
     --cpu 1 \
@@ -201,7 +257,9 @@ Usage: deploy.sh COMMAND
 Commands:
   require-configuration
   build-and-push-image
-  capture-production-revision
+  deploy-maintenance
+  resolve-and-verify-maintenance
+  wait-for-cutover
   configure-migration-job
   apply-migrations
   deploy-candidate
@@ -220,7 +278,9 @@ main() {
   case "$1" in
     require-configuration) require_configuration ;;
     build-and-push-image) build_and_push_image ;;
-    capture-production-revision) capture_production_revision ;;
+    deploy-maintenance) deploy_maintenance ;;
+    resolve-and-verify-maintenance) resolve_and_verify_maintenance ;;
+    wait-for-cutover) wait_for_cutover ;;
     configure-migration-job) configure_migration_job ;;
     apply-migrations) apply_migrations ;;
     deploy-candidate) deploy_candidate ;;

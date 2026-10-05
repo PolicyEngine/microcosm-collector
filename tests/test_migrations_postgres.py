@@ -5,6 +5,7 @@ from alembic import command
 from alembic.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from sqlalchemy import inspect
+from sqlalchemy.dialects.postgresql import JSONB
 
 from telemetry_collector.database import create_database_engine
 from telemetry_collector.migrate import SchemaState, alembic_config, upgrade_database
@@ -22,6 +23,76 @@ def _current_revision(database_url: str) -> tuple[str | None, str | None]:
         engine.dispose()
 
 
+def _legacy_metadata() -> sa.MetaData:
+    metadata = sa.MetaData()
+    runs = sa.Table(
+        "telemetry_runs",
+        metadata,
+        sa.Column("run_id", sa.Text(), primary_key=True),
+        sa.Column("country_code", sa.Text(), nullable=False),
+        sa.Column("pipeline", sa.Text(), nullable=False),
+        sa.Column("candidate_id", sa.Text()),
+        sa.Column("release_id", sa.Text()),
+        sa.Column("run_kind", sa.Text(), nullable=False),
+        sa.Column("owner_hf_id", sa.Text(), nullable=False),
+        sa.Column("owner_hf_username", sa.Text(), nullable=False),
+        sa.Column("status", sa.Text(), nullable=False),
+        sa.Column("current_stage", sa.Text(), nullable=False),
+        sa.Column("started_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("ended_at", sa.DateTime(timezone=True)),
+        sa.Column("heartbeat_at", sa.DateTime(timezone=True)),
+        sa.Column("resources", JSONB()),
+        sa.Column("work", JSONB()),
+        sa.Column("failure", JSONB()),
+    )
+    sa.Index(
+        "telemetry_runs_country_updated_idx",
+        runs.c.country_code,
+        runs.c.updated_at.desc(),
+    )
+    events = sa.Table(
+        "telemetry_events",
+        metadata,
+        sa.Column("event_id", sa.Text(), primary_key=True),
+        sa.Column(
+            "run_id",
+            sa.Text(),
+            sa.ForeignKey("telemetry_runs.run_id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+        sa.Column("producer_id", sa.Text(), nullable=False),
+        sa.Column("sequence", sa.BigInteger(), nullable=False),
+        sa.Column("emitted_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column(
+            "received_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.current_timestamp(),
+            nullable=False,
+        ),
+        sa.Column("event_type", sa.Text(), nullable=False),
+        sa.Column("stage_id", sa.Text()),
+        sa.Column("status", sa.Text(), nullable=False),
+        sa.Column("message", sa.Text()),
+        sa.Column("details", JSONB(), server_default="{}", nullable=False),
+        sa.Column("resources", JSONB()),
+        sa.UniqueConstraint(
+            "run_id",
+            "producer_id",
+            "sequence",
+            name="telemetry_events_run_id_producer_id_sequence_key",
+        ),
+    )
+    sa.Index(
+        "telemetry_events_run_order_idx",
+        events.c.run_id,
+        events.c.emitted_at,
+        events.c.producer_id,
+        events.c.sequence,
+    )
+    return metadata
+
+
 def test_upgrades_empty_postgres_database_to_head(postgres_url: str) -> None:
     assert upgrade_database(postgres_url) is SchemaState.EMPTY
 
@@ -34,22 +105,22 @@ def test_upgrades_empty_postgres_database_to_head(postgres_url: str) -> None:
             "telemetry_events",
         }
         assert _current_revision(postgres_url) == (
-            "0002_orm_schema",
-            "0002_orm_schema",
+            "0001_initial_schema",
+            "0001_initial_schema",
         )
     finally:
         engine.dispose()
 
 
-def test_adopts_populated_legacy_database(postgres_url: str) -> None:
+def test_hard_cutover_replaces_populated_unversioned_database(
+    postgres_url: str,
+) -> None:
     engine = create_database_engine(postgres_url)
-    config = alembic_config()
     with engine.begin() as connection:
-        config.attributes["connection"] = connection
-        command.upgrade(config, "0001_legacy_schema")
-        metadata = sa.MetaData()
-        runs = sa.Table("telemetry_runs", metadata, autoload_with=connection)
-        events = sa.Table("telemetry_events", metadata, autoload_with=connection)
+        metadata = _legacy_metadata()
+        metadata.create_all(connection)
+        runs = metadata.tables["telemetry_runs"]
+        events = metadata.tables["telemetry_events"]
         timestamp = sa.func.current_timestamp()
         connection.execute(
             runs.insert().values(
@@ -78,24 +149,30 @@ def test_adopts_populated_legacy_database(postgres_url: str) -> None:
                 details={},
             )
         )
-        sa.Table("alembic_version", metadata, autoload_with=connection).drop(connection)
     engine.dispose()
 
     assert upgrade_database(postgres_url) is SchemaState.LEGACY
 
     engine = create_database_engine(postgres_url)
     try:
+        inspector = inspect(engine)
+        assert set(inspector.get_table_names()) == {
+            "alembic_version",
+            "telemetry_runs",
+            "telemetry_producers",
+            "telemetry_events",
+        }
         metadata = sa.MetaData()
-        producers = sa.Table("telemetry_producers", metadata, autoload_with=engine)
+        runs = sa.Table("telemetry_runs", metadata, autoload_with=engine)
+        events = sa.Table("telemetry_events", metadata, autoload_with=engine)
         with engine.connect() as connection:
-            rows = connection.execute(sa.select(producers)).mappings().all()
-        assert [(row["run_id"], row["producer_id"]) for row in rows] == [
-            ("legacy-run", "legacy-producer")
-        ]
-        assert rows[0]["registered_at"] is not None
+            assert connection.scalar(sa.select(sa.func.count()).select_from(runs)) == 0
+            assert (
+                connection.scalar(sa.select(sa.func.count()).select_from(events)) == 0
+            )
         assert _current_revision(postgres_url) == (
-            "0002_orm_schema",
-            "0002_orm_schema",
+            "0001_initial_schema",
+            "0001_initial_schema",
         )
     finally:
         engine.dispose()
@@ -113,8 +190,8 @@ def test_migration_chain_downgrades_and_reupgrades_in_test_database(
             command.downgrade(config, "base")
             command.upgrade(config, "head")
         assert _current_revision(postgres_url) == (
-            "0002_orm_schema",
-            "0002_orm_schema",
+            "0001_initial_schema",
+            "0001_initial_schema",
         )
     finally:
         engine.dispose()

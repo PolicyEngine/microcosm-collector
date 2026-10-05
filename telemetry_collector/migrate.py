@@ -17,7 +17,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import Engine
 from sqlalchemy.engine.reflection import Inspector
 
-from telemetry_collector.database import create_database_engine
+from telemetry_collector.database import Base, create_database_engine
 
 SERVICE_ROOT = Path(__file__).resolve().parents[1]
 ALEMBIC_INI = SERVICE_ROOT / "alembic.ini"
@@ -150,7 +150,7 @@ def alembic_config() -> Config:
 
 
 def upgrade_database(database_url: str) -> SchemaState:
-    """Adopt a recognized legacy database and upgrade it to Alembic head."""
+    """Replace the unversioned prototype schema, then upgrade to Alembic head."""
 
     engine: Engine = create_database_engine(database_url)
     try:
@@ -163,7 +163,7 @@ def upgrade_database(database_url: str) -> SchemaState:
         with engine.begin() as connection:
             config.attributes["connection"] = connection
             if state is SchemaState.LEGACY:
-                command.stamp(config, "0001_legacy_schema")
+                Base.metadata.drop_all(connection)
             command.upgrade(config, "head")
         return state
     finally:
