@@ -8,6 +8,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
+COPY alembic.ini ./
+COPY migrations ./migrations
 COPY telemetry_collector ./telemetry_collector
 RUN uv sync --frozen --no-dev
 

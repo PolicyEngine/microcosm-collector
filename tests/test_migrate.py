@@ -117,6 +117,17 @@ def test_rejects_partial_legacy_database() -> None:
     assert classify_schema(inspector) is SchemaState.UNEXPECTED
 
 
+def test_rejects_unversioned_database_with_additional_telemetry_tables() -> None:
+    inspector = _legacy_inspector()
+    inspector.get_table_names.return_value = [
+        "telemetry_runs",
+        "telemetry_events",
+        "telemetry_producers",
+    ]
+
+    assert classify_schema(inspector) is SchemaState.UNEXPECTED
+
+
 def test_rejects_legacy_database_with_wrong_columns() -> None:
     inspector = _legacy_inspector()
     columns = inspector.get_columns("telemetry_runs")

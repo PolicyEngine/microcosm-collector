@@ -245,6 +245,26 @@ def test_health_does_not_require_credentials() -> None:
     assert response.json() == {"status": "ok"}
 
 
+def test_readiness_checks_repository_without_credentials() -> None:
+    repository = FakeTelemetryRepository()
+    client = TestClient(
+        create_app(
+            settings=settings(),
+            repository=repository,
+            huggingface_authenticator=StubHuggingFaceAuthenticator(),
+        )
+    )
+
+    assert client.get("/ready").json() == {"status": "ok"}
+
+    repository.is_ready = lambda: False  # type: ignore[method-assign]
+    unavailable = client.get("/ready")
+    assert unavailable.status_code == 503
+    assert unavailable.json()["detail"] == (
+        "Telemetry database is unavailable or not fully migrated."
+    )
+
+
 def test_streamed_request_body_is_bounded() -> None:
     client = TestClient(
         create_app(

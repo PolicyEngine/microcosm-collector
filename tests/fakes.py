@@ -116,3 +116,6 @@ class FakeTelemetryRepository:
             return run_documents(
                 deepcopy(run), deepcopy(list(self._events[run_id].values()))
             )
+
+    def is_ready(self) -> bool:
+        return True

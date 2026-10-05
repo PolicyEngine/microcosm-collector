@@ -297,6 +297,15 @@ def create_app(
     def health() -> dict[str, str]:
         return {"status": "ok"}
 
+    @application.get("/ready")
+    def ready() -> dict[str, str]:
+        if not repository.is_ready():
+            raise HTTPException(
+                status_code=503,
+                detail="Telemetry database is unavailable or not fully migrated.",
+            )
+        return {"status": "ok"}
+
     @application.post(
         "/v1/auth/huggingface/exchange",
         response_model=CollectorToken,

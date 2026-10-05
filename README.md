@@ -24,6 +24,7 @@ uv sync --dev
 export DATABASE_URL=postgresql://...
 export TELEMETRY_JWT_SECRET=...
 export TELEMETRY_READ_TOKEN=...
+uv run python -m telemetry_collector.migrate
 uv run uvicorn telemetry_collector.app:create_app_from_environment \
   --factory --host 127.0.0.1 --port 8080 --no-access-log
 ```
@@ -47,10 +48,12 @@ mutable infrastructure template.
 `.github/workflows/telemetry-service.yml` runs only when this directory or the
 workflow itself changes. Pull requests run tests, Ruff, and a container build.
 After a change reaches `main`, the workflow authenticates to Google Cloud with
-GitHub OIDC, pushes an image identified by the commit SHA, deploys it without
-production traffic, checks its revision-specific `/health` endpoint, and then
-routes production traffic to that exact revision. If the stable-address check
-fails, it restores the previous revision.
+GitHub OIDC and pushes an image identified by the commit SHA. It runs that exact
+image as a one-task Cloud Run job to apply Alembic migrations, then deploys the
+service without production traffic. The workflow checks the candidate's
+`/ready` endpoint before routing production traffic to that exact revision. If
+the stable-address check fails, it restores the previous revision. Manual
+production deployment runs are accepted only from `main`.
 
 The workflow reads its Google Cloud identifiers from the GitHub `Production`
 environment. Runtime secrets remain in Google Secret Manager. The dashboard
@@ -64,6 +67,17 @@ access logs for the container so authorization headers cannot enter application
 logs. Cloud Run and the HTTPS load balancer may retain request metadata, but the
 service never includes credentials in paths, query strings, bodies, or errors.
 
-The service creates its two tables on startup using
-`telemetry_collector/migrations/001_initial.sql`. For production schema changes,
-add a new idempotent migration instead of editing the initial migration.
+Application persistence uses SQLAlchemy ORM sessions and SQLAlchemy-managed
+connection pooling. Psycopg is installed only as SQLAlchemy's PostgreSQL DBAPI
+driver; application modules do not call it directly.
+
+Alembic owns the complete database schema. The service never creates or alters
+tables during application startup, and production deployment never requires a
+person to run database commands. Add a reviewed Alembic revision for every
+schema change. The deployment job recognizes an empty database, an
+Alembic-managed database, or the exact schema installed before Alembic was
+introduced; it refuses to modify any other schema. Production deployment only
+upgrades. Downgrades are reserved for disposable test databases.
+
+`/health` reports that the HTTP process is running. `/ready` additionally
+requires a database connection and the current Alembic revision.

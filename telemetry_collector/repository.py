@@ -10,6 +10,7 @@ from typing import Any, Protocol
 from sqlalchemy import and_, select, tuple_
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from telemetry_collector.auth import HuggingFacePrincipal
@@ -51,6 +52,8 @@ class TelemetryRepository(Protocol):
     ) -> list[dict[str, Any]]: ...
 
     def get_run(self, run_id: str) -> dict[str, Any] | None: ...
+
+    def is_ready(self) -> bool: ...
 
 
 def _now() -> datetime:
@@ -342,6 +345,16 @@ class PostgresTelemetryRepository:
         """Dispose the SQLAlchemy engine and its connection pool."""
 
         self.engine.dispose()
+
+    def is_ready(self) -> bool:
+        """Return whether PostgreSQL is reachable and fully migrated."""
+
+        from telemetry_collector.migrate import database_revision_is_current
+
+        try:
+            return database_revision_is_current(self.engine)
+        except SQLAlchemyError:
+            return False
 
     def register_run(
         self,

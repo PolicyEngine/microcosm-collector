@@ -10,6 +10,8 @@ from typing import Any
 import sqlalchemy as sa
 from alembic import command
 from alembic.config import Config
+from alembic.migration import MigrationContext
+from alembic.script import ScriptDirectory
 from sqlalchemy import inspect
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import Engine
@@ -86,7 +88,7 @@ def classify_schema(inspector: Inspector) -> SchemaState:
     tables = set(inspector.get_table_names())
     if "alembic_version" in tables:
         return SchemaState.VERSIONED
-    telemetry_tables = tables & set(LEGACY_COLUMNS)
+    telemetry_tables = {table for table in tables if table.startswith("telemetry_")}
     if not telemetry_tables:
         return SchemaState.EMPTY
     if telemetry_tables != set(LEGACY_COLUMNS):
@@ -166,6 +168,17 @@ def upgrade_database(database_url: str) -> SchemaState:
         return state
     finally:
         engine.dispose()
+
+
+def database_revision_is_current(engine: Engine) -> bool:
+    """Return whether the database is reachable and at the Alembic head."""
+
+    config = alembic_config()
+    expected = ScriptDirectory.from_config(config).get_current_head()
+    with engine.connect() as connection:
+        connection.execute(sa.select(1))
+        current = MigrationContext.configure(connection).get_current_revision()
+    return current is not None and current == expected
 
 
 def main() -> None:

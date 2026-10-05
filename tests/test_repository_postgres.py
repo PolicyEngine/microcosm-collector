@@ -109,3 +109,13 @@ def test_registration_rejects_owner_and_metadata_conflicts(
         )
 
     repository.close()
+
+
+def test_repository_readiness_requires_alembic_head(postgres_url: str) -> None:
+    repository = PostgresTelemetryRepository(postgres_url)
+    assert repository.is_ready() is False
+
+    upgrade_database(postgres_url)
+
+    assert repository.is_ready() is True
+    repository.close()

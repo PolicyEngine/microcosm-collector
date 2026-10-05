@@ -99,3 +99,22 @@ def test_adopts_populated_legacy_database(postgres_url: str) -> None:
         )
     finally:
         engine.dispose()
+
+
+def test_migration_chain_downgrades_and_reupgrades_in_test_database(
+    postgres_url: str,
+) -> None:
+    upgrade_database(postgres_url)
+    engine = create_database_engine(postgres_url)
+    config = alembic_config()
+    try:
+        with engine.begin() as connection:
+            config.attributes["connection"] = connection
+            command.downgrade(config, "base")
+            command.upgrade(config, "head")
+        assert _current_revision(postgres_url) == (
+            "0002_orm_schema",
+            "0002_orm_schema",
+        )
+    finally:
+        engine.dispose()
