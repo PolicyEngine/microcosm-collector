@@ -143,6 +143,57 @@ def test_later_registered_producer_stream_takes_precedence() -> None:
     ]
 
 
+def test_later_registered_producer_reopens_a_finished_run() -> None:
+    registered_at = datetime(2026, 10, 1, tzinfo=UTC)
+    old_progress = _event(
+        event_id="old-progress",
+        producer_registered_at=registered_at,
+        sequence=1,
+        timestamp=registered_at + timedelta(minutes=4),
+        status="progress",
+        stage_id="compile",
+    )
+    old_progress.update(
+        {
+            "event_type": "progress",
+            "details": {"done": 5, "total": 10},
+            "resources": {"cpu_user_seconds": 100},
+        }
+    )
+    events = [
+        old_progress,
+        _event(
+            event_id="old-completion",
+            producer_registered_at=registered_at,
+            sequence=2,
+            timestamp=registered_at + timedelta(minutes=5),
+            status="completed",
+            stage_id="complete",
+        ),
+        _event(
+            event_id="restart-started",
+            producer_id="producer-2",
+            producer_registered_at=registered_at + timedelta(minutes=10),
+            sequence=1,
+            timestamp=registered_at + timedelta(minutes=6),
+            status="started",
+            stage_id="created",
+        ),
+    ]
+
+    materialized = materialize_run(_registered(registered_at), events)
+
+    assert materialized["status"] == "running"
+    assert materialized["current_stage"] == "created"
+    assert materialized["ended_at"] is None
+    assert materialized["failure"] is None
+    assert materialized["started_at"] == registered_at + timedelta(minutes=6)
+    assert materialized["updated_at"] == registered_at + timedelta(minutes=10)
+    assert materialized["heartbeat_at"] is None
+    assert materialized["resources"] is None
+    assert materialized["work"] is None
+
+
 def test_progress_work_uses_json_compatible_timestamp() -> None:
     registered_at = datetime(2026, 10, 1, tzinfo=UTC)
     event = TelemetryEvent(

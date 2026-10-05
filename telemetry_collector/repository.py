@@ -108,7 +108,9 @@ def canonical_events(events: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
 def _apply_event(run: dict[str, Any], event: dict[str, Any]) -> None:
     timestamp = event["timestamp"]
     run["started_at"] = min(run["started_at"], timestamp)
-    run["updated_at"] = max(run["updated_at"], timestamp)
+    run["updated_at"] = max(
+        run["updated_at"], timestamp, event["producer_registered_at"]
+    )
     if event.get("resources") is not None:
         run["resources"] = event["resources"]
     if event["event_type"] == "heartbeat":
@@ -116,6 +118,13 @@ def _apply_event(run: dict[str, Any], event: dict[str, Any]) -> None:
     stage_id = event.get("stage_id")
     if stage_id and stage_id not in {"complete", "failed"}:
         run["current_stage"] = stage_id
+    if event["event_type"] == "run" and event["status"] == "started":
+        # A later producer represents a restarted attempt for the same stable
+        # run identifier. Its creation event must reopen a previously finished
+        # run before subsequent progress arrives.
+        run["status"] = "running"
+        run["ended_at"] = None
+        run["failure"] = None
     details = event.get("details") or {}
     if event["event_type"] == "progress" and {
         "done",
@@ -172,7 +181,31 @@ def materialize_run(
         "work": None,
         "failure": None,
     }
+    active_producer_id: str | None = None
     for event in canonical_events(events):
+        producer_id = event["producer_id"]
+        if active_producer_id is not None and producer_id != active_producer_id:
+            # A producer id identifies one execution attempt. Starting a later
+            # producer under the same stable run id must not retain the prior
+            # attempt's completion, progress, heartbeat, or resource snapshot.
+            run.update(
+                {
+                    "status": "running",
+                    "current_stage": "created",
+                    "started_at": event["timestamp"],
+                    "updated_at": max(
+                        run["updated_at"],
+                        event["timestamp"],
+                        event["producer_registered_at"],
+                    ),
+                    "ended_at": None,
+                    "heartbeat_at": None,
+                    "resources": None,
+                    "work": None,
+                    "failure": None,
+                }
+            )
+        active_producer_id = producer_id
         _apply_event(run, event)
     return run
 
