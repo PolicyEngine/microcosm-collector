@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 from telemetry_collector.app import CollectorSettings, create_app
 from telemetry_collector.auth import HuggingFacePrincipal
 from telemetry_collector.models import RunRegistration
-from telemetry_collector.repository import MemoryTelemetryRepository
+from tests.fakes import FakeTelemetryRepository
 
 
 class StubHuggingFaceAuthenticator:
@@ -53,7 +53,7 @@ def exchange(client: TestClient) -> str:
 
 
 def test_exchange_ingest_and_read_run() -> None:
-    repository = MemoryTelemetryRepository()
+    repository = FakeTelemetryRepository()
     authenticator = StubHuggingFaceAuthenticator()
     client = TestClient(
         create_app(
@@ -121,7 +121,7 @@ def test_non_member_cannot_exchange_token() -> None:
     client = TestClient(
         create_app(
             settings=settings(),
-            repository=MemoryTelemetryRepository(),
+            repository=FakeTelemetryRepository(),
             huggingface_authenticator=StubHuggingFaceAuthenticator(member=False),
         )
     )
@@ -140,11 +140,42 @@ def test_non_member_cannot_exchange_token() -> None:
     assert response.status_code == 403
 
 
+def test_run_identifier_cannot_be_reused_with_different_metadata() -> None:
+    repository = FakeTelemetryRepository()
+    client = TestClient(
+        create_app(
+            settings=settings(),
+            repository=repository,
+            huggingface_authenticator=StubHuggingFaceAuthenticator(),
+        )
+    )
+    exchange(client)
+
+    response = client.post(
+        "/v1/auth/huggingface/exchange",
+        headers={"Authorization": "Bearer hf_example"},
+        json={
+            "run_id": "route-a-1",
+            "producer_id": "producer-2",
+            "country_code": "US",
+            "pipeline": "different-pipeline",
+            "candidate_id": "candidate-1",
+            "release_id": None,
+            "run_kind": "build",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "Run identifier is already registered with different metadata."
+    )
+
+
 def test_run_token_is_bound_to_run_and_producer() -> None:
     client = TestClient(
         create_app(
             settings=settings(),
-            repository=MemoryTelemetryRepository(),
+            repository=FakeTelemetryRepository(),
             huggingface_authenticator=StubHuggingFaceAuthenticator(),
         )
     )
@@ -158,7 +189,7 @@ def test_run_token_is_bound_to_run_and_producer() -> None:
 
 
 def test_failed_validation_event_does_not_finish_the_run() -> None:
-    repository = MemoryTelemetryRepository()
+    repository = FakeTelemetryRepository()
     client = TestClient(
         create_app(
             settings=settings(),
@@ -202,7 +233,7 @@ def test_health_does_not_require_credentials() -> None:
     client = TestClient(
         create_app(
             settings=settings(),
-            repository=MemoryTelemetryRepository(),
+            repository=FakeTelemetryRepository(),
             huggingface_authenticator=StubHuggingFaceAuthenticator(),
         )
     )
@@ -215,7 +246,7 @@ def test_streamed_request_body_is_bounded() -> None:
     client = TestClient(
         create_app(
             settings=settings(),
-            repository=MemoryTelemetryRepository(),
+            repository=FakeTelemetryRepository(),
             huggingface_authenticator=StubHuggingFaceAuthenticator(),
         )
     )
@@ -237,7 +268,7 @@ def test_streamed_request_body_is_bounded() -> None:
 def test_run_pagination_does_not_skip_equal_timestamps(monkeypatch) -> None:
     fixed = datetime(2026, 10, 2, tzinfo=UTC)
     monkeypatch.setattr("telemetry_collector.repository._now", lambda: fixed)
-    repository = MemoryTelemetryRepository()
+    repository = FakeTelemetryRepository()
     principal = HuggingFacePrincipal(
         user_id="hf-user-1",
         username="builder",

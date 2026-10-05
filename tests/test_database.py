@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 from sqlalchemy import inspect
 from sqlalchemy.pool import QueuePool
 
@@ -61,3 +64,20 @@ def test_engine_uses_sqlalchemy_queue_pool() -> None:
         assert engine.pool._max_overflow == DB_MAX_OVERFLOW
     finally:
         engine.dispose()
+
+
+def test_application_modules_do_not_import_psycopg_directly() -> None:
+    package = Path(__file__).resolve().parents[1] / "telemetry_collector"
+    imported_modules: set[str] = set()
+    for source in package.glob("*.py"):
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported_modules.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported_modules.add(node.module)
+
+    assert not any(
+        module == "psycopg" or module.startswith("psycopg.")
+        for module in imported_modules
+    )

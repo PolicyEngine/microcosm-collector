@@ -31,6 +31,7 @@ from telemetry_collector.models import (
 )
 from telemetry_collector.repository import (
     PostgresTelemetryRepository,
+    RunRegistrationConflictError,
     TelemetryRepository,
 )
 
@@ -268,10 +269,12 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> Iterator[None]:
-        ensure_schema = getattr(repository, "ensure_schema", None)
-        if callable(ensure_schema):
-            ensure_schema()
-        yield
+        try:
+            yield
+        finally:
+            close = getattr(repository, "close", None)
+            if callable(close):
+                close()
 
     application = FastAPI(
         title="PolicyEngine Microcosm telemetry collector",
@@ -324,6 +327,8 @@ def create_app(
             repository.register_run(registration, principal)
         except PermissionError as error:
             raise HTTPException(status_code=403, detail=str(error)) from error
+        except RunRegistrationConflictError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
         return _issue_run_token(settings, registration, principal)
 
     @application.post(
@@ -378,18 +383,6 @@ def create_app(
         if run is None:
             raise HTTPException(status_code=404, detail="Run was not found.")
         return run
-
-    @application.get("/v1/stage-statistics", dependencies=[Depends(require_read_token)])
-    def stage_statistics(
-        country: Annotated[str | None, Query(pattern=r"^[A-Z]{2}$")] = None,
-        pipeline: str | None = None,
-    ) -> dict[str, Any]:
-        return {
-            "stages": repository.stage_statistics(
-                country=country,
-                pipeline=pipeline,
-            )
-        }
 
     return application
 

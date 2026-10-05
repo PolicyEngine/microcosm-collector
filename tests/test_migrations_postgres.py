@@ -1,40 +1,13 @@
 from __future__ import annotations
 
-import os
-from collections.abc import Iterator
-
-import pytest
 import sqlalchemy as sa
 from alembic import command
 from alembic.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from sqlalchemy import inspect
 
-from telemetry_collector.database import create_database_engine, normalize_database_url
+from telemetry_collector.database import create_database_engine
 from telemetry_collector.migrate import SchemaState, alembic_config, upgrade_database
-
-
-@pytest.fixture
-def postgres_url() -> Iterator[str]:
-    raw_url = os.environ.get("TEST_DATABASE_URL", "").strip()
-    if not raw_url:
-        pytest.skip("TEST_DATABASE_URL is required for PostgreSQL integration tests.")
-    url = normalize_database_url(raw_url)
-    if "test" not in (url.database or "").lower():
-        pytest.fail("TEST_DATABASE_URL must identify a dedicated test database.")
-    engine = create_database_engine(raw_url)
-
-    def reset() -> None:
-        metadata = sa.MetaData()
-        metadata.reflect(engine)
-        metadata.drop_all(engine)
-
-    reset()
-    try:
-        yield raw_url
-    finally:
-        reset()
-        engine.dispose()
 
 
 def _current_revision(database_url: str) -> tuple[str | None, str | None]:
