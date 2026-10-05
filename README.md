@@ -21,25 +21,25 @@ to the browser.
 
 ```bash
 uv sync --dev
-export DATABASE_URL=postgresql://...
-export TELEMETRY_JWT_SECRET=...
-export TELEMETRY_READ_TOKEN=...
 uv run python -m telemetry_collector.migrate
 uv run uvicorn telemetry_collector.app:create_app_from_environment \
   --factory --host 127.0.0.1 --port 8080 --no-access-log
 ```
 
-Use at least 32 random characters for `TELEMETRY_JWT_SECRET` and at least 24
-for `TELEMETRY_READ_TOKEN`. Point a Microcosm checkout at a local instance with
-`MICROCOSM_TELEMETRY_COLLECTOR_URL=http://localhost:8080`.
+Before running the migration or service, provide the database connection, JWT
+signing secret, and dashboard read credential through the documented runtime
+environment variables. Use at least 32 random characters for the JWT signing
+secret and at least 24 for the dashboard read credential. Configure a
+Microcosm checkout's collector setting to point at the local service when
+testing ingestion.
 
 ## Cloud Run deployment
 
 The production service is isolated in this top-level directory. Its Docker
 build context is `telemetry-service/`, so dashboard source files cannot enter
-the image. The service is available at the native Cloud Run address:
-
-`https://microcosm-telemetry-389282473430.us-central1.run.app`
+the image. Cloud Run assigns the production service address, which is supplied
+to authorized clients through deployment configuration and is intentionally
+not documented in the repository.
 
 Infrastructure was provisioned once with disposable scripts kept outside the
 repository. The repository intentionally contains no bootstrap script or
