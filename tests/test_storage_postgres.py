@@ -7,8 +7,8 @@ import pytest
 from telemetry_collector.auth import HuggingFacePrincipal
 from telemetry_collector.migrate import upgrade_database
 from telemetry_collector.models import RunRegistration, TelemetryEvent
-from telemetry_collector.repository import (
-    PostgresTelemetryRepository,
+from telemetry_collector.storage import (
+    PostgresTelemetryStore,
     RunRegistrationConflictError,
 )
 
@@ -53,13 +53,13 @@ def _event(
     )
 
 
-def test_repository_is_idempotent_and_reduces_out_of_order_events(
+def test_store_is_idempotent_and_reduces_out_of_order_events(
     postgres_url: str,
 ) -> None:
     upgrade_database(postgres_url)
-    repository = PostgresTelemetryRepository(postgres_url)
+    store = PostgresTelemetryStore(postgres_url)
     registered_at = datetime.now(UTC)
-    repository.register_run(_registration(), _principal())
+    store.register_run(_registration(), _principal())
     completed = _event(
         event_id="completed",
         sequence=2,
@@ -75,16 +75,16 @@ def test_repository_is_idempotent_and_reduces_out_of_order_events(
         stage_id="failed",
     )
 
-    assert repository.append_events("run-1", "owner-1", [completed]) == (1, 0)
-    assert repository.append_events("run-1", "owner-1", [completed]) == (0, 1)
-    assert repository.append_events("run-1", "owner-1", [delayed_failure]) == (
+    assert store.append_events("run-1", "owner-1", [completed]) == (1, 0)
+    assert store.append_events("run-1", "owner-1", [completed]) == (0, 1)
+    assert store.append_events("run-1", "owner-1", [delayed_failure]) == (
         1,
         0,
     )
 
-    listed = repository.list_runs(country="US", limit=10, before=None)
-    detail = repository.get_run("run-1")
-    repository.close()
+    listed = store.list_runs(country="US", limit=10, before=None)
+    detail = store.get_run("run-1")
+    store.close()
 
     assert listed[0]["status"] == "completed"
     assert detail is not None
@@ -101,25 +101,23 @@ def test_registration_rejects_owner_and_metadata_conflicts(
     postgres_url: str,
 ) -> None:
     upgrade_database(postgres_url)
-    repository = PostgresTelemetryRepository(postgres_url)
-    repository.register_run(_registration(), _principal())
+    store = PostgresTelemetryStore(postgres_url)
+    store.register_run(_registration(), _principal())
 
     with pytest.raises(PermissionError):
-        repository.register_run(_registration(), _principal("owner-2"))
+        store.register_run(_registration(), _principal("owner-2"))
     with pytest.raises(RunRegistrationConflictError):
-        repository.register_run(
-            _registration(pipeline="another-pipeline"), _principal()
-        )
+        store.register_run(_registration(pipeline="another-pipeline"), _principal())
 
-    repository.close()
+    store.close()
 
 
 def test_event_ingestion_rejects_another_owner_and_unregistered_producer(
     postgres_url: str,
 ) -> None:
     upgrade_database(postgres_url)
-    repository = PostgresTelemetryRepository(postgres_url)
-    repository.register_run(_registration(), _principal())
+    store = PostgresTelemetryStore(postgres_url)
+    store.register_run(_registration(), _principal())
     event = _event(
         event_id="owned-event",
         sequence=1,
@@ -129,22 +127,22 @@ def test_event_ingestion_rejects_another_owner_and_unregistered_producer(
     )
 
     with pytest.raises(PermissionError, match="another Hugging Face user"):
-        repository.append_events("run-1", "owner-2", [event])
+        store.append_events("run-1", "owner-2", [event])
 
     unregistered = event.model_copy(
         update={"event_id": "unknown-producer", "producer_id": "producer-2"}
     )
     with pytest.raises(PermissionError, match="not registered"):
-        repository.append_events("run-1", "owner-1", [unregistered])
+        store.append_events("run-1", "owner-1", [unregistered])
 
-    repository.close()
+    store.close()
 
 
-def test_repository_readiness_requires_alembic_head(postgres_url: str) -> None:
-    repository = PostgresTelemetryRepository(postgres_url)
-    assert repository.is_ready() is False
+def test_store_readiness_requires_alembic_head(postgres_url: str) -> None:
+    store = PostgresTelemetryStore(postgres_url)
+    assert store.is_ready() is False
 
     upgrade_database(postgres_url)
 
-    assert repository.is_ready() is True
-    repository.close()
+    assert store.is_ready() is True
+    store.close()

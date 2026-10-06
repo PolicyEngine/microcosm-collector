@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 
 from telemetry_collector.auth import HuggingFacePrincipal
 from telemetry_collector.models import RunRegistration, TelemetryEvent
-from telemetry_collector.repository import (
+from telemetry_collector.storage import (
     initial_run_state,
     materialize_run,
     run_documents,

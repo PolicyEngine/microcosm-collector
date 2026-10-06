@@ -32,10 +32,10 @@ from telemetry_collector.models import (
     PageCursor,
     RunRegistration,
 )
-from telemetry_collector.repository import (
-    PostgresTelemetryRepository,
+from telemetry_collector.storage import (
+    PostgresTelemetryStore,
     RunRegistrationConflictError,
-    TelemetryRepository,
+    TelemetryStore,
 )
 
 
@@ -302,7 +302,7 @@ def _decode_session_token(
 def create_app(
     *,
     settings: CollectorSettings,
-    repository: TelemetryRepository,
+    store: TelemetryStore,
     huggingface_authenticator: HuggingFaceAuthenticator,
 ) -> FastAPI:
     """Create the collector with explicit dependencies for tests and deployment."""
@@ -312,7 +312,7 @@ def create_app(
         try:
             yield
         finally:
-            close = getattr(repository, "close", None)
+            close = getattr(store, "close", None)
             if callable(close):
                 close()
 
@@ -346,7 +346,7 @@ def create_app(
 
     @application.get("/ready")
     def ready() -> dict[str, str]:
-        if not repository.is_ready():
+        if not store.is_ready():
             raise HTTPException(
                 status_code=503,
                 detail="Telemetry database is unavailable or not fully migrated.",
@@ -388,7 +388,7 @@ def create_app(
             organizations=claims.organizations,
         )
         try:
-            repository.register_run(registration, principal)
+            store.register_run(registration, principal)
         except PermissionError as error:
             raise HTTPException(status_code=403, detail=str(error)) from error
         except RunRegistrationConflictError as error:
@@ -411,7 +411,7 @@ def create_app(
                     detail="Event identity does not match the request path.",
                 )
         try:
-            accepted, duplicates = repository.append_events(
+            accepted, duplicates = store.append_events(
                 run_id, claims.subject, batch.events
             )
         except PermissionError as error:
@@ -428,7 +428,7 @@ def create_app(
         limit: Annotated[int, Query(ge=1, le=200)] = 60,
         before: str | None = None,
     ) -> dict[str, Any]:
-        runs = repository.list_runs(
+        runs = store.list_runs(
             country=country,
             limit=limit,
             before=_parse_page_cursor(before),
@@ -442,7 +442,7 @@ def create_app(
 
     @application.get("/v1/runs/{run_id}", dependencies=[Depends(require_read_token)])
     def get_run(run_id: str) -> dict[str, Any]:
-        run = repository.get_run(run_id)
+        run = store.get_run(run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Run was not found.")
         return run
@@ -454,9 +454,9 @@ def create_app_from_environment() -> FastAPI:
     """Create the production application from Cloud Run environment values."""
 
     settings = CollectorSettings.from_environment()
-    repository = PostgresTelemetryRepository(_required_environment("DATABASE_URL"))
+    store = PostgresTelemetryStore(_required_environment("DATABASE_URL"))
     return create_app(
         settings=settings,
-        repository=repository,
+        store=store,
         huggingface_authenticator=HuggingFaceAuthenticator(),
     )

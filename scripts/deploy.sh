@@ -22,7 +22,7 @@ require_configuration() {
   require_variables \
     PROJECT_ID \
     REGION \
-    ARTIFACT_REPOSITORY \
+    ARTIFACT_REGISTRY_NAME \
     CLOUD_SQL_CONNECTION \
     RUNTIME_SERVICE_ACCOUNT \
     MIGRATION_SERVICE_ACCOUNT \
@@ -78,13 +78,13 @@ build_and_push_image() {
   require_variables \
     REGION \
     PROJECT_ID \
-    ARTIFACT_REPOSITORY \
+    ARTIFACT_REGISTRY_NAME \
     IMAGE_NAME \
     GITHUB_SHA \
     GITHUB_OUTPUT
 
   local image
-  image="${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPOSITORY}/${IMAGE_NAME}:${GITHUB_SHA}"
+  image="${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REGISTRY_NAME}/${IMAGE_NAME}:${GITHUB_SHA}"
   docker build \
     --file telemetry-service/Dockerfile \
     --tag "$image" \

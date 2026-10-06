@@ -15,7 +15,7 @@ from telemetry_collector.auth import (
     HuggingFacePrincipal,
 )
 from telemetry_collector.models import RunRegistration, TelemetryEvent
-from tests.fakes import FakeTelemetryRepository
+from tests.fakes import FakeTelemetryStore
 
 
 class StubHuggingFaceAuthenticator:
@@ -74,12 +74,12 @@ def register(client: TestClient, session_token: str) -> None:
 
 
 def test_exchange_ingest_and_read_run() -> None:
-    repository = FakeTelemetryRepository()
+    store = FakeTelemetryStore()
     authenticator = StubHuggingFaceAuthenticator()
     client = TestClient(
         create_app(
             settings=settings(),
-            repository=repository,
+            store=store,
             huggingface_authenticator=authenticator,
         )
     )
@@ -152,7 +152,7 @@ def test_non_member_cannot_exchange_token() -> None:
     client = TestClient(
         create_app(
             settings=settings(),
-            repository=FakeTelemetryRepository(),
+            store=FakeTelemetryStore(),
             huggingface_authenticator=StubHuggingFaceAuthenticator(member=False),
         )
     )
@@ -175,7 +175,7 @@ def test_identity_provider_outage_is_retryable() -> None:
     client = TestClient(
         create_app(
             settings=settings(),
-            repository=FakeTelemetryRepository(),
+            store=FakeTelemetryStore(),
             huggingface_authenticator=authenticator,
         )
     )
@@ -189,11 +189,11 @@ def test_identity_provider_outage_is_retryable() -> None:
 
 
 def test_run_registration_requires_collector_membership_token() -> None:
-    repository = FakeTelemetryRepository()
+    store = FakeTelemetryStore()
     client = TestClient(
         create_app(
             settings=settings(),
-            repository=repository,
+            store=store,
             huggingface_authenticator=StubHuggingFaceAuthenticator(),
         )
     )
@@ -205,15 +205,15 @@ def test_run_registration_requires_collector_membership_token() -> None:
     )
 
     assert response.status_code == 401
-    assert repository.list_runs(country=None, limit=10, before=None) == []
+    assert store.list_runs(country=None, limit=10, before=None) == []
 
 
 def test_run_identifier_cannot_be_reused_with_different_metadata() -> None:
-    repository = FakeTelemetryRepository()
+    store = FakeTelemetryStore()
     client = TestClient(
         create_app(
             settings=settings(),
-            repository=repository,
+            store=store,
             huggingface_authenticator=StubHuggingFaceAuthenticator(),
         )
     )
@@ -241,8 +241,8 @@ def test_run_identifier_cannot_be_reused_with_different_metadata() -> None:
 
 
 def test_session_token_cannot_ingest_another_users_run() -> None:
-    repository = FakeTelemetryRepository()
-    repository.register_run(
+    store = FakeTelemetryStore()
+    store.register_run(
         RunRegistration(
             run_id="another-run",
             producer_id="another-producer",
@@ -258,7 +258,7 @@ def test_session_token_cannot_ingest_another_users_run() -> None:
     client = TestClient(
         create_app(
             settings=settings(),
-            repository=repository,
+            store=store,
             huggingface_authenticator=StubHuggingFaceAuthenticator(),
         )
     )
@@ -286,11 +286,11 @@ def test_session_token_cannot_ingest_another_users_run() -> None:
 
 
 def test_failed_validation_event_does_not_finish_the_run() -> None:
-    repository = FakeTelemetryRepository()
+    store = FakeTelemetryStore()
     client = TestClient(
         create_app(
             settings=settings(),
-            repository=repository,
+            store=store,
             huggingface_authenticator=StubHuggingFaceAuthenticator(),
         )
     )
@@ -331,7 +331,7 @@ def test_health_does_not_require_credentials() -> None:
     client = TestClient(
         create_app(
             settings=settings(),
-            repository=FakeTelemetryRepository(),
+            store=FakeTelemetryStore(),
             huggingface_authenticator=StubHuggingFaceAuthenticator(),
         )
     )
@@ -344,7 +344,7 @@ def test_maintenance_mode_keeps_health_available_and_rejects_data_requests() -> 
     client = TestClient(
         create_app(
             settings=replace(settings(), maintenance_mode=True),
-            repository=FakeTelemetryRepository(),
+            store=FakeTelemetryStore(),
             huggingface_authenticator=StubHuggingFaceAuthenticator(),
         )
     )
@@ -359,19 +359,19 @@ def test_maintenance_mode_keeps_health_available_and_rejects_data_requests() -> 
     assert client.get("/ready").status_code == 503
 
 
-def test_readiness_checks_repository_without_credentials() -> None:
-    repository = FakeTelemetryRepository()
+def test_readiness_checks_store_without_credentials() -> None:
+    store = FakeTelemetryStore()
     client = TestClient(
         create_app(
             settings=settings(),
-            repository=repository,
+            store=store,
             huggingface_authenticator=StubHuggingFaceAuthenticator(),
         )
     )
 
     assert client.get("/ready").json() == {"status": "ok"}
 
-    repository.is_ready = lambda: False  # type: ignore[method-assign]
+    store.is_ready = lambda: False  # type: ignore[method-assign]
     unavailable = client.get("/ready")
     assert unavailable.status_code == 503
     assert unavailable.json()["detail"] == (
@@ -383,7 +383,7 @@ def test_streamed_request_body_is_bounded() -> None:
     client = TestClient(
         create_app(
             settings=settings(),
-            repository=FakeTelemetryRepository(),
+            store=FakeTelemetryStore(),
             huggingface_authenticator=StubHuggingFaceAuthenticator(),
         )
     )
@@ -404,15 +404,15 @@ def test_streamed_request_body_is_bounded() -> None:
 
 def test_run_pagination_does_not_skip_equal_timestamps(monkeypatch) -> None:
     fixed = datetime(2026, 10, 2, tzinfo=UTC)
-    monkeypatch.setattr("telemetry_collector.repository._now", lambda: fixed)
-    repository = FakeTelemetryRepository()
+    monkeypatch.setattr("telemetry_collector.storage._now", lambda: fixed)
+    store = FakeTelemetryStore()
     principal = HuggingFacePrincipal(
         user_id="hf-user-1",
         username="builder",
         organizations=("policyengine",),
     )
     for index in range(205):
-        repository.register_run(
+        store.register_run(
             RunRegistration(
                 run_id=f"run-{index:03d}",
                 producer_id="producer-1",
@@ -424,7 +424,7 @@ def test_run_pagination_does_not_skip_equal_timestamps(monkeypatch) -> None:
     client = TestClient(
         create_app(
             settings=settings(),
-            repository=repository,
+            store=store,
             huggingface_authenticator=StubHuggingFaceAuthenticator(),
         )
     )
@@ -445,15 +445,15 @@ def test_run_pagination_does_not_skip_equal_timestamps(monkeypatch) -> None:
 
 def test_run_pagination_is_stable_when_an_older_run_updates(monkeypatch) -> None:
     timestamps = iter(datetime(2026, 10, day, tzinfo=UTC) for day in (1, 2, 3))
-    monkeypatch.setattr("telemetry_collector.repository._now", lambda: next(timestamps))
-    repository = FakeTelemetryRepository()
+    monkeypatch.setattr("telemetry_collector.storage._now", lambda: next(timestamps))
+    store = FakeTelemetryStore()
     principal = HuggingFacePrincipal(
         user_id="hf-user-1",
         username="builder",
         organizations=("policyengine",),
     )
     for run_id in ("old", "middle", "new"):
-        repository.register_run(
+        store.register_run(
             RunRegistration(
                 run_id=run_id,
                 producer_id="producer-1",
@@ -465,14 +465,14 @@ def test_run_pagination_is_stable_when_an_older_run_updates(monkeypatch) -> None
     client = TestClient(
         create_app(
             settings=settings(),
-            repository=repository,
+            store=store,
             huggingface_authenticator=StubHuggingFaceAuthenticator(),
         )
     )
     headers = {"X-Telemetry-Read-Token": "dashboard-read-token"}
 
     first = client.get("/v1/runs?country=US&limit=2", headers=headers)
-    repository.append_events(
+    store.append_events(
         "old",
         "hf-user-1",
         [
@@ -521,7 +521,7 @@ def test_invalid_pagination_cursor_returns_422(cursor: str) -> None:
     client = TestClient(
         create_app(
             settings=settings(),
-            repository=FakeTelemetryRepository(),
+            store=FakeTelemetryStore(),
             huggingface_authenticator=StubHuggingFaceAuthenticator(),
         )
     )

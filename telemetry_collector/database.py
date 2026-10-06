@@ -203,6 +203,6 @@ def create_database_engine(database_url: str) -> Engine:
 
 
 def create_session_factory(engine: Engine) -> sessionmaker:
-    """Create the short-lived session factory used by the repository."""
+    """Create the short-lived session factory used by the store."""
 
     return sessionmaker(bind=engine, expire_on_commit=False)

@@ -47,7 +47,7 @@ def test_require_configuration_lists_every_missing_variable() -> None:
     assert result.returncode == 1
     assert result.stderr == (
         "Missing telemetry deployment configuration: PROJECT_ID REGION "
-        "ARTIFACT_REPOSITORY CLOUD_SQL_CONNECTION RUNTIME_SERVICE_ACCOUNT "
+        "ARTIFACT_REGISTRY_NAME CLOUD_SQL_CONNECTION RUNTIME_SERVICE_ACCOUNT "
         "MIGRATION_SERVICE_ACCOUNT SERVICE MIGRATION_JOB IMAGE_NAME "
         "DATABASE_SECRET_NAME MIGRATION_DATABASE_SECRET_NAME JWT_SECRET_NAME "
         "READ_SECRET_NAME DEPLOYMENT_ENVIRONMENT "
@@ -61,7 +61,7 @@ def test_require_configuration_accepts_complete_environment() -> None:
         environment={
             "PROJECT_ID": "project",
             "REGION": "region",
-            "ARTIFACT_REPOSITORY": "repository",
+            "ARTIFACT_REGISTRY_NAME": "container-images",
             "CLOUD_SQL_CONNECTION": "connection",
             "RUNTIME_SERVICE_ACCOUNT": "service-account",
             "MIGRATION_SERVICE_ACCOUNT": "migration-service-account",
@@ -101,7 +101,7 @@ def test_build_and_push_image_records_the_immutable_uri(tmp_path: Path) -> None:
             "GITHUB_SHA": "abc123",
             "REGION": "us-central1",
             "PROJECT_ID": "example-project",
-            "ARTIFACT_REPOSITORY": "containers",
+            "ARTIFACT_REGISTRY_NAME": "containers",
             "IMAGE_NAME": "collector",
         },
     )

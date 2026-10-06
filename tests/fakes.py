@@ -10,7 +10,7 @@ from typing import Any
 
 from telemetry_collector.auth import HuggingFacePrincipal
 from telemetry_collector.models import RunRegistration, TelemetryEvent
-from telemetry_collector.repository import (
+from telemetry_collector.storage import (
     RunRegistrationConflictError,
     canonical_events,
     initial_run_state,
@@ -20,8 +20,8 @@ from telemetry_collector.repository import (
 )
 
 
-class FakeTelemetryRepository:
-    """Thread-safe in-memory implementation of the repository protocol."""
+class FakeTelemetryStore:
+    """Thread-safe in-memory implementation of the store protocol."""
 
     def __init__(self) -> None:
         self._runs: dict[str, dict[str, Any]] = {}

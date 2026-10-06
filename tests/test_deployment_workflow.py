@@ -74,6 +74,7 @@ def test_service_deployment_reads_resource_names_from_environment_variables() ->
     workflow = WORKFLOW.read_text(encoding="utf-8")
 
     expected_variables = {
+        "ARTIFACT_REGISTRY_NAME": "TELEMETRY_ARTIFACT_REGISTRY_NAME",
         "SERVICE": "TELEMETRY_SERVICE",
         "MIGRATION_JOB": "TELEMETRY_MIGRATION_JOB",
         "IMAGE_NAME": "TELEMETRY_IMAGE_NAME",
@@ -89,6 +90,28 @@ def test_service_deployment_reads_resource_names_from_environment_variables() ->
     }
     for environment_name, github_variable_name in expected_variables.items():
         assert f"{environment_name}: ${{{{ vars.{github_variable_name} }}}}" in workflow
+
+
+def test_telemetry_service_uses_store_vocabulary() -> None:
+    forbidden_term = "repo" + "sitory"
+    source_suffixes = {".ini", ".md", ".py", ".sh", ".toml", ".yml"}
+    source_files = [
+        path
+        for path in (ROOT / "telemetry-service").rglob("*")
+        if path.is_file()
+        and path.suffix in source_suffixes
+        and not {".pytest_cache", ".ruff_cache", ".venv"}.intersection(path.parts)
+    ]
+    source_files.append(WORKFLOW)
+
+    matches = [
+        str(path.relative_to(ROOT))
+        for path in source_files
+        if forbidden_term in path.read_text(encoding="utf-8").lower()
+        or forbidden_term in path.name.lower()
+    ]
+
+    assert matches == []
 
 
 def test_service_workflow_hard_cuts_over_before_migration() -> None:

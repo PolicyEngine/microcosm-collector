@@ -30,7 +30,7 @@ class RunRegistrationConflictError(ValueError):
     """Raised when a run identifier is reused with different metadata."""
 
 
-class TelemetryRepository(Protocol):
+class TelemetryStore(Protocol):
     """Storage operations used by the HTTP service."""
 
     def register_run(
@@ -370,8 +370,8 @@ def _requested_metadata(
     )
 
 
-class PostgresTelemetryRepository:
-    """PostgreSQL repository implemented with SQLAlchemy ORM sessions."""
+class PostgresTelemetryStore:
+    """PostgreSQL store implemented with SQLAlchemy ORM sessions."""
 
     def __init__(self, database_url: str) -> None:
         self.engine: Engine = create_database_engine(database_url)

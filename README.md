@@ -45,7 +45,7 @@ that origin in its delivery service; the address is intentionally not repeated
 in documentation.
 
 Infrastructure was provisioned once with disposable scripts kept outside the
-repository. The repository intentionally contains no bootstrap script or
+source tree. The source tree intentionally contains no bootstrap script or
 mutable infrastructure template.
 
 `.github/workflows/telemetry-service.yml` runs only when this directory or the
