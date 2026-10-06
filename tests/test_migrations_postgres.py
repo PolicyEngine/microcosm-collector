@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import sqlalchemy as sa
 from alembic import command
 from alembic.migration import MigrationContext
@@ -8,7 +9,12 @@ from sqlalchemy import inspect
 from sqlalchemy.dialects.postgresql import JSONB
 
 from telemetry_collector.database import create_database_engine
-from telemetry_collector.migrate import SchemaState, alembic_config, upgrade_database
+from telemetry_collector.migrate import (
+    SchemaState,
+    alembic_config,
+    upgrade_database,
+    verify_database,
+)
 
 
 def _current_revision(database_url: str) -> tuple[str | None, str | None]:
@@ -195,3 +201,20 @@ def test_migration_chain_downgrades_and_reupgrades_in_test_database(
         )
     finally:
         engine.dispose()
+
+
+def test_verification_rejects_schema_drift_at_alembic_head(
+    postgres_url: str,
+) -> None:
+    upgrade_database(postgres_url)
+    engine = create_database_engine(postgres_url)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                sa.text("ALTER TABLE telemetry_runs ADD COLUMN unexpected TEXT")
+            )
+    finally:
+        engine.dispose()
+
+    with pytest.raises(RuntimeError, match="differs from SQLAlchemy metadata"):
+        verify_database(postgres_url)

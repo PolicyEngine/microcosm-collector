@@ -9,12 +9,13 @@ from typing import Any
 
 import sqlalchemy as sa
 from alembic import command
+from alembic.autogenerate import compare_metadata
 from alembic.config import Config
 from alembic.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from sqlalchemy import inspect
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.engine.reflection import Inspector
 
 from telemetry_collector.database import Base, create_database_engine
@@ -22,6 +23,7 @@ from telemetry_collector.database import Base, create_database_engine
 SERVICE_ROOT = Path(__file__).resolve().parents[1]
 ALEMBIC_INI = SERVICE_ROOT / "alembic.ini"
 MIGRATIONS = SERVICE_ROOT / "migrations"
+MIGRATION_LOCK_NAME = "microcosm-telemetry-alembic"
 
 
 class SchemaState(StrEnum):
@@ -149,22 +151,58 @@ def alembic_config() -> Config:
     return config
 
 
+def _verify_connection(connection: Connection, config: Config) -> None:
+    expected_heads = set(ScriptDirectory.from_config(config).get_heads())
+    current_heads = set(MigrationContext.configure(connection).get_current_heads())
+    if not current_heads or current_heads != expected_heads:
+        raise RuntimeError(
+            "Database is not at the complete Alembic head after migration."
+        )
+    context = MigrationContext.configure(
+        connection,
+        opts={"compare_type": True, "compare_server_default": True},
+    )
+    differences = compare_metadata(context, Base.metadata)
+    if differences:
+        raise RuntimeError(
+            "Database schema differs from SQLAlchemy metadata after migration "
+            f"({len(differences)} difference(s))."
+        )
+
+
+def verify_database(database_url: str) -> None:
+    """Require a reachable database at Alembic head with no ORM schema drift."""
+
+    engine = create_database_engine(database_url)
+    try:
+        with engine.connect() as connection:
+            _verify_connection(connection, alembic_config())
+    finally:
+        engine.dispose()
+
+
 def upgrade_database(database_url: str) -> SchemaState:
     """Replace the unversioned prototype schema, then upgrade to Alembic head."""
 
     engine: Engine = create_database_engine(database_url)
     try:
-        state = classify_schema(inspect(engine))
-        if state is SchemaState.UNEXPECTED:
-            raise RuntimeError(
-                "Database schema does not match an empty, legacy, or Alembic-managed state."
-            )
         config = alembic_config()
         with engine.begin() as connection:
+            connection.execute(
+                sa.text("SELECT pg_advisory_xact_lock(hashtext(:name), 0)"),
+                {"name": MIGRATION_LOCK_NAME},
+            )
+            state = classify_schema(inspect(connection))
+            if state is SchemaState.UNEXPECTED:
+                raise RuntimeError(
+                    "Database schema does not match an empty, legacy, or "
+                    "Alembic-managed state."
+                )
             config.attributes["connection"] = connection
             if state is SchemaState.LEGACY:
                 Base.metadata.drop_all(connection)
             command.upgrade(config, "head")
+            _verify_connection(connection, config)
         return state
     finally:
         engine.dispose()
