@@ -45,6 +45,31 @@ def test_service_deployment_uses_oidc_and_verifies_before_promotion() -> None:
     assert "Restore the previous revision" not in workflow
 
 
+def test_service_deployment_qualifies_staging_before_production() -> None:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+
+    staging_start = workflow.index("  deploy-staging:")
+    production_start = workflow.index("  deploy-production:")
+    staging_job = workflow[staging_start:production_start]
+    production_job = workflow[production_start:]
+
+    assert "environment: staging" in staging_job
+    assert "image_uri: ${{ steps.image.outputs.uri }}" in staging_job
+    assert "build-and-push-image" in staging_job
+    assert "qualify-staging.sh" in staging_job
+    assert "HF_TOKEN: ${{ secrets.HF_TOKEN }}" in staging_job
+    assert (
+        "STAGING_READ_TOKEN: "
+        "${{ secrets.MICROCOSM_TELEMETRY_COLLECTOR_READ_TOKEN }}" in staging_job
+    )
+
+    assert "needs: deploy-staging" in production_job
+    assert "environment: Production" in production_job
+    assert "needs.deploy-staging.outputs.image_uri" in production_job
+    assert "build-and-push-image" not in production_job
+    assert "create-database-backup" in production_job
+
+
 def test_service_deployment_reads_resource_names_from_environment_variables() -> None:
     workflow = WORKFLOW.read_text(encoding="utf-8")
 
@@ -55,6 +80,12 @@ def test_service_deployment_reads_resource_names_from_environment_variables() ->
         "DATABASE_SECRET_NAME": "TELEMETRY_DATABASE_SECRET_NAME",
         "JWT_SECRET_NAME": "TELEMETRY_JWT_SECRET_NAME",
         "READ_SECRET_NAME": "TELEMETRY_READ_SECRET_NAME",
+        "MIGRATION_SERVICE_ACCOUNT": "TELEMETRY_MIGRATION_SERVICE_ACCOUNT",
+        "MIGRATION_DATABASE_SECRET_NAME": ("TELEMETRY_MIGRATION_DATABASE_SECRET_NAME"),
+        "PRODUCTION_CLOUD_SQL_CONNECTION": (
+            "TELEMETRY_PRODUCTION_CLOUD_SQL_CONNECTION"
+        ),
+        "PRODUCTION_SERVICE": "TELEMETRY_PRODUCTION_SERVICE",
     }
     for environment_name, github_variable_name in expected_variables.items():
         assert f"{environment_name}: ${{{{ vars.{github_variable_name} }}}}" in workflow
@@ -89,10 +120,11 @@ def test_service_workflow_has_no_multiline_run_blocks() -> None:
 
     assert "run: |" not in workflow
     assert "run: >" not in workflow
-    assert workflow.count("run: telemetry-service/scripts/deploy.sh") == 12
+    assert workflow.count("run: telemetry-service/scripts/deploy.sh") == 26
 
     for command in (
         "require-configuration",
+        "validate-environment-target",
         "build-and-push-image",
         "deploy-maintenance",
         "resolve-and-verify-maintenance",
@@ -101,10 +133,13 @@ def test_service_workflow_has_no_multiline_run_blocks() -> None:
         "apply-migrations",
         "deploy-candidate",
         "resolve-and-verify-candidate",
-        "route-production-traffic",
+        "route-service-traffic",
         "verify-stable-service",
+        "create-database-backup",
     ):
         assert f"run: telemetry-service/scripts/deploy.sh {command}" in workflow
+
+    assert "run: telemetry-service/scripts/qualify-staging.sh" in workflow
 
 
 def test_service_image_contains_alembic_runtime_files() -> None:

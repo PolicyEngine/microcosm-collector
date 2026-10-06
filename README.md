@@ -51,23 +51,32 @@ mutable infrastructure template.
 `.github/workflows/telemetry-service.yml` runs only when this directory or the
 workflow itself changes. Pull requests run tests, Ruff, and a container build.
 After a change reaches `main`, the workflow authenticates to Google Cloud with
-GitHub OIDC and pushes an image identified by the commit SHA. It first routes
-traffic to a verified maintenance revision that returns HTTP 503 for data
-operations, then waits for prior requests to finish. It runs that exact image
-as a one-task Cloud Run job to apply Alembic migrations, deploys a candidate
-without production traffic, checks the candidate's `/ready` endpoint, and only
-then routes traffic to the candidate. Once migration begins, failures leave the
-maintenance revision serving retryable responses; the workflow does not restore
-schema-incompatible application code. Manual production deployment runs are
-accepted only from `main`.
+GitHub OIDC and pushes one image identified by the commit SHA. It first applies
+the migration to the persistent staging PostgreSQL database, verifies both the
+Alembic revision and the complete SQLAlchemy metadata, deploys the staging
+collector, and exercises Hugging Face authentication, run registration, event
+ingestion, and dashboard reads. Production receives that exact image only when
+the staging sequence succeeds.
 
-The workflow reads its Google Cloud identifiers from the GitHub `Production`
-environment. Runtime secrets remain in Google Secret Manager. The dashboard
-deployment receives `MICROCOSM_TELEMETRY_COLLECTOR_URL` and the independent
-`MICROCOSM_TELEMETRY_COLLECTOR_READ_TOKEN` from the same GitHub environment.
-Public ingress lets developer machines reach the service; ingestion still
-requires a short-lived collector credential issued after Hugging Face
-authentication.
+Each deployment first routes traffic to a verified maintenance revision that
+returns HTTP 503 for data operations, then waits for prior requests to finish.
+Production also creates a completed Cloud SQL backup before its migration. The
+workflow runs the image as a one-task Cloud Run job to apply and verify Alembic
+migrations, deploys a candidate without stable traffic, checks the candidate's
+`/ready` endpoint, and only then directs traffic to the candidate. Once a
+production migration begins, failures leave the maintenance revision serving
+retryable responses; the workflow does not restore schema-incompatible
+application code. Manual deployment runs are accepted only from `main`.
+
+The workflow reads resource identifiers from the GitHub `staging` and
+`Production` environments. Runtime secrets remain in Google Secret Manager.
+The migration job uses a separate service account and database credential with
+schema-modification access; the collector runtime credential has only the data
+access required by the application. The dashboard deployment receives its
+collector address and independent read credential from deployment
+configuration. Public ingress lets developer machines reach the service;
+ingestion still requires a short-lived collector credential issued after
+Hugging Face authentication.
 
 Restrict the Cloud SQL instance to the Cloud Run connection and disable request
 access logs for the container so authorization headers cannot enter application
@@ -91,4 +100,6 @@ discards prototype telemetry data. Downgrades are reserved for disposable test
 databases.
 
 `/health` reports that the HTTP process is running. `/ready` additionally
-requires a database connection and the current Alembic revision.
+requires a database connection and the current Alembic revision. The migration
+job performs the stronger release-time comparison between the live schema and
+the complete SQLAlchemy metadata.
