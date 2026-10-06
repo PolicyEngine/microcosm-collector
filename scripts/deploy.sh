@@ -24,7 +24,13 @@ require_configuration() {
     REGION \
     ARTIFACT_REPOSITORY \
     CLOUD_SQL_CONNECTION \
-    RUNTIME_SERVICE_ACCOUNT
+    RUNTIME_SERVICE_ACCOUNT \
+    SERVICE \
+    MIGRATION_JOB \
+    IMAGE_NAME \
+    DATABASE_SECRET_NAME \
+    JWT_SECRET_NAME \
+    READ_SECRET_NAME
 }
 
 build_and_push_image() {
@@ -54,7 +60,7 @@ configure_migration_job() {
     IMAGE_URI \
     RUNTIME_SERVICE_ACCOUNT \
     CLOUD_SQL_CONNECTION \
-    DATABASE_SECRET
+    DATABASE_SECRET_NAME
 
   gcloud run jobs deploy "$MIGRATION_JOB" \
     --project "$PROJECT_ID" \
@@ -62,7 +68,7 @@ configure_migration_job() {
     --image "$IMAGE_URI" \
     --service-account "$RUNTIME_SERVICE_ACCOUNT" \
     --set-cloudsql-instances "$CLOUD_SQL_CONNECTION" \
-    --set-secrets "DATABASE_URL=${DATABASE_SECRET}:latest" \
+    --set-secrets "DATABASE_URL=${DATABASE_SECRET_NAME}:latest" \
     --command uv \
     --args "run,--no-sync,python,-m,telemetry_collector.migrate" \
     --tasks 1 \
@@ -89,9 +95,9 @@ deploy_maintenance() {
     IMAGE_URI \
     RUNTIME_SERVICE_ACCOUNT \
     CLOUD_SQL_CONNECTION \
-    DATABASE_SECRET \
-    JWT_SECRET \
-    READ_SECRET
+    DATABASE_SECRET_NAME \
+    JWT_SECRET_NAME \
+    READ_SECRET_NAME
 
   gcloud run deploy "$SERVICE" \
     --project "$PROJECT_ID" \
@@ -100,7 +106,7 @@ deploy_maintenance() {
     --image "$IMAGE_URI" \
     --service-account "$RUNTIME_SERVICE_ACCOUNT" \
     --add-cloudsql-instances "$CLOUD_SQL_CONNECTION" \
-    --set-secrets "DATABASE_URL=${DATABASE_SECRET}:latest,TELEMETRY_JWT_SECRET=${JWT_SECRET}:latest,TELEMETRY_READ_TOKEN=${READ_SECRET}:latest" \
+    --set-secrets "DATABASE_URL=${DATABASE_SECRET_NAME}:latest,TELEMETRY_JWT_SECRET=${JWT_SECRET_NAME}:latest,TELEMETRY_READ_TOKEN=${READ_SECRET_NAME}:latest" \
     --set-env-vars "TELEMETRY_MAINTENANCE_MODE=1" \
     --min 1 \
     --max 4 \
@@ -166,9 +172,9 @@ deploy_candidate() {
     IMAGE_URI \
     RUNTIME_SERVICE_ACCOUNT \
     CLOUD_SQL_CONNECTION \
-    DATABASE_SECRET \
-    JWT_SECRET \
-    READ_SECRET
+    DATABASE_SECRET_NAME \
+    JWT_SECRET_NAME \
+    READ_SECRET_NAME
 
   gcloud run deploy "$SERVICE" \
     --project "$PROJECT_ID" \
@@ -177,7 +183,7 @@ deploy_candidate() {
     --image "$IMAGE_URI" \
     --service-account "$RUNTIME_SERVICE_ACCOUNT" \
     --add-cloudsql-instances "$CLOUD_SQL_CONNECTION" \
-    --set-secrets "DATABASE_URL=${DATABASE_SECRET}:latest,TELEMETRY_JWT_SECRET=${JWT_SECRET}:latest,TELEMETRY_READ_TOKEN=${READ_SECRET}:latest" \
+    --set-secrets "DATABASE_URL=${DATABASE_SECRET_NAME}:latest,TELEMETRY_JWT_SECRET=${JWT_SECRET_NAME}:latest,TELEMETRY_READ_TOKEN=${READ_SECRET_NAME}:latest" \
     --set-env-vars "TELEMETRY_MAINTENANCE_MODE=0" \
     --min 1 \
     --max 4 \

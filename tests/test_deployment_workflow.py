@@ -45,6 +45,21 @@ def test_service_deployment_uses_oidc_and_verifies_before_promotion() -> None:
     assert "Restore the previous revision" not in workflow
 
 
+def test_service_deployment_reads_resource_names_from_environment_variables() -> None:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+
+    expected_variables = {
+        "SERVICE": "TELEMETRY_SERVICE",
+        "MIGRATION_JOB": "TELEMETRY_MIGRATION_JOB",
+        "IMAGE_NAME": "TELEMETRY_IMAGE_NAME",
+        "DATABASE_SECRET_NAME": "TELEMETRY_DATABASE_SECRET_NAME",
+        "JWT_SECRET_NAME": "TELEMETRY_JWT_SECRET_NAME",
+        "READ_SECRET_NAME": "TELEMETRY_READ_SECRET_NAME",
+    }
+    for environment_name, github_variable_name in expected_variables.items():
+        assert f"{environment_name}: ${{{{ vars.{github_variable_name} }}}}" in workflow
+
+
 def test_service_workflow_hard_cuts_over_before_migration() -> None:
     workflow = WORKFLOW.read_text(encoding="utf-8")
     deploy_script = DEPLOY_SCRIPT.read_text(encoding="utf-8")

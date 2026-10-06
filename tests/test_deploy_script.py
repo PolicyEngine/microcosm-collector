@@ -47,7 +47,9 @@ def test_require_configuration_lists_every_missing_variable() -> None:
     assert result.returncode == 1
     assert result.stderr == (
         "Missing telemetry deployment configuration: PROJECT_ID REGION "
-        "ARTIFACT_REPOSITORY CLOUD_SQL_CONNECTION RUNTIME_SERVICE_ACCOUNT\n"
+        "ARTIFACT_REPOSITORY CLOUD_SQL_CONNECTION RUNTIME_SERVICE_ACCOUNT "
+        "SERVICE MIGRATION_JOB IMAGE_NAME DATABASE_SECRET_NAME JWT_SECRET_NAME "
+        "READ_SECRET_NAME\n"
     )
 
 
@@ -60,6 +62,12 @@ def test_require_configuration_accepts_complete_environment() -> None:
             "ARTIFACT_REPOSITORY": "repository",
             "CLOUD_SQL_CONNECTION": "connection",
             "RUNTIME_SERVICE_ACCOUNT": "service-account",
+            "SERVICE": "service",
+            "MIGRATION_JOB": "migration-job",
+            "IMAGE_NAME": "image",
+            "DATABASE_SECRET_NAME": "database-secret",
+            "JWT_SECRET_NAME": "jwt-secret",
+            "READ_SECRET_NAME": "read-secret",
         },
     )
 
