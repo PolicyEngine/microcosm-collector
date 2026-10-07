@@ -72,7 +72,7 @@ application code. Manual deployment runs are accepted only from `main`.
 
 The workflow reads resource identifiers from the GitHub `staging` and
 `Production` environments. Runtime secrets remain in Google Secret Manager.
-Each GitHub environment also supplies a dedicated
+Both GitHub environments supply the same dedicated credential under the name
 `TELEMETRY_HF_QUALIFICATION_TOKEN`. This credential is used only by the
 deployment workflow to prove PolicyEngine organization membership through
 Hugging Face; it is not injected into Cloud Run and does not replace the
