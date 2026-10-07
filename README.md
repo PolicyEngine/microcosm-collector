@@ -56,7 +56,9 @@ the migration to the persistent staging PostgreSQL database, verifies both the
 Alembic revision and the complete SQLAlchemy metadata, deploys the staging
 collector, and exercises Hugging Face authentication, run registration, event
 ingestion, and dashboard reads. Production receives that exact image only when
-the staging sequence succeeds.
+the staging sequence succeeds. The production candidate repeats the same
+authentication, write, and read qualification against the production database
+before it receives stable traffic.
 
 Each deployment first routes traffic to a verified maintenance revision that
 returns HTTP 503 for data operations, then waits for prior requests to finish.
@@ -70,6 +72,12 @@ application code. Manual deployment runs are accepted only from `main`.
 
 The workflow reads resource identifiers from the GitHub `staging` and
 `Production` environments. Runtime secrets remain in Google Secret Manager.
+Each GitHub environment also supplies a dedicated
+`TELEMETRY_HF_QUALIFICATION_TOKEN`. This credential is used only by the
+deployment workflow to prove PolicyEngine organization membership through
+Hugging Face; it is not injected into Cloud Run and does not replace the
+dashboard credentials that read either private UK dataset. The generic
+project-level `HF_TOKEN` is not used for deployment qualification.
 The migration job uses a separate service account and database credential with
 schema-modification access; the collector runtime credential has only the data
 access required by the application. The dashboard deployment receives its
