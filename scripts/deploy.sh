@@ -74,6 +74,16 @@ validate_environment_target() {
   esac
 }
 
+check_secrets_exist() {
+  require_variables \
+    PROJECT_ID DATABASE_SECRET_NAME MIGRATION_DATABASE_SECRET_NAME \
+    JWT_SECRET_NAME READ_SECRET_NAME
+
+  bash "$(dirname "$0")/check-secrets-exist.sh" \
+    "$DATABASE_SECRET_NAME" "$MIGRATION_DATABASE_SECRET_NAME" \
+    "$JWT_SECRET_NAME" "$READ_SECRET_NAME"
+}
+
 build_and_push_image() {
   require_variables \
     REGION \
@@ -333,6 +343,7 @@ Usage: deploy.sh COMMAND
 Commands:
   require-configuration
   validate-environment-target
+  check-secrets-exist
   build-and-push-image
   deploy-maintenance
   resolve-and-verify-maintenance
@@ -356,6 +367,7 @@ main() {
   case "$1" in
     require-configuration) require_configuration ;;
     validate-environment-target) validate_environment_target ;;
+    check-secrets-exist) check_secrets_exist ;;
     build-and-push-image) build_and_push_image ;;
     deploy-maintenance) deploy_maintenance ;;
     resolve-and-verify-maintenance) resolve_and_verify_maintenance ;;

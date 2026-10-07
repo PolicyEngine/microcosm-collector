@@ -15,9 +15,10 @@ the authenticated Hugging Face user owns the referenced run and that each
 producer was registered first. The raw Hugging Face token is neither logged nor
 written to Postgres.
 
-The dashboard query endpoints require `X-Telemetry-Read-Token`. This credential
-is configured only in the dashboard server environment and is never returned
-to the browser.
+The dashboard query endpoints require `X-Telemetry-Read-Token`. The dashboard
+server retrieves this credential from Google Secret Manager at runtime. Vercel
+authenticates using its OIDC identity; the credential is never returned to the
+browser or passed through GitHub Actions.
 
 ## Local development
 
@@ -53,12 +54,12 @@ workflow itself changes. Pull requests run tests, Ruff, and a container build.
 After a change reaches `main`, the workflow authenticates to Google Cloud with
 GitHub OIDC and pushes one image identified by the commit SHA. It first applies
 the migration to the persistent staging PostgreSQL database, verifies both the
-Alembic revision and the complete SQLAlchemy metadata, deploys the staging
-collector, and exercises Hugging Face authentication, run registration, event
-ingestion, and dashboard reads. Production receives that exact image only when
-the staging sequence succeeds. The production candidate repeats the same
-authentication, write, and read qualification against the production database
-before it receives stable traffic.
+Alembic revision and the complete SQLAlchemy metadata, and deploys the staging
+collector. Production receives that exact image only when the staging sequence
+succeeds. Before either environment changes, deployment checks only that its
+runtime database, migration database, JWT signing, and read-token secret
+resources exist. It does not access their payloads or test their values. The
+previous HF authentication and write/read deployment qualification is removed.
 
 Each deployment first routes traffic to a verified maintenance revision that
 returns HTTP 503 for data operations, then waits for prior requests to finish.
@@ -74,11 +75,37 @@ The workflow reads resource identifiers from the GitHub `staging` and
 `Production` environments. Runtime secrets remain in Google Secret Manager.
 The migration job uses a separate service account and database credential with
 schema-modification access; the collector runtime credential has only the data
-access required by the application. The dashboard deployment receives its
-collector address and independent read credential from deployment
-configuration. Public ingress lets developer machines reach the service;
+access required by the application. The dashboard receives its collector
+address and Secret Manager resource references through non-secret configuration.
+Public ingress lets developer machines reach the service;
 ingestion still requires a short-lived collector credential issued after
 Hugging Face authentication.
+
+## Dashboard runtime access
+
+The Vercel project configures these server-only, non-secret settings separately
+for production and preview:
+
+- `MICROCOSM_TELEMETRY_COLLECTOR_URL`: the matching environment's collector address.
+- `MICROCOSM_TELEMETRY_READ_SECRET_VERSION`: the full Secret Manager version
+  resource for that collector's read credential.
+- `MICROCOSM_TELEMETRY_GOOGLE_IDENTITY_PROVIDER`: the full Google workload
+  identity provider resource that trusts this Vercel project.
+
+The provider must trust the project's Vercel OIDC issuer and audience. Bind the
+production identity to only the production read secret, and the preview identity
+to only the staging read secret. Grant secret-access permission on those
+individual resources. These identity bindings and Vercel settings require
+one-time provisioning before this change is deployed; their provisioning scripts
+stay outside the source tree. The GitHub deployment identity needs metadata read
+permission on the required secrets for the existence checks.
+
+Local dashboard development uses Google Application Default Credentials and
+the same collector address and secret-version settings. No copied collector
+token or service-account key is required. The runtime caches a retrieved value
+for up to one minute and retries failed retrievals on subsequent requests.
+Configuration checks during deployment only confirm secret existence; they do
+not establish that credentials work or that runtime permissions are correct.
 
 Restrict the Cloud SQL instance to the Cloud Run connection and disable request
 access logs for the container so authorization headers cannot enter application
