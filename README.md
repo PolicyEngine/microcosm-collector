@@ -56,7 +56,9 @@ the migration to the persistent staging PostgreSQL database, verifies both the
 Alembic revision and the complete SQLAlchemy metadata, deploys the staging
 collector, and exercises Hugging Face authentication, run registration, event
 ingestion, and dashboard reads. Production receives that exact image only when
-the staging sequence succeeds.
+the staging sequence succeeds. The production candidate repeats the same
+authentication, write, and read qualification against the production database
+before it receives stable traffic.
 
 Each deployment first routes traffic to a verified maintenance revision that
 returns HTTP 503 for data operations, then waits for prior requests to finish.
