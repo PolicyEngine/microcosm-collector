@@ -45,7 +45,7 @@ def test_service_deployment_uses_oidc_and_verifies_before_promotion() -> None:
     assert "Restore the previous revision" not in workflow
 
 
-def test_service_deployment_qualifies_each_candidate_before_promotion() -> None:
+def test_service_deployment_checks_secret_existence_before_changing_traffic() -> None:
     workflow = WORKFLOW.read_text(encoding="utf-8")
 
     staging_start = workflow.index("  deploy-staging:")
@@ -56,51 +56,16 @@ def test_service_deployment_qualifies_each_candidate_before_promotion() -> None:
     assert "environment: staging" in staging_job
     assert "image_uri: ${{ steps.image.outputs.uri }}" in staging_job
     assert "build-and-push-image" in staging_job
-    assert "qualify-deployment.sh" in staging_job
-    assert (
-        "TELEMETRY_HF_QUALIFICATION_TOKEN: "
-        "${{ secrets.TELEMETRY_HF_QUALIFICATION_TOKEN }}" in staging_job
-    )
-    assert (
-        "TELEMETRY_READ_TOKEN: "
-        "${{ secrets.MICROCOSM_TELEMETRY_COLLECTOR_READ_TOKEN }}" in staging_job
-    )
-    assert "HF_TOKEN: ${{ secrets.HF_TOKEN }}" not in staging_job
-    assert staging_job.index("Resolve and verify the candidate revision") < (
-        staging_job.index("Exercise staging authentication, writes, and reads")
-    )
-    assert staging_job.index(
-        "Exercise staging authentication, writes, and reads"
-    ) < staging_job.index("Promote the verified revision")
 
     assert "needs: deploy-staging" in production_job
     assert "environment: Production" in production_job
     assert "needs.deploy-staging.outputs.image_uri" in production_job
     assert "build-and-push-image" not in production_job
     assert "create-database-backup" in production_job
-    assert "qualify-deployment.sh" in production_job
-    assert (
-        "TELEMETRY_HF_QUALIFICATION_TOKEN: "
-        "${{ secrets.TELEMETRY_HF_QUALIFICATION_TOKEN }}" in production_job
-    )
-    assert (
-        "TELEMETRY_READ_TOKEN: "
-        "${{ secrets.MICROCOSM_TELEMETRY_COLLECTOR_READ_TOKEN }}" in production_job
-    )
-    assert production_job.index("Resolve and verify the candidate revision") < (
-        production_job.index("Exercise production authentication, writes, and reads")
-    )
-    assert production_job.index(
-        "Exercise production authentication, writes, and reads"
-    ) < production_job.index("Promote the verified revision")
-
-
-def test_qualification_credentials_are_not_injected_into_cloud_run() -> None:
-    workflow = WORKFLOW.read_text(encoding="utf-8")
-    deploy_script = DEPLOY_SCRIPT.read_text(encoding="utf-8")
-
-    assert workflow.count("secrets.TELEMETRY_HF_QUALIFICATION_TOKEN") == 2
-    assert "TELEMETRY_HF_QUALIFICATION_TOKEN" not in deploy_script
+    for job in (staging_job, production_job):
+        assert job.index("setup-gcloud@v2") < job.index("check-secrets-exist")
+        assert job.index("check-secrets-exist") < job.index("deploy-maintenance")
+        assert job.index("check-secrets-exist") < job.index("apply-migrations")
 
 
 def test_service_deployment_reads_resource_names_from_environment_variables() -> None:
@@ -176,11 +141,12 @@ def test_service_workflow_has_no_multiline_run_blocks() -> None:
 
     assert "run: |" not in workflow
     assert "run: >" not in workflow
-    assert workflow.count("run: telemetry-service/scripts/deploy.sh") == 26
+    assert workflow.count("run: telemetry-service/scripts/deploy.sh") == 28
 
     for command in (
         "require-configuration",
         "validate-environment-target",
+        "check-secrets-exist",
         "build-and-push-image",
         "deploy-maintenance",
         "resolve-and-verify-maintenance",
@@ -194,8 +160,6 @@ def test_service_workflow_has_no_multiline_run_blocks() -> None:
         "create-database-backup",
     ):
         assert f"run: telemetry-service/scripts/deploy.sh {command}" in workflow
-
-    assert workflow.count("run: telemetry-service/scripts/qualify-deployment.sh") == 2
 
 
 def test_service_image_contains_alembic_runtime_files() -> None:
