@@ -382,6 +382,92 @@ def test_blocked_run_event_is_accepted_and_ends_the_run() -> None:
     assert listed.json()["runs"][0]["ended_at"] is not None
 
 
+def _blocked_event(details: dict[str, object]) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "event_id": "gates-refused",
+        "run_id": "route-a-1",
+        "producer_id": "producer-1",
+        "sequence": 1,
+        "timestamp": datetime.now(UTC).isoformat(),
+        "event_type": "run",
+        "stage_id": "blocked",
+        "status": "blocked",
+        "message": "The gates refused the candidate.",
+        "details": details,
+        "resources": None,
+    }
+
+
+@pytest.mark.parametrize(
+    "details",
+    [
+        {},
+        {"blocking_failure_count": 1, "blocking_gate_ids": []},
+        {"phase": "pre flight", "blocking_failure_count": 1, "blocking_gate_ids": []},
+        {"phase": "terminal", "blocking_gate_ids": ["uk_target_fit"]},
+        {"phase": "terminal", "blocking_failure_count": 0, "blocking_gate_ids": []},
+        {"phase": "terminal", "blocking_failure_count": True, "blocking_gate_ids": []},
+        {"phase": "terminal", "blocking_failure_count": 1},
+        {"phase": "terminal", "blocking_failure_count": 1, "blocking_gate_ids": [""]},
+    ],
+)
+def test_blocked_event_without_a_valid_block_is_rejected(
+    details: dict[str, object],
+) -> None:
+    store = FakeTelemetryStore()
+    client = TestClient(
+        create_app(
+            settings=settings(),
+            store=store,
+            huggingface_authenticator=StubHuggingFaceAuthenticator(),
+        )
+    )
+    token = exchange(client)
+    register(client, token)
+    response = client.post(
+        "/v1/runs/route-a-1/events",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"events": [_blocked_event(details)]},
+    )
+    detail = client.get(
+        "/v1/runs/route-a-1",
+        headers={"X-Telemetry-Read-Token": "dashboard-read-token"},
+    )
+
+    assert response.status_code == 422
+    assert detail.json()["progress"]["status"] == "running"
+
+
+def test_blocked_event_naming_no_gate_and_no_statuses_is_accepted() -> None:
+    client = TestClient(
+        create_app(
+            settings=settings(),
+            store=FakeTelemetryStore(),
+            huggingface_authenticator=StubHuggingFaceAuthenticator(),
+        )
+    )
+    token = exchange(client)
+    register(client, token)
+    response = client.post(
+        "/v1/runs/route-a-1/events",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "events": [
+                _blocked_event(
+                    {
+                        "phase": "preflight",
+                        "blocking_failure_count": 2,
+                        "blocking_gate_ids": [],
+                    }
+                )
+            ]
+        },
+    )
+
+    assert response.status_code == 202
+
+
 def test_health_does_not_require_credentials() -> None:
     client = TestClient(
         create_app(

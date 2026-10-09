@@ -20,6 +20,30 @@ server retrieves this credential from Google Secret Manager at runtime. Vercel
 authenticates using its OIDC identity; the credential is never returned to the
 browser or passed through GitHub Actions.
 
+## Responses a producer acts on
+
+Microcosm's delivery service (from PolicyEngine/microcosm#1147) treats any 4xx
+other than 401, 408 and 429 as the collector's final answer for a run: it stops
+delivering that run, keeps its telemetry on the build machine and warns once.
+A 401 on registration or events makes it exchange its token again (a 401 or
+403 from the token exchange itself is final); 408, 429, 5xx and the
+maintenance revision's 503 are retried. So the collector answers 4xx only when
+sending the same request again cannot succeed:
+
+- `403`: the Hugging Face user is not a member of the organization (token
+  exchange), the run belongs to another user, the producer was not registered
+  for it, or an event names a different run than its path.
+- `404` on `POST /v1/runs/{run_id}/events` ("Run is not registered"): the
+  delivery service sends events only after its registration returned 201, so
+  this means the run disappeared after it registered, for example a database
+  reset while a build was running. That build's remaining telemetry stays local.
+- `409` on `POST /v1/runs`: the run id is already registered with different
+  metadata.
+- `413`: the request body is larger than 1 MiB.
+- `422`: the request does not match the event schema, including a `blocked`
+  event without a valid block (a safe-identifier `phase`, a
+  `blocking_failure_count` of at least 1, and `blocking_gate_ids`).
+
 ## Local development
 
 ```bash
