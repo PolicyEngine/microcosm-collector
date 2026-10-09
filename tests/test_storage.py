@@ -213,3 +213,136 @@ def test_progress_work_uses_json_compatible_timestamp() -> None:
     materialized = materialize_run(_registered(registered_at), [event])
 
     assert materialized["work"]["updated_at"] == registered_at.isoformat()
+
+
+def test_blocked_run_event_ends_the_run_with_its_block() -> None:
+    registered_at = datetime(2026, 10, 1, tzinfo=UTC)
+    blocked = _event(
+        event_id="blocked",
+        producer_registered_at=registered_at,
+        sequence=2,
+        timestamp=registered_at + timedelta(minutes=9),
+        status="blocked",
+        stage_id="blocked",
+    )
+    blocked["details"] = {
+        "phase": "terminal",
+        "blocking_failure_count": 1,
+        "blocking_gate_ids": ["uk_target_fit"],
+        "gate_statuses": {"uk_target_fit": "failed"},
+    }
+    events = [
+        _event(
+            event_id="gates",
+            producer_registered_at=registered_at,
+            sequence=1,
+            timestamp=registered_at + timedelta(minutes=8),
+            status="completed",
+            stage_id="gate_battery",
+        ),
+        blocked,
+    ]
+    events[0]["event_type"] = "stage"
+
+    materialized = materialize_run(_registered(registered_at), events)
+    documents = run_documents(_registered(registered_at), events)
+
+    block = {
+        "phase": "terminal",
+        "blocking_failure_count": 1,
+        "blocking_gate_ids": ["uk_target_fit"],
+    }
+    assert materialized["status"] == "blocked"
+    assert materialized["current_stage"] == "blocked"
+    assert materialized["ended_at"] == blocked["timestamp"]
+    assert materialized["failure"] is None
+    assert materialized["block"] == block
+    assert documents["progress"]["status"] == "blocked"
+    assert documents["progress"]["block"] == block
+    assert documents["run_manifest"]["block"] == block
+    assert documents["events"][-1]["details"]["gate_statuses"] == {
+        "uk_target_fit": "failed"
+    }
+
+
+def test_blocked_run_without_gate_ids_or_statuses_keeps_its_count() -> None:
+    registered_at = datetime(2026, 10, 1, tzinfo=UTC)
+    blocked = _event(
+        event_id="blocked",
+        producer_registered_at=registered_at,
+        sequence=1,
+        timestamp=registered_at + timedelta(minutes=1),
+        status="blocked",
+        stage_id="blocked",
+    )
+    blocked["details"] = {
+        "phase": "preflight",
+        "blocking_failure_count": 2,
+        "blocking_gate_ids": [],
+    }
+
+    materialized = materialize_run(_registered(registered_at), [blocked])
+
+    assert materialized["status"] == "blocked"
+    assert materialized["block"] == {
+        "phase": "preflight",
+        "blocking_failure_count": 2,
+        "blocking_gate_ids": [],
+    }
+
+
+def test_failed_run_keeps_its_error_code() -> None:
+    registered_at = datetime(2026, 10, 1, tzinfo=UTC)
+    failed = _event(
+        event_id="failed",
+        producer_registered_at=registered_at,
+        sequence=1,
+        timestamp=registered_at + timedelta(minutes=1),
+        status="failed",
+        stage_id="failed",
+    )
+    failed["details"] = {
+        "error_type": "KeyboardInterrupt",
+        "error_code": "INTERRUPTED",
+        "failure_class": "interrupted",
+        "failed_during": "calibrating",
+    }
+
+    assert materialize_run(_registered(registered_at), [failed])["failure"] == {
+        "message": "failed",
+        "error_type": "KeyboardInterrupt",
+        "error_code": "INTERRUPTED",
+        "failure_class": "interrupted",
+        "failed_during": "calibrating",
+    }
+
+
+def test_restarted_producer_clears_a_previous_block() -> None:
+    registered_at = datetime(2026, 10, 1, tzinfo=UTC)
+    blocked = _event(
+        event_id="blocked",
+        producer_registered_at=registered_at,
+        sequence=1,
+        timestamp=registered_at + timedelta(minutes=1),
+        status="blocked",
+        stage_id="blocked",
+    )
+    blocked["details"] = {
+        "phase": "terminal",
+        "blocking_failure_count": 1,
+        "blocking_gate_ids": ["uk_target_fit"],
+    }
+    restarted = _event(
+        event_id="restart-started",
+        producer_id="producer-2",
+        producer_registered_at=registered_at + timedelta(minutes=10),
+        sequence=1,
+        timestamp=registered_at + timedelta(minutes=11),
+        status="started",
+        stage_id="created",
+    )
+
+    materialized = materialize_run(_registered(registered_at), [blocked, restarted])
+
+    assert materialized["status"] == "running"
+    assert materialized["block"] is None

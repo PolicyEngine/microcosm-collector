@@ -119,7 +119,7 @@ def _apply_event(run: dict[str, Any], event: dict[str, Any]) -> None:
     if event["event_type"] == "heartbeat":
         run["heartbeat_at"] = timestamp
     stage_id = event.get("stage_id")
-    if stage_id and stage_id not in {"complete", "failed"}:
+    if stage_id and stage_id not in {"complete", "failed", "blocked"}:
         run["current_stage"] = stage_id
     if event["event_type"] == "run" and event["status"] == "started":
         # A later producer represents a restarted attempt for the same stable
@@ -128,6 +128,7 @@ def _apply_event(run: dict[str, Any], event: dict[str, Any]) -> None:
         run["status"] = "running"
         run["ended_at"] = None
         run["failure"] = None
+        run["block"] = None
     details = event.get("details") or {}
     if event["event_type"] == "progress" and {
         "done",
@@ -155,8 +156,23 @@ def _apply_event(run: dict[str, Any], event: dict[str, Any]) -> None:
         run["failure"] = {
             "message": event.get("message"),
             "error_type": details.get("error_type"),
+            "error_code": details.get("error_code"),
             "failure_class": details.get("failure_class"),
             "failed_during": details.get("failed_during") or stage_id,
+        }
+        run["block"] = None
+    elif event["status"] == "blocked" and (
+        event["event_type"] == "run" or stage_id == "blocked"
+    ):
+        # The gates refused the candidate: the run ended without failing.
+        run["status"] = "blocked"
+        run["current_stage"] = "blocked"
+        run["ended_at"] = timestamp
+        run["failure"] = None
+        run["block"] = {
+            "phase": details.get("phase"),
+            "blocking_failure_count": details.get("blocking_failure_count"),
+            "blocking_gate_ids": details.get("blocking_gate_ids") or [],
         }
     elif event["status"] == "completed" and (
         event["event_type"] == "run" or stage_id == "complete"
@@ -165,6 +181,7 @@ def _apply_event(run: dict[str, Any], event: dict[str, Any]) -> None:
         run["current_stage"] = "complete"
         run["ended_at"] = timestamp
         run["failure"] = None
+        run["block"] = None
 
 
 def materialize_run(
@@ -183,6 +200,8 @@ def materialize_run(
         "resources": None,
         "work": None,
         "failure": None,
+        # Rebuilt from the events on every read; not a stored column.
+        "block": None,
     }
     active_producer_id: str | None = None
     for event in canonical_events(events):
@@ -206,6 +225,7 @@ def materialize_run(
                     "resources": None,
                     "work": None,
                     "failure": None,
+                    "block": None,
                 }
             )
         active_producer_id = producer_id
@@ -291,11 +311,13 @@ def run_documents(
         "resources": run.get("resources"),
         "work": run.get("work"),
         "failure": run.get("failure"),
+        "block": run.get("block"),
     }
     manifest = {
         **common,
         "identity": identity,
         "failure": run.get("failure"),
+        "block": run.get("block"),
         "delivery": {
             "mode": "collector",
             "upload_attempts": None,

@@ -327,6 +327,61 @@ def test_failed_validation_event_does_not_finish_the_run() -> None:
     assert detail.json()["progress"]["status"] == "running"
 
 
+def test_blocked_run_event_is_accepted_and_ends_the_run() -> None:
+    store = FakeTelemetryStore()
+    client = TestClient(
+        create_app(
+            settings=settings(),
+            store=store,
+            huggingface_authenticator=StubHuggingFaceAuthenticator(),
+        )
+    )
+    token = exchange(client)
+    register(client, token)
+    response = client.post(
+        "/v1/runs/route-a-1/events",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "events": [
+                {
+                    "schema_version": 1,
+                    "event_id": "gates-refused",
+                    "run_id": "route-a-1",
+                    "producer_id": "producer-1",
+                    "sequence": 1,
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    "event_type": "run",
+                    "stage_id": "blocked",
+                    "status": "blocked",
+                    "message": "The gates refused the candidate at terminal.",
+                    "details": {
+                        "phase": "terminal",
+                        "blocking_failure_count": 1,
+                        "blocking_gate_ids": ["uk_target_fit"],
+                        "gate_statuses": {"uk_target_fit": "failed"},
+                    },
+                    "resources": None,
+                }
+            ]
+        },
+    )
+    headers = {"X-Telemetry-Read-Token": "dashboard-read-token"}
+    detail = client.get("/v1/runs/route-a-1", headers=headers)
+    listed = client.get("/v1/runs?country=US", headers=headers)
+
+    assert response.status_code == 202
+    assert response.json() == {"accepted": 1, "duplicates": 0}
+    progress = detail.json()["progress"]
+    assert progress["status"] == "blocked"
+    assert progress["block"] == {
+        "phase": "terminal",
+        "blocking_failure_count": 1,
+        "blocking_gate_ids": ["uk_target_fit"],
+    }
+    assert listed.json()["runs"][0]["status"] == "blocked"
+    assert listed.json()["runs"][0]["ended_at"] is not None
+
+
 def test_health_does_not_require_credentials() -> None:
     client = TestClient(
         create_app(

@@ -69,7 +69,7 @@ class TelemetryEvent(BaseModel):
     timestamp: datetime
     event_type: Literal["run", "stage", "progress", "calibration", "heartbeat"]
     stage_id: str | None = Field(default=None, pattern=SAFE_IDENTIFIER)
-    status: Literal["started", "progress", "completed", "failed"]
+    status: Literal["started", "progress", "completed", "failed", "blocked"]
     message: str | None = Field(default=None, max_length=500)
     details: dict[str, Any] = Field(default_factory=dict)
     resources: ResourceSnapshot | None = None
