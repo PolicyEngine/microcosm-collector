@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
-from sqlalchemy import and_, select, tuple_
+from sqlalchemy import Select, and_, func, select, tuple_
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
@@ -497,6 +497,52 @@ def _event_mapping(
     }
 
 
+def _stored_events_statement(
+    run_id: str,
+) -> Select[tuple[StoredTelemetryEvent, datetime]]:
+    return (
+        select(
+            StoredTelemetryEvent,
+            TelemetryProducer.registered_at,
+        )
+        .join(
+            TelemetryProducer,
+            and_(
+                StoredTelemetryEvent.run_id == TelemetryProducer.run_id,
+                StoredTelemetryEvent.producer_id == TelemetryProducer.producer_id,
+            ),
+        )
+        .where(StoredTelemetryEvent.run_id == run_id)
+    )
+
+
+class _PostgresStoredEvents:
+    """Reads one producer's stored events inside the ingestion transaction."""
+
+    def __init__(self, session: Session, run_id: str) -> None:
+        self._session = session
+        self._run_id = run_id
+
+    def events_from(self, producer_id: str, sequence: int) -> list[dict[str, Any]]:
+        rows = self._session.execute(
+            _stored_events_statement(self._run_id)
+            .where(
+                StoredTelemetryEvent.producer_id == producer_id,
+                StoredTelemetryEvent.sequence >= sequence,
+            )
+            .order_by(StoredTelemetryEvent.sequence, StoredTelemetryEvent.event_id)
+        ).all()
+        return [_event_mapping(event, registered_at) for event, registered_at in rows]
+
+    def earliest_timestamp(self, producer_id: str) -> datetime:
+        return self._session.execute(
+            select(func.min(StoredTelemetryEvent.emitted_at)).where(
+                StoredTelemetryEvent.run_id == self._run_id,
+                StoredTelemetryEvent.producer_id == producer_id,
+            )
+        ).scalar_one()
+
+
 def _registered_metadata(
     run: TelemetryRun,
 ) -> tuple[str, str, str | None, str | None, str]:
@@ -585,19 +631,7 @@ class PostgresTelemetryStore:
 
     def _events_for_run(self, session: Session, run_id: str) -> list[dict[str, Any]]:
         rows = session.execute(
-            select(
-                StoredTelemetryEvent,
-                TelemetryProducer.registered_at,
-            )
-            .join(
-                TelemetryProducer,
-                and_(
-                    StoredTelemetryEvent.run_id == TelemetryProducer.run_id,
-                    StoredTelemetryEvent.producer_id == TelemetryProducer.producer_id,
-                ),
-            )
-            .where(StoredTelemetryEvent.run_id == run_id)
-            .order_by(
+            _stored_events_statement(run_id).order_by(
                 TelemetryProducer.registered_at,
                 TelemetryProducer.producer_id,
                 StoredTelemetryEvent.sequence,
@@ -605,6 +639,29 @@ class PostgresTelemetryStore:
             )
         ).all()
         return [_event_mapping(event, registered_at) for event, registered_at in rows]
+
+    def _stored_producers(
+        self, session: Session, run_id: str
+    ) -> dict[str, StoredProducer]:
+        last_sequence = (
+            select(func.max(StoredTelemetryEvent.sequence))
+            .where(
+                StoredTelemetryEvent.run_id == TelemetryProducer.run_id,
+                StoredTelemetryEvent.producer_id == TelemetryProducer.producer_id,
+            )
+            .scalar_subquery()
+        )
+        rows = session.execute(
+            select(
+                TelemetryProducer.producer_id,
+                TelemetryProducer.registered_at,
+                last_sequence,
+            ).where(TelemetryProducer.run_id == run_id)
+        ).all()
+        return {
+            producer_id: StoredProducer(producer_id, registered_at, sequence)
+            for producer_id, registered_at, sequence in rows
+        }
 
     def append_events(
         self,
@@ -625,16 +682,8 @@ class PostgresTelemetryStore:
                 raise PermissionError("Run belongs to another Hugging Face user.")
             if not models:
                 return 0, 0
-            producer_ids = {model.producer_id for model in models}
-            registered_producer_ids = set(
-                session.execute(
-                    select(TelemetryProducer.producer_id).where(
-                        TelemetryProducer.run_id == run_id,
-                        TelemetryProducer.producer_id.in_(producer_ids),
-                    )
-                ).scalars()
-            )
-            if registered_producer_ids != producer_ids:
+            producers = self._stored_producers(session, run_id)
+            if not {model.producer_id for model in models} <= producers.keys():
                 raise PermissionError(
                     "Telemetry producer is not registered for this run."
                 )
@@ -656,31 +705,33 @@ class PostgresTelemetryStore:
                         "resources": event["resources"],
                     }
                 )
-            accepted_ids = session.execute(
-                insert(StoredTelemetryEvent)
-                .values(values)
-                .on_conflict_do_nothing()
-                .returning(StoredTelemetryEvent.event_id)
-            ).scalars()
-            accepted = len(accepted_ids.all())
-            if accepted:
-                session.flush()
-                materialized = materialize_run(
-                    _run_mapping(run), self._events_for_run(session, run_id)
+            # Returning the stored rows gives the fold the same database values
+            # (time zone, JSON) that a full re-read would.
+            inserted_events = (
+                session.execute(
+                    insert(StoredTelemetryEvent)
+                    .values(values)
+                    .on_conflict_do_nothing()
+                    .returning(StoredTelemetryEvent)
                 )
-                for field in (
-                    "status",
-                    "current_stage",
-                    "started_at",
-                    "updated_at",
-                    "ended_at",
-                    "heartbeat_at",
-                    "resources",
-                    "work",
-                    "failure",
-                ):
-                    setattr(run, field, materialized[field])
-        return accepted, len(models) - accepted
+                .scalars()
+                .all()
+            )
+            if inserted_events:
+                materialized = apply_event_batch(
+                    _run_mapping(run),
+                    producers.values(),
+                    [
+                        _event_mapping(
+                            event, producers[event.producer_id].registered_at
+                        )
+                        for event in inserted_events
+                    ],
+                    _PostgresStoredEvents(session, run_id),
+                )
+                for column, value in materialized.items():
+                    setattr(run, column, value)
+        return len(inserted_events), len(models) - len(inserted_events)
 
     def list_runs(
         self,
