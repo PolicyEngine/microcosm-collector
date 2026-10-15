@@ -61,25 +61,57 @@ loopback-only development option when testing ingestion. Production Microcosm
 builds use the fixed collector origin shipped by the package and do not accept
 a destination environment variable.
 
+## Tests
+
+```bash
+uv sync --locked --dev
+uv run pytest -q
+uv run ruff check .
+uv run ruff format --check .
+```
+
+The PostgreSQL integration tests and the migration checks need a disposable
+database whose name contains `test`, given as `TEST_DATABASE_URL`. Without it
+they are skipped. CI runs them against PostgreSQL 16 and also runs
+`python -m telemetry_collector.migrate` and `alembic check` against that
+database.
+
+## Releases
+
+Every pull request needs a changelog fragment, `changelog.d/<name>.<type>.md`,
+where `<type>` is `breaking`, `added`, `changed`, `fixed` or `removed`. A
+breaking fragment bumps the major version, an added or removed fragment the
+minor version, and any other fragment the patch version.
+
+Each merge to `main` runs `.github/workflows/push.yaml` twice. The first run
+bumps `pyproject.toml`, collects the fragments into `CHANGELOG.md`, updates
+`uv.lock`, and commits the result as "Update microcosm-collector" with the
+PolicyEngine GitHub App, which may bypass the main ruleset. The second run, on
+that commit, verifies it, tags it with the bare version (for example `0.2.0`),
+and then runs the gated deployment described below.
+
 ## Cloud Run deployment
 
-The production service is isolated in this top-level directory. Its Docker
-build context is `telemetry-service/`, so dashboard source files cannot enter
-the image. Cloud Run assigns the production service address. Microcosm fixes
-that origin in its delivery service; the address is intentionally not repeated
-in documentation.
+This service was developed in `telemetry-service/` inside
+PolicyEngine/calibration-diagnostics, and its history was extracted here.
+calibration-diagnostics deploys production until this repo takes over (see
+"Deployment gate" below). The Docker build context is the root of this repo.
+Cloud Run assigns the production service address. Microcosm fixes that origin
+in its delivery service; the address is intentionally not repeated in
+documentation.
 
 Infrastructure was provisioned once with disposable scripts kept outside the
 source tree. The source tree intentionally contains no bootstrap script or
 mutable infrastructure template.
 
-`.github/workflows/telemetry-service.yml` runs only when this directory or the
-workflow itself changes. Pull requests run tests, Ruff, and a container build.
-After a change reaches `main`, the workflow authenticates to Google Cloud with
-GitHub OIDC and pushes one image identified by the commit SHA. It first applies
-the migration to the persistent staging PostgreSQL database, verifies both the
-Alembic revision and the complete SQLAlchemy metadata, and deploys the staging
-collector. Production receives that exact image only when the staging sequence
+`.github/workflows/pr.yaml` runs actionlint and `.github/workflows/ci.yml`
+(tests, migration checks, Ruff and a container build) on every pull request,
+and reports one "Required checks" status that the main ruleset requires.
+`.github/workflows/push.yaml` runs the same checks on `main`. When deployment
+is enabled, it then authenticates to Google Cloud with GitHub OIDC and pushes
+one image identified by the commit SHA. It first applies the migration to the
+persistent staging PostgreSQL database, verifies both the Alembic revision and
+the complete SQLAlchemy metadata, and deploys the staging collector. Production receives that exact image only when the staging sequence
 succeeds. Before either environment changes, deployment checks only that its
 runtime database, migration database, JWT signing, and read-token secret
 resources exist. It does not access their payloads or test their values. The
@@ -93,17 +125,75 @@ migrations, deploys a candidate without stable traffic, checks the candidate's
 `/ready` endpoint, and only then directs traffic to the candidate. Once a
 production migration begins, failures leave the maintenance revision serving
 retryable responses; the workflow does not restore schema-incompatible
-application code. Manual deployment runs are accepted only from `main`.
+application code. To repeat a deployment, re-run the failed jobs of that push.
 
 The workflow reads resource identifiers from the GitHub `staging` and
-`Production` environments. Runtime secrets remain in Google Secret Manager.
-The migration job uses a separate service account and database credential with
-schema-modification access; the collector runtime credential has only the data
-access required by the application. The dashboard receives its collector
+`production` environments, which accept only `main`. Runtime secrets remain in
+Google Secret Manager. The migration job uses a separate service account and
+database credential with schema-modification access; the collector runtime
+credential has only the data access required by the application. The dashboard receives its collector
 address and Secret Manager resource references through non-secret configuration.
 Public ingress lets developer machines reach the service;
 ingestion still requires a short-lived collector credential issued after
 Hugging Face authentication.
+
+### Google Cloud access
+
+The deployment jobs exchange their GitHub OIDC token through a Workload
+Identity provider dedicated to this repo, then act as the same deployment
+service account that calibration-diagnostics uses. The provider maps
+`google.subject=assertion.sub`, `attribute.actor=assertion.actor`,
+`attribute.ref=assertion.ref` and `attribute.repository=assertion.repository`,
+and accepts a token only when:
+
+```
+assertion.repository=='PolicyEngine/microcosm-collector' && assertion.ref=='refs/heads/main'
+```
+
+The service account grants `roles/iam.workloadIdentityUser` to this repo's
+principal set (`attribute.repository/PolicyEngine/microcosm-collector`). A job
+running for a tag, a pull request or any other branch cannot obtain Google
+credentials. Both deployment jobs therefore also require
+`github.event_name == 'push' && github.ref == 'refs/heads/main'`, so that such a
+run skips them instead of failing at authentication. No other job requests an
+OIDC token.
+
+### Deployment gate
+
+Both deployment jobs run only when the repo variable `COLLECTOR_DEPLOY_ENABLED`
+is `true`. Leave it unset until the cutover from calibration-diagnostics is
+complete:
+
+1. Google Cloud trusts this repo's GitHub OIDC identity, as described above.
+2. The `staging` and `production` environments hold the same secrets and
+   variables, by name, as the calibration-diagnostics `staging` and
+   `Production` environments: the secrets `TELEMETRY_GCP_WIF_PROVIDER` (this
+   repo's provider) and `TELEMETRY_GCP_DEPLOY_SERVICE_ACCOUNT`, and every
+   `TELEMETRY_*` variable read by `.github/workflows/push.yaml`.
+3. calibration-diagnostics no longer deploys this service.
+
+### Carrying over changes from calibration-diagnostics
+
+Until cutover, changes to `telemetry-service/` can still merge in
+calibration-diagnostics. `tools/extraction-source.env` records the
+calibration-diagnostics commit that this history was extracted from. To carry
+later changes over, from the root of a clean checkout of `main`:
+
+```bash
+tools/extract-from-calibration-diagnostics.sh ../collector-extraction \
+  tools/extraction-source.env
+git switch -c carry-over-telemetry-service
+git fetch ../collector-extraction main
+git merge FETCH_HEAD
+```
+
+The script needs git and uv. git-filter-repo rewrites unchanged source
+commits to the same commits, so the merge adds only the newer ones. The
+script refuses to continue if the previously extracted commit is not part of
+the new history, because merging that history would duplicate this one rather
+than extend it. Resolve any conflicts with changes made here, such as paths in
+tests, then add a changelog fragment and open a pull request that includes the
+updated record.
 
 ## Dashboard runtime access
 

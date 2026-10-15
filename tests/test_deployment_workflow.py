@@ -1,35 +1,163 @@
+"""The collector validates every change and deploys only once deployment is enabled."""
+
+import re
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
-WORKFLOW = ROOT / ".github" / "workflows" / "telemetry-service.yml"
-DOCKERFILE = ROOT / "telemetry-service" / "Dockerfile"
-DEPLOY_SCRIPT = ROOT / "telemetry-service" / "scripts" / "deploy.sh"
+import yaml
+
+ROOT = Path(__file__).resolve().parents[1]
+WORKFLOWS = ROOT / ".github" / "workflows"
+VALIDATION_WORKFLOW = WORKFLOWS / "ci.yml"
+PULL_REQUEST_WORKFLOW = WORKFLOWS / "pr.yaml"
+PUSH_WORKFLOW = WORKFLOWS / "push.yaml"
+DOCKERFILE = ROOT / "Dockerfile"
+DEPLOY_SCRIPT = ROOT / "scripts" / "deploy.sh"
+DEPLOY_GATE = "vars.COLLECTOR_DEPLOY_ENABLED == 'true'"
+# The Workload Identity provider accepts this repo's tokens only when
+# assertion.ref == 'refs/heads/main', so jobs that authenticate check it first.
+MAIN_PUSH_GUARD = "github.event_name == 'push' && github.ref == 'refs/heads/main'"
+DEPLOY_CONDITION = f"{MAIN_PUSH_GUARD} && {DEPLOY_GATE}"
+DEPLOY_JOBS = {"deploy-staging", "deploy-production"}
+WORKLOAD_IDENTITY_SECRETS = {
+    "TELEMETRY_GCP_WIF_PROVIDER",
+    "TELEMETRY_GCP_DEPLOY_SERVICE_ACCOUNT",
+}
 
 
-def test_service_workflow_is_path_scoped_and_uses_an_isolated_build_context() -> None:
-    workflow = WORKFLOW.read_text(encoding="utf-8")
-    deploy_script = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+def load_workflow(workflow_path: Path) -> dict:
+    # BaseLoader keeps YAML's 'on' key a string, matching GitHub's parser.
+    return yaml.load(workflow_path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
 
-    assert workflow.count("- telemetry-service/**") == 2
-    assert "branches: [main]" in workflow
-    assert "github.ref == 'refs/heads/main'" in workflow
-    assert "working-directory: telemetry-service" in workflow
-    assert "docker build \\" in deploy_script
-    assert "--file telemetry-service/Dockerfile \\" in deploy_script
-    assert '--tag "$image" \\' in deploy_script
-    assert "telemetry-service" in deploy_script
-    assert (
-        'docker build --file telemetry-service/Dockerfile --tag "$image" .'
-        not in deploy_script
+
+def workflow_paths() -> list[Path]:
+    return sorted(WORKFLOWS.glob("*.y*ml"))
+
+
+def authenticates_to_google_cloud(job: dict) -> bool:
+    return job.get("permissions", {}).get("id-token") == "write" or any(
+        step.get("uses", "").startswith("google-github-actions/auth@")
+        for step in job.get("steps", [])
     )
 
 
+def push_job_text(job_name: str, next_job_name: str | None) -> str:
+    workflow = PUSH_WORKFLOW.read_text(encoding="utf-8")
+    start = workflow.index(f"  {job_name}:")
+    end = workflow.index(f"  {next_job_name}:") if next_job_name else len(workflow)
+    return workflow[start:end]
+
+
+def test_service_image_builds_from_the_collector_root() -> None:
+    deploy_script = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+
+    assert "docker build \\" in deploy_script
+    assert "--file Dockerfile \\" in deploy_script
+    assert '--tag "$image" \\' in deploy_script
+    assert re.search(r'--tag "\$image" \\\n\s+\.\n', deploy_script)
+    assert "telemetry-service" not in deploy_script
+
+
+def test_deployment_runs_only_when_collector_deploy_is_enabled() -> None:
+    jobs = load_workflow(PUSH_WORKFLOW)["jobs"]
+
+    for job_name in DEPLOY_JOBS:
+        assert jobs[job_name]["if"] == DEPLOY_CONDITION, job_name
+    for workflow_path in workflow_paths():
+        for job_name, job in load_workflow(workflow_path)["jobs"].items():
+            if "environment" in job:
+                assert job_name in DEPLOY_JOBS, (workflow_path.name, job_name)
+
+
+def test_google_cloud_authentication_runs_only_on_pushes_to_main() -> None:
+    authenticating_jobs = {
+        (workflow_path.name, job_name): (workflow, job)
+        for workflow_path in workflow_paths()
+        for workflow in [load_workflow(workflow_path)]
+        for job_name, job in workflow["jobs"].items()
+        if authenticates_to_google_cloud(job)
+    }
+
+    # Only the release pass of push.yaml reaches these jobs, and pull requests,
+    # tags and reusable calls can never run them.
+    assert set(authenticating_jobs) == {
+        ("push.yaml", "deploy-staging"),
+        ("push.yaml", "deploy-production"),
+    }
+    for (workflow_name, job_name), (workflow, job) in authenticating_jobs.items():
+        assert workflow["on"] == {"push": {"branches": ["main"]}}, workflow_name
+        assert job["if"].startswith(f"{MAIN_PUSH_GUARD} && "), job_name
+
+
+def test_deployment_uses_main_only_staging_then_production_environments() -> None:
+    workflow = load_workflow(PUSH_WORKFLOW)
+    jobs = workflow["jobs"]
+
+    assert workflow["on"] == {"push": {"branches": ["main"]}}
+    assert jobs["deploy-staging"]["environment"] == "staging"
+    assert jobs["deploy-production"]["environment"] == "production"
+    assert jobs["deploy-staging"]["needs"] == "tag"
+    assert jobs["deploy-production"]["needs"] == "deploy-staging"
+    assert jobs["verify"]["uses"] == "./.github/workflows/ci.yml"
+    for job_name in DEPLOY_JOBS:
+        assert jobs[job_name]["concurrency"]["cancel-in-progress"] == "false"
+
+
+def test_only_deployment_jobs_hold_oidc_tokens_and_workload_identity_secrets() -> None:
+    for workflow_path in workflow_paths():
+        workflow = load_workflow(workflow_path)
+        assert "id-token" not in workflow.get("permissions", {}), workflow_path.name
+        oidc_jobs = {
+            job_name
+            for job_name, job in workflow["jobs"].items()
+            if job.get("permissions", {}).get("id-token") == "write"
+        }
+        expected_jobs = DEPLOY_JOBS if workflow_path == PUSH_WORKFLOW else set()
+        assert oidc_jobs == expected_jobs, workflow_path.name
+
+    jobs = load_workflow(PUSH_WORKFLOW)["jobs"]
+    for job_name in DEPLOY_JOBS:
+        job_text = yaml.safe_dump(jobs[job_name])
+        assert set(re.findall(r"secrets\.(\w+)", job_text)) == (
+            WORKLOAD_IDENTITY_SECRETS
+        )
+
+
+def test_pull_requests_report_one_required_check() -> None:
+    workflow = load_workflow(PULL_REQUEST_WORKFLOW)
+    jobs = workflow["jobs"]
+
+    assert set(workflow["on"]) == {"pull_request"}
+    assert jobs["verify"]["uses"] == "./.github/workflows/ci.yml"
+    assert "actionlint" in jobs["lint-workflows"]["steps"][-1]["uses"]
+    required = jobs["required"]
+    assert required["name"] == "Required checks"
+    assert required["if"] == "always()"
+    assert set(required["needs"]) == {"lint-workflows", "changelog", "verify"}
+    assert required["steps"][-1]["run"] == (
+        'test "$RESULTS" = "success success success"'
+    )
+
+
+def test_validation_is_reusable_and_runs_against_postgres() -> None:
+    workflow = load_workflow(VALIDATION_WORKFLOW)
+    validate = workflow["jobs"]["validate"]
+    commands = [step["run"] for step in validate["steps"] if "run" in step]
+
+    assert set(workflow["on"]) == {"workflow_call"}
+    assert validate["services"]["postgres"]["image"] == "postgres:16-alpine"
+    assert validate["env"]["TEST_DATABASE_URL"].endswith("/telemetry_test")
+    assert "uv run pytest -q" in commands
+    assert 'DATABASE_URL="$TEST_DATABASE_URL" uv run alembic check' in commands
+    assert "docker build --tag microcosm-collector:validation ." in commands
+    assert "defaults" not in validate
+
+
 def test_service_deployment_uses_oidc_and_verifies_before_promotion() -> None:
-    workflow = WORKFLOW.read_text(encoding="utf-8")
+    workflow = PUSH_WORKFLOW.read_text(encoding="utf-8")
     deploy_script = DEPLOY_SCRIPT.read_text(encoding="utf-8")
 
     assert "id-token: write" in workflow
-    assert "uses: google-github-actions/auth@v2" in workflow
+    assert "uses: google-github-actions/auth@" in workflow
     assert "--default-url" in deploy_script
     assert "httpGet.path=/health" in deploy_script
     assert '"${url}/ready"' in deploy_script
@@ -46,33 +174,35 @@ def test_service_deployment_uses_oidc_and_verifies_before_promotion() -> None:
 
 
 def test_service_deployment_checks_secret_existence_before_changing_traffic() -> None:
-    workflow = WORKFLOW.read_text(encoding="utf-8")
-
-    staging_start = workflow.index("  deploy-staging:")
-    production_start = workflow.index("  deploy-production:")
-    staging_job = workflow[staging_start:production_start]
-    production_job = workflow[production_start:]
+    staging_job = push_job_text("deploy-staging", "deploy-production")
+    production_job = push_job_text("deploy-production", None)
 
     assert "environment: staging" in staging_job
     assert "image_uri: ${{ steps.image.outputs.uri }}" in staging_job
     assert "build-and-push-image" in staging_job
 
     assert "needs: deploy-staging" in production_job
-    assert "environment: Production" in production_job
+    assert "environment: production" in production_job
     assert "needs.deploy-staging.outputs.image_uri" in production_job
     assert "build-and-push-image" not in production_job
     assert "create-database-backup" in production_job
     for job in (staging_job, production_job):
-        assert job.index("setup-gcloud@v2") < job.index("check-secrets-exist")
+        assert job.index("google-github-actions/setup-gcloud@") < job.index(
+            "check-secrets-exist"
+        )
         assert job.index("check-secrets-exist") < job.index("deploy-maintenance")
         assert job.index("check-secrets-exist") < job.index("apply-migrations")
 
 
 def test_service_deployment_reads_resource_names_from_environment_variables() -> None:
-    workflow = WORKFLOW.read_text(encoding="utf-8")
+    workflow = PUSH_WORKFLOW.read_text(encoding="utf-8")
 
     expected_variables = {
+        "PROJECT_ID": "TELEMETRY_GCP_PROJECT_ID",
+        "REGION": "TELEMETRY_GCP_REGION",
         "ARTIFACT_REGISTRY_NAME": "TELEMETRY_ARTIFACT_REGISTRY_NAME",
+        "CLOUD_SQL_CONNECTION": "TELEMETRY_CLOUD_SQL_CONNECTION",
+        "RUNTIME_SERVICE_ACCOUNT": "TELEMETRY_RUNTIME_SERVICE_ACCOUNT",
         "SERVICE": "TELEMETRY_SERVICE",
         "MIGRATION_JOB": "TELEMETRY_MIGRATION_JOB",
         "IMAGE_NAME": "TELEMETRY_IMAGE_NAME",
@@ -87,38 +217,62 @@ def test_service_deployment_reads_resource_names_from_environment_variables() ->
         "PRODUCTION_SERVICE": "TELEMETRY_PRODUCTION_SERVICE",
     }
     for environment_name, github_variable_name in expected_variables.items():
-        assert f"{environment_name}: ${{{{ vars.{github_variable_name} }}}}" in workflow
+        assert (
+            workflow.count(
+                f"{environment_name}: ${{{{ vars.{github_variable_name} }}}}"
+            )
+            == 2
+        )
 
 
-def test_telemetry_service_uses_store_vocabulary() -> None:
+def test_collector_uses_store_vocabulary() -> None:
     forbidden_term = "repo" + "sitory"
-    source_suffixes = {".ini", ".md", ".py", ".sh", ".toml", ".yml"}
-    source_files = [
-        path
-        for path in (ROOT / "telemetry-service").rglob("*")
-        if path.is_file()
-        and path.suffix in source_suffixes
-        and not {".pytest_cache", ".ruff_cache", ".venv"}.intersection(path.parts)
+    # GitHub's expression context and the OIDC claim and attribute names in
+    # Workload Identity conditions use the word; the collector's own words do not.
+    external_names = [
+        f"{prefix}.{forbidden_term}" for prefix in ("github", "assertion", "attribute")
     ]
-    source_files.append(WORKFLOW)
+    source_suffixes = {
+        ".env",
+        ".ini",
+        ".mako",
+        ".md",
+        ".py",
+        ".sh",
+        ".toml",
+        ".yaml",
+        ".yml",
+    }
+    ignored_parts = {".git", ".pytest_cache", ".ruff_cache", ".venv", "__pycache__"}
+    source_files = [
+        source_path
+        for source_path in ROOT.rglob("*")
+        if source_path.is_file()
+        and source_path.suffix in source_suffixes
+        and not ignored_parts.intersection(source_path.relative_to(ROOT).parts)
+    ]
+
+    def own_words(source_path: Path) -> str:
+        source_text = source_path.read_text(encoding="utf-8").lower()
+        for external_name in external_names:
+            source_text = source_text.replace(external_name, "")
+        return source_text
 
     matches = [
-        str(path.relative_to(ROOT))
-        for path in source_files
-        if forbidden_term in path.read_text(encoding="utf-8").lower()
-        or forbidden_term in path.name.lower()
+        str(source_path.relative_to(ROOT))
+        for source_path in source_files
+        if forbidden_term in own_words(source_path)
+        or forbidden_term in source_path.name.lower()
     ]
 
+    assert WORKFLOWS / "push.yaml" in source_files
     assert matches == []
 
 
 def test_service_workflow_hard_cuts_over_before_migration() -> None:
-    workflow = WORKFLOW.read_text(encoding="utf-8")
+    workflow = PUSH_WORKFLOW.read_text(encoding="utf-8")
     deploy_script = DEPLOY_SCRIPT.read_text(encoding="utf-8")
 
-    assert "image: postgres:16-alpine" in workflow
-    assert "TEST_DATABASE_URL:" in workflow
-    assert "uv run alembic check" in workflow
     assert "--set-cloudsql-instances" in deploy_script
     assert '"run,--no-sync,python,-m,telemetry_collector.migrate"' in deploy_script
     assert "--max-retries 0" in deploy_script
@@ -136,13 +290,15 @@ def test_service_workflow_hard_cuts_over_before_migration() -> None:
     assert workflow.count("steps.image.outputs.uri") >= 2
 
 
-def test_service_workflow_has_no_multiline_run_blocks() -> None:
-    workflow = WORKFLOW.read_text(encoding="utf-8")
+def test_workflow_shell_logic_lives_in_scripts() -> None:
+    for workflow_path in workflow_paths():
+        for job in load_workflow(workflow_path)["jobs"].values():
+            for step in job.get("steps", []):
+                if "run" in step:
+                    assert "\n" not in step["run"].strip(), (workflow_path.name, step)
 
-    assert "run: |" not in workflow
-    assert "run: >" not in workflow
-    assert workflow.count("run: telemetry-service/scripts/deploy.sh") == 28
-
+    workflow = PUSH_WORKFLOW.read_text(encoding="utf-8")
+    assert workflow.count("run: scripts/deploy.sh") == 28
     for command in (
         "require-configuration",
         "validate-environment-target",
@@ -159,7 +315,7 @@ def test_service_workflow_has_no_multiline_run_blocks() -> None:
         "verify-stable-service",
         "create-database-backup",
     ):
-        assert f"run: telemetry-service/scripts/deploy.sh {command}" in workflow
+        assert f"run: scripts/deploy.sh {command}" in workflow
 
 
 def test_service_image_contains_alembic_runtime_files() -> None:

@@ -1,8 +1,9 @@
 [project]
-name = "policyengine-telemetry-collector"
+name = "microcosm-collector"
 version = "0.1.0"
 description = "Authenticated ingestion and query API for Microcosm build telemetry"
 requires-python = ">=3.13"
+license = "MIT"
 dependencies = [
   "alembic>=1.16,<2",
   "fastapi>=0.115,<1",
@@ -14,7 +15,7 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=8.3,<9", "ruff>=0.11,<1"]
+dev = ["pytest>=8.3,<9", "pyyaml>=6,<7", "ruff>=0.11,<1"]
 
 [build-system]
 requires = ["hatchling"]
@@ -36,3 +37,35 @@ ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
 "telemetry_collector/app.py" = ["B008"]
+
+[tool.towncrier]
+directory = "changelog.d"
+filename = "CHANGELOG.md"
+title_format = "## [{version}] - {project_date}"
+issue_format = ""
+underlines = ["", "", ""]
+
+[[tool.towncrier.type]]
+directory = "breaking"
+name = "Breaking changes"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "added"
+name = "Added"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "changed"
+name = "Changed"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "fixed"
+name = "Fixed"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "removed"
+name = "Removed"
+showcontent = true

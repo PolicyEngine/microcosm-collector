@@ -1,0 +1,52 @@
+name: Pull request
+
+on:
+  pull_request:
+
+# A new push to a pull request supersedes the run on its previous head.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint-workflows:
+    name: Lint workflows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      # rhysd/actionlint 1.7.12, which also runs shellcheck on `run:` steps.
+      - uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+        with:
+          args: -color
+
+  changelog:
+    name: Check changelog fragment
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          python-version: "3.13"
+      - run: bash tools/check-changelog.sh
+
+  verify:
+    uses: ./.github/workflows/ci.yml
+
+  # The main ruleset requires this check by name.
+  required:
+    name: Required checks
+    if: always()
+    needs: [lint-workflows, changelog, verify]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all validation jobs to succeed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: test "$RESULTS" = "success success success"

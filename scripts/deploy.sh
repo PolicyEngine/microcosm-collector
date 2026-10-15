@@ -96,9 +96,9 @@ build_and_push_image() {
   local image
   image="${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REGISTRY_NAME}/${IMAGE_NAME}:${GITHUB_SHA}"
   docker build \
-    --file telemetry-service/Dockerfile \
+    --file Dockerfile \
     --tag "$image" \
-    telemetry-service
+    .
   docker push "$image"
   printf 'uri=%s\n' "$image" >> "$GITHUB_OUTPUT"
 }

@@ -8,8 +8,8 @@ import pytest
 
 from tests.test_deploy_script import install_command_stub
 
-ROOT = Path(__file__).resolve().parents[2]
-SCRIPT = ROOT / "telemetry-service/scripts/check-secrets-exist.sh"
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / "scripts/check-secrets-exist.sh"
 
 
 @pytest.mark.parametrize("missing_secret", ["", "database", "migration", "jwt", "read"])
