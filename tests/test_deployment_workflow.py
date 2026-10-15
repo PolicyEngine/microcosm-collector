@@ -101,8 +101,10 @@ def test_pull_requests_report_one_required_check() -> None:
     required = jobs["required"]
     assert required["name"] == "Required checks"
     assert required["if"] == "always()"
-    assert set(required["needs"]) == {"lint-workflows", "verify"}
-    assert required["steps"][-1]["run"] == 'test "$RESULTS" = "success success"'
+    assert set(required["needs"]) == {"lint-workflows", "changelog", "verify"}
+    assert required["steps"][-1]["run"] == (
+        'test "$RESULTS" = "success success success"'
+    )
 
 
 def test_validation_is_reusable_and_runs_against_postgres() -> None:
