@@ -64,7 +64,7 @@ def test_deployment_uses_main_only_staging_then_production_environments() -> Non
     assert workflow["on"] == {"push": {"branches": ["main"]}}
     assert jobs["deploy-staging"]["environment"] == "staging"
     assert jobs["deploy-production"]["environment"] == "production"
-    assert jobs["deploy-staging"]["needs"] == "verify"
+    assert jobs["deploy-staging"]["needs"] == "tag"
     assert jobs["deploy-production"]["needs"] == "deploy-staging"
     assert jobs["verify"]["uses"] == "./.github/workflows/ci.yml"
     for job_name in DEPLOY_JOBS:

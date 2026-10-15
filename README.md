@@ -76,6 +76,20 @@ they are skipped. CI runs them against PostgreSQL 16 and also runs
 `python -m telemetry_collector.migrate` and `alembic check` against that
 database.
 
+## Releases
+
+Every pull request needs a changelog fragment, `changelog.d/<name>.<type>.md`,
+where `<type>` is `breaking`, `added`, `changed`, `fixed` or `removed`. A
+breaking fragment bumps the major version, an added or removed fragment the
+minor version, and any other fragment the patch version.
+
+Each merge to `main` runs `.github/workflows/push.yaml` twice. The first run
+bumps `pyproject.toml`, collects the fragments into `CHANGELOG.md`, updates
+`uv.lock`, and commits the result as "Update microcosm-collector" with the
+PolicyEngine GitHub App, which may bypass the main ruleset. The second run, on
+that commit, verifies it, tags it with the bare version (for example `0.2.0`),
+and then runs the gated deployment described below.
+
 ## Cloud Run deployment
 
 This service was developed in `telemetry-service/` inside

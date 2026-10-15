@@ -7,18 +7,67 @@ on:
 permissions:
   contents: read
 
-# Every push to main is verified. Deployment stays off until this repo takes
-# over from calibration-diagnostics: both deployment jobs run only when the
-# repo variable COLLECTOR_DEPLOY_ENABLED is 'true'. They then deploy one
-# image to staging and, only after staging succeeds, the same image to
-# production. The staging and production environments accept only main.
+# Every merge runs this workflow twice. On the merge commit, versioning commits
+# the new version and changelog as "Update microcosm-collector" with the
+# PolicyEngine GitHub App token: unlike GITHUB_TOKEN, its push starts another
+# run, and the app may bypass the main ruleset. On that release commit, the
+# remaining jobs verify, tag, then deploy, each only after the one before.
+#
+# Deployment stays off until this repo takes over from calibration-diagnostics:
+# both deployment jobs run only when the repo variable COLLECTOR_DEPLOY_ENABLED
+# is 'true'. They then deploy one image to staging and, only after staging
+# succeeds, the same image to production. The staging and production
+# environments accept only main.
 jobs:
+  versioning:
+    name: Update versioning
+    if: |
+      github.repository == 'PolicyEngine/microcosm-collector'
+      && github.event.head_commit.message != 'Update microcosm-collector'
+    runs-on: ubuntu-latest
+    steps:
+      - id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          python-version: "3.13"
+      - run: bash tools/update-version.sh
+      - uses: EndBug/add-and-commit@290ea2c423ad77ca9c62ae0f5b224379612c0321 # v10
+        with:
+          add: "."
+          author_name: Github Actions[bot]
+          committer_name: Github Actions[bot]
+          message: Update microcosm-collector
+          github_token: ${{ steps.app-token.outputs.token }}
+          fetch: false
+
   verify:
+    if: |
+      github.repository == 'PolicyEngine/microcosm-collector'
+      && github.event.head_commit.message == 'Update microcosm-collector'
     uses: ./.github/workflows/ci.yml
+
+  tag:
+    name: Publish git tag
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - run: bash tools/publish-git-tag.sh
 
   deploy-staging:
     name: Deploy image and migration in staging
-    needs: verify
+    needs: tag
     if: vars.COLLECTOR_DEPLOY_ENABLED == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
