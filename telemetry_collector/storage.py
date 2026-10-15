@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
@@ -109,6 +110,14 @@ def canonical_events(events: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _apply_event(run: dict[str, Any], event: dict[str, Any]) -> None:
+    """Apply one event to the run state.
+
+    ``apply_event_batch`` folds batches onto stored columns, which relies on
+    ``updated_at`` staying a maximum, ``started_at`` a minimum, and every other
+    write depending only on the event. A rule change does not revise the
+    stored columns of runs already in progress.
+    """
+
     timestamp = event["timestamp"]
     run["started_at"] = min(run["started_at"], timestamp)
     run["updated_at"] = max(
@@ -184,27 +193,14 @@ def _apply_event(run: dict[str, Any], event: dict[str, Any]) -> None:
         run["block"] = None
 
 
-def materialize_run(
-    registered_run: dict[str, Any], events: Iterable[dict[str, Any]]
-) -> dict[str, Any]:
-    """Rebuild mutable run state from a stable canonical event order."""
+def _fold_events(
+    run: dict[str, Any],
+    active_producer_id: str | None,
+    ordered_events: Iterable[dict[str, Any]],
+) -> None:
+    """Apply ordered events that follow ``active_producer_id``'s events."""
 
-    run = {
-        **registered_run,
-        "status": "running",
-        "current_stage": "created",
-        "started_at": registered_run["registered_at"],
-        "updated_at": registered_run["registered_at"],
-        "ended_at": None,
-        "heartbeat_at": None,
-        "resources": None,
-        "work": None,
-        "failure": None,
-        # Rebuilt from the events on every read; not a stored column.
-        "block": None,
-    }
-    active_producer_id: str | None = None
-    for event in canonical_events(events):
+    for event in ordered_events:
         producer_id = event["producer_id"]
         if active_producer_id is not None and producer_id != active_producer_id:
             # A producer id identifies one execution attempt. Starting a later
@@ -230,7 +226,140 @@ def materialize_run(
             )
         active_producer_id = producer_id
         _apply_event(run, event)
+
+
+def materialize_run(
+    registered_run: dict[str, Any], events: Iterable[dict[str, Any]]
+) -> dict[str, Any]:
+    """Rebuild mutable run state from a stable canonical event order."""
+
+    run = {
+        **registered_run,
+        "status": "running",
+        "current_stage": "created",
+        "started_at": registered_run["registered_at"],
+        "updated_at": registered_run["registered_at"],
+        "ended_at": None,
+        "heartbeat_at": None,
+        "resources": None,
+        "work": None,
+        "failure": None,
+        # Rebuilt from the events on every read; not a stored column.
+        "block": None,
+    }
+    _fold_events(run, None, canonical_events(events))
     return run
+
+
+MATERIALIZED_RUN_COLUMNS = (
+    "status",
+    "current_stage",
+    "started_at",
+    "updated_at",
+    "ended_at",
+    "heartbeat_at",
+    "resources",
+    "work",
+    "failure",
+)
+
+
+@dataclass(frozen=True)
+class StoredProducer:
+    """A registered producer and its highest sequence stored before a batch."""
+
+    producer_id: str
+    registered_at: datetime
+    last_sequence: int | None
+
+
+class StoredEventReader(Protocol):
+    """Targeted reads of one producer's stored events, including the batch's."""
+
+    def events_from(self, producer_id: str, sequence: int) -> list[dict[str, Any]]:
+        """Return the producer's events from ``sequence`` onward, in order."""
+        ...
+
+    def earliest_timestamp(self, producer_id: str) -> datetime:
+        """Return the earliest timestamp among the producer's events."""
+        ...
+
+
+def _materialized_columns(run: dict[str, Any]) -> dict[str, Any]:
+    return {column: run[column] for column in MATERIALIZED_RUN_COLUMNS}
+
+
+def apply_event_batch(
+    run: dict[str, Any],
+    producers: Iterable[StoredProducer],
+    accepted_events: Iterable[dict[str, Any]],
+    stored_events: StoredEventReader,
+) -> dict[str, Any]:
+    """Return the materialized columns after a batch, without replaying the run.
+
+    ``run`` holds the columns materialized before the batch, ``producers`` each
+    producer's highest sequence stored before it, and ``accepted_events`` its
+    newly stored events. The result equals ``materialize_run`` over every stored event.
+    ``updated_at`` is a maximum over every event and ``started_at`` a minimum
+    over the final producer's events; every other column is set by the latest
+    event that writes it. Folding new events onto the stored columns is
+    therefore exact when they follow the active producer's stored events.
+    Only an event delivered after later events of its producer replays that
+    producer's stored events from it onward.
+    """
+
+    ordered_events = canonical_events(accepted_events)
+    reported_producers = [
+        producer for producer in producers if producer.last_sequence is not None
+    ]
+    if not reported_producers:
+        return _materialized_columns(materialize_run(run, ordered_events))
+    active_producer = max(
+        reported_producers,
+        key=lambda producer: (producer.registered_at, producer.producer_id),
+    )
+    active_position = (
+        active_producer.registered_at,
+        active_producer.producer_id,
+        active_producer.last_sequence,
+    )
+    state = _materialized_columns(run)
+    for event in ordered_events:
+        state["updated_at"] = max(
+            state["updated_at"], event["timestamp"], event["producer_registered_at"]
+        )
+    following_events = [
+        event for event in ordered_events if _event_order(event)[:3] > active_position
+    ]
+    if any(
+        event["producer_id"] != active_producer.producer_id
+        for event in following_events
+    ):
+        # A later producer's first event resets the run, so the events it
+        # follows contribute only to updated_at.
+        _fold_events(state, active_producer.producer_id, following_events)
+        return _materialized_columns(state)
+    if len(reported_producers) == 1 and any(
+        event["producer_id"] != active_producer.producer_id for event in ordered_events
+    ):
+        # An earlier producer's first events now precede the active producer's,
+        # whose attempt therefore starts at its own earliest event rather than
+        # at the run's registration.
+        state["started_at"] = stored_events.earliest_timestamp(
+            active_producer.producer_id
+        )
+    late_sequences = [
+        event["sequence"]
+        for event in ordered_events
+        if event["producer_id"] == active_producer.producer_id
+        and event["sequence"] < active_producer.last_sequence
+    ]
+    if late_sequences:
+        following_events = stored_events.events_from(
+            active_producer.producer_id, min(late_sequences)
+        )
+    _fold_events(state, active_producer.producer_id, following_events)
+    return _materialized_columns(state)
 
 
 def run_summary(run: dict[str, Any]) -> dict[str, Any]:
