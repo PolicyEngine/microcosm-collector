@@ -152,6 +152,29 @@ complete:
    read by `.github/workflows/push.yaml`.
 3. calibration-diagnostics no longer deploys this service.
 
+### Carrying over changes from calibration-diagnostics
+
+Until cutover, changes to `telemetry-service/` can still merge in
+calibration-diagnostics. `tools/extraction-source.env` records the
+calibration-diagnostics commit that this history was extracted from. To carry
+later changes over, from the root of a clean checkout of `main`:
+
+```bash
+tools/extract-from-calibration-diagnostics.sh ../collector-extraction \
+  tools/extraction-source.env
+git switch -c carry-over-telemetry-service
+git fetch ../collector-extraction main
+git merge FETCH_HEAD
+```
+
+The script needs git and uv. git-filter-repo rewrites unchanged source
+commits to the same commits, so the merge adds only the newer ones. The
+script refuses to continue if the previously extracted commit is not part of
+the new history, because merging that history would duplicate this one rather
+than extend it. Resolve any conflicts with changes made here, such as paths in
+tests, then add a changelog fragment and open a pull request that includes the
+updated record.
+
 ## Dashboard runtime access
 
 The Vercel project configures these server-only, non-secret settings separately
