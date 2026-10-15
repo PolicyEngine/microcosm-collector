@@ -17,7 +17,9 @@ permissions:
 # both deployment jobs run only when the repo variable COLLECTOR_DEPLOY_ENABLED
 # is 'true'. They then deploy one image to staging and, only after staging
 # succeeds, the same image to production. The staging and production
-# environments accept only main.
+# environments accept only main, and Google Cloud's Workload Identity provider
+# accepts this repo's tokens only for refs/heads/main, so both jobs also check
+# that they run for a push to main.
 jobs:
   versioning:
     name: Update versioning
@@ -68,7 +70,9 @@ jobs:
   deploy-staging:
     name: Deploy image and migration in staging
     needs: tag
-    if: vars.COLLECTOR_DEPLOY_ENABLED == 'true'
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && vars.COLLECTOR_DEPLOY_ENABLED == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: staging
@@ -170,7 +174,9 @@ jobs:
   deploy-production:
     name: Deploy staging image to production
     needs: deploy-staging
-    if: vars.COLLECTOR_DEPLOY_ENABLED == 'true'
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && vars.COLLECTOR_DEPLOY_ENABLED == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     environment: production

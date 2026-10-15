@@ -13,6 +13,10 @@ PUSH_WORKFLOW = WORKFLOWS / "push.yaml"
 DOCKERFILE = ROOT / "Dockerfile"
 DEPLOY_SCRIPT = ROOT / "scripts" / "deploy.sh"
 DEPLOY_GATE = "vars.COLLECTOR_DEPLOY_ENABLED == 'true'"
+# The Workload Identity provider accepts this repo's tokens only when
+# assertion.ref == 'refs/heads/main', so jobs that authenticate check it first.
+MAIN_PUSH_GUARD = "github.event_name == 'push' && github.ref == 'refs/heads/main'"
+DEPLOY_CONDITION = f"{MAIN_PUSH_GUARD} && {DEPLOY_GATE}"
 DEPLOY_JOBS = {"deploy-staging", "deploy-production"}
 WORKLOAD_IDENTITY_SECRETS = {
     "TELEMETRY_GCP_WIF_PROVIDER",
@@ -27,6 +31,13 @@ def load_workflow(workflow_path: Path) -> dict:
 
 def workflow_paths() -> list[Path]:
     return sorted(WORKFLOWS.glob("*.y*ml"))
+
+
+def authenticates_to_google_cloud(job: dict) -> bool:
+    return job.get("permissions", {}).get("id-token") == "write" or any(
+        step.get("uses", "").startswith("google-github-actions/auth@")
+        for step in job.get("steps", [])
+    )
 
 
 def push_job_text(job_name: str, next_job_name: str | None) -> str:
@@ -50,11 +61,31 @@ def test_deployment_runs_only_when_collector_deploy_is_enabled() -> None:
     jobs = load_workflow(PUSH_WORKFLOW)["jobs"]
 
     for job_name in DEPLOY_JOBS:
-        assert jobs[job_name]["if"] == DEPLOY_GATE, job_name
+        assert jobs[job_name]["if"] == DEPLOY_CONDITION, job_name
     for workflow_path in workflow_paths():
         for job_name, job in load_workflow(workflow_path)["jobs"].items():
             if "environment" in job:
                 assert job_name in DEPLOY_JOBS, (workflow_path.name, job_name)
+
+
+def test_google_cloud_authentication_runs_only_on_pushes_to_main() -> None:
+    authenticating_jobs = {
+        (workflow_path.name, job_name): (workflow, job)
+        for workflow_path in workflow_paths()
+        for workflow in [load_workflow(workflow_path)]
+        for job_name, job in workflow["jobs"].items()
+        if authenticates_to_google_cloud(job)
+    }
+
+    # Only the release pass of push.yaml reaches these jobs, and pull requests,
+    # tags and reusable calls can never run them.
+    assert set(authenticating_jobs) == {
+        ("push.yaml", "deploy-staging"),
+        ("push.yaml", "deploy-production"),
+    }
+    for (workflow_name, job_name), (workflow, job) in authenticating_jobs.items():
+        assert workflow["on"] == {"push": {"branches": ["main"]}}, workflow_name
+        assert job["if"].startswith(f"{MAIN_PUSH_GUARD} && "), job_name
 
 
 def test_deployment_uses_main_only_staging_then_production_environments() -> None:
@@ -196,8 +227,11 @@ def test_service_deployment_reads_resource_names_from_environment_variables() ->
 
 def test_collector_uses_store_vocabulary() -> None:
     forbidden_term = "repo" + "sitory"
-    # GitHub names this expression context; the collector's own words do not use it.
-    github_context = "github." + forbidden_term
+    # GitHub's expression context and the OIDC claim and attribute names in
+    # Workload Identity conditions use the word; the collector's own words do not.
+    external_names = [
+        f"{prefix}.{forbidden_term}" for prefix in ("github", "assertion", "attribute")
+    ]
     source_suffixes = {
         ".env",
         ".ini",
@@ -218,11 +252,16 @@ def test_collector_uses_store_vocabulary() -> None:
         and not ignored_parts.intersection(source_path.relative_to(ROOT).parts)
     ]
 
+    def own_words(source_path: Path) -> str:
+        source_text = source_path.read_text(encoding="utf-8").lower()
+        for external_name in external_names:
+            source_text = source_text.replace(external_name, "")
+        return source_text
+
     matches = [
         str(source_path.relative_to(ROOT))
         for source_path in source_files
-        if forbidden_term
-        in source_path.read_text(encoding="utf-8").lower().replace(github_context, "")
+        if forbidden_term in own_words(source_path)
         or forbidden_term in source_path.name.lower()
     ]
 

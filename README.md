@@ -137,19 +137,39 @@ Public ingress lets developer machines reach the service;
 ingestion still requires a short-lived collector credential issued after
 Hugging Face authentication.
 
+### Google Cloud access
+
+The deployment jobs exchange their GitHub OIDC token through a Workload
+Identity provider dedicated to this repo, then act as the same deployment
+service account that calibration-diagnostics uses. The provider maps
+`google.subject=assertion.sub`, `attribute.actor=assertion.actor`,
+`attribute.ref=assertion.ref` and `attribute.repository=assertion.repository`,
+and accepts a token only when:
+
+```
+assertion.repository=='PolicyEngine/microcosm-collector' && assertion.ref=='refs/heads/main'
+```
+
+The service account grants `roles/iam.workloadIdentityUser` to this repo's
+principal set (`attribute.repository/PolicyEngine/microcosm-collector`). A job
+running for a tag, a pull request or any other branch cannot obtain Google
+credentials. Both deployment jobs therefore also require
+`github.event_name == 'push' && github.ref == 'refs/heads/main'`, so that such a
+run skips them instead of failing at authentication. No other job requests an
+OIDC token.
+
 ### Deployment gate
 
 Both deployment jobs run only when the repo variable `COLLECTOR_DEPLOY_ENABLED`
 is `true`. Leave it unset until the cutover from calibration-diagnostics is
 complete:
 
-1. Google Cloud trusts this repo's GitHub OIDC identity for the deployment
-   service account that calibration-diagnostics uses today.
+1. Google Cloud trusts this repo's GitHub OIDC identity, as described above.
 2. The `staging` and `production` environments hold the same secrets and
    variables, by name, as the calibration-diagnostics `staging` and
-   `Production` environments: the secrets `TELEMETRY_GCP_WIF_PROVIDER` and
-   `TELEMETRY_GCP_DEPLOY_SERVICE_ACCOUNT`, and every `TELEMETRY_*` variable
-   read by `.github/workflows/push.yaml`.
+   `Production` environments: the secrets `TELEMETRY_GCP_WIF_PROVIDER` (this
+   repo's provider) and `TELEMETRY_GCP_DEPLOY_SERVICE_ACCOUNT`, and every
+   `TELEMETRY_*` variable read by `.github/workflows/push.yaml`.
 3. calibration-diagnostics no longer deploys this service.
 
 ### Carrying over changes from calibration-diagnostics
