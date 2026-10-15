@@ -1,11 +1,16 @@
-"""The collector is distributed under its repo's name."""
+"""The collector is distributed under its repo's name and the MIT license."""
 
+import hashlib
 import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DISTRIBUTION_NAME = "microcosm-collector"
 IMPORT_PACKAGE = "telemetry_collector"
+# SHA-256 of PolicyEngine/microcosm-emitter's LICENSE: the same MIT text and holder.
+EMITTER_LICENSE_SHA256 = (
+    "919d42904bc9c6bb0621ab4eb7e4c9828d1467ea5ee64da7ca88eed53af1530b"
+)
 IGNORED_PARTS = {".git", ".pytest_cache", ".ruff_cache", ".venv", "__pycache__", "dist"}
 TEXT_SUFFIXES = {".env", ".ini", ".lock", ".md", ".py", ".sh", ".toml", ".yaml", ".yml"}
 
@@ -57,3 +62,11 @@ def test_retired_distribution_name_is_gone() -> None:
 
     assert (ROOT / "uv.lock") in text_files()
     assert mentions == []
+
+
+def test_collector_is_mit_licensed_like_the_emitter() -> None:
+    license_text = (ROOT / "LICENSE").read_bytes()
+
+    assert license_text.startswith(b"MIT License\n\nCopyright (c) 2026 PolicyEngine\n")
+    assert hashlib.sha256(license_text).hexdigest() == EMITTER_LICENSE_SHA256
+    assert pyproject()["project"]["license"] == "MIT"

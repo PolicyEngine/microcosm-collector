@@ -3,6 +3,7 @@ name = "microcosm-collector"
 version = "0.1.0"
 description = "Authenticated ingestion and query API for Microcosm build telemetry"
 requires-python = ">=3.13"
+license = "MIT"
 dependencies = [
   "alembic>=1.16,<2",
   "fastapi>=0.115,<1",
