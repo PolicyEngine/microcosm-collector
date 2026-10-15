@@ -61,25 +61,43 @@ loopback-only development option when testing ingestion. Production Microcosm
 builds use the fixed collector origin shipped by the package and do not accept
 a destination environment variable.
 
+## Tests
+
+```bash
+uv sync --locked --dev
+uv run pytest -q
+uv run ruff check .
+uv run ruff format --check .
+```
+
+The PostgreSQL integration tests and the migration checks need a disposable
+database whose name contains `test`, given as `TEST_DATABASE_URL`. Without it
+they are skipped. CI runs them against PostgreSQL 16 and also runs
+`python -m telemetry_collector.migrate` and `alembic check` against that
+database.
+
 ## Cloud Run deployment
 
-The production service is isolated in this top-level directory. Its Docker
-build context is `telemetry-service/`, so dashboard source files cannot enter
-the image. Cloud Run assigns the production service address. Microcosm fixes
-that origin in its delivery service; the address is intentionally not repeated
-in documentation.
+This service was developed in `telemetry-service/` inside
+PolicyEngine/calibration-diagnostics, and its history was extracted here.
+calibration-diagnostics deploys production until this repo takes over (see
+"Deployment gate" below). The Docker build context is the root of this repo.
+Cloud Run assigns the production service address. Microcosm fixes that origin
+in its delivery service; the address is intentionally not repeated in
+documentation.
 
 Infrastructure was provisioned once with disposable scripts kept outside the
 source tree. The source tree intentionally contains no bootstrap script or
 mutable infrastructure template.
 
-`.github/workflows/telemetry-service.yml` runs only when this directory or the
-workflow itself changes. Pull requests run tests, Ruff, and a container build.
-After a change reaches `main`, the workflow authenticates to Google Cloud with
-GitHub OIDC and pushes one image identified by the commit SHA. It first applies
-the migration to the persistent staging PostgreSQL database, verifies both the
-Alembic revision and the complete SQLAlchemy metadata, and deploys the staging
-collector. Production receives that exact image only when the staging sequence
+`.github/workflows/pr.yaml` runs actionlint and `.github/workflows/ci.yml`
+(tests, migration checks, Ruff and a container build) on every pull request,
+and reports one "Required checks" status that the main ruleset requires.
+`.github/workflows/push.yaml` runs the same checks on `main`. When deployment
+is enabled, it then authenticates to Google Cloud with GitHub OIDC and pushes
+one image identified by the commit SHA. It first applies the migration to the
+persistent staging PostgreSQL database, verifies both the Alembic revision and
+the complete SQLAlchemy metadata, and deploys the staging collector. Production receives that exact image only when the staging sequence
 succeeds. Before either environment changes, deployment checks only that its
 runtime database, migration database, JWT signing, and read-token secret
 resources exist. It does not access their payloads or test their values. The
@@ -93,17 +111,32 @@ migrations, deploys a candidate without stable traffic, checks the candidate's
 `/ready` endpoint, and only then directs traffic to the candidate. Once a
 production migration begins, failures leave the maintenance revision serving
 retryable responses; the workflow does not restore schema-incompatible
-application code. Manual deployment runs are accepted only from `main`.
+application code. To repeat a deployment, re-run the failed jobs of that push.
 
 The workflow reads resource identifiers from the GitHub `staging` and
-`Production` environments. Runtime secrets remain in Google Secret Manager.
-The migration job uses a separate service account and database credential with
-schema-modification access; the collector runtime credential has only the data
-access required by the application. The dashboard receives its collector
+`production` environments, which accept only `main`. Runtime secrets remain in
+Google Secret Manager. The migration job uses a separate service account and
+database credential with schema-modification access; the collector runtime
+credential has only the data access required by the application. The dashboard receives its collector
 address and Secret Manager resource references through non-secret configuration.
 Public ingress lets developer machines reach the service;
 ingestion still requires a short-lived collector credential issued after
 Hugging Face authentication.
+
+### Deployment gate
+
+Both deployment jobs run only when the repo variable `COLLECTOR_DEPLOY_ENABLED`
+is `true`. Leave it unset until the cutover from calibration-diagnostics is
+complete:
+
+1. Google Cloud trusts this repo's GitHub OIDC identity for the deployment
+   service account that calibration-diagnostics uses today.
+2. The `staging` and `production` environments hold the same secrets and
+   variables, by name, as the calibration-diagnostics `staging` and
+   `Production` environments: the secrets `TELEMETRY_GCP_WIF_PROVIDER` and
+   `TELEMETRY_GCP_DEPLOY_SERVICE_ACCOUNT`, and every `TELEMETRY_*` variable
+   read by `.github/workflows/push.yaml`.
+3. calibration-diagnostics no longer deploys this service.
 
 ## Dashboard runtime access
 

@@ -2,8 +2,8 @@ import os
 import subprocess
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
-DEPLOY_SCRIPT = ROOT / "telemetry-service" / "scripts" / "deploy.sh"
+ROOT = Path(__file__).resolve().parents[1]
+DEPLOY_SCRIPT = ROOT / "scripts" / "deploy.sh"
 
 
 def run_deploy(
@@ -109,8 +109,7 @@ def test_build_and_push_image_records_the_immutable_uri(tmp_path: Path) -> None:
     image = "us-central1-docker.pkg.dev/example-project/containers/collector:abc123"
     assert result.returncode == 0, result.stderr
     assert command_log.read_text().splitlines() == [
-        "docker <build> <--file> <telemetry-service/Dockerfile> "
-        f"<--tag> <{image}> <telemetry-service>",
+        f"docker <build> <--file> <Dockerfile> <--tag> <{image}> <.>",
         f"docker <push> <{image}>",
     ]
     assert github_output.read_text() == f"uri={image}\n"

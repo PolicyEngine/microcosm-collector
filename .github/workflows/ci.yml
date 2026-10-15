@@ -1,0 +1,42 @@
+name: Verify collector
+
+# Called by pr.yaml for every pull request and by push.yaml before deploying.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Test, lint, and build
+    runs-on: ubuntu-latest
+    env:
+      TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/telemetry_test
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: telemetry_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d telemetry_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          python-version: "3.13"
+      - run: uv sync --locked --dev
+      - run: uv run pytest -q
+      - run: DATABASE_URL="$TEST_DATABASE_URL" uv run python -m telemetry_collector.migrate
+      - run: DATABASE_URL="$TEST_DATABASE_URL" uv run alembic check
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: docker build --tag microcosm-collector:validation .
