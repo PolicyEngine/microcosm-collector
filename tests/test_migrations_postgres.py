@@ -16,6 +16,10 @@ from telemetry_collector.migrate import (
     verify_database,
 )
 
+HEAD_REVISION = "0002_artifact_intake"
+TELEMETRY_TABLES = {"telemetry_runs", "telemetry_producers", "telemetry_events"}
+ARTIFACT_TABLES = {"artifact_submissions", "artifact_jobs"}
+
 
 def _current_revision(database_url: str) -> tuple[str | None, str | None]:
     engine = create_database_engine(database_url)
@@ -106,14 +110,10 @@ def test_upgrades_empty_postgres_database_to_head(postgres_url: str) -> None:
     try:
         assert set(inspect(engine).get_table_names()) == {
             "alembic_version",
-            "telemetry_runs",
-            "telemetry_producers",
-            "telemetry_events",
+            *TELEMETRY_TABLES,
+            *ARTIFACT_TABLES,
         }
-        assert _current_revision(postgres_url) == (
-            "0001_initial_schema",
-            "0001_initial_schema",
-        )
+        assert _current_revision(postgres_url) == (HEAD_REVISION, HEAD_REVISION)
     finally:
         engine.dispose()
 
@@ -164,9 +164,8 @@ def test_hard_cutover_replaces_populated_unversioned_database(
         inspector = inspect(engine)
         assert set(inspector.get_table_names()) == {
             "alembic_version",
-            "telemetry_runs",
-            "telemetry_producers",
-            "telemetry_events",
+            *TELEMETRY_TABLES,
+            *ARTIFACT_TABLES,
         }
         metadata = sa.MetaData()
         runs = sa.Table("telemetry_runs", metadata, autoload_with=engine)
@@ -176,10 +175,7 @@ def test_hard_cutover_replaces_populated_unversioned_database(
             assert (
                 connection.scalar(sa.select(sa.func.count()).select_from(events)) == 0
             )
-        assert _current_revision(postgres_url) == (
-            "0001_initial_schema",
-            "0001_initial_schema",
-        )
+        assert _current_revision(postgres_url) == (HEAD_REVISION, HEAD_REVISION)
     finally:
         engine.dispose()
 
@@ -195,10 +191,7 @@ def test_migration_chain_downgrades_and_reupgrades_in_test_database(
             config.attributes["connection"] = connection
             command.downgrade(config, "base")
             command.upgrade(config, "head")
-        assert _current_revision(postgres_url) == (
-            "0001_initial_schema",
-            "0001_initial_schema",
-        )
+        assert _current_revision(postgres_url) == (HEAD_REVISION, HEAD_REVISION)
     finally:
         engine.dispose()
 
@@ -218,3 +211,25 @@ def test_verification_rejects_schema_drift_at_alembic_head(
 
     with pytest.raises(RuntimeError, match="differs from SQLAlchemy metadata"):
         verify_database(postgres_url)
+
+
+def test_downgrading_artifact_intake_keeps_the_telemetry_schema(
+    postgres_url: str,
+) -> None:
+    upgrade_database(postgres_url)
+    engine = create_database_engine(postgres_url)
+    config = alembic_config()
+    try:
+        with engine.begin() as connection:
+            config.attributes["connection"] = connection
+            command.downgrade(config, "0001_initial_schema")
+        assert set(inspect(engine).get_table_names()) == {
+            "alembic_version",
+            *TELEMETRY_TABLES,
+        }
+        assert _current_revision(postgres_url) == (
+            "0001_initial_schema",
+            HEAD_REVISION,
+        )
+    finally:
+        engine.dispose()

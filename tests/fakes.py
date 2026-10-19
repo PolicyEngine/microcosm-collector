@@ -1,10 +1,11 @@
-"""In-memory protocol fake for HTTP contract unit tests."""
+"""In-memory protocol fakes for HTTP contract and worker unit tests."""
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Mapping
 from copy import deepcopy
-from datetime import datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from threading import RLock
 from typing import Any
 
@@ -17,6 +18,20 @@ from telemetry_collector.storage import (
     materialize_run,
     run_documents,
     run_summary,
+)
+from telemetry_collector.submission_store import (
+    ATTEMPTS_EXHAUSTED,
+    ClaimedJob,
+    FinalJobStatus,
+    SubmissionOwnershipError,
+    SubmissionRecord,
+    files_with_generations,
+    new_submission_values,
+)
+from telemetry_collector.submissions import (
+    MAX_JOB_ATTEMPTS,
+    SubmissionRequest,
+    derive_job_id,
 )
 
 
@@ -128,3 +143,179 @@ class FakeTelemetryStore:
 
     def is_ready(self) -> bool:
         return True
+
+
+class FakeSubmissionStore:
+    """In-memory implementation of the submission store protocol."""
+
+    def __init__(self, *, clock: Callable[[], datetime] | None = None) -> None:
+        self._clock = clock or (lambda: datetime.now(UTC))
+        self._submissions: dict[str, SubmissionRecord] = {}
+        self._jobs: dict[str, dict[str, Any]] = {}
+        self._lock = RLock()
+
+    def _with_job(self, record: SubmissionRecord) -> SubmissionRecord:
+        job = self._jobs.get(derive_job_id(record.submission_id, record.kind))
+        return deepcopy(
+            replace(
+                record,
+                job_id=None if job is None else job["job_id"],
+                job_attempts=0 if job is None else job["attempts"],
+                job_enqueued=job is not None and job["enqueued_at"] is not None,
+            )
+        )
+
+    def create_submission(
+        self, request: SubmissionRequest, principal: HuggingFacePrincipal
+    ) -> tuple[SubmissionRecord, bool]:
+        with self._lock:
+            values = new_submission_values(request, principal, self._clock())
+            existing = self._submissions.get(values["submission_id"])
+            if existing is not None:
+                if existing.owner_hf_id != principal.user_id:
+                    raise SubmissionOwnershipError(
+                        "Submission belongs to another Hugging Face user."
+                    )
+                return self._with_job(existing), False
+            record = SubmissionRecord(
+                **values, job_id=None, job_attempts=0, job_enqueued=False
+            )
+            self._submissions[record.submission_id] = record
+            return self._with_job(record), True
+
+    def get_submission(self, submission_id: str) -> SubmissionRecord | None:
+        with self._lock:
+            record = self._submissions.get(submission_id)
+            return None if record is None else self._with_job(record)
+
+    def accept_submission(
+        self, submission_id: str, generations: Mapping[str, str]
+    ) -> SubmissionRecord:
+        with self._lock:
+            record = self._submissions[submission_id]
+            if record.status == "awaiting_upload":
+                now = self._clock()
+                record = replace(
+                    record,
+                    files=files_with_generations(record.files, generations),
+                    status="queued",
+                    accepted_at=now,
+                    updated_at=now,
+                )
+                self._submissions[submission_id] = record
+                job_id = derive_job_id(submission_id, record.kind)
+                self._jobs.setdefault(
+                    job_id,
+                    {
+                        "job_id": job_id,
+                        "submission_id": submission_id,
+                        "status": "queued",
+                        "attempts": 0,
+                        "enqueued_at": None,
+                        "lease_holder": None,
+                        "lease_expires_at": None,
+                        "last_error": None,
+                    },
+                )
+            return self._with_job(record)
+
+    def mark_job_enqueued(self, job_id: str) -> None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is not None and job["enqueued_at"] is None:
+                job["enqueued_at"] = self._clock()
+
+    def _set_submission(self, job: dict[str, Any], **changes: Any) -> None:
+        submission_id = job["submission_id"]
+        self._submissions[submission_id] = replace(
+            self._submissions[submission_id], updated_at=self._clock(), **changes
+        )
+
+    def _finish(
+        self,
+        job: dict[str, Any],
+        status: FinalJobStatus,
+        result: dict[str, Any] | None,
+        rejection: dict[str, Any] | None,
+    ) -> None:
+        job.update(
+            status=status,
+            lease_holder=None,
+            lease_expires_at=None,
+            last_error=rejection,
+        )
+        self._set_submission(
+            job,
+            status=status,
+            result=deepcopy(result),
+            rejection=deepcopy(rejection),
+            finished_at=self._clock(),
+        )
+
+    def claim_job(
+        self, job_id: str, *, holder: str, lease_seconds: float
+    ) -> ClaimedJob | None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            now = self._clock()
+            claimable = job["status"] == "queued" or (
+                job["status"] == "running"
+                and (
+                    job["lease_holder"] == holder
+                    or job["lease_expires_at"] is None
+                    or job["lease_expires_at"] <= now
+                )
+            )
+            if not claimable:
+                return None
+            if job["attempts"] >= MAX_JOB_ATTEMPTS:
+                self._finish(job, "failed", None, ATTEMPTS_EXHAUSTED)
+                return None
+            job.update(
+                status="running",
+                attempts=job["attempts"] + 1,
+                lease_holder=holder,
+                lease_expires_at=now + timedelta(seconds=lease_seconds),
+            )
+            self._set_submission(job, status="processing")
+            return ClaimedJob(
+                job_id=job_id,
+                attempt=job["attempts"],
+                submission=self._with_job(self._submissions[job["submission_id"]]),
+            )
+
+    def finish_job(
+        self,
+        job_id: str,
+        *,
+        holder: str,
+        status: FinalJobStatus,
+        result: dict[str, Any] | None,
+        rejection: dict[str, Any] | None,
+    ) -> bool:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job["status"] != "running":
+                return False
+            if job["lease_holder"] != holder:
+                return False
+            self._finish(job, status, result, rejection)
+            return True
+
+    def release_job(self, job_id: str, *, holder: str, error: dict[str, Any]) -> bool:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job["status"] != "running":
+                return False
+            if job["lease_holder"] != holder:
+                return False
+            job.update(
+                status="queued",
+                lease_holder=None,
+                lease_expires_at=None,
+                last_error=deepcopy(error),
+            )
+            self._set_submission(job, status="queued")
+            return True

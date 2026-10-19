@@ -7,10 +7,13 @@ from typing import Any
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
     Index,
+    Integer,
     MetaData,
     Text,
     UniqueConstraint,
@@ -160,6 +163,92 @@ class TelemetryEvent(Base):
     producer: Mapped[TelemetryProducer] = relationship(back_populates="events")
 
 
+SUBMISSION_STATUSES = (
+    "awaiting_upload",
+    "queued",
+    "processing",
+    "succeeded",
+    "rejected",
+    "failed",
+)
+JOB_STATUSES = ("queued", "running", "succeeded", "rejected", "failed")
+
+
+def _one_of(column: str, values: tuple[str, ...]) -> str:
+    return f"{column} IN ({', '.join(repr(value) for value in values)})"
+
+
+class ArtifactSubmission(Base):
+    """One build's hand-over of files, stored in the private intake bucket."""
+
+    __tablename__ = "artifact_submissions"
+    __table_args__ = (
+        CheckConstraint(_one_of("status", SUBMISSION_STATUSES), name="status"),
+    )
+
+    submission_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    owner_hf_id: Mapped[str] = mapped_column(Text, nullable=False)
+    owner_hf_username: Mapped[str] = mapped_column(Text, nullable=False)
+    licensed_data: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    provenance: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    # The inventory sorted by name; acceptance adds each object's generation.
+    files: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
+    inventory_sha256: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    rejection: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    jobs: Mapped[list[ArtifactJob]] = relationship(
+        back_populates="submission",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+
+class ArtifactJob(Base):
+    """Worker job for a submission, also the record of whether it was enqueued."""
+
+    __tablename__ = "artifact_jobs"
+    __table_args__ = (CheckConstraint(_one_of("status", JOB_STATUSES), name="status"),)
+
+    job_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    submission_id: Mapped[str] = mapped_column(
+        Text,
+        ForeignKey(
+            "artifact_submissions.submission_id",
+            name="fk_artifact_jobs_submission_id_artifact_submissions",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+    )
+    job_type: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Null until Cloud Tasks accepted the job; completion retries enqueue it.
+    enqueued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_holder: Mapped[str | None] = mapped_column(Text)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+    submission: Mapped[ArtifactSubmission] = relationship(back_populates="jobs")
+
+
+Index("artifact_jobs_submission_idx", ArtifactJob.submission_id)
 Index(
     "telemetry_runs_country_registered_idx",
     TelemetryRun.country_code,
