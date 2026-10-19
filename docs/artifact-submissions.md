@@ -21,7 +21,8 @@ in a worker job (Cloud Run Jobs), which has its own memory and time limits.
    collector validates it, derives the submission ID, records it, and returns
    its status with one signed upload URL for each file that is not yet stored.
 3. **Upload.** The client sends each file with `PUT` to its URL, with exactly
-   the headers the response lists.
+   the headers the response lists. An object can be created only once, so a
+   repeated upload of a stored file gets 412, which means it is already there.
 4. **Complete.** `POST /v1/submissions/{submission_id}/complete`. The collector
    lists the submission's stored objects and checks that every inventory file
    exists, has the declared size, and carries the declared SHA-256 in its
@@ -115,10 +116,11 @@ files that stay in private intake storage.
 | Signed URL lifetime | 30 minutes | A client that runs out of time creates the submission again for fresh URLs; the request is idempotent. |
 | Job attempts | 3 | After the third failure that is not a rejection, the job is `failed`. |
 
-Each signed URL allows one `PUT` of one object. It requires the headers
-`Content-Type: application/octet-stream`, `x-goog-meta-sha256: <sha256>`, and
-`x-goog-content-length-range: <size>,<size>`, so the storage service refuses an
-upload of any other size.
+Each signed URL allows one `PUT` of one object. Its signature covers the
+headers `Content-Type: application/octet-stream`, `x-goog-meta-sha256: <sha256>`,
+`x-goog-content-length-range: <size>,<size>` and `x-goog-if-generation-match: 0`,
+so the storage service refuses an upload of any other size, and refuses to
+replace an object once it exists.
 
 ## Identifiers
 
@@ -144,7 +146,7 @@ creating the same submission gets 403.
 | Status | Meaning | Final |
 |---|---|---|
 | `awaiting_upload` | Recorded; files may still be missing. | no |
-| `queued` | Completion found every object with the declared size and recorded digest; a job is recorded. | no |
+| `queued` | Completion found every object with the declared size and recorded digest; a job is recorded. Also the status between a failed attempt and the next one. | no |
 | `processing` | A worker holds the job. | no |
 | `succeeded` | The worker matched every file's SHA-256 and the kind's handler finished. | yes |
 | `rejected` | The bytes did not match the inventory, or the handler refused the content. Repeating the same submission cannot succeed. | yes |
@@ -192,8 +194,11 @@ creating the same submission gets 403.
 ```
 
 `rejection` is `{code, message}` for a rejected or failed submission, and
-`result` is `null` then. The emitter stores the receipt beside its queued
-upload.
+`result` is `null` then. The collector's own codes are `content_mismatch` and
+`object_missing` (rejected: the stored bytes differ from the inventory, or an
+object is gone), and `worker_error` and `attempts_exhausted` (failed); a
+handler may reject with its own code. The emitter stores the receipt beside
+its queued upload.
 
 ## Disclosure
 
@@ -219,4 +224,4 @@ generation. A handler returns a JSON result, which goes into the receipt, or
 refuses the content, which rejects the submission. The calibration-tree worker
 (K4) and the Orrery worker (O4) register the handlers for their kinds. Until
 they do, both kinds only have their bytes checked and are kept in intake
-storage.
+storage, with the result `{"processed_by": "intake-only", "verified_files": <count>}`.
