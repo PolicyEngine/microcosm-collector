@@ -1,0 +1,1 @@
+Document the artifact submission contract (`docs/artifact-submissions.md`): the `calibration-diagnostics` and `orrery-inputs` kinds and their file roles, provenance, collector-derived identifiers, statuses, receipts, size limits, and the rule that intake storage and outputs derived from licensed data stay private.
