@@ -1,0 +1,87 @@
+{
+  "cases": [
+    {
+      "description": "Microcosm's toy country with grouped presentation, a scope boundary and source references; the overlay holds a computing phase and its replay, loaded from saved run evidence.",
+      "execution": "toy-recorded-execution/graph.execution.json",
+      "expected": "toy-recorded-execution/graph.orrery.json",
+      "name": "toy-recorded-execution",
+      "schema": "toy-recorded-execution/graph.schema.json",
+      "title": null
+    },
+    {
+      "description": "The same schema projected without an execution overlay.",
+      "execution": null,
+      "expected": "toy-declarations-only/graph.orrery.json",
+      "name": "toy-declarations-only",
+      "schema": "toy-declarations-only/graph.schema.json",
+      "title": null
+    },
+    {
+      "description": "One phase whose threshold check fails; no presentation contract.",
+      "execution": "toy-failed-check/graph.execution.json",
+      "expected": "toy-failed-check/graph.orrery.json",
+      "name": "toy-failed-check",
+      "schema": "toy-failed-check/graph.schema.json",
+      "title": null
+    },
+    {
+      "description": "Rewritten, expanded and reweighted populations, an artifact input, numbers outside JavaScript's safe range and a title.",
+      "execution": null,
+      "expected": "declaration-features-titled/graph.orrery.json",
+      "name": "declaration-features-titled",
+      "schema": "declaration-features-titled/graph.schema.json",
+      "title": "Declaration features"
+    },
+    {
+      "description": "UK calibration nodes on a three-household fixture, with UK's artifact summaries and one failed summary provider.",
+      "execution": "uk-calibration-summaries/graph.execution.json",
+      "expected": "uk-calibration-summaries/graph.orrery.json",
+      "name": "uk-calibration-summaries",
+      "schema": "uk-calibration-summaries/graph.schema.json",
+      "title": null
+    },
+    {
+      "description": "The complete UK dense graph's declarations and presentation contract, with no execution overlay.",
+      "execution": null,
+      "expected": "uk-full-dense-declarations/graph.orrery.json.gz",
+      "name": "uk-full-dense-declarations",
+      "schema": "uk-full-dense-declarations/graph.schema.json.gz",
+      "title": null
+    }
+  ],
+  "limits": {
+    "boundaries": [
+      {
+        "constant": "_MAX_NODES",
+        "refusal_one_below": "Orrery adapter: node limit.",
+        "smallest_accepted": 40
+      },
+      {
+        "constant": "_MAX_EDGES",
+        "refusal_one_below": "Orrery adapter: edge limit.",
+        "smallest_accepted": 71
+      },
+      {
+        "constant": "_MAX_OUTPUT_BYTES",
+        "refusal_one_below": "Orrery adapter: prospective metadata size.",
+        "smallest_accepted": 320674
+      }
+    ],
+    "case": "toy-recorded-execution",
+    "orrery_constants": {
+      "_MAX_EDGES": 100000,
+      "_MAX_ITEMS": 2000000,
+      "_MAX_NODES": 20000,
+      "_MAX_OUTPUT_BYTES": 67108864,
+      "_SAFE_INTEGER": 9007199254740991
+    },
+    "schema_constants": {
+      "_MAX_BYTES": 33554432,
+      "_MAX_DEPTH": 64,
+      "_MAX_ITEMS": 2000000,
+      "_MAX_STRING": 131072
+    }
+  },
+  "microcosm_commit": "8d159a8c5653ad63affb1a5d2e39034f877db2ff",
+  "microcosm_repo": "PolicyEngine/microcosm"
+}
