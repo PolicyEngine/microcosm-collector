@@ -26,11 +26,14 @@ from telemetry_collector.auth import (
     HuggingFaceAuthenticator,
     HuggingFacePrincipal,
 )
+from telemetry_collector.intake import IntakeSettings
 from telemetry_collector.models import (
     CollectorToken,
     EventBatch,
     PageCursor,
     RunRegistration,
+    SessionScope,
+    TokenExchangeRequest,
 )
 from telemetry_collector.storage import (
     PostgresTelemetryStore,
@@ -50,6 +53,8 @@ class CollectorSettings:
     collector_audience: str = "microcosm-telemetry-collector"
     session_token_ttl_seconds: int = 60 * 60
     maintenance_mode: bool = False
+    # None while artifact intake is switched off (the default).
+    intake: IntakeSettings | None = None
 
     @classmethod
     def from_environment(cls) -> CollectorSettings:
@@ -77,6 +82,7 @@ class CollectorSettings:
                 os.environ.get("TELEMETRY_SESSION_TOKEN_TTL_SECONDS", "3600")
             ),
             maintenance_mode=os.environ.get("TELEMETRY_MAINTENANCE_MODE") == "1",
+            intake=IntakeSettings.from_environment(),
         )
 
 
@@ -224,9 +230,16 @@ def _parse_page_cursor(value: str | None) -> tuple[datetime, str] | None:
     return timestamp, run_id
 
 
+SCOPE_REFUSALS: dict[str, str] = {
+    "telemetry:write": "Collector credential cannot write telemetry.",
+    "artifacts:submit": "Collector credential cannot submit artifacts.",
+}
+
+
 def _issue_session_token(
     settings: CollectorSettings,
     principal: HuggingFacePrincipal,
+    scope: SessionScope = "telemetry:write",
 ) -> CollectorToken:
     now = datetime.now(UTC)
     expires = now + timedelta(seconds=settings.session_token_ttl_seconds)
@@ -237,7 +250,7 @@ def _issue_session_token(
             "sub": principal.user_id,
             "username": principal.username,
             "organizations": list(principal.organizations),
-            "scope": "telemetry:write",
+            "scope": scope,
             "iat": now,
             "exp": expires,
         },
@@ -270,13 +283,16 @@ def _decode_token(
 
 
 def _decode_session_token(
-    settings: CollectorSettings, authorization: str | None
+    settings: CollectorSettings,
+    authorization: str | None,
+    required_scope: SessionScope = "telemetry:write",
 ) -> SessionTokenClaims:
     payload = _decode_token(settings, authorization)
-    if payload.get("scope") != "telemetry:write":
+    # Each token carries exactly one scope, and each endpoint accepts one.
+    if payload.get("scope") != required_scope:
         raise HTTPException(
             status_code=403,
-            detail="Collector credential cannot write telemetry.",
+            detail=SCOPE_REFUSALS[required_scope],
         )
     subject = payload.get("sub")
     username = payload.get("username")
@@ -358,9 +374,15 @@ def create_app(
         response_model=CollectorToken,
     )
     def exchange_huggingface_token(
+        exchange_request: TokenExchangeRequest | None = None,
         authorization: Annotated[str | None, Header()] = None,
     ) -> CollectorToken:
         opaque_token = _bearer_token(authorization)
+        scope = (exchange_request or TokenExchangeRequest()).scope
+        if scope == "artifacts:submit" and settings.intake is None:
+            raise HTTPException(
+                status_code=404, detail="Artifact intake is not enabled."
+            )
         try:
             principal = huggingface_authenticator.authenticate(
                 opaque_token,
@@ -375,7 +397,7 @@ def create_app(
                 status_code=403,
                 detail="The Hugging Face user is not a PolicyEngine organization member.",
             )
-        return _issue_session_token(settings, principal)
+        return _issue_session_token(settings, principal, scope)
 
     @application.post("/v1/runs", status_code=status.HTTP_201_CREATED)
     def register_run(
