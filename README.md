@@ -90,14 +90,14 @@ bumps `pyproject.toml`, collects the fragments into `CHANGELOG.md`, updates
 `uv.lock`, and commits the result as "Update microcosm-collector" with the
 PolicyEngine GitHub App, which may bypass the main ruleset. The second run, on
 that commit, verifies it, tags it with the bare version (for example `0.2.0`),
-and then runs the gated deployment described below.
+and then runs the deployment described below, if it is enabled.
 
 ## Cloud Run deployment
 
 This service was developed in `telemetry-service/` inside
 PolicyEngine/calibration-diagnostics, and its history was extracted here.
 calibration-diagnostics deploys production until this repo takes over (see
-"Deployment gate" below). The Docker build context is the root of this repo.
+"Enabling deployment" below). The Docker build context is the root of this repo.
 Cloud Run assigns the production service address. Microcosm fixes that origin
 in its delivery service; the address is intentionally not repeated in
 documentation.
@@ -155,24 +155,38 @@ assertion.repository=='PolicyEngine/microcosm-collector' && assertion.ref=='refs
 The service account grants `roles/iam.workloadIdentityUser` to this repo's
 principal set (`attribute.repository/PolicyEngine/microcosm-collector`). A job
 running for a tag, a pull request or any other branch cannot obtain Google
-credentials. Both deployment jobs therefore also require
-`github.event_name == 'push' && github.ref == 'refs/heads/main'`, so that such a
-run skips them instead of failing at authentication. No other job requests an
-OIDC token.
+credentials. No other job requests an OIDC token.
 
-### Deployment gate
+Both deployment jobs also require
+`github.event_name == 'push' && github.ref == 'refs/heads/main'`. The Push
+workflow runs only for pushes to `main`, so this condition is always true
+today. It guards only against a later change to the workflow's triggers, such
+as adding tags or manual dispatch: the deployment jobs would skip those runs
+instead of reaching authentication.
+
+### Enabling deployment
 
 Both deployment jobs run only when the repo variable `COLLECTOR_DEPLOY_ENABLED`
-is `true`. Leave it unset until the cutover from calibration-diagnostics is
-complete:
+is `true`. It is unset, so releases from `main` are tagged but not deployed.
 
-1. Google Cloud trusts this repo's GitHub OIDC identity, as described above.
-2. The `staging` and `production` environments hold the same secrets and
-   variables, by name, as the calibration-diagnostics `staging` and
-   `Production` environments: the secrets `TELEMETRY_GCP_WIF_PROVIDER` (this
-   repo's provider) and `TELEMETRY_GCP_DEPLOY_SERVICE_ACCOUNT`, and every
-   `TELEMETRY_*` variable read by `.github/workflows/push.yaml`.
-3. calibration-diagnostics no longer deploys this service.
+The deployment's access and configuration are already provisioned:
+
+- The `microcosm-collector` Workload Identity provider and the deployment
+  service account's binding for this repo exist, as described above.
+- The `staging` and `production` environments each hold the secrets
+  `TELEMETRY_GCP_WIF_PROVIDER` (this repo's provider) and
+  `TELEMETRY_GCP_DEPLOY_SERVICE_ACCOUNT`, and the 15 `TELEMETRY_*` variables
+  that `.github/workflows/push.yaml` reads, copied by name and value from the
+  calibration-diagnostics `staging` and `Production` environments.
+
+What remains is the cutover from calibration-diagnostics, in this order:
+
+1. Carry over every `telemetry-service/` change merged in calibration-diagnostics
+   (see below).
+2. Stop calibration-diagnostics from deploying this service through its
+   `telemetry-service.yml` workflow.
+3. Set `COLLECTOR_DEPLOY_ENABLED` to `true`. The next release from `main` then
+   deploys to staging and, if that succeeds, to production.
 
 ### Carrying over changes from calibration-diagnostics
 
