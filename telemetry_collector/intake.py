@@ -12,7 +12,10 @@ import re
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from telemetry_collector.submission_store import SubmissionStore
 
 INTAKE_SWITCH = "COLLECTOR_INTAKE_ENABLED"
 SERVICE_ACCOUNT_PATTERN = (
@@ -138,3 +141,12 @@ class WorkerQueue(Protocol):
     """Starts a worker job execution for a job ID, at most once per ID."""
 
     def enqueue(self, job_id: str) -> None: ...
+
+
+@dataclass(frozen=True)
+class IntakeServices:
+    """What the submission endpoints need while intake is switched on."""
+
+    submissions: SubmissionStore
+    objects: IntakeObjectStore
+    worker_queue: WorkerQueue

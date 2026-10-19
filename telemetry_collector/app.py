@@ -26,7 +26,8 @@ from telemetry_collector.auth import (
     HuggingFaceAuthenticator,
     HuggingFacePrincipal,
 )
-from telemetry_collector.intake import IntakeSettings
+from telemetry_collector.intake import IntakeServices, IntakeSettings
+from telemetry_collector.intake_api import submission_router
 from telemetry_collector.models import (
     CollectorToken,
     EventBatch,
@@ -320,8 +321,15 @@ def create_app(
     settings: CollectorSettings,
     store: TelemetryStore,
     huggingface_authenticator: HuggingFaceAuthenticator,
+    intake_services: IntakeServices | None = None,
 ) -> FastAPI:
-    """Create the collector with explicit dependencies for tests and deployment."""
+    """Create the collector with explicit dependencies for tests and deployment.
+
+    The submission endpoints exist only when ``settings.intake`` is set.
+    """
+
+    if settings.intake is not None and intake_services is None:
+        raise ValueError("Intake is switched on but its services were not provided.")
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> Iterator[None]:
@@ -355,6 +363,18 @@ def create_app(
         authorization: Annotated[str | None, Header()] = None,
     ) -> SessionTokenClaims:
         return _decode_session_token(settings, authorization)
+
+    def submitter_claims(
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> SessionTokenClaims:
+        return _decode_session_token(settings, authorization, "artifacts:submit")
+
+    if settings.intake is not None and intake_services is not None:
+        application.include_router(
+            submission_router(
+                services=intake_services, submitter_claims=submitter_claims
+            )
+        )
 
     @application.get("/health")
     def health() -> dict[str, str]:
@@ -477,8 +497,33 @@ def create_app_from_environment() -> FastAPI:
 
     settings = CollectorSettings.from_environment()
     store = PostgresTelemetryStore(_required_environment("DATABASE_URL"))
+    intake_services = None
+    if settings.intake is not None:
+        # Imported only when intake is on, so a collector with intake off
+        # never loads the Google Cloud clients or looks for credentials.
+        from telemetry_collector.google_cloud import (
+            CloudTasksWorkerQueue,
+            GoogleCloudStorageIntake,
+        )
+        from telemetry_collector.submission_store import PostgresSubmissionStore
+
+        intake_services = IntakeServices(
+            submissions=PostgresSubmissionStore(store.engine),
+            objects=GoogleCloudStorageIntake(
+                bucket_name=settings.intake.bucket,
+                signing_service_account=settings.intake.signing_service_account,
+            ),
+            worker_queue=CloudTasksWorkerQueue(
+                queue=settings.intake.worker_queue,
+                worker_job=settings.intake.worker_job,
+                invoker_service_account=(
+                    settings.intake.worker_invoker_service_account
+                ),
+            ),
+        )
     return create_app(
         settings=settings,
         store=store,
         huggingface_authenticator=HuggingFaceAuthenticator(),
+        intake_services=intake_services,
     )

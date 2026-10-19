@@ -41,6 +41,7 @@ ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
 "telemetry_collector/app.py" = ["B008"]
+"telemetry_collector/intake_api.py" = ["B008"]
 
 [tool.towncrier]
 directory = "changelog.d"

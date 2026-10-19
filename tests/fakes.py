@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -10,6 +10,15 @@ from threading import RLock
 from typing import Any
 
 from telemetry_collector.auth import HuggingFacePrincipal
+from telemetry_collector.intake import (
+    UPLOAD_CONTENT_TYPE,
+    IntakeObjectMissingError,
+    PlannedUpload,
+    SignedUpload,
+    StoredObject,
+    WorkerQueueUnavailableError,
+    required_upload_headers,
+)
 from telemetry_collector.models import RunRegistration, TelemetryEvent
 from telemetry_collector.storage import (
     RunRegistrationConflictError,
@@ -319,3 +328,79 @@ class FakeSubmissionStore:
             )
             self._set_submission(job, status="queued")
             return True
+
+
+class FakeIntakeObjectStore:
+    """In-memory intake bucket; ``upload`` stands in for a client's PUT."""
+
+    def __init__(self, *, clock: Callable[[], datetime] | None = None) -> None:
+        self._clock = clock or (lambda: datetime.now(UTC))
+        self.objects: dict[str, tuple[bytes, str | None, str]] = {}
+        self.signed: list[PlannedUpload] = []
+        self.unreadable: set[str] = set()
+        self._next_generation = 1000
+
+    def upload(self, object_name: str, content: bytes, *, sha256: str | None) -> str:
+        self._next_generation += 1
+        generation = str(self._next_generation)
+        self.objects[object_name] = (content, sha256, generation)
+        return generation
+
+    def sign_uploads(
+        self, uploads: Sequence[PlannedUpload], *, lifetime_seconds: int
+    ) -> list[SignedUpload]:
+        self.signed.extend(uploads)
+        expires_at = self._clock() + timedelta(seconds=lifetime_seconds)
+        return [
+            SignedUpload(
+                name=upload.name,
+                url=f"https://storage.example.test/{upload.object_name}?signed=1",
+                method="PUT",
+                headers={
+                    "Content-Type": UPLOAD_CONTENT_TYPE,
+                    **required_upload_headers(upload.size, upload.sha256),
+                },
+                expires_at=expires_at,
+            )
+            for upload in uploads
+        ]
+
+    def list_objects(self, prefix: str) -> dict[str, StoredObject]:
+        return {
+            name: StoredObject(
+                object_name=name,
+                size=len(content),
+                generation=generation,
+                sha256=sha256,
+            )
+            for name, (content, sha256, generation) in self.objects.items()
+            if name.startswith(prefix)
+        }
+
+    def read_chunks(
+        self, object_name: str, generation: str, *, chunk_size: int = 4
+    ) -> Iterator[bytes]:
+        if object_name in self.unreadable:
+            raise OSError("Storage is unavailable.")
+        stored = self.objects.get(object_name)
+        if stored is None or stored[2] != generation:
+            raise IntakeObjectMissingError(object_name)
+        content = stored[0]
+        for offset in range(0, len(content), chunk_size):
+            yield content[offset : offset + chunk_size]
+
+
+class FakeWorkerQueue:
+    """Records enqueued job IDs; ``available = False`` simulates an outage."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.enqueued: list[str] = []
+        self.available = True
+
+    def enqueue(self, job_id: str) -> None:
+        self.calls.append(job_id)
+        if not self.available:
+            raise WorkerQueueUnavailableError("The worker queue is unavailable.")
+        if job_id not in self.enqueued:
+            self.enqueued.append(job_id)
