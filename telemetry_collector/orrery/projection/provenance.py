@@ -7,7 +7,7 @@ copy can be compared with ``git rev-parse <commit>:<directory>/<module>``. The
 README's "Orrery projection" section describes how to copy a later version.
 """
 
-MICROCOSM_REPOSITORY = "PolicyEngine/microcosm"
+MICROCOSM_REPO = "PolicyEngine/microcosm"
 #: The head of PolicyEngine/microcosm#1295 when the modules were copied.
 MICROCOSM_COMMIT = "8d159a8c5653ad63affb1a5d2e39034f877db2ff"
 MICROCOSM_SOURCE_DIRECTORY = "packages/microcosm-graph/src/microcosm/graph"

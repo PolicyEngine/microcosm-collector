@@ -473,7 +473,7 @@ def generate(microcosm_root: Path, fixture_root: Path) -> None:
         shutil.rmtree(fixture_root)
     fixture_root.mkdir(parents=True)
     index: dict = {
-        "microcosm_repository": "PolicyEngine/microcosm",
+        "microcosm_repo": "PolicyEngine/microcosm",
         "microcosm_commit": commit,
         "cases": [],
     }

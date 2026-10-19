@@ -9,7 +9,7 @@ from telemetry_collector.orrery.projection import orrery_document_from_schema
 from telemetry_collector.orrery.projection.provenance import (
     CHANGED_MODULES,
     MICROCOSM_COMMIT,
-    MICROCOSM_REPOSITORY,
+    MICROCOSM_REPO,
     MICROCOSM_SOURCE_DIRECTORY,
     ORRERY_ADAPTER,
     SOURCE_BLOBS,
@@ -30,7 +30,7 @@ def git_blob_id(source: Path) -> str:
 
 
 def test_provenance_names_the_microcosm_commit_and_directory_copied_from() -> None:
-    assert MICROCOSM_REPOSITORY == "PolicyEngine/microcosm"
+    assert MICROCOSM_REPO == "PolicyEngine/microcosm"
     assert len(MICROCOSM_COMMIT) == 40
     assert set(MICROCOSM_COMMIT) <= set("0123456789abcdef")
     assert MICROCOSM_SOURCE_DIRECTORY == "packages/microcosm-graph/src/microcosm/graph"
@@ -60,7 +60,7 @@ def test_unchanged_modules_have_their_microcosm_source_blob_ids() -> None:
 def test_expected_outputs_were_saved_from_the_commit_the_code_was_copied_from() -> None:
     fixture_index = json.loads((FIXTURE_ROOT / "fixtures.json").read_text())
 
-    assert fixture_index["microcosm_repository"] == MICROCOSM_REPOSITORY
+    assert fixture_index["microcosm_repo"] == MICROCOSM_REPO
     assert fixture_index["microcosm_commit"] == MICROCOSM_COMMIT
 
 
