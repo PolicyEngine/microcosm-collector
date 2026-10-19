@@ -66,9 +66,11 @@ a destination environment variable.
 ```bash
 uv sync --locked --dev
 uv run pytest -q
-uv run ruff check .
-uv run ruff format --check .
+bash tools/check-quality.sh
 ```
+
+`tools/check-quality.sh` runs Ruff's lint and format checks and syntax-checks
+every shell script in `tools/` and `scripts/` with `bash -n`, as CI does.
 
 The PostgreSQL integration tests and the migration checks need a disposable
 database whose name contains `test`, given as `TEST_DATABASE_URL`. Without it
