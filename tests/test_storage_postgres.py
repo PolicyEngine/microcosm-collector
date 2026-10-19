@@ -3,7 +3,7 @@ from __future__ import annotations
 import random
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -24,6 +24,7 @@ from telemetry_collector.storage import (
 from tests.event_schedules import (
     ONE_PRODUCER,
     RESTARTED_PRODUCERS,
+    RUN_REGISTERED_AT,
     Event,
     every_kind_stream,
     in_batches,
@@ -349,4 +350,95 @@ def test_incremental_batch_apply_stores_the_fully_materialized_state(
                 store, run_id, f"{description}: batch {batch_number}"
             )
         _assert_listed_as_fully_materialized(store, run_id, expected)
+    store.close()
+
+
+# Offsets far from UTC on either side, so consecutive events alternate between
+# them and every second pair has wall-clock times in the opposite order to
+# their instants.
+NON_UTC_OFFSETS = (timezone(timedelta(hours=14)), timezone(timedelta(hours=-12)))
+
+
+def _with_non_utc_offsets(schedule: Sequence[Sequence[Event]]) -> list[list[Event]]:
+    """Re-express every timestamp in a non-UTC offset, keeping its instant."""
+
+    return [
+        [
+            event
+            | {
+                "timestamp": event["timestamp"].astimezone(
+                    NON_UTC_OFFSETS[event["sequence"] % len(NON_UTC_OFFSETS)]
+                )
+            }
+            for event in batch
+        ]
+        for batch in schedule
+    ]
+
+
+def test_incremental_batch_apply_stores_database_values_for_non_utc_timestamps(
+    postgres_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fold the stored rows, not the submitted values, whatever offset a producer uses.
+
+    ``work.updated_at`` is stored as text. A fold over the submitted timestamps
+    would keep the producer's offset where a full re-read of the stored events
+    gives the database's.
+    """
+
+    upgrade_database(postgres_url)
+    store = PostgresTelemetryStore(postgres_url)
+    late_event_stream = long_stream("producer-a", 60)
+    late_event = late_event_stream[-6]
+    earlier_and_later_attempts = {
+        "producer-a": RUN_REGISTERED_AT,
+        "producer-b": RUN_REGISTERED_AT + timedelta(minutes=30),
+    }
+    deliveries = [
+        (
+            "every kind in batches of three",
+            ONE_PRODUCER,
+            in_batches(every_kind_stream("producer-a"), 3),
+        ),
+        (
+            "a late event replays the events stored after it",
+            ONE_PRODUCER,
+            [
+                *in_batches(
+                    [event for event in late_event_stream if event is not late_event],
+                    20,
+                ),
+                [late_event],
+            ],
+        ),
+        (
+            "an earlier attempt first reports after a later attempt",
+            earlier_and_later_attempts,
+            [
+                *in_batches(long_stream("producer-b", 40, first_minute=40.0), 10),
+                *in_batches(long_stream("producer-a", 10), 5),
+            ],
+        ),
+    ]
+
+    for run_number, (description, registrations, schedule) in enumerate(deliveries):
+        materialized_by_offset = {}
+        for offset_name, offset_schedule in (
+            ("UTC", schedule),
+            ("non-UTC", _with_non_utc_offsets(schedule)),
+        ):
+            run_id = f"run-{run_number}-{offset_name}"
+            _register_producers(store, run_id, registrations, monkeypatch)
+            for batch_number, batch in enumerate(offset_schedule, start=1):
+                store.append_events(run_id, "owner-1", _for_run(batch, run_id))
+                materialized = _assert_stored_state_is_fully_materialized(
+                    store, run_id, f"{description}, {offset_name}: batch {batch_number}"
+                )
+            materialized_by_offset[offset_name] = {
+                column: materialized[column] for column in MATERIALIZED_RUN_COLUMNS
+            }
+        # The same instants give the same run, whatever offset carried them.
+        assert materialized_by_offset["non-UTC"] == materialized_by_offset["UTC"], (
+            description
+        )
     store.close()
