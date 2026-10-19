@@ -10,8 +10,9 @@ The modules keep their Microcosm names and contents, so a copy from a later
 Microcosm commit can be compared file by file. ``orrery.py`` leaves out
 Microcosm's command-line entry point, whose overlay option reads Microcosm's
 content store, and the two functions that compile a ``Graph`` object before
-projecting it; every other module is unchanged. The modules need only the
-standard library: not the content store, numpy, pandas or microcosm-frame.
+projecting it; every other module is unchanged. ``provenance.py`` records the
+Microcosm commit and each source file. The modules need only the standard
+library: not the content store, numpy, pandas or microcosm-frame.
 """
 
 from .execution_overlay import (

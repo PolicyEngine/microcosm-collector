@@ -4,7 +4,7 @@ Static export never reads population data. A supplied execution overlay is
 projected as recorded; it is never verified against a content store here.
 
 Copied from Microcosm's ``microcosm.graph.orrery`` without its command-line
-entry point and its ``Graph`` input functions (see the package docstring).
+entry point and its ``Graph`` input functions (see ``provenance.py``).
 """
 
 from __future__ import annotations
