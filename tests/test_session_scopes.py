@@ -6,8 +6,13 @@ from fastapi.testclient import TestClient
 
 from telemetry_collector.app import CollectorSettings, create_app
 from telemetry_collector.auth import HuggingFacePrincipal
-from telemetry_collector.intake import IntakeSettings
-from tests.fakes import FakeTelemetryStore
+from telemetry_collector.intake import IntakeServices, IntakeSettings
+from tests.fakes import (
+    FakeIntakeObjectStore,
+    FakeSubmissionStore,
+    FakeTelemetryStore,
+    FakeWorkerQueue,
+)
 
 JWT_SECRET = "test-secret-that-is-long-enough-32"
 
@@ -38,11 +43,21 @@ def collector_client(*, intake: IntakeSettings | None) -> TestClient:
         collector_issuer="test-collector",
         intake=intake,
     )
+    intake_services = (
+        None
+        if intake is None
+        else IntakeServices(
+            submissions=FakeSubmissionStore(),
+            objects=FakeIntakeObjectStore(),
+            worker_queue=FakeWorkerQueue(),
+        )
+    )
     return TestClient(
         create_app(
             settings=settings,
             store=FakeTelemetryStore(),
             huggingface_authenticator=MemberAuthenticator(),
+            intake_services=intake_services,
         )
     )
 
