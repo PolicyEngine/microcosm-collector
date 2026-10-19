@@ -298,3 +298,17 @@ def test_enqueue_treats_an_existing_task_as_enqueued() -> None:
 def test_enqueue_reports_an_unavailable_queue(session: StandInSession) -> None:
     with pytest.raises(WorkerQueueUnavailableError):
         worker_queue(session).enqueue("job-0123")
+
+
+def test_a_reader_without_a_signing_account_cannot_sign_uploads() -> None:
+    reader = GoogleCloudStorageIntake(
+        bucket_name="collector-intake",
+        client=StandInStorageClient(),
+        credentials=StandInCredentials(),
+    )
+    planned = PlannedUpload(
+        name="a.json", object_name="submissions/sub-1/a.json", size=1, sha256="a" * 64
+    )
+
+    with pytest.raises(RuntimeError, match="signing service account"):
+        reader.sign_uploads([planned], lifetime_seconds=60)

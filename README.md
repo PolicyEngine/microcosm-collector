@@ -1,8 +1,9 @@
 # Microcosm telemetry collector
 
 This service accepts live build telemetry from Microcosm and exposes a
-read-only API to the calibration dashboard. It does not store dataset artifacts
-or Hugging Face credentials.
+read-only API to the calibration dashboard. It never stores Hugging Face
+credentials, and it stores build artifacts only when artifact intake is
+switched on (see "Artifact intake").
 
 ## Authentication
 
@@ -43,6 +44,58 @@ sending the same request again cannot succeed:
 - `422`: the request does not match the event schema, including a `blocked`
   event without a valid block (a safe-identifier `phase`, a
   `blocking_failure_count` of at least 1, and `blocking_gate_ids`).
+
+## Artifact intake
+
+Builds hand calibration diagnostics and Orrery inputs to the collector as
+submissions. [`docs/artifact-submissions.md`](docs/artifact-submissions.md) is
+the contract: kinds, file roles, provenance, identifiers, statuses, receipts and
+limits. File bytes go straight to a private bucket through signed upload URLs;
+`POST /v1/submissions/{id}/complete` checks the stored objects' sizes and
+recorded digests and enqueues a worker job through Cloud Tasks; the worker, a
+Cloud Run Job running `uv run --no-sync python -m telemetry_collector.worker`,
+recomputes every file's SHA-256 and runs the handler registered for the kind.
+Until the calibration-tree and Orrery workers register theirs, both kinds are
+only checked and kept.
+
+Intake is off unless `COLLECTOR_INTAKE_ENABLED` is exactly `1`. While it is
+off, the collector reads no other intake setting, the submission endpoints do
+not exist, and the token exchange answers 404 to `{"scope": "artifacts:submit"}`.
+`scripts/deploy.sh` sets none of these variables, so deploying this code
+changes nothing.
+
+| Setting | Read by | Value |
+|---|---|---|
+| `COLLECTOR_INTAKE_ENABLED` | service | `1` switches intake on |
+| `COLLECTOR_INTAKE_BUCKET` | service, worker | the private intake bucket's name |
+| `COLLECTOR_INTAKE_SIGNING_SERVICE_ACCOUNT` | service | the runtime service account, which signs upload URLs through IAM `signBlob` |
+| `COLLECTOR_WORKER_QUEUE` | service | `projects/<project>/locations/<region>/queues/<queue>` |
+| `COLLECTOR_WORKER_JOB` | service | `projects/<project>/locations/<region>/jobs/<job>` |
+| `COLLECTOR_WORKER_INVOKER_SERVICE_ACCOUNT` | service | the account whose OAuth token each Cloud Task uses to run the worker job |
+| `COLLECTOR_WORKER_JOB_ID` | worker | set on each execution by its Cloud Task |
+| `DATABASE_URL` | worker | the runtime database secret, as for the service |
+
+None of these values is secret. Switching intake on for an environment needs,
+in that environment's project and region:
+
+- **A bucket** with uniform bucket-level access, public access prevention
+  enforced, and no lifecycle deletion, so intake files stay available for
+  back-building.
+- **A Cloud Tasks queue** for worker jobs.
+- **A worker Cloud Run Job** running the released image with the command above,
+  one task, two task retries (three attempts, matching the worker's limit) and
+  a one-hour task timeout, with the runtime database secret as `DATABASE_URL`,
+  the Cloud SQL connection and `COLLECTOR_INTAKE_BUCKET`.
+- **Permissions:** the runtime service account may create and read objects in
+  the bucket, sign as itself (`roles/iam.serviceAccountTokenCreator` on
+  itself), enqueue on the queue, and act as the invoker account; the invoker
+  account may run the worker job with overrides; the worker's service account
+  may read the bucket, connect to Cloud SQL and read the runtime database
+  secret.
+- **Deployment wiring:** `scripts/deploy.sh` passing the settings to the
+  service and updating the worker job's image on every release, from new
+  `staging` and `production` environment variables. That change is the one
+  that switches intake on.
 
 ## Local development
 

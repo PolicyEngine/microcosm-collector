@@ -45,13 +45,16 @@ def _default_credentials() -> Any:
 
 
 class GoogleCloudStorageIntake:
-    """The private intake bucket, signing URLs through IAM without a key file."""
+    """The private intake bucket, signing URLs through IAM without a key file.
+
+    The worker only reads, so it constructs this without a signing account.
+    """
 
     def __init__(
         self,
         *,
         bucket_name: str,
-        signing_service_account: str,
+        signing_service_account: str | None = None,
         client: Any | None = None,
         credentials: Any | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
@@ -73,6 +76,8 @@ class GoogleCloudStorageIntake:
     ) -> list[SignedUpload]:
         if not uploads:
             return []
+        if self._signing_service_account is None:
+            raise RuntimeError("Signing uploads needs a signing service account.")
         access_token = self._access_token()
         expires_at = self._clock() + timedelta(seconds=lifetime_seconds)
 
