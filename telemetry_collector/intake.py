@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
+from datetime import datetime
+from typing import Protocol
 
 INTAKE_SWITCH = "COLLECTOR_INTAKE_ENABLED"
 SERVICE_ACCOUNT_PATTERN = (
@@ -56,3 +59,82 @@ class IntakeSettings:
                 "COLLECTOR_WORKER_INVOKER_SERVICE_ACCOUNT", SERVICE_ACCOUNT_PATTERN
             ),
         )
+
+
+UPLOAD_CONTENT_TYPE = "application/octet-stream"
+
+
+def required_upload_headers(size: int, sha256: str) -> dict[str, str]:
+    """Headers every signed upload must carry, all covered by its signature.
+
+    They record the declared SHA-256 as object metadata, make the storage
+    service refuse a body of any other size, and allow the object to be
+    created only once.
+    """
+
+    return {
+        "x-goog-meta-sha256": sha256,
+        "x-goog-content-length-range": f"{size},{size}",
+        "x-goog-if-generation-match": "0",
+    }
+
+
+@dataclass(frozen=True)
+class PlannedUpload:
+    """A file the client still has to upload."""
+
+    name: str
+    object_name: str
+    size: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class SignedUpload:
+    """How a client uploads one file: the URL, method and exact headers."""
+
+    name: str
+    url: str
+    method: str
+    headers: dict[str, str]
+    expires_at: datetime
+
+
+@dataclass(frozen=True)
+class StoredObject:
+    """Metadata of an object in the intake bucket."""
+
+    object_name: str
+    size: int
+    generation: str
+    sha256: str | None
+
+
+class IntakeObjectMissingError(LookupError):
+    """The object, at the requested generation, is not in the intake bucket."""
+
+
+class WorkerQueueUnavailableError(RuntimeError):
+    """The worker queue did not accept the job; enqueueing can be retried."""
+
+
+class IntakeObjectStore(Protocol):
+    """The private intake bucket."""
+
+    def sign_uploads(
+        self, uploads: Sequence[PlannedUpload], *, lifetime_seconds: int
+    ) -> list[SignedUpload]: ...
+
+    def list_objects(self, prefix: str) -> dict[str, StoredObject]:
+        """Every object under ``prefix``, keyed by object name."""
+
+    def read_chunks(
+        self, object_name: str, generation: str, *, chunk_size: int = ...
+    ) -> Iterator[bytes]:
+        """Stream one generation of an object; IntakeObjectMissingError if gone."""
+
+
+class WorkerQueue(Protocol):
+    """Starts a worker job execution for a job ID, at most once per ID."""
+
+    def enqueue(self, job_id: str) -> None: ...
