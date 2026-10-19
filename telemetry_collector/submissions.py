@@ -37,7 +37,7 @@ SHA256_PATTERN = r"^[0-9a-f]{64}$"
 HUGGINGFACE_REPO_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$"
 GIT_COMMIT_PATTERN = r"^[0-9a-f]{40}$"
 # Relative path segments; the validator also refuses "." and ".." segments.
-REPOSITORY_FOLDER_PATTERN = r"^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$"
+REPO_FOLDER_PATTERN = r"^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$"
 
 
 @dataclass(frozen=True)
@@ -72,7 +72,7 @@ class HuggingFaceLocation(BaseModel):
 
     repo: str = Field(pattern=HUGGINGFACE_REPO_PATTERN, max_length=200)
     commit: str = Field(pattern=GIT_COMMIT_PATTERN)
-    folder: str = Field(pattern=REPOSITORY_FOLDER_PATTERN, max_length=512)
+    folder: str = Field(pattern=REPO_FOLDER_PATTERN, max_length=512)
 
     @model_validator(mode="after")
     def refuse_relative_segments(self) -> HuggingFaceLocation:

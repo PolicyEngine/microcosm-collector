@@ -9,6 +9,8 @@ from sqlalchemy.pool import QueuePool
 from telemetry_collector.database import (
     DB_MAX_OVERFLOW,
     DB_POOL_SIZE,
+    ArtifactJob,
+    ArtifactSubmission,
     Base,
     TelemetryEvent,
     TelemetryProducer,
@@ -18,12 +20,16 @@ from telemetry_collector.database import (
 )
 
 
-def test_orm_metadata_defines_runs_producers_and_events() -> None:
+def test_orm_metadata_defines_telemetry_and_artifact_intake_tables() -> None:
     assert set(Base.metadata.tables) == {
         "telemetry_runs",
         "telemetry_producers",
         "telemetry_events",
+        "artifact_submissions",
+        "artifact_jobs",
     }
+    assert set(inspect(ArtifactSubmission).relationships.keys()) == {"jobs"}
+    assert set(inspect(ArtifactJob).relationships.keys()) == {"submission"}
     assert set(inspect(TelemetryRun).relationships.keys()) == {"producers"}
     assert set(inspect(TelemetryProducer).relationships.keys()) == {"run", "events"}
     assert set(inspect(TelemetryEvent).relationships.keys()) == {"producer"}
