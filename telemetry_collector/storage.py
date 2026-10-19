@@ -306,6 +306,10 @@ def apply_event_batch(
     therefore exact when they follow the active producer's stored events.
     Only an event delivered after later events of its producer replays that
     producer's stored events from it onward.
+
+    The caller must read ``run`` and ``producers``, and serve ``stored_events``,
+    while holding a lock that keeps other batches for the run from committing,
+    so that they describe every event stored before this batch.
     """
 
     ordered_events = canonical_events(accepted_events)
@@ -682,6 +686,13 @@ class PostgresTelemetryStore:
                 raise PermissionError("Run belongs to another Hugging Face user.")
             if not models:
                 return 0, 0
+            # Keep this read after the run's row lock above. Appending events and
+            # registering a producer both take that lock, so every earlier batch
+            # for this run has committed, and no other can commit until this
+            # transaction ends. Read before the lock, a concurrent batch's events
+            # would be missing from ``last_sequence``: this batch's earlier
+            # sequences would then fold on top of them instead of being replayed
+            # as late events.
             producers = self._stored_producers(session, run_id)
             if not {model.producer_id for model in models} <= producers.keys():
                 raise PermissionError(
