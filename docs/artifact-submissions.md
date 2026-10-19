@@ -87,8 +87,10 @@ recorded something it ignored.
 
 ## Kinds and file roles
 
-The role names are the ones the emitter's typed interface uses for the same
-files.
+The emitter builds submissions from the roles a staged bundle names in its
+typed interface. The calibration roles have the same names there. The Orrery
+inputs are named `orrery_schema`, `execution_overlay`, `orrery_upstream` and
+`orrery_evidence` in a bundle, and the emitter maps them to the roles below.
 
 | Kind | Role | Count | Size limit per file | Consumer |
 |---|---|---|---|---|
