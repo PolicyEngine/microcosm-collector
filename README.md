@@ -176,24 +176,49 @@ complete:
 
 Until cutover, changes to `telemetry-service/` can still merge in
 calibration-diagnostics. `tools/extraction-source.env` records the
-calibration-diagnostics commit that this history was extracted from. To carry
-later changes over, from the root of a clean checkout of `main`:
+calibration-diagnostics commit that this history was extracted from, and the
+commit it was rewritten to here. To carry later changes over, from the root of
+a clean, up-to-date checkout of `main`:
 
 ```bash
+git switch -c carry-over-telemetry-service
 tools/extract-from-calibration-diagnostics.sh ../collector-extraction \
   tools/extraction-source.env
-git switch -c carry-over-telemetry-service
 git fetch ../collector-extraction main
 git merge FETCH_HEAD
 ```
 
 The script needs git and uv. git-filter-repo rewrites unchanged source
-commits to the same commits, so the merge adds only the newer ones. The
-script refuses to continue if the previously extracted commit is not part of
-the new history, because merging that history would duplicate this one rather
-than extend it. Resolve any conflicts with changes made here, such as paths in
-tests, then add a changelog fragment and open a pull request that includes the
-updated record.
+commits to the same commits, so the merge adds only the newer ones. Resolve
+any conflicts with changes made here, such as paths in tests, then add a
+changelog fragment and open a pull request that includes the updated record.
+
+Merge a carry-over pull request with a merge commit ("Create a merge commit"),
+never with "Squash and merge" or "Rebase and merge". Squash and rebase merges
+put the carried-over changes on `main` under new commits, so `main` no longer
+contains the commits the record names, and the next carry-over would add them
+a second time, conflicting with the copies of their changes already there.
+
+The script refuses to continue, without writing the record, in either case
+where merging its output would duplicate this history rather than extend it:
+
+- The recorded extracted commit is not in the history of `HEAD` in the
+  checkout that runs the script. Either an earlier carry-over pull request was
+  squash-merged or rebase-merged, or the script ran from a checkout other than
+  the collector's `main` or a branch created from it.
+- The recorded extracted commit is not part of the new extraction, because
+  the source history or the filter changed.
+
+To recover from a squash-merged or rebase-merged carry-over pull request
+(number `<number>` below), merge its original head into the next carry-over
+branch with the `ours` strategy, which records those commits as merged without
+changing any file, then run the remaining steps above on that branch:
+
+```bash
+git switch -c carry-over-telemetry-service
+git fetch origin "pull/<number>/head"
+git merge -s ours FETCH_HEAD
+```
 
 ## Dashboard runtime access
 
