@@ -22,6 +22,11 @@ from pathlib import Path
 from typing import Any
 
 from telemetry_collector.database import create_database_engine
+from telemetry_collector.disclosure import (
+    OutputKind,
+    OutputVisibility,
+    output_visibility,
+)
 from telemetry_collector.google_cloud import GoogleCloudStorageIntake
 from telemetry_collector.intake import IntakeObjectMissingError, IntakeObjectStore
 from telemetry_collector.submission_store import (
@@ -82,6 +87,14 @@ class JobContext:
             intake_object_name(self.submission.submission_id, name),
             self._file(name)["generation"],
         )
+
+    def output_visibility(self, output: OutputKind) -> OutputVisibility:
+        """The visibility to record for an output of this submission.
+
+        Raises ``NeverPublishedError`` for native evidence.
+        """
+
+        return output_visibility(output, licensed_data=self.submission.licensed_data)
 
     def download(self, name: str, destination: Path) -> Path:
         """Write a file to ``destination`` and return that path."""
