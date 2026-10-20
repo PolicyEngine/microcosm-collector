@@ -14,10 +14,12 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
 from jwt import (
     ExpiredSignatureError,
+    ImmatureSignatureError,
     InvalidAudienceError,
     InvalidIssuerError,
     InvalidSignatureError,
     InvalidTokenError,
+    MissingRequiredClaimError,
 )
 from jwt.algorithms import ECAlgorithm
 
@@ -341,6 +343,20 @@ def test_token_with_any_other_algorithm_is_refused(algorithm: str) -> None:
         verify(token, signing_key=signing_key, hs256_secret=HS256_SECRET)
 
 
+def switch_window_token(
+    algorithm: str,
+    private_key: ec.EllipticCurvePrivateKey,
+    signing_key: SessionSigningKey,
+    claims: dict[str, object],
+) -> str:
+    """A token as either kind of signer would issue it during the switch."""
+
+    if algorithm == "ES256":
+        return es256_token(private_key, signing_key.key_id, claims)
+    return jwt.encode(claims, HS256_SECRET, algorithm="HS256")
+
+
+@pytest.mark.parametrize("algorithm", ["ES256", "HS256"])
 @pytest.mark.parametrize(
     ("claim_overrides", "expected_error"),
     [
@@ -350,38 +366,47 @@ def test_token_with_any_other_algorithm_is_refused(algorithm: str) -> None:
             {"exp": datetime.now(UTC) - timedelta(minutes=1)},
             ExpiredSignatureError,
         ),
+        (
+            {"nbf": datetime.now(UTC) + timedelta(minutes=5)},
+            ImmatureSignatureError,
+        ),
+        (
+            {"iat": datetime.now(UTC) + timedelta(minutes=5)},
+            ImmatureSignatureError,
+        ),
     ],
-    ids=["audience", "issuer", "expired"],
+    ids=["audience", "issuer", "expired", "not-before-later", "issued-later"],
 )
-def test_es256_token_must_carry_the_collectors_registered_claims(
-    claim_overrides: dict[str, object], expected_error: type[InvalidTokenError]
+def test_token_must_carry_the_collectors_registered_claims(
+    algorithm: str,
+    claim_overrides: dict[str, object],
+    expected_error: type[InvalidTokenError],
 ) -> None:
+    # HS256 tokens issued before the switch go through the same checks as the
+    # ES256 tokens issued after it.
     private_key = p256_private_key()
     signing_key = SessionSigningKey.from_pem(private_key_pem(private_key))
+    token = switch_window_token(
+        algorithm, private_key, signing_key, session_claims(**claim_overrides)
+    )
 
     with pytest.raises(expected_error):
-        verify(
-            es256_token(
-                private_key, signing_key.key_id, session_claims(**claim_overrides)
-            ),
-            signing_key=signing_key,
-            hs256_secret=None,
-        )
+        verify(token, signing_key=signing_key, hs256_secret=HS256_SECRET)
 
 
+@pytest.mark.parametrize("algorithm", ["ES256", "HS256"])
 @pytest.mark.parametrize("missing_claim", ["aud", "exp", "iat", "iss", "scope", "sub"])
-def test_es256_token_without_a_required_claim_is_refused(missing_claim: str) -> None:
+def test_token_without_a_required_claim_is_refused(
+    algorithm: str, missing_claim: str
+) -> None:
     private_key = p256_private_key()
     signing_key = SessionSigningKey.from_pem(private_key_pem(private_key))
     claims = session_claims()
     del claims[missing_claim]
+    token = switch_window_token(algorithm, private_key, signing_key, claims)
 
-    with pytest.raises(InvalidTokenError):
-        verify(
-            es256_token(private_key, signing_key.key_id, claims),
-            signing_key=signing_key,
-            hs256_secret=None,
-        )
+    with pytest.raises(MissingRequiredClaimError, match=missing_claim):
+        verify(token, signing_key=signing_key, hs256_secret=HS256_SECRET)
 
 
 def test_malformed_token_is_refused() -> None:
