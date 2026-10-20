@@ -158,12 +158,18 @@ For each environment (read-only):
   of the roles query below. Note which role owns the tables and what the
   runtime user is granted. These were provisioned by scripts kept outside
   this repo, so this record is the only specification of them. The roles
-  query lists every role's attributes and memberships in one result; psql 16
-  and later no longer show memberships in `\du`:
+  query lists every role's attributes and memberships in one result, since
+  psql 16 and later no longer show memberships in `\du`. Each membership
+  carries its PostgreSQL 16 options (`admin`, `inherit`, `set`, from
+  `pg_auth_members`), which show how each role was made (step 5.2):
 
   ```sql
   SELECT r.rolname, r.rolcanlogin, r.rolcreaterole, r.rolcreatedb, r.rolinherit,
-         ARRAY(SELECT g.rolname FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.roleid
+         ARRAY(SELECT g.rolname || ' (' || concat_ws(', ',
+                        CASE WHEN m.admin_option THEN 'admin' END,
+                        CASE WHEN m.inherit_option THEN 'inherit' END,
+                        CASE WHEN m.set_option THEN 'set' END) || ')'
+               FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.roleid
                WHERE m.member = r.oid ORDER BY 1) AS member_of
   FROM pg_roles r
   WHERE r.rolname !~ '^(pg_|cloudsql)'
@@ -347,7 +353,7 @@ Match the record's IP configuration (Cloud Run connects through the Cloud SQL
 connector, so a public IP needs no authorized networks), SSL mode, database
 flags, maintenance window and point-in-time recovery.
 
-Create every user the step 3.2 record lists, except `postgres`, with the
+Create every role the step 3.2 roles query lists, except `postgres`, with the
 **same names** as on the old instance and new random passwords. Google's import
 guide says every user that owns objects or was granted permissions on objects
 in the dumped database must exist on the target instance, or the import
@@ -356,38 +362,106 @@ fails. Besides the migration and runtime users, create each role in
 the collector doesn't use, and none for staging), with a random password that
 isn't kept.
 
+**Make each role the way its old one was made.** An export carries no roles,
+so nothing corrects a role's attributes or memberships later. Made the same
+way, each role's row and its creator's row match the record, so step 6.4's
+comparison of the roles query shows real differences only. The record shows
+how each was made:
+
+- **Its row lists `cloudsqlsuperuser`:** Cloud SQL made it. Cloud SQL's pages
+  "About PostgreSQL users and roles" and "Create and manage users" say a user
+  created with `gcloud sql users create` is a member of `cloudsqlsuperuser`,
+  with the `CREATEROLE`, `CREATEDB` and `LOGIN` attributes. Create it that way.
+  If its row lacks one of those attributes, see the staging check below.
+- **Its row doesn't list `cloudsqlsuperuser`:** it was made in SQL, or its
+  membership was taken away later. On PostgreSQL 16, a role made by a role
+  that isn't a superuser, such as Cloud SQL's `postgres`, "is automatically
+  granted back to the creating user, just as if the bootstrap superuser had
+  executed the command `GRANT created_user TO creating_user WITH ADMIN TRUE,
+  SET FALSE, INHERIT FALSE`" (PostgreSQL 16, "Role Attributes"). The roles
+  query shows that grant as `ROLE (admin)` in the creator's `member_of`,
+  normally `postgres`'s. Create the role in SQL, connected as that creator,
+  with exactly the attributes its row shows. PostgreSQL then makes the same
+  grant, so both rows match the record, and nothing has to be removed
+  afterwards. If no role lists it as `(admin)`, create it as `postgres`;
+  step 6.4 then accepts that one extra entry in `postgres`'s row.
+
+For the SQL, run `psql` through the Cloud SQL Auth Proxy
+(`cloud-sql-proxy "$NEW_CLOUD_SQL_CONNECTION"` in another shell, listening on
+127.0.0.1:5432). First set `postgres`'s password on the new instance, typed
+rather than printed:
+`gcloud sql users set-password postgres --instance "$NEW_INSTANCE" --project "$NEW_PROJECT_ID" --prompt-for-password`.
+
 ```bash
 migration_password="$(openssl rand -hex 32)"
 runtime_password="$(openssl rand -hex 32)"
-gcloud sql users create "$MIGRATION_DATABASE_USER" --instance "$NEW_INSTANCE" \
-  --project "$NEW_PROJECT_ID" --password "$migration_password"
-gcloud sql users create "$RUNTIME_DATABASE_USER" --instance "$NEW_INSTANCE" \
-  --project "$NEW_PROJECT_ID" --password "$runtime_password"
+create_user_with_cloud_sql() {   # USER PASSWORD
+  gcloud sql users create "$1" --instance "$NEW_INSTANCE" --project "$NEW_PROJECT_ID" --password "$2"
+}
+create_user_in_sql() {           # CREATOR USER PASSWORD 'ATTRIBUTES'
+  psql "host=127.0.0.1 port=5432 dbname=postgres user=$1" --set ON_ERROR_STOP=1 \
+    --set user_name="$2" --set user_password="$3" --set attributes="$4" <<'SQL'
+CREATE ROLE :"user_name" WITH :attributes PASSWORD :'user_password';
+SQL
+}
+# The calls below are examples: for each role, make the one call its step 3.2 row
+# calls for, with the attributes its row shows. The placeholder stops the loop.
+create_user_with_cloud_sql "$MIGRATION_DATABASE_USER" "$migration_password"
+create_user_in_sql postgres "$RUNTIME_DATABASE_USER" "$runtime_password" 'LOGIN NOCREATEROLE NOCREATEDB INHERIT'
 for other_database_user in "${OTHER_DATABASE_USERS[@]}"; do   # none for staging
-  gcloud sql users create "$other_database_user" --instance "$NEW_INSTANCE" \
-    --project "$NEW_PROJECT_ID" --password "$(openssl rand -hex 32)"
+  create_user_in_sql postgres "$other_database_user" "$(openssl rand -hex 32)" 'ATTRIBUTES FROM ITS ROW'
 done
 ```
 
-Keep the two password variables in this shell for step 5.3.
+psql puts the variables' values into the statement, quoted as a name
+(`:"user_name"`), as a string (`:'user_password'`) or as written
+(`:attributes`), so neither the shell's history nor psql's holds a password.
+PostgreSQL's `CREATE ROLE` page warns that a password in the statement "might
+also be logged in ... the server log": the server logs it if the statement
+fails, or if the `log_statement` flag recorded in step 3.2 is `ddl` or `all`.
+Keep the two password variables in this shell for step 5.3. Then grant the
+other memberships the rows show, and run the roles query on the new instance:
+it must already match the record, apart from the differences this step names.
 
-**Give each user no more than its record shows.** Cloud SQL's pages "About
-PostgreSQL users and roles" and "Create and manage users" say a user created
-this way is a member of `cloudsqlsuperuser`, with the `CREATEROLE`,
-`CREATEDB` and `LOGIN` attributes. An old user created in SQL may have less,
-and an export carries no roles, so nothing corrects it later. For each new
-user, compare with its row from the roles query in step 3.2 and remove what
-the row doesn't show:
+**Check once, on staging's new instance, whether `postgres` can change a user
+Cloud SQL made.** PostgreSQL 16's `ALTER ROLE` page says a role with
+`CREATEROLE` that isn't a superuser, as Cloud SQL's `postgres` is, can change
+another role's attributes "only for non-superuser and non-replication roles
+for which they have been granted `ADMIN OPTION`". Cloud SQL's pages say "You
+can change the attributes of any user using the ALTER ROLE command", but not
+whether `postgres` holds `ADMIN OPTION` on users Cloud SQL makes. So don't
+rely on it until this check has passed, in staging's pass and before
+production's step 5.2:
 
-- **Membership of `cloudsqlsuperuser`:**
-  `gcloud sql users assign-roles USER --instance "$NEW_INSTANCE" --project "$NEW_PROJECT_ID" --type BUILT_IN --revoke-existing-roles`,
-  with `--database-roles` for any membership the row does show, once that
-  role exists. Google's page gives this as the way to take
-  `cloudsqlsuperuser` away from a user.
-- **Attributes:** in SQL, connected as `postgres`, for example
-  `ALTER ROLE telemetry_runtime NOCREATEROLE NOCREATEDB;`, and
-  `ALTER ROLE telemetry_app NOLOGIN;` if its row shows no `LOGIN`. Google's
-  page says `ALTER ROLE` changes any user's attributes.
+```bash
+gcloud sql users create move_check --instance "$NEW_INSTANCE" --project "$NEW_PROJECT_ID" \
+  --password "$(openssl rand -hex 32)"
+psql "host=127.0.0.1 port=5432 dbname=postgres user=postgres" <<'SQL'
+SELECT g.rolname AS holder, m.admin_option, m.inherit_option, m.set_option
+FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.member
+WHERE m.roleid = 'move_check'::regrole;
+ALTER ROLE move_check NOCREATEROLE NOCREATEDB NOLOGIN;
+SQL
+gcloud sql users delete move_check --instance "$NEW_INSTANCE" --project "$NEW_PROJECT_ID" --quiet
+```
+
+Write the result in the window notes. It matters only for a row that lists
+`cloudsqlsuperuser` but lacks `CREATEROLE`, `CREATEDB` or `LOGIN`:
+
+- **`ALTER ROLE` succeeds:** create that user with `gcloud sql users create`,
+  then remove what its row lacks with `ALTER ROLE` as `postgres`, for example
+  `ALTER ROLE telemetry_app NOLOGIN;`.
+- **It fails** with "permission denied to alter role": create that user in
+  SQL as `postgres` instead, with the attributes its row shows, so that
+  `postgres` holds `ADMIN OPTION` on it. Its row then lacks
+  `cloudsqlsuperuser`, and `postgres`'s row lists it as `(admin)`; step 6.4
+  accepts exactly these two differences for that user. It then has less
+  privilege than its record. The README asks no more of the two users the
+  collector uses: the migration credential needs "schema-modification
+  access", and the runtime credential "only the data access required by the
+  application". If that user is the importing user, the `public` schema step
+  below must give it `CREATE` on `public`, and step 6.4 accepts that
+  difference too.
 
 Step 6.4 compares the result. Also recreate what an export doesn't carry: the
 database-level privileges (`GRANT CONNECT` and `CREATE ON DATABASE`) from the
@@ -701,10 +775,11 @@ On both instances, as the migration user:
   and `telemetry_events`; later migrations add more.
 - `\l`, `\dp public.*` and `\ddp` match the step 3.2 record, so the
   database-level, table and default privileges all came across.
-- The roles query from step 3.2 gives the same rows, so every user has the
-  same attributes and memberships. If a new user has more, such as
-  `cloudsqlsuperuser`, `CREATEROLE` or `CREATEDB` left from
-  `gcloud sql users create`, remove it as in step 5.2 and compare again.
+- The roles query from step 3.2 gives the same rows, `postgres`'s included,
+  so every role has the same attributes and the same memberships with the
+  same options. Step 5.2 already compared them before the window; the only
+  accepted differences are the ones it names for a role it had to make
+  differently, as written in the window notes.
 
 If anything else differs, stop and roll back (section 10, first row).
 
