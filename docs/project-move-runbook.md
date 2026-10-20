@@ -405,7 +405,8 @@ CREATE ROLE :"user_name" WITH :attributes PASSWORD :'user_password';
 SQL
 }
 # The calls below are examples: for each role, make the one call its step 3.2 row
-# calls for, with the attributes its row shows. The placeholder stops the loop.
+# calls for, with the attributes its row shows. Until the placeholder in the loop
+# is replaced, PostgreSQL refuses each call there and creates nothing.
 create_user_with_cloud_sql "$MIGRATION_DATABASE_USER" "$migration_password"
 create_user_in_sql postgres "$RUNTIME_DATABASE_USER" "$runtime_password" 'LOGIN NOCREATEROLE NOCREATEDB INHERIT'
 for other_database_user in "${OTHER_DATABASE_USERS[@]}"; do   # none for staging
@@ -459,15 +460,61 @@ Write the result in the window notes. It matters only for a row that lists
   privilege than its record. The README asks no more of the two users the
   collector uses: the migration credential needs "schema-modification
   access", and the runtime credential "only the data access required by the
-  application". If that user is the importing user, the `public` schema step
-  below must give it `CREATE` on `public`, and step 6.4 accepts that
-  difference too.
+  application". If that user is the importing user, the "Before any import"
+  steps below must also grant it `CREATE` on `public`, and step 6.4 accepts
+  that difference too.
 
-Step 6.4 compares the result. Also recreate what an export doesn't carry: the
-database-level privileges (`GRANT CONNECT` and `CREATE ON DATABASE`) from the
-`\l` record, and role memberships from the roles query. Table privileges,
-schema privileges and default privileges (`\dp`, `\dn+`, `\ddp`) come with the
-export, provided the roles exist.
+**Before any import into the new database** (step 5.5's rehearsal and step
+6.3), give it the record's privileges and owners. An export doesn't carry the
+database-level privileges. And the importing user (normally the migration
+user) can create the tables only if it may create objects in schema `public`:
+on PostgreSQL 15 and later, `public` belongs to `pg_database_owner`, that is
+to the database's owner, and other users no longer have `CREATE` on it
+(PostgreSQL 15 release notes). On the old database the importing user had it
+in one of three ways, which the `\l` and `\dn+ public` records show: it owns
+the database or is a member of its owner (as every `cloudsqlsuperuser` member
+is, if `cloudsqlsuperuser` owns it); it owns `public`; or it was granted
+`CREATE` on `public`. The dump also sets `public`'s owner and privileges, but
+as the importing user and only after creating the tables, so it can't give
+the importing user what those tables need. Cloud SQL's users pages don't say
+who owns a database that `gcloud sql databases create` makes, so compare
+first.
+
+Connected to the new database as `postgres`, compare `\l "$DATABASE_NAME"` and
+`\dn+ public` with the record, then apply what differs, in this order:
+
+1. **Privileges:** the database-level ones from `\l` (`GRANT CONNECT`,
+   `GRANT CREATE ON DATABASE`) and `public`'s from `\dn+ public`
+   (`GRANT USAGE, CREATE ON SCHEMA public TO ...`). `postgres` may grant them
+   while it acts as the owner, which it does through `cloudsqlsuperuser` if
+   that owns the new database. Grant them before changing an owner: after
+   that, `postgres` no longer acts as the owner.
+2. **Owners:** `ALTER DATABASE ... OWNER TO ...` or
+   `ALTER SCHEMA public OWNER TO ...`. PostgreSQL 16's `ALTER DATABASE` page
+   says: "To alter the owner, you must be able to `SET ROLE` to the new owning
+   role, and you must have the `CREATEDB` privilege."
+   - **If Cloud SQL made the new owner,** connect as that user: as a
+     `cloudsqlsuperuser` member with `CREATEDB`, it can make itself the owner
+     of a database that `cloudsqlsuperuser` owns.
+   - **If `postgres` made it,** `postgres` holds it only as `(admin)`, without
+     `SET`. The "Role Attributes" page says a creator "can gain access to the
+     created role by simply granting that role back to themselves with the
+     `INHERIT` and/or `SET` options", so grant `SET` for the change and revoke
+     it afterwards, for example:
+
+     ```sql
+     GRANT telemetry_migrator TO postgres WITH SET TRUE;
+     ALTER DATABASE telemetry OWNER TO telemetry_migrator;
+     REVOKE telemetry_migrator FROM postgres;
+     ```
+
+     The revoke removes only the grant `postgres` made; the same page says
+     the automatic grant "cannot be removed or changed by the `CREATEROLE`
+     user". The roles query's `postgres` row must match the record again.
+
+Table privileges and default privileges (`\dp`, `\ddp`) come with the export,
+provided the roles exist. Step 6.4 compares all four records after the
+import.
 
 Let both instances' service agents use the bucket. Google's export and import
 pages name `roles/storage.objectAdmin` for both:
@@ -623,8 +670,8 @@ Before production's window, export the production database with `--offload`
 instance), import it into the new instance as in step 6.3, and note both
 durations. Then delete and re-create the new database
 (`gcloud sql databases delete`, then `create`), so the window's import starts
-empty, and grant the database-level privileges from step 5.2 again: deleting
-the database drops them. Staging's window gives the same timings for staging's
+empty, and repeat step 5.2's "Before any import" steps (privileges, then
+owners): deleting the database drops them. Staging's window gives the same timings for staging's
 size.
 
 ## 6. The window
@@ -762,7 +809,8 @@ gcloud sql import sql "$NEW_INSTANCE" "$export_object" \
 ```
 
 Import as the role that owns the tables in the step 3.2 record (normally the
-migration user), so the restored objects keep their owner. If #12's intake is
+migration user), so the restored objects keep their owner. Step 5.2's "Before
+any import" steps let it create them in `public`. If #12's intake is
 switched on, its bucket isn't copied: it stays in the old project (step 5.3).
 
 ### 6.4 Check the copy
@@ -773,8 +821,9 @@ On both instances, as the migration user:
 - `SELECT count(*)` on every table in the `public` schema gives the same
   counts. At revision `0001` these are `telemetry_runs`, `telemetry_producers`
   and `telemetry_events`; later migrations add more.
-- `\l`, `\dp public.*` and `\ddp` match the step 3.2 record, so the
-  database-level, table and default privileges all came across.
+- `\l`, `\dn+ public`, `\dp public.*` and `\ddp` match the step 3.2 record,
+  so the database's owner and privileges, `public`'s owner and privileges,
+  and the table and default privileges all came across.
 - The roles query from step 3.2 gives the same rows, `postgres`'s included,
   so every role has the same attributes and the same memberships with the
   same options. Step 5.2 already compared them before the window; the only
