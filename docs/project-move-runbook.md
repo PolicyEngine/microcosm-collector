@@ -21,10 +21,24 @@ another.
 
 ## 1. People and access
 
-- **Google Cloud:** permission to create a project under the chosen parent and
-  link the billing account; then the owner role on the new project. Read access
-  to `policyengine-api`, and Cloud SQL admin on the old instances for the
-  export.
+- **Google Cloud, the new project:** permission to create a project under the
+  chosen parent and link the billing account; then the owner role on the new
+  project.
+- **Google Cloud, `policyengine-api`:** the steps change resources there, not
+  only read them. The project owner role covers all of these, if that is
+  simpler for the windows:
+
+  | Steps | What they do in `policyengine-api` | Role |
+  |---|---|---|
+  | 2, 3.2, 6.1, 9 | read resources and their IAM policies | `roles/viewer` and `roles/iam.securityReviewer` |
+  | 3.2, 5.3 | read the collector's secret values (step 3.2's database connection uses the migration user's password) | `roles/secretmanager.secretAccessor` on the collector's secrets |
+  | 3.2, 5.2, 5.5, 6.3, 11 | connect to and export the old databases; delete the old instances | `roles/cloudsql.admin` |
+  | 5.3, 11 | change the intake bucket's IAM policy (#12) | `roles/storage.admin` on that bucket |
+  | 6.2, 8.4, 10, 11 | update the old service and its traffic; run and cancel job executions; delete the old services and jobs | `roles/run.admin`, and `roles/iam.serviceAccountUser` on the old runtime account, because a service update deploys a revision that runs as it |
+  | 6.2, 10, 11 | pause, resume and delete #12's queue | `roles/cloudtasks.queueAdmin` |
+  | 6.2, 6.7, 10, 11 | pause, resume and delete #12's and #19's schedules | `roles/cloudscheduler.admin` |
+  | 6.7, 10, 11 | disable, enable and delete #19's alert policies; delete its notification channel | `roles/monitoring.alertPolicyEditor` and `roles/monitoring.notificationChannelEditor` |
+  | 11 | delete secrets, service accounts, this repo's Workload Identity provider and the collector's images | `roles/secretmanager.admin`, `roles/iam.serviceAccountAdmin`, `roles/iam.workloadIdentityPoolAdmin` and `roles/artifactregistry.repoAdmin` |
 - **DNS:** edit access to the chosen zone (choice 5). For D3 B only, a Google
   account that is a verified owner of the base domain in Search Console; D3
   C's certificate needs only a DNS record.
