@@ -1,6 +1,6 @@
 """The collector's daily Hugging Face check, run as a Cloud Run job.
 
-Cloud Scheduler starts the job once a day. It runs two checks:
+Cloud Scheduler starts the job twice a day. It runs two checks:
 
 1. **The token check** requests every dataset in ``HUGGINGFACE_DATASETS``
    with the collector's read token and reports each one that answers with

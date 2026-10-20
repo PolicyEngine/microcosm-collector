@@ -56,3 +56,10 @@ def test_the_readme_says_what_switching_on_the_releases_json_check_needs() -> No
     assert f"`{RELEASE_RULES_MODULE}`" in section
     assert "`manifest_file_digests`" in section
     assert "tests/test_releases_record_check.py" in section
+
+
+def test_the_readme_gives_the_schedule_the_absence_alert_relies_on() -> None:
+    section = readme_section()
+
+    assert "`0 6,18 * * *`" in section
+    assert "no execution has succeeded for 23 hours" in section
