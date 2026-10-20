@@ -262,7 +262,8 @@ def _check_build_files(
         return
     try:
         digests = manifest_file_digests(json.loads(read_manifest(manifest_path)))
-    except ValueError as error:
+    # json.loads raises RecursionError for nesting too deep to decode.
+    except (ValueError, RecursionError) as error:
         report(
             "MANIFEST_FILES_UNREADABLE",
             f"{manifest_path} does not list its build's files with their "
