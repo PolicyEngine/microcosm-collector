@@ -300,7 +300,7 @@ def test_workflow_shell_logic_lives_in_scripts() -> None:
                     assert "\n" not in step["run"].strip(), (workflow_path.name, step)
 
     workflow = PUSH_WORKFLOW.read_text(encoding="utf-8")
-    assert workflow.count("run: scripts/deploy.sh") == 28
+    assert workflow.count("run: scripts/deploy.sh") == 29
     for command in (
         "require-configuration",
         "validate-environment-target",
@@ -316,8 +316,39 @@ def test_workflow_shell_logic_lives_in_scripts() -> None:
         "route-service-traffic",
         "verify-stable-service",
         "create-database-backup",
+        "configure-huggingface-check-job",
     ):
         assert f"run: scripts/deploy.sh {command}" in workflow
+
+
+def test_only_production_configures_the_huggingface_check_job() -> None:
+    staging_job = push_job_text("deploy-staging", "deploy-production")
+    production_job = push_job_text("deploy-production", None)
+    command = "run: scripts/deploy.sh configure-huggingface-check-job"
+
+    assert command not in staging_job
+    assert production_job.count(command) == 1
+    check_step = production_job[production_job.index(command) :]
+    assert check_step.index(
+        "IMAGE_URI: ${{ needs.deploy-staging.outputs.image_uri }}"
+    ) < (check_step.index("- name:"))
+    # A misconfigured check job stops the deploy before production changes.
+    assert production_job.index("check-secrets-exist") < production_job.index(command)
+    assert production_job.index(command) < production_job.index("deploy-maintenance")
+
+
+def test_huggingface_check_job_reads_its_names_from_production_variables() -> None:
+    staging_job = push_job_text("deploy-staging", "deploy-production")
+    production_job = push_job_text("deploy-production", None)
+
+    for environment_name, github_variable_name in {
+        "HF_CHECK_JOB": "TELEMETRY_HF_CHECK_JOB",
+        "WORKER_SERVICE_ACCOUNT": "TELEMETRY_WORKER_SERVICE_ACCOUNT",
+        "HF_READ_SECRET_NAME": "TELEMETRY_HF_READ_SECRET_NAME",
+    }.items():
+        mapping = f"{environment_name}: ${{{{ vars.{github_variable_name} }}}}"
+        assert production_job.count(mapping) == 1
+        assert github_variable_name not in staging_job
 
 
 def test_service_image_contains_alembic_runtime_files() -> None:
