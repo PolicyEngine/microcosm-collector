@@ -69,28 +69,31 @@ so the byte-level SHA-256 check belongs to the worker.
 
 | Field | Rule |
 |---|---|
-| `contract_version` | `1` |
-| `kind` | `calibration-diagnostics` or `orrery-inputs` |
+| `contract_version` | The integer `1`. |
+| `kind` | `calibration-diagnostics` or `orrery-inputs`. |
 | `licensed_data` | Required boolean: whether the build used licensed microdata. See "Disclosure". |
-| `provenance.run_id` | The telemetry run ID (a safe identifier, as for `POST /v1/runs`). The run does not have to be registered with the collector. |
-| `provenance.build_id` | The build: the attempt ID Microcosm assigns, the same from staging through release. |
+| `provenance` | An object with exactly the five keys below. Every key is required: `release` and `huggingface` may be `null`, but are never left out. |
+| `provenance.run_id` | The telemetry run ID: 1–192 characters from `A-Z`, `a-z`, `0-9`, `.`, `_`, `:` and `-`, starting with a letter or digit (`[A-Za-z0-9][A-Za-z0-9._:-]{0,191}`), as for `POST /v1/runs`. The run does not have to be registered with the collector. |
+| `provenance.build_id` | The build: the attempt ID Microcosm assigns, the same from staging through release. 1–128 characters from `A-Z`, `a-z`, `0-9`, `.`, `_` and `-`, starting with a letter or digit (`[A-Za-z0-9][A-Za-z0-9._-]{0,127}`). This is the emitter interface's `safe_identifier` rule. |
 | `provenance.country_code` | Two upper-case letters, as in run registration. |
-| `provenance.release` | The release ID, or `null` for a staged build that is not a release. |
-| `provenance.huggingface` | Where the same bytes live on Hugging Face: `repo` (`owner/name`, a dataset repo), `commit` (40 lowercase hex characters, the commit that holds them) and `folder` (each file's Hugging Face path is `<folder>/<name>`). Required for `calibration-diagnostics`. For `orrery-inputs` it may be `null`, for a build that exists only on the build machine. |
+| `provenance.release` | The release ID, with the `build_id` syntax, or `null` for a staged build that is not a release. |
+| `provenance.huggingface` | Where the same bytes live on Hugging Face: an object with exactly `repo`, `commit` and `folder`, or `null`. Required (not `null`) for `calibration-diagnostics`. For `orrery-inputs` it may be `null`, for a build that exists only on the build machine. |
+| `provenance.huggingface.repo` | The dataset repo, `owner/name`. Each of the two parts is 1–96 characters with the `build_id` character set, starting with a letter or digit. |
+| `provenance.huggingface.commit` | 40 lowercase hex characters: the full ID of the Hugging Face commit that added the folder, which is the commit that wrote these files there. Never a later commit, a branch or a tag, so the same folder always gives the same submission ID. |
+| `provenance.huggingface.folder` | 1–512 characters: one or more segments joined by `/`, each with the `build_id` syntax. There is no leading or trailing `/`, and no empty, `.` or `..` segment. Each file's Hugging Face path is `<folder>/<name>`. |
 | `files[].name` | A flat file name: `[A-Za-z0-9][A-Za-z0-9._-]{0,191}`, unique within the submission. |
 | `files[].role` | One of the kind's roles below. |
-| `files[].size` | Bytes, at least 1, within the role's limit. |
+| `files[].size` | The file's length in bytes: an integer, at least 1, within the role's limit. The emitter's file entries (its Orrery `PublicationFile` and its bundle hand-over entries) call the same number `bytes`, and a client copies that value here unchanged. |
 | `files[].sha256` | 64 lowercase hex characters. |
+
+The collector compares and hashes every value exactly as sent. Each string
+field is ASCII by its syntax, and the collector applies no case folding,
+trimming or Unicode normalisation.
 
 Unknown fields are refused (422), so a client cannot believe the collector
 recorded something it ignored.
 
 ## Kinds and file roles
-
-The emitter builds submissions from the roles a staged bundle names in its
-typed interface. The calibration roles have the same names there. The Orrery
-inputs are named `orrery_schema`, `execution_overlay`, `orrery_upstream` and
-`orrery_evidence` in a bundle, and the emitter maps them to the roles below.
 
 | Kind | Role | Count | Size limit per file | Consumer |
 |---|---|---|---|---|
@@ -98,15 +101,62 @@ inputs are named `orrery_schema`, `execution_overlay`, `orrery_upstream` and
 | | `build_manifest` | 0 or 1 | 64 MiB | |
 | | `release_manifest` | 0 or 1 | 64 MiB | |
 | | `demographics` | 0 or 1 | 64 MiB | |
-| `orrery-inputs` | `schema` (`graph.schema.json`) | exactly 1 | 64 MiB | Orrery worker (O4) |
-| | `execution_overlay` (`graph.execution.json`) | exactly 1 | 32 MiB | |
-| | `upstream` (`upstream-<sha256>.json`) | 0 or more | 64 MiB | |
-| | `evidence` (native evidence files) | 0 or more | 2 GiB | kept private, never published |
+| `orrery-inputs` | `schema` | exactly 1 | 64 MiB | Orrery worker (O4) |
+| | `execution_overlay` | exactly 1 | 32 MiB | |
+| | `upstream` | 0 or more | 64 MiB | |
+| | `evidence` | 0 or more | 2 GiB | kept private, never published |
 
 The calibration roles are the files the calibration-tree publisher reads for a
 build today. The Orrery roles are the inputs the projection needs
 (`orrery_json_from_schema(schema, execution=overlay)`), plus the native evidence
-files that stay in private intake storage.
+files that stay in private intake storage. Intake checks each file's role,
+count and size, not its name; the Orrery worker (O4) rejects a submission whose
+files it cannot use.
+
+### The roles the emitter sends
+
+The emitter (emitter#27) builds submissions from a staged bundle: each bundle
+file has a role in the bundle hand-over, named in emitter#27's
+`microcosm_emitter_interface`. The emitter sends the contract role in
+`files[].role`; bundle roles never reach the collector.
+
+| Kind | Bundle role | Contract role sent | File Microcosm writes |
+|---|---|---|---|
+| `calibration-diagnostics` | `calibration_diagnostics` | `calibration_diagnostics` | the build's diagnostics file, such as `calibration_diagnostics.json` or `<dataset>.diagnostics.json` |
+| | `build_manifest` | `build_manifest` | `build_manifest.json` |
+| | `release_manifest` | `release_manifest` | `release_manifest.json` |
+| | `demographics` | `demographics` | the build's demographics file |
+| `orrery-inputs` | `orrery_schema` | `schema` | `graph.schema.json` |
+| | `execution_overlay` | `execution_overlay` | `graph.execution.json` |
+| | `orrery_upstream` | `upstream` | `upstream-<sha256>.json` |
+| | `orrery_evidence` | `evidence` | the native evidence files: `execution.evidence.json` and `evidence-<phase>-{graph,manifest,binding,summaries}.json` |
+
+A bundle gives a `calibration-diagnostics` submission when it has a
+`calibration_diagnostics` file, and an `orrery-inputs` submission when it has
+both an `orrery_schema` and an `execution_overlay` file. Its other files, such
+as the dataset and its sidecars, are not submitted.
+
+### The emitter's earlier Orrery publication roles
+
+The emitter's direct Orrery upload to microcosm-runs, which O7 removes, uses
+another set of roles: emitter#22's `PublicationFileRole`. When O7 submits a
+queued upload from that path as `orrery-inputs`, its files map like this:
+
+| `PublicationFileRole` | File | Contract role |
+|---|---|---|
+| `schema` | `graph.schema.json` | `schema` |
+| `upstream` | `upstream-<sha256>.json` | `upstream` |
+| `index` | `execution.evidence.json` | `evidence` |
+| `declaration` | `evidence-<phase>-graph.json` | `evidence` |
+| `manifest` | `evidence-<phase>-manifest.json` | `evidence` |
+| `binding` | `evidence-<phase>-binding.json` | `evidence` |
+| `summaries` | `evidence-<phase>-summaries.json` | `evidence` |
+| `graph` | `graph.orrery.json` | none: the collector projects its own Orrery artifact (O4) |
+
+That path has no execution overlay role: before microcosm#1295, the overlay
+existed only inside `graph.orrery.json`. A queued upload can therefore become
+an `orrery-inputs` submission only once its overlay exists as
+`graph.execution.json`. How O7 obtains the overlay is decided in O7.
 
 ## Limits
 
@@ -131,11 +181,15 @@ means UTF-8, keys sorted, no whitespace, non-ASCII characters escaped.
 
 | Identifier | Derivation |
 |---|---|
-| `inventory_sha256` | SHA-256 of the canonical JSON of `files`, sorted by `name`, each with exactly `name`, `role`, `size`, `sha256` |
-| `submission_id` | `sub-` + the first 32 hex characters of the SHA-256 of the canonical JSON of `{contract_version, kind, licensed_data, provenance, files}` (files sorted by name) |
+| `files_sha256` | SHA-256 of the canonical JSON of `files`, sorted by `name`, each with exactly `name`, `role`, `size`, `sha256` |
+| `submission_id` | `sub-` + the first 32 hex characters of the SHA-256 of the canonical JSON of `{contract_version, kind, licensed_data, provenance, files}` (files sorted by name). The hashed `provenance` always holds all five keys, with `null` written as JSON `null`; `huggingface`, when present, holds exactly its three keys. |
 | `job_id` | `job-` + the first 32 hex characters of the SHA-256 of the canonical JSON of `{submission_id, job_type}`; `job_type` is the kind |
 | Object name | `submissions/<submission_id>/<name>` in the intake bucket |
 | `receipt_sha256` | SHA-256 of the canonical JSON of the receipt without `receipt_sha256` |
+
+`files_sha256` is not the emitter's `inventory_sha256`. That digest covers the
+emitter inventory's `version` and `publication_id` as well as its files, whose
+sizes it calls `bytes`, so the two never match and neither replaces the other.
 
 So the same request always names the same submission, and every request in the
 flow can be retried. A staging submission and a release submission of the same
@@ -179,7 +233,7 @@ creating the same submission gets 403.
   "status": "succeeded",
   "licensed_data": true,
   "provenance": {"…": "as submitted"},
-  "inventory_sha256": "…",
+  "files_sha256": "…",
   "files": [
     {"name": "calibration_diagnostics.json", "role": "calibration_diagnostics",
      "size": 18734221, "sha256": "…", "generation": "1760866403123456"}
