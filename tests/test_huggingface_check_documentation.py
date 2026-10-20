@@ -63,3 +63,16 @@ def test_the_readme_gives_the_schedule_the_absence_alert_relies_on() -> None:
 
     assert "`0 6,18 * * *`" in section
     assert "no execution has succeeded for 23 hours" in section
+
+
+def test_the_readme_says_to_create_the_alert_policies_before_the_first_run() -> None:
+    # A metric-absence condition starts watching only after the job writes a
+    # data point once the policy exists, so policies created after the last
+    # successful run never report a schedule that never starts the job.
+    section = " ".join(readme_section().split())
+
+    assert (
+        "Create the notification channel and both alert policies before the "
+        "job's first execution" in section
+    )
+    assert "at least one data point after the policy is created" in section
