@@ -438,9 +438,9 @@ The dashboard's access to the read secret is set in section 8.1.
   the key ID published in the JWKS doesn't change. Add it to both grant loops
   above: `roles/secretmanager.secretAccessor` for the runtime account and
   `roles/secretmanager.viewer` for the deployment account. The deployment
-  checks that it exists and mounts it as `TELEMETRY_JWT_SIGNING_KEY`, so
-  production's deployment stops at "Check required Secret Manager entries
-  exist" without it.
+  checks that it exists and mounts it as `TELEMETRY_JWT_SIGNING_KEY` in both
+  environments, so without it that environment's deployment stops at "Check
+  required Secret Manager entries exist".
 - **#12's intake:** in the new project, the Cloud Tasks queue, the worker
   job, the recovery job (its three `COLLECTOR_WORKER_*` settings naming the
   new queue, worker job and invoker account), the invoker account, the
@@ -509,8 +509,10 @@ deployment, then production's). From merge to tag this took 25 minutes on
 2026-10-15 and 88 minutes on 2026-10-19 and 2026-10-20, when the
 organization's runners were queued; on 2026-10-20, calibration-diagnostics'
 last collector deploy run took 2 hours 25 minutes in all, of which its staging
-and production deploy jobs ran for 4 and 6 minutes. So plan for about 30
-minutes on a quiet day and 2 to 3 hours when runners are queued, and measure
+and production deploy jobs ran for 4 and 6 minutes. So plan for about 40
+minutes on a quiet day (25 minutes to the tag, about 10 for the two deploy
+jobs, and the export and import) and 2 to 3 hours when runners are queued,
+and measure
 it in staging's window. If #12's intake is switched on, add the wait for its
 worker executions in step 6.2, up to about 3 hours, unless they are cancelled
 or the queue is paused early. The dashboard's collector reads stay down until
