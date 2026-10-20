@@ -224,6 +224,14 @@ act as the worker service account. The schedule, the account it starts the
 job with, and the alert policies are created once by hand; the deploy does not
 change them.
 
+Create the notification channel and both alert policies before the job's
+first execution, then create the schedule and run the job once by hand. A
+metric-absence condition is met only after the job writes at least one data
+point after the policy is created or changed. Policies created after the last
+successful run therefore never report a schedule that cannot start the job,
+and the same holds after either policy is edited until the next successful
+run.
+
 **Switching on the `releases.json` check.** It is off for every dataset. For
 a dataset, it can be switched on once:
 
