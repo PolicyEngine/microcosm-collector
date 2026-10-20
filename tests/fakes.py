@@ -11,13 +11,12 @@ from typing import Any
 
 from telemetry_collector.auth import HuggingFacePrincipal
 from telemetry_collector.intake import (
-    UPLOAD_CONTENT_TYPE,
     IntakeObjectMissingError,
     PlannedUpload,
     SignedUpload,
     StoredObject,
     WorkerQueueUnavailableError,
-    required_upload_headers,
+    upload_instruction_headers,
 )
 from telemetry_collector.models import RunRegistration, TelemetryEvent
 from telemetry_collector.storage import (
@@ -373,10 +372,9 @@ class FakeIntakeObjectStore:
                 name=upload.name,
                 url=f"https://storage.example.test/{upload.object_name}?signed=1",
                 method="PUT",
-                headers={
-                    "Content-Type": UPLOAD_CONTENT_TYPE,
-                    **required_upload_headers(upload.size, upload.sha256),
-                },
+                headers=upload_instruction_headers(
+                    upload.size, upload.sha256, "storage.example.test"
+                ),
                 expires_at=expires_at,
             )
             for upload in uploads

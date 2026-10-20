@@ -190,6 +190,7 @@ def test_creating_a_submission_returns_an_upload_for_every_file(
     assert diagnostics["url"].startswith("https://")
     assert diagnostics["headers"] == {
         "Content-Type": "application/octet-stream",
+        "Host": "storage.example.test",
         "x-goog-meta-sha256": hashlib.sha256(DIAGNOSTICS_BYTES).hexdigest(),
         "x-goog-content-length-range": (
             f"{len(DIAGNOSTICS_BYTES)},{len(DIAGNOSTICS_BYTES)}"

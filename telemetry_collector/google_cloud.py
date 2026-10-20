@@ -12,6 +12,7 @@ from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from urllib.parse import urlsplit
 
 import google.auth
 import requests
@@ -28,6 +29,7 @@ from telemetry_collector.intake import (
     StoredObject,
     WorkerQueueUnavailableError,
     required_upload_headers,
+    upload_instruction_headers,
 )
 
 CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
@@ -82,13 +84,15 @@ class GoogleCloudStorageIntake:
         expires_at = self._clock() + timedelta(seconds=lifetime_seconds)
 
         def sign(upload: PlannedUpload) -> SignedUpload:
-            headers = required_upload_headers(upload.size, upload.sha256)
+            # The library adds Content-Type and Host to the headers it is
+            # given, so it gets its own copy; the instruction lists every
+            # signed header explicitly instead.
             url = self._bucket.blob(upload.object_name).generate_signed_url(
                 version="v4",
                 method="PUT",
                 expiration=timedelta(seconds=lifetime_seconds),
                 content_type=UPLOAD_CONTENT_TYPE,
-                headers=headers,
+                headers=required_upload_headers(upload.size, upload.sha256),
                 service_account_email=self._signing_service_account,
                 access_token=access_token,
             )
@@ -96,7 +100,9 @@ class GoogleCloudStorageIntake:
                 name=upload.name,
                 url=url,
                 method="PUT",
-                headers={"Content-Type": UPLOAD_CONTENT_TYPE, **headers},
+                headers=upload_instruction_headers(
+                    upload.size, upload.sha256, urlsplit(url).netloc
+                ),
                 expires_at=expires_at,
             )
 

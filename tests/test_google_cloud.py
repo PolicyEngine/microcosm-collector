@@ -7,10 +7,13 @@ import io
 import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 import requests
 from google.api_core.exceptions import NotFound
+from google.auth.credentials import AnonymousCredentials
+from google.cloud import storage
 
 from telemetry_collector.google_cloud import (
     CloudTasksWorkerQueue,
@@ -140,11 +143,53 @@ def test_signed_uploads_pin_the_size_digest_and_single_creation() -> None:
     assert signed.url.startswith("https://storage.googleapis.com/")
     assert signed.headers == {
         "Content-Type": "application/octet-stream",
+        "Host": "storage.googleapis.com",
         "x-goog-meta-sha256": "a" * 64,
         "x-goog-content-length-range": "2048,2048",
         "x-goog-if-generation-match": "0",
     }
     assert signed.expires_at == datetime(2026, 10, 20, 9, 30, tzinfo=UTC)
+
+
+def test_upload_instructions_list_every_header_the_real_signature_covers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import google.cloud.storage._signing as signing
+
+    signed_messages: list[tuple[str, str]] = []
+
+    def stand_in_sign_blob(
+        message: str, access_token: str, service_account_email: str, *_: Any
+    ) -> str:
+        # Stands in for the IAM signBlob request the library makes.
+        signed_messages.append((access_token, service_account_email))
+        return base64.b64encode(b"signature").decode()
+
+    monkeypatch.setattr(signing, "_sign_message", stand_in_sign_blob)
+    client = storage.Client(
+        project="example-project", credentials=AnonymousCredentials()
+    )
+    planned = PlannedUpload(
+        name="calibration_diagnostics.json",
+        object_name="submissions/sub-1/calibration_diagnostics.json",
+        size=2048,
+        sha256="a" * 64,
+    )
+
+    [signed] = storage_intake(client).sign_uploads([planned], lifetime_seconds=1800)
+
+    query = parse_qs(urlsplit(signed.url).query)
+    [signed_header_names] = query["X-Goog-SignedHeaders"]
+    assert signed_header_names.split(";") == sorted(
+        name.lower() for name in signed.headers
+    )
+    assert signed_header_names == (
+        "content-type;host;x-goog-content-length-range;"
+        "x-goog-if-generation-match;x-goog-meta-sha256"
+    )
+    assert signed.headers["Host"] == urlsplit(signed.url).netloc
+    assert query["X-Goog-Expires"] == ["1800"]
+    assert signed_messages == [("access-token-1", SIGNER)]
 
 
 def test_signing_refreshes_an_expired_access_token_once() -> None:

@@ -82,6 +82,20 @@ def required_upload_headers(size: int, sha256: str) -> dict[str, str]:
     }
 
 
+def upload_instruction_headers(size: int, sha256: str, host: str) -> dict[str, str]:
+    """Every header a V4 signed upload's signature covers, as the client sends it.
+
+    The signature covers ``Content-Type`` and ``Host`` as well as the required
+    headers, so an upload instruction lists all five.
+    """
+
+    return {
+        "Content-Type": UPLOAD_CONTENT_TYPE,
+        "Host": host,
+        **required_upload_headers(size, sha256),
+    }
+
+
 @dataclass(frozen=True)
 class PlannedUpload:
     """A file the client still has to upload."""
