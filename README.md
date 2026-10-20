@@ -163,6 +163,87 @@ here:
    A command that sets a job's secrets with `--set-secrets` replaces all of
    its mounts, so any such command for these jobs must list this one too.
 
+## Daily Hugging Face check
+
+`python -m telemetry_collector.huggingface_check` runs once a day in
+production as a Cloud Run job, started by Cloud Scheduler. It reads Hugging
+Face with the collector's read token and runs two checks:
+
+1. **Token check.** It requests every dataset in `HUGGINGFACE_DATASETS` once.
+   Any answer but HTTP 200 is a problem, including a redirect or no answer.
+2. **`releases.json` check.** For each dataset whose entry sets
+   `checks_releases_record`, at that dataset's head commit:
+   - there is exactly one `releases.json`, at the root, and no `latest*.json`
+     file anywhere;
+   - the record passes the rules in `microcosm_emitter_interface.releases`,
+     the code the emitter's release writer runs before every write: `current`
+     names a listed build that is not withdrawn, `default` names a listed
+     release, and every listed build has its folder and a
+     `release_manifest.json` naming the same release and build;
+   - every file in a listed build's folder is in that build's manifest and
+     has the SHA-256 the manifest records. Files stored with LFS are compared
+     by the SHA-256 Hugging Face records for their content, without a
+     download; other files are downloaded and hashed.
+
+   The rules that compare one write with the state before it (existing build
+   entries change only `withdrawn`; nothing inside an existing build folder
+   is added, changed or removed) need that earlier state, so only the release
+   writer applies them. The file check above finds any later change to a
+   build's files except a change to its manifest.
+
+**Problems and alerts.** Each problem is one JSON log entry with severity
+`ERROR`, naming the check, the dataset and a code such as `HTTP_404`,
+`UNREACHABLE`, `POINTER_FILE_PRESENT` or `SHA256_MISMATCH`, followed by a
+summary entry. The job then exits 1, or 2 when the token setting itself is
+missing or unusable, so the execution fails. Two Cloud Monitoring alert
+policies email a person through a notification channel: one when an execution
+of the job fails, and one when no execution has succeeded for more than a
+day, so a stopped schedule is noticed too. No log entry includes the token.
+
+**Deployment.** The production deploy runs
+`scripts/deploy.sh configure-huggingface-check-job` before it changes the
+service. It confirms the read token's secret exists, reading only its
+metadata, then deploys the job with the released image, one task, no retries
+and the token as its only secret. A missing secret or account therefore stops
+the deploy before production changes. The job's names come from three
+production environment variables:
+
+| Variable | Value |
+|---|---|
+| `TELEMETRY_HF_CHECK_JOB` | the check job's name |
+| `TELEMETRY_WORKER_SERVICE_ACCOUNT` | the worker service account, the only identity that may read the token |
+| `TELEMETRY_HF_READ_SECRET_NAME` | the read token's Secret Manager secret |
+
+Staging has no check job: there is one token and one schedule. The deployment
+service account needs metadata read access to the secret and permission to
+act as the worker service account. The schedule, the account it starts the
+job with, and the alert policies are created once by hand; the deploy does not
+change them.
+
+**Switching on the `releases.json` check.** It is off for every dataset. For
+a dataset, it can be switched on once:
+
+1. the microcosm-emitter-interface package, with
+   `microcosm_emitter_interface.releases` (PolicyEngine/microcosm-emitter#24),
+   is published and added to this collector's dependencies;
+2. Microcosm's new release manifest is defined, and `manifest_file_digests`
+   reads its file list as defined there. Until then it reads a `files` list
+   of entries with `name` and `sha256`, the fields of the interface package's
+   `ReleaseFile`;
+3. the dataset publishes builds side by side with `releases.json`, and its
+   `latest*.json` files are deleted. Before that, the check would report them
+   every day.
+
+Then one change sets `checks_releases_record=True` on that dataset's entry.
+`tests/test_releases_record_check.py` tests the check against the real rules,
+and is skipped until the package is installed. To run it now against a
+checkout of PolicyEngine/microcosm-emitter:
+
+```bash
+uv run --with ../microcosm-emitter/packages/microcosm-emitter-interface \
+  python -m pytest tests/test_releases_record_check.py
+```
+
 ## Releases
 
 Every pull request needs a changelog fragment, `changelog.d/<name>.<type>.md`,
