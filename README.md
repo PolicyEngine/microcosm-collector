@@ -165,9 +165,10 @@ here:
 
 ## Daily Hugging Face check
 
-`python -m telemetry_collector.huggingface_check` runs once a day in
-production as a Cloud Run job, started by Cloud Scheduler. It reads Hugging
-Face with the collector's read token and runs two checks:
+`python -m telemetry_collector.huggingface_check` runs in production as a
+Cloud Run job, started by Cloud Scheduler at 06:00 and 18:00 UTC
+(`0 6,18 * * *`). It reads Hugging Face with the collector's read token and
+runs two checks:
 
 1. **Token check.** It requests every dataset in `HUGGINGFACE_DATASETS` once.
    Any answer but HTTP 200 is a problem, including a redirect or no answer.
@@ -197,8 +198,11 @@ Face with the collector's read token and runs two checks:
 summary entry. The job then exits 1, or 2 when the token setting itself is
 missing or unusable, so the execution fails. Two Cloud Monitoring alert
 policies email a person through a notification channel: one when an execution
-of the job fails, and one when no execution has succeeded for more than a
-day, so a stopped schedule is noticed too. No log entry includes the token.
+of the job fails, and one when no execution has succeeded for 23 hours, so a
+stopped schedule is noticed too. Cloud Monitoring limits how long a metric may
+be absent before it alerts to about a day, which is why the check runs twice
+a day: the second alert then means two runs in a row did not succeed. No log
+entry includes the token.
 
 **Deployment.** The production deploy runs
 `scripts/deploy.sh configure-huggingface-check-job` before it changes the
