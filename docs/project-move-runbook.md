@@ -270,8 +270,13 @@ Match the record's IP configuration (Cloud Run connects through the Cloud SQL
 connector, so a public IP needs no authorized networks), SSL mode, database
 flags, maintenance window and point-in-time recovery.
 
-Create the two users with the **same names** as on the old instance, so the
-ownership and `GRANT` statements in the export apply, and new random passwords:
+Create every user the step 3.2 record lists, except `postgres`, with the
+**same names** as on the old instance and new random passwords. Google's import
+guide says every user that owns objects or was granted permissions on objects
+in the dumped database must exist on the target instance, or the import
+fails. Besides the migration and runtime users, production's instance lists
+`telemetry_app` today, which the collector doesn't use; give it a random
+password that isn't kept.
 
 ```bash
 migration_password="$(openssl rand -hex 32)"
@@ -280,6 +285,9 @@ gcloud sql users create "$MIGRATION_DATABASE_USER" --instance "$NEW_INSTANCE" \
   --project "$NEW_PROJECT_ID" --password "$migration_password"
 gcloud sql users create "$RUNTIME_DATABASE_USER" --instance "$NEW_INSTANCE" \
   --project "$NEW_PROJECT_ID" --password "$runtime_password"
+# Production only, and any other user the record lists:
+gcloud sql users create telemetry_app --instance "$NEW_INSTANCE" \
+  --project "$NEW_PROJECT_ID" --password "$(openssl rand -hex 32)"
 ```
 
 Keep the two password variables in this shell for step 5.3. Then recreate what
@@ -313,7 +321,7 @@ First see the form of the old value with its credentials hidden:
 
 ```bash
 gcloud secrets versions access latest --secret "$DATABASE_SECRET_NAME" --project "$OLD_PROJECT_ID" \
-  | sed -E 's#//[^@]*@#//USER:PASSWORD@#'
+  | sed -E 's#//.*@#//USER:PASSWORD@#'
 ```
 
 Build the new values in the same form. For the usual Cloud SQL socket form:
@@ -394,7 +402,9 @@ Before production's window, export the production database with `--offload`
 instance), import it into the new instance as in step 6.3, and note both
 durations. Then delete and re-create the new database
 (`gcloud sql databases delete`, then `create`), so the window's import starts
-empty. Staging's window gives the same timings for staging's size.
+empty, and grant the database-level privileges from step 5.2 again: deleting
+the database drops them. Staging's window gives the same timings for staging's
+size.
 
 ## 6. The window
 
@@ -477,7 +487,8 @@ On both instances, as the migration user:
 - `SELECT count(*)` on every table in the `public` schema gives the same
   counts. At revision `0001` these are `telemetry_runs`, `telemetry_producers`
   and `telemetry_events`; later migrations add more.
-- `\dp public.*` and `\ddp` match the step 3.2 record.
+- `\l`, `\dp public.*` and `\ddp` match the step 3.2 record, so the
+  database-level, table and default privileges all came across.
 
 If anything differs, stop and roll back (section 10, first row).
 
@@ -775,7 +786,8 @@ after an agreed holding period:
 | `PRODUCTION_COLLECTOR_URL`, `TRUSTED_COLLECTOR_ORIGINS` | emitter source (`core/constants.py`) | every emitter service module | the hostname, by an emitter release |
 
 **Unverified:** nothing in this runbook has been run. The current deployment
-account's roles, the database roles and privileges, and the dashboard
+account's roles, the database roles and privileges (including whether
+production's `telemetry_app` owns or holds anything), and the dashboard
 identity's bindings were not read for it (they are recorded in step 3.2).
 Whether a workflow re-run reads changed environment values is unchecked (step
 6.6). Every setting above needs checking end to end in the staging pass.
