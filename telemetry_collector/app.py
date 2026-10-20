@@ -32,6 +32,11 @@ from telemetry_collector.models import (
     PageCursor,
     RunRegistration,
 )
+from telemetry_collector.session_tokens import (
+    SIGNING_KEY_VARIABLE,
+    SessionSigningKey,
+    verify_session_token,
+)
 from telemetry_collector.storage import (
     PostgresTelemetryStore,
     RunRegistrationConflictError,
@@ -43,8 +48,12 @@ from telemetry_collector.storage import (
 class CollectorSettings:
     """Secrets and policy read once when the collector starts."""
 
-    jwt_secret: str
+    # The HS256 secret. It signs new session tokens only while no signing key
+    # is configured, and verifies HS256 tokens for as long as it is configured.
+    jwt_secret: str | None
     read_token: str
+    # The ES256 key that signs new session tokens once it is configured.
+    signing_key: SessionSigningKey | None = None
     required_huggingface_org: str = "policyengine"
     collector_issuer: str = "policyengine-telemetry"
     collector_audience: str = "microcosm-telemetry-collector"
@@ -53,9 +62,14 @@ class CollectorSettings:
 
     @classmethod
     def from_environment(cls) -> CollectorSettings:
-        jwt_secret = _required_environment("TELEMETRY_JWT_SECRET")
+        jwt_secret = _optional_environment("TELEMETRY_JWT_SECRET")
+        signing_key_pem = _optional_environment(SIGNING_KEY_VARIABLE)
         read_token = _required_environment("TELEMETRY_READ_TOKEN")
-        if len(jwt_secret) < 32:
+        if jwt_secret is None and signing_key_pem is None:
+            raise RuntimeError(
+                f"{SIGNING_KEY_VARIABLE} or TELEMETRY_JWT_SECRET is required."
+            )
+        if jwt_secret is not None and len(jwt_secret) < 32:
             raise RuntimeError(
                 "TELEMETRY_JWT_SECRET must contain at least 32 characters."
             )
@@ -63,9 +77,18 @@ class CollectorSettings:
             raise RuntimeError(
                 "TELEMETRY_READ_TOKEN must contain at least 24 characters."
             )
+        try:
+            signing_key = (
+                None
+                if signing_key_pem is None
+                else SessionSigningKey.from_pem(signing_key_pem)
+            )
+        except ValueError as error:
+            raise RuntimeError(str(error)) from None
         return cls(
             jwt_secret=jwt_secret,
             read_token=read_token,
+            signing_key=signing_key,
             required_huggingface_org=os.environ.get("TELEMETRY_HF_ORG", "policyengine"),
             collector_issuer=os.environ.get(
                 "TELEMETRY_JWT_ISSUER", "policyengine-telemetry"
@@ -78,6 +101,10 @@ class CollectorSettings:
             ),
             maintenance_mode=os.environ.get("TELEMETRY_MAINTENANCE_MODE") == "1",
         )
+
+    def __post_init__(self) -> None:
+        if self.signing_key is None and self.jwt_secret is None:
+            raise ValueError("Session tokens need a signing key or an HS256 secret.")
 
 
 @dataclass(frozen=True)
@@ -177,10 +204,14 @@ class MaintenanceModeMiddleware:
 
 
 def _required_environment(name: str) -> str:
-    value = os.environ.get(name, "").strip()
-    if not value:
+    value = _optional_environment(name)
+    if value is None:
         raise RuntimeError(f"{name} is required.")
     return value
+
+
+def _optional_environment(name: str) -> str | None:
+    return os.environ.get(name, "").strip() or None
 
 
 def _bearer_token(value: str | None) -> str:
@@ -255,13 +286,12 @@ def _decode_token(
 ) -> dict[str, Any]:
     token = _bearer_token(authorization)
     try:
-        return jwt.decode(
+        return verify_session_token(
             token,
-            settings.jwt_secret,
-            algorithms=["HS256"],
+            signing_key=settings.signing_key,
+            hs256_secret=settings.jwt_secret,
             issuer=settings.collector_issuer,
             audience=settings.collector_audience,
-            options={"require": ["aud", "exp", "iat", "iss", "scope", "sub"]},
         )
     except InvalidTokenError as error:
         raise HTTPException(

@@ -1,4 +1,10 @@
-"""Keys that sign and verify the collector's session tokens."""
+"""Keys that sign and verify the collector's session tokens.
+
+Once an ES256 key is configured it signs every new token, and its public half
+is published as a JWKS. While the HS256 secret is also configured, tokens
+signed with it are still accepted, so tokens issued before the switch keep
+working until they expire. Removing the secret retires HS256.
+"""
 
 from __future__ import annotations
 
@@ -6,14 +12,18 @@ import base64
 import hashlib
 import json
 from dataclasses import dataclass, field
+from typing import Any
 
+import jwt
 from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
 ES256 = "ES256"
+HS256 = "HS256"
 SIGNING_KEY_VARIABLE = "TELEMETRY_JWT_SIGNING_KEY"
 P256_COORDINATE_BYTES = 32
+REQUIRED_CLAIMS = ["aud", "exp", "iat", "iss", "scope", "sub"]
 
 
 def _base64url(value: bytes) -> str:
@@ -83,3 +93,44 @@ class SessionSigningKey:
             "use": "sig",
             "alg": ES256,
         }
+
+
+def verify_session_token(
+    token: str,
+    *,
+    signing_key: SessionSigningKey | None,
+    hs256_secret: str | None,
+    issuer: str,
+    audience: str,
+) -> dict[str, Any]:
+    """Return a session token's claims, or raise ``jwt.InvalidTokenError``.
+
+    The header's algorithm chooses the key, and decoding then allows only that
+    algorithm, so no key is ever checked as another kind (such as the
+    published public key used as an HS256 secret). ES256 needs the configured
+    key's ID in the header; HS256 needs the HS256 secret to be configured.
+    """
+
+    header = jwt.get_unverified_header(token)
+    algorithm = header.get("alg")
+    verification_key: ec.EllipticCurvePublicKey | str
+    if (
+        algorithm == ES256
+        and signing_key is not None
+        and header.get("kid") == signing_key.key_id
+    ):
+        verification_key = signing_key.public_key
+    elif algorithm == HS256 and hs256_secret is not None:
+        verification_key = hs256_secret
+    else:
+        raise jwt.InvalidTokenError(
+            "The session token's algorithm or key ID is not accepted."
+        )
+    return jwt.decode(
+        token,
+        verification_key,
+        algorithms=[algorithm],
+        issuer=issuer,
+        audience=audience,
+        options={"require": REQUIRED_CLAIMS},
+    )
