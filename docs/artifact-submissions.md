@@ -407,12 +407,19 @@ latest processing round.
   bucket-level access with public access prevention enforced, and only the
   collector's own service accounts can read it. A signed URL allows only the
   upload of one object of one size.
-- **`licensed_data: true` keeps derived outputs private.** Workers record every
-  output derived from such a submission with visibility `private`, and never
-  make it public themselves; it becomes public only after output clearance
-  (decision D5). `licensed_data` has no default, so a producer must state it.
+- **Orrery outputs of licensed builds stay private until cleared.** The Orrery
+  worker (O4) records every Orrery artifact derived from a submission with
+  `licensed_data: true` with visibility `private`, and never makes it public
+  itself; it becomes public only after output clearance (decision D5). Orrery
+  artifacts from submissions with `licensed_data: false` may be public.
+- **Calibration data may be public, licensed or not.** Calibration trees built
+  from a `calibration-diagnostics` submission (K4) may be published publicly,
+  including when `licensed_data` is `true` (decision D10).
 - **Native evidence is never published,** whatever `licensed_data` says. Public
   Orrery artifacts do not link to it (O4).
+- **`licensed_data` has no default,** so a producer must state it. The worker
+  framework applies these rules for every handler, so K4 and O4 never derive
+  them again.
 - **Status and receipts go only to the submitting user,** and hold names,
   sizes and digests, never file contents.
 
