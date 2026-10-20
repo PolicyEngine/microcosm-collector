@@ -61,6 +61,7 @@ DATABASE_SECRET_NAME=$(collector_variable TELEMETRY_DATABASE_SECRET_NAME)
 MIGRATION_DATABASE_SECRET_NAME=$(collector_variable TELEMETRY_MIGRATION_DATABASE_SECRET_NAME)
 JWT_SECRET_NAME=$(collector_variable TELEMETRY_JWT_SECRET_NAME)
 READ_SECRET_NAME=$(collector_variable TELEMETRY_READ_SECRET_NAME)
+HF_CHECK_JOB=$(collector_variable TELEMETRY_HF_CHECK_JOB)   # production, once #19 has merged
 
 # Names are scoped to a project, so the new resources can reuse the old ones.
 NEW_INSTANCE=$OLD_INSTANCE
@@ -413,11 +414,13 @@ The dashboard's access to the read secret is set in section 8.1.
 - **S2's daily check (#19), production only:** the worker service account
   (the one that may read S1's token), with `roles/iam.serviceAccountUser` on
   it for the deployment account; `roles/secretmanager.viewer` on S1's secret
-  for the deployment account; the Cloud Scheduler job that starts the check at
-  06:00 and 18:00 UTC and the account it uses; the notification channel and
-  both alert policies, as in the README. The deployment configures the check
-  job itself, before it changes the service, and fails there until these
-  exist.
+  for the deployment account; the account Cloud Scheduler starts the check
+  as; the notification channel and both alert policies, as in the README.
+  Production's deployment configures the check job itself, before it changes
+  the service, and stops at that step without S1's secret, the worker
+  account, or either of the deployment account's two roles. The channel and
+  the policies don't affect the deployment. Create the schedule in step 6.7,
+  once the deployment has created the job.
 
 ### 5.4 Create the Cloud Run service once
 
@@ -665,6 +668,38 @@ minutes have passed since its last dispatch, or fails it if it has already
 been dispatched three times. The old queue and schedule stay paused until
 section 11.
 
+**S2's daily check (#19), in production's window:** production's deployment
+has created the check job in the new project. Create its schedule, then run
+the job once by hand and wait for it:
+
+```bash
+gcloud scheduler jobs create http HF_CHECK_SCHEDULE --location "$REGION" --project "$NEW_PROJECT_ID" \
+  --schedule '0 6,18 * * *' --time-zone Etc/UTC \
+  --uri "https://run.googleapis.com/v2/projects/$NEW_PROJECT_ID/locations/$REGION/jobs/$HF_CHECK_JOB:run" \
+  --http-method post --oauth-service-account-email HF_CHECK_SCHEDULER_ACCOUNT
+gcloud run jobs execute "$HF_CHECK_JOB" --region "$REGION" --project "$NEW_PROJECT_ID" --wait
+```
+
+The execution must succeed. The README says a metric-absence condition "is
+met only after the job writes at least one data point after the policy is
+created", so until this run the new "no successful execution for 23 hours"
+policy can't report a stopped schedule.
+
+Then stop the old project's check, alerts first:
+
+```bash
+for old_alert_policy in OLD_FAILURE_POLICY OLD_ABSENCE_POLICY; do
+  gcloud monitoring policies update "$old_alert_policy" --no-enabled --project "$OLD_PROJECT_ID"
+done
+gcloud scheduler jobs pause HF_CHECK_SCHEDULE --location "$REGION" --project "$OLD_PROJECT_ID"
+```
+
+The two policy names are in the step 3.2 record. Disable the policies before
+pausing the schedule, and do both before section 11 removes the old check job
+or revokes S1's old token. Otherwise the old project emails false alerts:
+the failure policy at the next failed run, and the absence policy 23 hours
+after the last successful one.
+
 ## 7. The hostname and DNS
 
 Records at Cloudflare must be "DNS only". If the zone ever gets CAA records,
@@ -856,6 +891,9 @@ For each environment:
   events in the build monitor.
 - The old service answers as choice 7 says: `503` in maintenance mode, or
   `/ready` when kept serving.
+- If #19 has merged: step 6.7's execution of the check job succeeded, the
+  old project's two alert policies are disabled, and its check schedule is
+  paused.
 
 ## 10. Rollback
 
@@ -864,7 +902,7 @@ the moment the old service entered maintenance mode.
 
 | Situation | What to do |
 |---|---|
-| In the window, before section 8 | Route the old service back: `gcloud run services update-traffic "$SERVICE" --project "$OLD_PROJECT_ID" --region "$REGION" --to-revisions "PREVIOUS_REVISION=100"`, with the revision recorded in step 3.2. Set the GitHub environment values back to the step 3.2 record. If step 6.2 paused #12's queue and recovery schedule, resume them (`gcloud tasks queues resume`, `gcloud scheduler jobs resume`). Builds kept their events and deliver them to the old service, except builds on a machine discarded when the build ended, such as a Modal container, which lost the events not sent by then. |
+| In the window, before section 8 | Route the old service back: `gcloud run services update-traffic "$SERVICE" --project "$OLD_PROJECT_ID" --region "$REGION" --to-revisions "PREVIOUS_REVISION=100"`, with the revision recorded in step 3.2. Set the GitHub environment values back to the step 3.2 record. If step 6.2 paused #12's queue and recovery schedule, resume them (`gcloud tasks queues resume`, `gcloud scheduler jobs resume`). If step 6.7 ran, pause the schedules it created in the new project and disable the new alert policies; for #19, resume the old check schedule and enable the old policies again (`--enabled`). Builds kept their events and deliver them to the old service, except builds on a machine discarded when the build ended, such as a Modal container, which lost the events not sent by then. |
 | A deployment into the new project fails | As in calibration-diagnostics#233: before the migration step, fix and re-run the failed jobs. The new service isn't in use yet, so the first row also applies. |
 | After the dashboard switched (8.1), before the emitter release (8.2) | Builds still use only the old address. If the old service was in maintenance mode the whole time, nothing new is in the new database: do the first row, then set the dashboard's settings back and redeploy it. If the old service was kept serving against the new database (8.4), new events are in the new database: do the next row. |
 | After the emitter release | New events are in the new database. Put the new service in maintenance mode (step 6.2's commands with the new project), export the new database, import it into a fresh database on the old instance (drop and re-create the old database first, or import under a new name and update the old runtime database secret), route the old service back to its pre-move revision, set the GitHub and dashboard settings back, and release the emitter with the old `PRODUCTION_COLLECTOR_URL` (the old origin is still trusted, so only that constant changes). Builds that started on the new default keep it until they finish, and keep their events locally while the new service is in maintenance mode. |
