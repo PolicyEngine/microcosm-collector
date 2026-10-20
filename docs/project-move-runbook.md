@@ -1230,13 +1230,33 @@ after an agreed holding period:
 | Dashboard settings | calibration-diagnostics GitHub `Production` environment and the Vercel project | see section 8.1 | see section 8.1 |
 | `PRODUCTION_COLLECTOR_URL`, `TRUSTED_COLLECTOR_ORIGINS` | emitter source (`core/constants.py`) | every emitter service module | the hostname, by an emitter release |
 
-**Unverified:** nothing in this runbook has been run. The current deployment
-account's roles, the database roles and privileges (including whether
-production's `telemetry_app` owns or holds anything, and whether the old
-users are members of `cloudsqlsuperuser`), and the dashboard
-identity's bindings were not read for it (they are recorded in step 3.2).
-Whether a workflow re-run reads changed environment values is unchecked (step
-6.6). Every setting above needs checking end to end in the staging pass.
+**Unverified before the staging window.** Nothing in this runbook has been
+run against Cloud SQL or the new project. Still open:
+
+- **Whether `postgres` may change a user Cloud SQL made** with `ALTER ROLE`,
+  which PostgreSQL 16 allows only with `ADMIN OPTION` on that user. Step
+  5.2's check on staging's new instance settles it, and gives the fallback.
+- **Database owners:** who owns a database that `gcloud sql databases create`
+  makes, and the old databases' owners, `public` privileges, roles, grants and
+  memberships (including whether production's `telemetry_app` owns or holds
+  anything). These need a database connection; step 3.2 records the old ones,
+  and step 5.2 compares the new database before any import.
+- **VPC Service Controls:** whether either project is inside a service
+  perimeter, which could block access between them: the new accounts' access
+  to the old intake bucket (step 5.3), and the old project's image reads from
+  the new Artifact Registry store (step 4.1). Checking needs
+  organization-level access.
+- **Project liens:** whether `policyengine-api` has a lien that stops it being
+  deleted, which matters if the intake bucket stays there. Listing liens needs
+  `gcloud alpha resource-manager liens list`.
+- **#12's deployment wiring,** not yet written: its GitHub variable names
+  (step 6.5, this table), and whether it grants storage roles on the bucket or
+  on the project (step 3.2).
+- The current deployment account's roles and the dashboard identity's bindings
+  (recorded in step 3.2), and whether a workflow re-run reads changed
+  environment values (step 6.6).
+
+Every setting above needs checking end to end in the staging pass.
 
 ## 13. Code changes that go with this runbook (not yet written)
 
