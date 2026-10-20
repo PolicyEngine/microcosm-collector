@@ -1,3 +1,10 @@
+## [0.3.1] - 2026-10-20
+
+### Fixed
+
+- Refuse to carry over `telemetry-service/` changes when the recorded extraction is not in the history of `HEAD`: `tools/extract-from-calibration-diagnostics.sh` exited successfully after a squash-merged or rebase-merged carry-over pull request, although merging its output would add the carried-over commits a second time. Carry-over pull requests must be merged with a merge commit; the README describes the rule and how to recover.
+
+
 ## [0.3.0] - 2026-10-19
 
 ### Added
