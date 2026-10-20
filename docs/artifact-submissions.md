@@ -212,7 +212,8 @@ an `orrery-inputs` submission only once its overlay exists as
 | Files per submission | 256 | Keeps the inventory and the response, with one signed URL per file, well under 1 MiB; the emitter reads at most 1 MiB of any response. |
 | Total size per submission | 8 GiB | Bounds one worker job. |
 | Signed URL lifetime | 30 minutes | A client that runs out of time creates the submission again for fresh URLs; the request is idempotent. |
-| Job attempts | 3 | After the third failure that is not a rejection, the job is `failed`. |
+| Job attempts | 3 per processing round | See "Attempts, dispatches and recovery". |
+| Worker dispatches | 3 per processing round | See "Attempts, dispatches and recovery". |
 
 ### Signed uploads
 
@@ -242,7 +243,8 @@ means UTF-8, keys sorted, no whitespace, non-ASCII characters escaped.
 |---|---|
 | `files_sha256` | SHA-256 of the canonical JSON of `files`, sorted by `name`, each with exactly `name`, `role`, `size`, `sha256` |
 | `submission_id` | `sub-` + the first 32 hex characters of the SHA-256 of the canonical JSON of `{contract_version, kind, licensed_data, provenance, files}` (files sorted by name). The hashed `provenance` always holds all five keys, with `null` written as JSON `null`; `huggingface`, when present, holds exactly its three keys. |
-| `job_id` | `job-` + the first 32 hex characters of the SHA-256 of the canonical JSON of `{submission_id, job_type}`; `job_type` is the kind |
+| `job_id` | `job-` + the first 32 hex characters of the SHA-256 of the canonical JSON of `{submission_id, job_type, processing_round}`. `job_type` is the kind. `processing_round` is `1` for the job completion records, and one more for each reprocessing (see "Reprocessing"). |
+| Cloud Task name | `<job_id>-<dispatch number>`, counting dispatches from 1 within the job |
 | Object name | `submissions/<submission_id>/<name>` in the intake bucket |
 | `receipt_sha256` | SHA-256 of the canonical JSON of the receipt without `receipt_sha256` |
 
@@ -261,11 +263,14 @@ creating the same submission gets 403.
 | Status | Meaning | Final |
 |---|---|---|
 | `awaiting_upload` | Recorded; files may still be missing. | no |
-| `queued` | Completion found every object with the declared size and recorded digest; a job is recorded. Also the status between a failed attempt and the next one. | no |
+| `queued` | Completion found every object with the declared size and recorded digest; a job is recorded. Also the status between a failed attempt and the next one, and after an operator asks for reprocessing. | no |
 | `processing` | A worker holds the job. | no |
 | `succeeded` | The worker matched every file's SHA-256 and the kind's handler finished. | yes |
 | `rejected` | A stored object or its bytes did not match the inventory, or the handler refused the content. Repeating the same submission cannot succeed. | yes |
-| `failed` | The handler failed for another reason on every attempt. An operator can re-run it. | yes |
+| `failed` | The job failed for another reason on its last attempt, or did not finish within its attempts or dispatches. An operator can reprocess it. | yes |
+
+Final means final for the client: only an operator's reprocessing returns a
+final submission to `queued`.
 
 ## Responses
 
@@ -307,7 +312,8 @@ Create, completion and status answer with the submission's status document:
 - **Timestamps** are ISO 8601 in UTC with an explicit `+00:00` offset.
   `accepted_at` and `finished_at` stay `null` until the submission gets there.
 - **`job`** is `null` until completion records a job, then
-  `{"job_id": "job-…", "attempts": 0}`, counting the worker's attempts so far.
+  `{"job_id": "job-…", "processing_round": 1, "attempts": 0}` for the
+  current processing round, counting the worker's attempts in that round.
 - **`rejection`** is `null` unless the status is `rejected` or `failed`, and
   then `{"code": …, "message": …}` (see "Receipt").
 - **`uploads`** is only in create responses. It holds one instruction for each
@@ -371,7 +377,7 @@ Every error body has a `detail` message. Errors specific to intake also have a
   "created_at": "…",
   "accepted_at": "…",
   "finished_at": "…",
-  "job": {"job_id": "job-…", "attempts": 1},
+  "job": {"job_id": "job-…", "processing_round": 1, "attempts": 1},
   "result": {"…": "the handler's output, for example the published build's reference"},
   "rejection": null,
   "receipt_sha256": "…"
@@ -388,10 +394,12 @@ completion, which never had a job. The collector's own codes are:
 | `content_mismatch` | `rejected` | The worker read bytes that differ from the inventory. |
 | `object_missing` | `rejected` | The worker found an object gone at its recorded generation. |
 | `worker_error` | `failed` | The last attempt failed with an error that was not a rejection. |
-| `attempts_exhausted` | `failed` | The job did not finish within its attempts. |
+| `attempts_exhausted` | `failed` | The job's last attempt ended without recording a result. |
+| `worker_unavailable` | `failed` | No worker execution finished the job within its dispatches. |
 
 A handler may reject with its own code. The emitter stores the receipt beside
-its queued upload.
+its queued upload. The receipt of a reprocessed submission describes its
+latest processing round.
 
 ## Disclosure
 
@@ -417,4 +425,40 @@ generation. A handler returns a JSON result, which goes into the receipt, or
 refuses the content, which rejects the submission. The calibration-tree worker
 (K4) and the Orrery worker (O4) register the handlers for their kinds. Until
 they do, both kinds only have their bytes checked and are kept in intake
-storage, with the result `{"processed_by": "intake-only", "verified_files": <count>}`.
+storage, with the result `{"processed_by": "intake-only", "verified_files": <count>}`;
+an operator reprocesses them once a handler exists.
+
+### Attempts, dispatches and recovery
+
+- **A dispatch** creates one Cloud Task, named `<job_id>-<dispatch number>`,
+  which starts one execution of the worker job. A task name can be used only
+  once, so repeating a dispatch never starts a second execution.
+- **An attempt** is one claim of the job by a worker. A claim leases the job
+  for 65 minutes, longer than the worker job's one-hour task timeout, so a
+  lease expires only after its attempt has ended. Cloud Run runs a failed task
+  up to twice more within the same execution, and each of those runs is a new
+  attempt by the same lease holder.
+- **Limits:** 3 attempts and 3 dispatches in each processing round. An error
+  on the third attempt fails the job with `worker_error`.
+- **Recovery** runs every 10 minutes and finds attempts that ended without
+  recording a result, such as a memory kill, a task timeout, or an execution
+  that exited before claiming its job:
+  - A job whose lease expired after its third attempt is `failed` with
+    `attempts_exhausted`. With fewer attempts, it is queued and dispatched
+    again.
+  - A queued job with no claim, release or dispatch for 30 minutes is
+    dispatched again.
+  - A job that would need a fourth dispatch is `failed` with
+    `worker_unavailable`.
+
+  So every job reaches a final status within its 3 attempts or 3 dispatches.
+
+### Reprocessing
+
+An operator can reprocess any final submission that has recorded object
+generations, which excludes one rejected at completion. Reprocessing records a
+new job with the next `processing_round`, which reads the same object
+generations, and returns the submission to `queued`. Earlier jobs and their
+results stay recorded. This is how stored Orrery inputs are projected again
+when the projection or Orrery changes, and how intake-only submissions are
+processed once K4 or O4 registers a handler.
