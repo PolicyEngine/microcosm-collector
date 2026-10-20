@@ -191,7 +191,9 @@ The plan's constraints:
   settings name the old project, so merge #234 before the move, or never
   dispatch that workflow afterwards.
 - The new project has to include whatever has merged by then: #12's intake
-  resources, S1's secret and its mount, C5's signing key.
+  resources (including its recovery job and schedule), S1's secret and its
+  mount, C5's signing key, and S2's daily check job, schedule and alert
+  policies (#19).
 
 If both D2 and D3 are adopted, there are two orders:
 

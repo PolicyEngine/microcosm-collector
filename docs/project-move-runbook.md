@@ -84,10 +84,16 @@ from the old instance in step 3.2.
 - PolicyEngine/microcosm-emitter#29 has merged, so changing the emitter's
   default is a constant change (section 8.2).
 - List what has merged here that needs its own resources in the new project,
-  and add those steps where this runbook marks them: #12's artifact intake (a
-  bucket, a Cloud Tasks queue, a worker job and their permissions, as in the
-  README's "Artifact intake" section), S1's Hugging Face read token (#13), and
-  C5's session signing key.
+  and add those steps where this runbook marks them:
+  - #12's artifact intake: a bucket, a Cloud Tasks queue, the worker job, the
+    recovery job and its Cloud Scheduler job, the invoker account and their
+    permissions, as in the README's "Artifact intake" section;
+  - S1's Hugging Face read token (#13, PR #18);
+  - C5's session signing key (#16), a fifth Secret Manager secret per
+    environment;
+  - S2's daily check (#19): production's check job, its Cloud Scheduler job
+    and the account that job runs as, a notification channel and two Cloud
+    Monitoring alert policies, and three production variables.
 
 ### 3.2 Record the current state
 
@@ -150,8 +156,10 @@ gcloud services enable run.googleapis.com sqladmin.googleapis.com \
 ```
 
 Also enable `compute.googleapis.com` and `certificatemanager.googleapis.com`
-for a load balancer (D3 C), and `cloudtasks.googleapis.com` if #12's intake is
-switched on.
+for a load balancer (D3 C); `cloudtasks.googleapis.com` and
+`cloudscheduler.googleapis.com` if #12's intake is switched on; and
+`cloudscheduler.googleapis.com` and `monitoring.googleapis.com` if #19's daily
+check has merged.
 
 ### 4.1 Artifact Registry
 
@@ -372,13 +380,27 @@ The dashboard's access to the read secret is set in section 8.1.
   Hugging Face, store that, and revoke the old token in section 11. Grant
   `roles/secretmanager.secretAccessor` only to the account the worker jobs run
   as, and mount it into the worker jobs as `COLLECTOR_HF_READ_TOKEN`.
-- **C5's session signing key:** copy it the same way, so tokens signed before
-  the move verify afterwards and the key ID published in the JWKS doesn't
-  change.
-- **#12's intake:** the bucket, queue, worker job, invoker account and
-  permissions from the README's "Artifact intake" section, in the new project.
-  Copy the intake objects in the window (step 6.3), and check whether stored
-  submission rows name the bucket.
+- **C5's session signing key (#16):** create the secret named by
+  `TELEMETRY_JWT_SIGNING_KEY_SECRET_NAME` in the new project and copy its
+  value the same way, so tokens signed before the move verify afterwards and
+  the key ID published in the JWKS doesn't change. Add it to both grant loops
+  above: `roles/secretmanager.secretAccessor` for the runtime account and
+  `roles/secretmanager.viewer` for the deployment account. The deployment
+  checks that it exists and mounts it as `TELEMETRY_JWT_SIGNING_KEY`, so
+  production's deployment stops at "Check required Secret Manager entries
+  exist" without it.
+- **#12's intake:** the bucket, queue, worker job, recovery job and its Cloud
+  Scheduler job, invoker account and permissions from the README's "Artifact
+  intake" section, in the new project. Copy the intake objects in the window
+  (step 6.3), and check whether stored submission rows name the bucket.
+- **S2's daily check (#19), production only:** the worker service account
+  (the one that may read S1's token), granted to the deployment account with
+  `roles/iam.serviceAccountUser`; `roles/secretmanager.viewer` on S1's secret
+  for the deployment account; the Cloud Scheduler job that starts the check at
+  06:00 and 18:00 UTC and the account it uses; the notification channel and
+  both alert policies, as in the README. The deployment configures the check
+  job itself, before it changes the service, and fails there until these
+  exist.
 
 ### 5.4 Create the Cloud Run service once
 
@@ -461,7 +483,19 @@ sleep 35
 ```
 
 The `curl` must print `503`, as `resolve-and-verify-maintenance` checks. The
-pause outlasts the 30-second request timeout, so no write is still running.
+pause outlasts the 30-second request timeout, so no request to the service is
+still writing.
+
+**If #12's intake is switched on,** its worker job and its recovery job also
+write to the database, and maintenance mode doesn't stop them. Pause what
+starts them, in the old project, and wait until no execution is running:
+
+```bash
+gcloud tasks queues pause WORKER_QUEUE --location "$REGION" --project "$OLD_PROJECT_ID"
+gcloud scheduler jobs pause RECOVERY_SCHEDULE --location "$REGION" --project "$OLD_PROJECT_ID"
+gcloud run jobs executions list --job WORKER_JOB --region "$REGION" --project "$OLD_PROJECT_ID" --limit 5
+```
+
 From here the old database doesn't change.
 
 ### 6.3 Export and import
@@ -507,8 +541,10 @@ gh secret set TELEMETRY_GCP_DEPLOY_SERVICE_ACCOUNT "${collector_settings[@]}" --
 
 In production's window, also set `TELEMETRY_PRODUCTION_CLOUD_SQL_CONNECTION`
 to production's new connection in **both** environments, since staging's
-`validate-environment-target` compares against it. The other variables keep
-their values if the new resources reused the old names (section 12).
+`validate-environment-target` compares against it. If #19 has merged, also
+set production's `TELEMETRY_WORKER_SERVICE_ACCOUNT` to the new worker account.
+The other variables keep their values if the new resources reused the old
+names (section 12).
 
 ### 6.6 Deploy
 
@@ -711,7 +747,7 @@ For each environment:
 - `gcloud run services describe "$SERVICE" --project "$NEW_PROJECT_ID" --region "$REGION" --format=json`
   shows an image in the new store, tagged with this repo's release commit (whose
   message is "Update microcosm-collector"), the new Cloud SQL connection, and
-  the four secret names.
+  the four secret names (five once #16 has merged).
 - `curl -fsS "$(gcloud run services describe "$SERVICE" --project "$NEW_PROJECT_ID" --region "$REGION" --format='value(status.url)')/ready"`
   succeeds, and so do the hostname checks in section 7.
 - `gcloud run jobs executions list --job "$MIGRATION_JOB" --project "$NEW_PROJECT_ID" --region "$REGION" --limit 1`
@@ -733,7 +769,7 @@ the moment the old service entered maintenance mode.
 
 | Situation | What to do |
 |---|---|
-| In the window, before section 8 | Route the old service back: `gcloud run services update-traffic "$SERVICE" --project "$OLD_PROJECT_ID" --region "$REGION" --to-revisions "PREVIOUS_REVISION=100"`, with the revision recorded in step 3.2. Set the GitHub environment values back to the step 3.2 record. Nothing is lost: builds kept their events and deliver them to the old service. |
+| In the window, before section 8 | Route the old service back: `gcloud run services update-traffic "$SERVICE" --project "$OLD_PROJECT_ID" --region "$REGION" --to-revisions "PREVIOUS_REVISION=100"`, with the revision recorded in step 3.2. Set the GitHub environment values back to the step 3.2 record. If step 6.2 paused #12's queue and recovery schedule, resume them (`gcloud tasks queues resume`, `gcloud scheduler jobs resume`). Nothing is lost: builds kept their events and deliver them to the old service. |
 | A deployment into the new project fails | As in calibration-diagnostics#233: before the migration step, fix and re-run the failed jobs. The new service isn't in use yet, so the first row also applies. |
 | After the dashboard switched (8.1), before the emitter release (8.2) | Builds still use only the old address. If the old service was in maintenance mode the whole time, nothing new is in the new database: do the first row, then set the dashboard's settings back and redeploy it. If the old service was kept serving against the new database (8.4), new events are in the new database: do the next row. |
 | After the emitter release | New events are in the new database. Put the new service in maintenance mode (step 6.2's commands with the new project), export the new database, import it into a fresh database on the old instance (drop and re-create the old database first, or import under a new name and update the old runtime database secret), route the old service back to its pre-move revision, set the GitHub and dashboard settings back, and release the emitter with the old `PRODUCTION_COLLECTOR_URL` (the old origin is still trusted, so only that constant changes). Builds that started on the new default keep it until they finish, and keep their events locally while the new service is in maintenance mode. |
@@ -778,7 +814,11 @@ after an agreed holding period:
 | `TELEMETRY_GCP_DEPLOY_SERVICE_ACCOUNT` | same (secret) | `google-github-actions/auth`, `service_account` | the new deployment account |
 | `COLLECTOR_DEPLOY_ENABLED` | this repo's variable | the deployment jobs' `if:` | unchanged (`true`) |
 | `roles/artifactregistry.reader` on the new project for the old deployment account and the old project's Cloud Run service agent | Google Cloud IAM (step 4.1) | Cloud Run, when `deploy-production` deploys staging's image into the old project | removed in section 11 |
+| `TELEMETRY_JWT_SIGNING_KEY_SECRET_NAME` (if #16 merged) | same, in both environments (variable) | `check-secrets-exist`, `--set-secrets` | unchanged when the new secret reuses the name |
+| `TELEMETRY_WORKER_SERVICE_ACCOUNT` (if #19 merged) | `production` (variable) | `configure-huggingface-check-job`, `--service-account` | the new worker account |
+| `TELEMETRY_HF_CHECK_JOB`, `TELEMETRY_HF_READ_SECRET_NAME` (if #19 merged) | `production` (variables) | `configure-huggingface-check-job` | unchanged when the new resources reuse the names |
 | `DATABASE_URL`, `TELEMETRY_JWT_SECRET`, `TELEMETRY_READ_TOKEN` | Google Secret Manager in the new project | the service, through `--set-secrets` | new database URL; copied signing secret and read token |
+| `TELEMETRY_JWT_SIGNING_KEY` (if #16 merged) | Secret Manager in the new project | the service, through `--set-secrets` | copied key |
 | `DATABASE_URL` (migration job) | Secret Manager in the new project | the migration job, through `--set-secrets` | new migration database URL |
 | `COLLECTOR_HF_READ_TOKEN` (if S1 merged) | Secret Manager in the new project | the worker jobs, through a secret mount | copied or rotated |
 | `TELEMETRY_MAINTENANCE_MODE` | `scripts/deploy.sh` (`--set-env-vars`), and step 6.2 on the old service | the service | unchanged |
