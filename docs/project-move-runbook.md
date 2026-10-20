@@ -350,7 +350,7 @@ the row doesn't show:
   `ALTER ROLE telemetry_app NOLOGIN;` if its row shows no `LOGIN`. Google's
   page says `ALTER ROLE` changes any user's attributes.
 
-Step 6.4 compares the result. Then recreate what an export doesn't carry: the
+Step 6.4 compares the result. Also recreate what an export doesn't carry: the
 database-level privileges (`GRANT CONNECT` and `CREATE ON DATABASE`) from the
 `\l` record, and role memberships from the roles query. Table privileges,
 schema privileges and default privileges (`\dp`, `\dn+`, `\ddp`) come with the
@@ -445,10 +445,10 @@ The dashboard's access to the read secret is set in section 8.1.
   job, the recovery job (its three `COLLECTOR_WORKER_*` settings naming the
   new queue, worker job and invoker account), the invoker account, the
   account Cloud Scheduler starts the recovery job as, and the permissions
-  from the README's "Artifact intake" section. Create the
-  recovery job's Cloud Scheduler job only in step 6.7: until the window's
-  deployment, the new database is empty or holds step 5.5's rehearsal copy,
-  and a recovery run would dispatch jobs from it.
+  from the README's "Artifact intake" section. Create the recovery job's
+  Cloud Scheduler job only in step 6.7: until the window's deployment, the
+  new database is empty or holds step 5.5's rehearsal copy, and a recovery
+  run would dispatch jobs from it.
 
   **Keep the intake bucket in the old project.** When a submission is
   completed, the collector records each stored object's generation number in
@@ -512,12 +512,11 @@ last collector deploy run took 2 hours 25 minutes in all, of which its staging
 and production deploy jobs ran for 4 and 6 minutes. So plan for about 40
 minutes on a quiet day (25 minutes to the tag, about 10 for the two deploy
 jobs, and the export and import) and 2 to 3 hours when runners are queued,
-and measure
-it in staging's window. If #12's intake is switched on, add the wait for its
-worker executions in step 6.2, up to about 3 hours, unless they are cancelled
-or the queue is paused early. The dashboard's collector reads stay down until
-section 8.1's dashboard deployment finishes, unless the old service keeps
-serving (section 8.4).
+and measure it in staging's window. If #12's intake is switched on, add the
+wait for its worker executions in step 6.2, up to about 3 hours, unless they
+are cancelled or the queue is paused early. The dashboard's collector reads
+stay down until section 8.1's dashboard deployment finishes, unless the old
+service keeps serving (section 8.4).
 
 While the window lasts:
 
