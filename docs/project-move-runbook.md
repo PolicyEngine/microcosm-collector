@@ -86,9 +86,10 @@ from the old instance in step 3.2.
   default is a constant change (section 8.2).
 - List what has merged here that needs its own resources in the new project,
   and add those steps where this runbook marks them:
-  - #12's artifact intake: a bucket, a Cloud Tasks queue, the worker job, the
-    recovery job and its Cloud Scheduler job, the invoker account and their
-    permissions, as in the README's "Artifact intake" section;
+  - #12's artifact intake: a Cloud Tasks queue, the worker job, the recovery
+    job and its Cloud Scheduler job, the invoker account and their
+    permissions, as in the README's "Artifact intake" section. Its bucket
+    stays in the old project (step 5.3);
   - S1's Hugging Face read token (#13, PR #18);
   - C5's session signing key (#16), a fifth Secret Manager secret per
     environment;
@@ -390,10 +391,25 @@ The dashboard's access to the read secret is set in section 8.1.
   checks that it exists and mounts it as `TELEMETRY_JWT_SIGNING_KEY`, so
   production's deployment stops at "Check required Secret Manager entries
   exist" without it.
-- **#12's intake:** the bucket, queue, worker job, recovery job and its Cloud
-  Scheduler job, invoker account and permissions from the README's "Artifact
-  intake" section, in the new project. Copy the intake objects in the window
-  (step 6.3), and check whether stored submission rows name the bucket.
+- **#12's intake:** in the new project, the Cloud Tasks queue, the worker
+  job, the recovery job (its three `COLLECTOR_WORKER_*` settings naming the
+  new queue, worker job and invoker account), the invoker account, the
+  account Cloud Scheduler starts the recovery job as, and the permissions
+  from the README's "Artifact intake" section. Create the
+  recovery job's Cloud Scheduler job only in step 6.7: until the window's
+  deployment, the new database is empty or holds step 5.5's rehearsal copy,
+  and a recovery run would dispatch jobs from it.
+
+  **Keep the intake bucket in the old project.** When a submission is
+  completed, the collector records each stored object's generation number in
+  the submission's row, and the worker reads every file at that generation.
+  Cloud Storage assigns generation numbers, and they can't be set, so a copy
+  in another bucket has different ones and the worker couldn't read any
+  accepted submission's files. Grant the new runtime account and the new
+  worker job's account the roles on the old bucket that step 3.2 recorded for
+  the old accounts. `COLLECTOR_INTAKE_BUCKET` keeps its value. Moving the
+  bucket later needs a code change that records the copies' generations;
+  none is written.
 - **S2's daily check (#19), production only:** the worker service account
   (the one that may read S1's token), with `roles/iam.serviceAccountUser` on
   it for the deployment account; `roles/secretmanager.viewer` on S1's secret
@@ -443,7 +459,9 @@ organization's runners were queued; on 2026-10-20, calibration-diagnostics'
 last collector deploy run took 2 hours 25 minutes in all, of which its staging
 and production deploy jobs ran for 4 and 6 minutes. So plan for about 30
 minutes on a quiet day and 2 to 3 hours when runners are queued, and measure
-it in staging's window. The dashboard's collector reads stay down until
+it in staging's window. If #12's intake is switched on, add the wait for its
+worker executions in step 6.2, up to about 3 hours, unless they are cancelled
+or the queue is paused early. The dashboard's collector reads stay down until
 section 8.1's dashboard deployment finishes, unless the old service keeps
 serving (section 8.4).
 
@@ -493,14 +511,48 @@ pause outlasts the 30-second request timeout, so no request to the service is
 still writing.
 
 **If #12's intake is switched on,** its worker job and its recovery job also
-write to the database, and maintenance mode doesn't stop them. Pause what
-starts them, in the old project, and wait until no execution is running:
+write to the database, and maintenance mode doesn't stop them. In the old
+project, pause the queue and the recovery schedule together, then make sure
+no execution of either job is still running:
 
 ```bash
 gcloud tasks queues pause WORKER_QUEUE --location "$REGION" --project "$OLD_PROJECT_ID"
 gcloud scheduler jobs pause RECOVERY_SCHEDULE --location "$REGION" --project "$OLD_PROJECT_ID"
-gcloud run jobs executions list --job WORKER_JOB --region "$REGION" --project "$OLD_PROJECT_ID" --limit 5
+for intake_job in WORKER_JOB RECOVERY_JOB; do
+  gcloud run jobs executions list --job "$intake_job" --region "$REGION" \
+    --project "$OLD_PROJECT_ID" --format=json \
+    | jq -r '.[] | select(.status.completionTime == null) | .metadata.name'
+done
 ```
+
+The loop prints the executions that haven't finished; repeat it until it
+prints nothing. An operator's `reprocess` run is an execution of the recovery
+job, so the loop covers it too.
+
+- **A recovery execution** only updates job rows and creates Cloud Tasks.
+  Wait for it.
+- **A worker execution** can run for about 3 hours: three attempts
+  (`--max-retries 2`) of up to 1 hour each (`--task-timeout 1h`). Either wait,
+  which lengthens the window, or cancel it with
+  `gcloud run jobs executions cancel EXECUTION --region "$REGION" --project "$OLD_PROJECT_ID" --quiet`.
+  A cancelled attempt records no result. Its job stays `running` in the
+  copied database until its lease expires, up to 65 minutes after the attempt
+  started; then the new project's recovery job dispatches it again, or fails
+  it if it has used its three attempts or three dispatches.
+- **To keep the window short,** pause the queue and the schedule up to 3
+  hours before it starts, so worker executions finish first (resume both if
+  the window is called off). Submissions completed in the meantime wait in
+  the paused queue, and the new project's recovery job dispatches them after
+  the move (step 6.7).
+- **Never pause the queue alone.** Tasks can still be added to a paused
+  queue, and recovery dispatches a job again each time it has waited 30
+  minutes without a claim, and fails it after its third dispatch. With the
+  queue paused and recovery running, queued jobs fail about 90 minutes after
+  their first dispatch.
+
+Uploads in flight need nothing. A signed upload URL (valid for 30 minutes)
+names the bucket, which stays where it is (step 5.3), so a build's `complete`
+request to the new service finds the files there.
 
 From here the old database doesn't change.
 
@@ -516,8 +568,7 @@ gcloud sql import sql "$NEW_INSTANCE" "$export_object" \
 
 Import as the role that owns the tables in the step 3.2 record (normally the
 migration user), so the restored objects keep their owner. If #12's intake is
-switched on, copy the intake objects too:
-`gcloud storage cp --recursive gs://OLD_INTAKE_BUCKET/* gs://NEW_INTAKE_BUCKET/`.
+switched on, its bucket isn't copied: it stays in the old project (step 5.3).
 
 ### 6.4 Check the copy
 
@@ -552,6 +603,19 @@ set production's `TELEMETRY_WORKER_SERVICE_ACCOUNT` to the new worker account.
 The other variables keep their values if the new resources reused the old
 names (section 12).
 
+If #12's intake is switched on, point its settings at the new project, through
+whichever environment variables #12's deployment wiring reads (not yet
+written):
+
+- `COLLECTOR_WORKER_QUEUE` and `COLLECTOR_WORKER_JOB`:
+  `projects/$NEW_PROJECT_ID/locations/$REGION/queues/...` and `.../jobs/...`;
+- `COLLECTOR_INTAKE_SIGNING_SERVICE_ACCOUNT`: the new runtime account;
+- `COLLECTOR_WORKER_INVOKER_SERVICE_ACCOUNT`: the new invoker account.
+
+`COLLECTOR_INTAKE_BUCKET` keeps its value (step 5.3). With the old values, the
+new service would try to sign uploads as the old runtime account and enqueue
+into the old project's paused queue, so intake would stop.
+
 ### 6.6 Deploy
 
 Each window needs its own merge. Its release runs the Push workflow, which
@@ -578,6 +642,28 @@ runs the migration job (the restored database is already at the current
 revision, and the job checks the schema against the SQLAlchemy metadata),
 deploys and checks a candidate revision, and moves traffic to it. In
 production it also takes a backup of the new instance first.
+
+### 6.7 Start the scheduled jobs in the new project
+
+After the deployment in step 6.6 has finished.
+
+**#12's intake, if switched on:** create the recovery job's schedule in the
+new project, every 10 minutes as the README says, as the account created for
+it in step 5.3:
+
+```bash
+gcloud scheduler jobs create http RECOVERY_SCHEDULE --location "$REGION" --project "$NEW_PROJECT_ID" \
+  --schedule '*/10 * * * *' \
+  --uri "https://run.googleapis.com/v2/projects/$NEW_PROJECT_ID/locations/$REGION/jobs/RECOVERY_JOB:run" \
+  --http-method post --oauth-service-account-email RECOVERY_SCHEDULER_ACCOUNT
+```
+
+Compare its settings with the old schedule's record from step 3.2. Jobs that
+the old service queued before step 6.2 are still in the old, paused queue.
+The new recovery job dispatches each one again into the new queue once 30
+minutes have passed since its last dispatch, or fails it if it has already
+been dispatched three times. The old queue and schedule stay paused until
+section 11.
 
 ## 7. The hostname and DNS
 
@@ -826,6 +912,9 @@ after an agreed holding period:
 | `TELEMETRY_JWT_SIGNING_KEY_SECRET_NAME` (if #16 merged) | same, in both environments (variable) | `check-secrets-exist`, `--set-secrets` | unchanged when the new secret reuses the name |
 | `TELEMETRY_WORKER_SERVICE_ACCOUNT` (if #19 merged) | `production` (variable) | `configure-huggingface-check-job`, `--service-account` | the new worker account |
 | `TELEMETRY_HF_CHECK_JOB`, `TELEMETRY_HF_READ_SECRET_NAME` (if #19 merged) | `production` (variables) | `configure-huggingface-check-job` | unchanged when the new resources reuse the names |
+| `COLLECTOR_WORKER_QUEUE`, `COLLECTOR_WORKER_JOB` (if #12's intake is switched on) | the environment variables #12's deployment wiring will read (not yet written); set by hand on the recovery job | the service and the recovery job | the new project's queue and worker job |
+| `COLLECTOR_INTAKE_SIGNING_SERVICE_ACCOUNT`, `COLLECTOR_WORKER_INVOKER_SERVICE_ACCOUNT` (same) | same | the service signs upload URLs as the first; the service and the recovery job dispatch as the second | the new runtime account and the new invoker account |
+| `COLLECTOR_INTAKE_BUCKET` (same) | same | the service and the worker job | unchanged: the bucket stays in the old project (step 5.3) |
 | `DATABASE_URL`, `TELEMETRY_JWT_SECRET`, `TELEMETRY_READ_TOKEN` | Google Secret Manager in the new project | the service, through `--set-secrets` | new database URL; copied signing secret and read token |
 | `TELEMETRY_JWT_SIGNING_KEY` (if #16 merged) | Secret Manager in the new project | the service, through `--set-secrets` | copied key |
 | `DATABASE_URL` (migration job) | Secret Manager in the new project | the migration job, through `--set-secrets` | new migration database URL |

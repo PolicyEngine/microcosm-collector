@@ -201,6 +201,11 @@ The plan's constraints:
   resources (including its recovery job and schedule), S1's secret and its
   mount, C5's signing key, and S2's daily check job, schedule and alert
   policies (#19).
+- If #12's intake is switched on before the move, its bucket stays in
+  `policyengine-api`: each accepted submission's row records its files'
+  Cloud Storage generation numbers, which a copy into a new bucket doesn't
+  keep (the runbook's step 5.3). Switching intake on after the move creates
+  the bucket in the new project from the start.
 
 If both D2 and D3 are adopted, there are two orders:
 
