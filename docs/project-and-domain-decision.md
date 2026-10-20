@@ -76,9 +76,10 @@ Which DNS zone (from public name-server records, 2026-10-20):
   project holds that zone wasn't checked.
 - Neither zone has CAA records today. If one is added, it must allow
   `pki.goog` and `letsencrypt.org`.
-- Domain mapping (B) and the load balancer's certificate (C) both need the
-  base domain verified in Google Search Console by the account that creates
-  them.
+- Domain mapping (B) needs the base domain verified in Google Search Console
+  by the account that creates the mapping. The load balancer's certificate (C)
+  doesn't: Certificate Manager's DNS authorization needs only a `CNAME` record
+  in the zone.
 
 Whatever is chosen, three things stay as they are:
 
@@ -100,23 +101,27 @@ Whatever is chosen, three things stay as they are:
 - **Where:** `PRODUCTION_COLLECTOR_URL`, and after
   PolicyEngine/microcosm-emitter#29 also `TRUSTED_COLLECTOR_ORIGINS`, both in
   `core/constants.py`. Every service module resolves the origin through
-  `core/collector_origin.py`. The emitter stack's #27 adds a fourth module
-  (`huggingface/service/module.py`), which should use the same resolver.
+  `core/collector_origin.py`. In the emitter stack, #27 makes a third service
+  module, `huggingface/service/module.py` (added by #23), send submissions to
+  the collector; it chooses the origin with its own copy of the old expression
+  and should use the same resolver.
 - **The change:** one emitter PR adds the new origin to
   `TRUSTED_COLLECTOR_ORIGINS` and points `PRODUCTION_COLLECTOR_URL` at it.
   Merging it publishes a release to PyPI.
 - **Who picks it up:**
   - Builds that start the separately installed emitter (emitter #21 and #22,
-    and Microcosm's H2a) use the newest installed emitter at their next
-    start. They need no Microcosm change. A running build keeps the emitter it
-    started with.
+    and Microcosm's H2a) use the new release from their next start once it is
+    installed on that machine or in that build image. They need no Microcosm
+    change. A running build keeps the emitter it started with.
   - Builds pinned to `microcosm-emitter==0.2.1` (Microcosm's
     `packages/microcosm-build/pyproject.toml` today) keep the old address
     until Microcosm moves off that pin.
 - **If the old address stops answering,** a build that still uses it keeps
   its telemetry on its own machine: the emitter retries with a backoff of up
-  to 60 seconds and keeps undelivered events for seven days (up to 100 MiB).
-  A build never fails because of telemetry.
+  to 60 seconds and keeps undelivered events for seven days (up to 100 MiB),
+  and a later emitter on the same machine sends them. A machine discarded
+  when its build ends, such as a Modal container, loses the events not sent
+  by then. A build never fails because of telemetry.
 
 ### The calibration dashboard (calibration-diagnostics)
 
@@ -124,25 +129,27 @@ Whatever is chosen, three things stay as they are:
 |---|---|---|---|---|
 | `MICROCOSM_TELEMETRY_COLLECTOR_URL` | GitHub `Production` environment variable; also set in the Vercel project for Production and Preview | `deploy.yml` passes the GitHub value to `.github/scripts/deploy-dashboard.sh`, which requires it and sets it on the production deployment with `vercel deploy --env`. Preview deployments use the Vercel value. The server reads it in `frontend/lib/server/microcosm/telemetry-collector-client.ts`. | the new default address (if D3 is A) | the custom hostname, in all three places (GitHub Production, Vercel Production, and Vercel Preview with the staging address) |
 | `MICROCOSM_TELEMETRY_READ_SECRET_VERSION` | Vercel project setting, Production and Preview | `telemetry-collector-client.ts`: the full Secret Manager version resource, which names the project | the new project's read secrets | no |
-| `MICROCOSM_TELEMETRY_GOOGLE_IDENTITY_PROVIDER` | Vercel project setting, Production only | `frontend/lib/server/secret-manager.ts`, on Vercel: the Workload Identity provider resource, named by project number | only if the provider moves (see choice 10) | no |
+| `MICROCOSM_TELEMETRY_GOOGLE_IDENTITY_PROVIDER` | Vercel project setting, one entry for Production and Preview | `frontend/lib/server/secret-manager.ts`, on Vercel: the Workload Identity provider resource, named by project number | only if the provider moves (see choice 10) | no |
 | `TELEMETRY_GCP_PROJECT_ID`, `TELEMETRY_READ_SECRET_NAME` | GitHub `Production` environment variables | `deploy.yml` step "Check collector read secret exists" | the new project | no |
 | `TELEMETRY_GCP_WIF_PROVIDER`, `TELEMETRY_GCP_DEPLOY_SERVICE_ACCOUNT` | GitHub `Production` environment secrets | the same step's Google authentication | no, if the dashboard's own identity in `policyengine-api` is granted metadata read on the new read secret | no |
 
 Two things found while checking:
 
-- **Preview has no `MICROCOSM_TELEMETRY_GOOGLE_IDENTITY_PROVIDER`.** On a
-  Preview deployment the server can't read its read token ("Configure
-  MICROCOSM_TELEMETRY_GOOGLE_IDENTITY_PROVIDER."), so the build monitor shows
-  only the Hugging Face runs and lists `collector` under "Runs that could not
-  be read". Whether that's intended wasn't checked. It is independent of D2
-  and D3.
+- **Preview reads staging's collector.** The identity-provider setting covers
+  Production and Preview, the provider accepts both environments' Vercel
+  identities, and staging's read secret grants the Preview identity access. So
+  under choice 10 both identities need access to the new project's read
+  secrets, each to its own environment's.
 - **After C6,** the dashboard authenticates to the collector with its own
   Vercel OIDC token instead of a shared read token, so it no longer reads
   Secret Manager for the collector. If C6 lands before the move, only
   `MICROCOSM_TELEMETRY_COLLECTOR_URL` changes.
 
 Settings take effect on the next deployment: a merge to calibration-diagnostics
-`main`, or a re-run of its latest "Deploy production" run.
+`main`, or a re-run of its latest "Deploy production" run. Whether a re-run
+reads a changed GitHub variable such as `MICROCOSM_TELEMETRY_COLLECTOR_URL`
+hasn't been checked (the runbook's step 6.6 has the same question), so a merge
+is the reliable way.
 
 ### microcosm-runs
 
@@ -225,16 +232,17 @@ If both D2 and D3 are adopted, there are two orders:
    `collector.microcosm.institute`; and whether staging gets one, for example
    `collector-staging.microcosm.institute`, or keeps its default address.
 5. **DNS:** which zone (`microcosm.institute` on Cloudflare, or
-   `policyengine.org` on Cloud DNS); who adds the records; which Google account
-   verifies the base domain in Search Console.
+   `policyengine.org` on Cloud DNS); who adds the records; for D3 B, which
+   Google account verifies the base domain in Search Console.
 6. **Order:** hostname first, or both together.
 7. **The old address after the move:** keep the old service serving,
    connected to the new database, until no build uses emitter 0.2.1; or leave
    it in maintenance mode, so builds still on it keep their telemetry locally;
    or delete it. A redirect isn't possible.
 8. **The window:** when, and how long is acceptable. During it, running builds
-   keep their events locally and deliver them afterwards, and the build monitor
-   shows only Hugging Face runs.
+   keep their events locally and deliver them afterwards, except on a machine
+   discarded when its build ends, such as a Modal container, which loses the
+   events not sent by then. The build monitor shows only Hugging Face runs.
 9. **Staging data:** dump and restore it like production (which also rehearses
    the production move), or start staging empty.
 10. **The dashboard's Google identity:** create a new Vercel Workload Identity
