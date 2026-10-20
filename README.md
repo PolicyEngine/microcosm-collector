@@ -58,10 +58,12 @@ token for `expires_in` seconds and exchanges again after a 401.
 Every deployed revision mounts the signing key, as `TELEMETRY_JWT_SIGNING_KEY`,
 from the Secret Manager secret named by the `TELEMETRY_JWT_SIGNING_KEY_SECRET_NAME`
 variable of the `staging` and `production` environments. Without that
-variable, deployment stops at its first step, its configuration check, and it
-checks that the secret exists before changing traffic. As for the other secrets, the runtime service account
-needs to access the secret's versions and the deployment identity needs to read
-its metadata. Each environment has its own key.
+variable, deployment stops at its first step, its configuration check. It also
+checks that the secret exists before changing traffic. Each environment has its
+own key in its own secret. As for the other secrets, grant two roles on the
+secret itself: `roles/secretmanager.secretAccessor` to the runtime service
+account, which reads the key, and `roles/secretmanager.viewer` to the
+deployment identity, whose existence check reads the secret's metadata.
 
 The switch window starts with the first deployment that mounts the signing key
 and ends with the change that stops mounting `TELEMETRY_JWT_SECRET`. During
@@ -85,9 +87,22 @@ To retire HS256:
 2. Once that release has deployed to both environments, delete the
    `TELEMETRY_JWT_SECRET_NAME` variables and the HS256 secrets.
 
-To rotate the signing key, add a version to its secret and deploy. The new
-revision signs with, and publishes, only the new key. Tokens signed with the
-previous key get 401 and are exchanged again.
+To rotate the signing key, put the new key in a new secret. Don't add a
+version to the secret the service already mounts. Cloud Run reads a secret
+mounted as an environment variable when each instance starts, so a new
+version would reach every instance the serving revision starts from then on,
+while its running instances keep the old key. Until the next deployment, a
+token signed by one instance would get 401 from another, and
+`/.well-known/jwks.json` would answer with whichever key the instance holds.
+
+1. Generate the new key straight into a new secret, and grant it the same two
+   roles as the first key.
+2. Set `TELEMETRY_JWT_SIGNING_KEY_SECRET_NAME` in that environment to the new
+   secret's name. The serving revision keeps reading the old secret.
+3. Deploy. The new revision signs with, and publishes, only the new key.
+   Tokens signed with the previous key get 401 and are exchanged again.
+4. Delete the old secret once rolling back to a revision that mounts it is no
+   longer wanted, since such a revision can't start without it.
 
 ## Responses a producer acts on
 
