@@ -104,7 +104,9 @@ For each environment (read-only):
 
 - The service's URL, serving revision, image, Cloud SQL connection and secret
   names: the `gcloud run services describe` command in step 0 of
-  calibration-diagnostics#233. The serving revision is the rollback target.
+  calibration-diagnostics#233. This serving revision isn't the rollback
+  target: production redeploys between the windows, so step 6.1 records the
+  target again just before each window's changes.
 - The instance's settings:
   `gcloud sql instances describe "$OLD_INSTANCE" --project "$OLD_PROJECT_ID" --format=yaml`.
   Keep the database version, edition, tier, disk size, availability type,
@@ -495,14 +497,26 @@ While the window lasts:
   because microcosm-runs' authorization call needs a collector endpoint that
   doesn't exist, so nothing changes for them.
 
-### 6.1 Check that no deployment is running
+### 6.1 Check that no deployment is running, and record the rollback target
 
 ```bash
 gh run list -R PolicyEngine/microcosm-collector --workflow push.yaml --status in_progress
 gh run list -R PolicyEngine/microcosm-collector --workflow push.yaml --status queued
 ```
 
-Both must list nothing.
+Both must list nothing. Then record the revision the old service serves now.
+It is the rollback target (section 10). Every merge since step 3.2 has
+redeployed production, possibly with migrations, so an earlier revision may
+not match the database schema.
+
+```bash
+rollback_revision=$(gcloud run services describe "$SERVICE" --project "$OLD_PROJECT_ID" \
+  --region "$REGION" --format=json \
+  | jq -r '.status.traffic[] | select((.percent // 0) > 0) | .revisionName')
+echo "$rollback_revision"
+```
+
+It must print one revision name. Write it in the window's notes too.
 
 ### 6.2 Put the old service in maintenance mode
 
@@ -915,10 +929,10 @@ the moment the old service entered maintenance mode.
 
 | Situation | What to do |
 |---|---|
-| In the window, before section 8 | Route the old service back: `gcloud run services update-traffic "$SERVICE" --project "$OLD_PROJECT_ID" --region "$REGION" --to-revisions "PREVIOUS_REVISION=100"`, with the revision recorded in step 3.2. Set the GitHub environment values back to the step 3.2 record. If step 6.2 paused #12's queue and recovery schedule, resume them (`gcloud tasks queues resume`, `gcloud scheduler jobs resume`). If step 6.7 ran, pause the schedules it created in the new project and disable the new alert policies; for #19, resume the old check schedule and enable the old policies again (`--enabled`). Builds kept their events and deliver them to the old service, except builds on a machine discarded when the build ended, such as a Modal container, which lost the events not sent by then. |
+| In the window, before section 8 | Route the old service back: `gcloud run services update-traffic "$SERVICE" --project "$OLD_PROJECT_ID" --region "$REGION" --to-revisions "$rollback_revision=100"`, with the revision step 6.1 recorded in this window. Set back, to the step 3.2 record, only the GitHub values step 6.5 changed in this window: in staging's window, staging's; in production's window, production's and `TELEMETRY_PRODUCTION_CLOUD_SQL_CONNECTION` in staging's environment. Staging's other values stay pointed at the new project, where its database now is. If step 6.2 paused #12's queue and recovery schedule, resume them (`gcloud tasks queues resume`, `gcloud scheduler jobs resume`). If step 6.7 ran, pause the schedules it created in the new project and disable the new alert policies; for #19, resume the old check schedule and enable the old policies again (`--enabled`). Builds kept their events and deliver them to the old service, except builds on a machine discarded when the build ended, such as a Modal container, which lost the events not sent by then. |
 | A deployment into the new project fails | As in calibration-diagnostics#233: before the migration step, fix and re-run the failed jobs. The new service isn't in use yet, so the first row also applies. |
 | After the dashboard switched (8.1), before the emitter release (8.2) | Builds still use only the old address. If the old service was in maintenance mode the whole time, nothing new is in the new database: do the first row, then set the dashboard's settings back and redeploy it. If the old service was kept serving against the new database (8.4), new events are in the new database: do the next row. |
-| After the emitter release | New events are in the new database. Put the new service in maintenance mode (step 6.2's commands with the new project), export the new database, import it into a fresh database on the old instance (drop and re-create the old database first, or import under a new name and update the old runtime database secret), route the old service back to its pre-move revision, set the GitHub and dashboard settings back, and release the emitter with the old `PRODUCTION_COLLECTOR_URL` (the old origin is still trusted, so only that constant changes). Builds that started on the new default keep it until they finish, and keep their events locally while the new service is in maintenance mode. |
+| After the emitter release | New events are in the new database. Put the new service in maintenance mode (step 6.2's commands with the new project), export the new database, import it into a fresh database on the old instance (drop and re-create the old database first, or import under a new name and update the old runtime database secret), route the old service back to the revision step 6.1 recorded in production's window (if a release with a migration has deployed in the new project since, that revision's code is older than the imported schema: set the GitHub values back first, and let the next merge deploy the current release to the old project instead), set the GitHub and dashboard settings back, and release the emitter with the old `PRODUCTION_COLLECTOR_URL` (the old origin is still trusted, so only that constant changes). Builds that started on the new default keep it until they finish, and keep their events locally while the new service is in maintenance mode. |
 | The hostname | D3 B: delete the mapping, or map the hostname back to the old project's service with `--force-override`. D3 C: point the `A` record back to what it named before, if anything. |
 
 ## 11. Retire the old resources
