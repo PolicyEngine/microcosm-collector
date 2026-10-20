@@ -768,8 +768,10 @@ done
 ```
 
 The loop prints the executions that haven't finished; repeat it until it
-prints nothing. An operator's `reprocess` run is an execution of the recovery
-job, so the loop covers it too.
+prints nothing. It also lists an operator's `reprocess` run made as an
+execution of the recovery job. #12's README also allows running `reprocess`
+locally through the Cloud SQL Auth Proxy, which the loop can't see, so make
+sure nobody runs it that way during the window.
 
 - **A recovery execution** only updates job rows and creates Cloud Tasks.
   Wait for it.
