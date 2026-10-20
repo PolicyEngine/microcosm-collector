@@ -119,10 +119,21 @@ For each environment (read-only):
   them.
 - **The database's roles and privileges.** Connect as the migration user
   through Cloud SQL Studio, or with `psql` through the Cloud SQL Auth Proxy,
-  and save the output of `\du`, `\l`, `\dn+ public`, `\dp public.*` and
-  `\ddp`. Note which role owns the tables and what the runtime user is
-  granted. These were provisioned by scripts kept outside this repo, so this
-  record is the only specification of them.
+  and save the output of `\l`, `\dn+ public`, `\dp public.*` and `\ddp`, and
+  of the roles query below. Note which role owns the tables and what the
+  runtime user is granted. These were provisioned by scripts kept outside
+  this repo, so this record is the only specification of them. The roles
+  query lists every role's attributes and memberships in one result; psql 16
+  and later no longer show memberships in `\du`:
+
+  ```sql
+  SELECT r.rolname, r.rolcanlogin, r.rolcreaterole, r.rolcreatedb, r.rolinherit,
+         ARRAY(SELECT g.rolname FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.roleid
+               WHERE m.member = r.oid ORDER BY 1) AS member_of
+  FROM pg_roles r
+  WHERE r.rolname !~ '^(pg_|cloudsql)'
+  ORDER BY 1;
+  ```
 - Who may read each secret:
   `gcloud secrets get-iam-policy SECRET --project "$OLD_PROJECT_ID" --format=yaml`
   for each secret the environment uses: the four named above, and, if
@@ -311,16 +322,39 @@ gcloud sql users create "$MIGRATION_DATABASE_USER" --instance "$NEW_INSTANCE" \
   --project "$NEW_PROJECT_ID" --password "$migration_password"
 gcloud sql users create "$RUNTIME_DATABASE_USER" --instance "$NEW_INSTANCE" \
   --project "$NEW_PROJECT_ID" --password "$runtime_password"
-# Production only, and any other user the record lists:
-gcloud sql users create telemetry_app --instance "$NEW_INSTANCE" \
-  --project "$NEW_PROJECT_ID" --password "$(openssl rand -hex 32)"
+# Every other user the record lists: (telemetry_app) for production today, () for staging.
+other_database_users=(telemetry_app)
+for other_database_user in "${other_database_users[@]}"; do
+  gcloud sql users create "$other_database_user" --instance "$NEW_INSTANCE" \
+    --project "$NEW_PROJECT_ID" --password "$(openssl rand -hex 32)"
+done
 ```
 
-Keep the two password variables in this shell for step 5.3. Then recreate what
-an export doesn't carry: the database-level privileges (`GRANT CONNECT` and
-`CREATE ON DATABASE`) and role memberships from the `\l` and `\du` record.
-Table privileges, schema privileges and default privileges (`\dp`, `\dn+`,
-`\ddp`) come with the export, provided the roles exist.
+Keep the two password variables in this shell for step 5.3.
+
+**Give each user no more than its record shows.** Cloud SQL's pages "About
+PostgreSQL users and roles" and "Create and manage users" say a user created
+this way is a member of `cloudsqlsuperuser`, with the `CREATEROLE`,
+`CREATEDB` and `LOGIN` attributes. An old user created in SQL may have less,
+and an export carries no roles, so nothing corrects it later. For each new
+user, compare with its row from the roles query in step 3.2 and remove what
+the row doesn't show:
+
+- **Membership of `cloudsqlsuperuser`:**
+  `gcloud sql users assign-roles USER --instance "$NEW_INSTANCE" --project "$NEW_PROJECT_ID" --type BUILT_IN --revoke-existing-roles`,
+  with `--database-roles` for any membership the row does show, once that
+  role exists. Google's page gives this as the way to take
+  `cloudsqlsuperuser` away from a user.
+- **Attributes:** in SQL, connected as `postgres`, for example
+  `ALTER ROLE telemetry_runtime NOCREATEROLE NOCREATEDB;`, and
+  `ALTER ROLE telemetry_app NOLOGIN;` if its row shows no `LOGIN`. Google's
+  page says `ALTER ROLE` changes any user's attributes.
+
+Step 6.4 compares the result. Then recreate what an export doesn't carry: the
+database-level privileges (`GRANT CONNECT` and `CREATE ON DATABASE`) from the
+`\l` record, and role memberships from the roles query. Table privileges,
+schema privileges and default privileges (`\dp`, `\dn+`, `\ddp`) come with the
+export, provided the roles exist.
 
 Let both instances' service agents use the bucket. Google's export and import
 pages name `roles/storage.objectAdmin` for both:
@@ -610,8 +644,12 @@ On both instances, as the migration user:
   and `telemetry_events`; later migrations add more.
 - `\l`, `\dp public.*` and `\ddp` match the step 3.2 record, so the
   database-level, table and default privileges all came across.
+- The roles query from step 3.2 gives the same rows, so every user has the
+  same attributes and memberships. If a new user has more, such as
+  `cloudsqlsuperuser`, `CREATEROLE` or `CREATEDB` left from
+  `gcloud sql users create`, remove it as in step 5.2 and compare again.
 
-If anything differs, stop and roll back (section 10, first row).
+If anything else differs, stop and roll back (section 10, first row).
 
 ### 6.5 Point the GitHub environment at the new project
 
@@ -999,7 +1037,8 @@ after an agreed holding period:
 
 **Unverified:** nothing in this runbook has been run. The current deployment
 account's roles, the database roles and privileges (including whether
-production's `telemetry_app` owns or holds anything), and the dashboard
+production's `telemetry_app` owns or holds anything, and whether the old
+users are members of `cloudsqlsuperuser`), and the dashboard
 identity's bindings were not read for it (they are recorded in step 3.2).
 Whether a workflow re-run reads changed environment values is unchecked (step
 6.6). Every setting above needs checking end to end in the staging pass.
