@@ -23,6 +23,7 @@ from telemetry_collector.intake import (
     SignedUpload,
     StoredObject,
     WorkerQueueUnavailableError,
+    dispatch_job,
 )
 from telemetry_collector.submission_store import (
     SubmissionOwnershipError,
@@ -114,7 +115,11 @@ def _timestamp(value: datetime | None) -> str | None:
 def _job_summary(record: SubmissionRecord) -> dict[str, Any] | None:
     if record.job_id is None:
         return None
-    return {"job_id": record.job_id, "attempts": record.job_attempts}
+    return {
+        "job_id": record.job_id,
+        "processing_round": record.processing_round,
+        "attempts": record.job_attempts,
+    }
 
 
 def status_document(
@@ -320,10 +325,10 @@ def submission_router(
                     for file in record.files
                 },
             )
-        if record.status == "queued" and not record.job_enqueued:
+        if record.status == "queued" and record.job_dispatch_count == 0:
             assert record.job_id is not None, "An accepted submission has a job."
             try:
-                services.worker_queue.enqueue(record.job_id)
+                dispatch_job(submissions, services.worker_queue, record.job_id, 1)
             except WorkerQueueUnavailableError as error:
                 raise IntakeProblemError(
                     503,
@@ -331,7 +336,6 @@ def submission_router(
                     "The worker queue is unavailable; retry completion.",
                     headers={"Retry-After": str(QUEUE_RETRY_AFTER_SECONDS)},
                 ) from error
-            submissions.mark_job_enqueued(record.job_id)
             record = owned_submission(submission_id, claims)
         response.status_code = 200 if record.status in FINAL_STATUSES else 202
         return status_document(record)

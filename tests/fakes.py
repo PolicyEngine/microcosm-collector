@@ -10,6 +10,7 @@ from threading import RLock
 from typing import Any
 
 from telemetry_collector.auth import HuggingFacePrincipal
+from telemetry_collector.google_cloud import cloud_task_id
 from telemetry_collector.intake import (
     IntakeObjectMissingError,
     PlannedUpload,
@@ -28,14 +29,24 @@ from telemetry_collector.storage import (
     run_summary,
 )
 from telemetry_collector.submission_store import (
+    ATTEMPT_ABANDONED,
     ATTEMPTS_EXHAUSTED,
     ClaimedJob,
+    JobRecovery,
+    SubmissionNotReprocessableError,
     SubmissionOwnershipError,
     SubmissionRecord,
     files_with_generations,
+    is_reprocessable,
+    job_is_claimable,
+    job_is_stalled,
+    new_job_values,
     new_submission_values,
+    recovery_decision,
 )
 from telemetry_collector.submissions import (
+    FINAL_STATUSES,
+    INTAKE_ONLY_HANDLER,
     MAX_JOB_ATTEMPTS,
     FinalStatus,
     SubmissionRequest,
@@ -154,7 +165,12 @@ class FakeTelemetryStore:
 
 
 class FakeSubmissionStore:
-    """In-memory implementation of the submission store protocol."""
+    """In-memory implementation of the submission store protocol.
+
+    It shares the PostgreSQL store's decisions (``job_is_claimable``,
+    ``job_is_stalled``, ``recovery_decision``, ``is_reprocessable``), and the
+    store contract tests run against both.
+    """
 
     def __init__(self, *, clock: Callable[[], datetime] | None = None) -> None:
         self._clock = clock or (lambda: datetime.now(UTC))
@@ -163,13 +179,21 @@ class FakeSubmissionStore:
         self._lock = RLock()
 
     def _with_job(self, record: SubmissionRecord) -> SubmissionRecord:
-        job = self._jobs.get(derive_job_id(record.submission_id, record.kind))
+        job = (
+            None
+            if record.processing_round == 0
+            else self._jobs.get(
+                derive_job_id(
+                    record.submission_id, record.kind, record.processing_round
+                )
+            )
+        )
         return deepcopy(
             replace(
                 record,
                 job_id=None if job is None else job["job_id"],
                 job_attempts=0 if job is None else job["attempts"],
-                job_enqueued=job is not None and job["enqueued_at"] is not None,
+                job_dispatch_count=0 if job is None else job["dispatch_count"],
             )
         )
 
@@ -186,7 +210,7 @@ class FakeSubmissionStore:
                     )
                 return self._with_job(existing), False
             record = SubmissionRecord(
-                **values, job_id=None, job_attempts=0, job_enqueued=False
+                **values, job_id=None, job_attempts=0, job_dispatch_count=0
             )
             self._submissions[record.submission_id] = record
             return self._with_job(record), True
@@ -195,6 +219,12 @@ class FakeSubmissionStore:
         with self._lock:
             record = self._submissions.get(submission_id)
             return None if record is None else self._with_job(record)
+
+    def _add_job(self, record: SubmissionRecord, processing_round: int) -> None:
+        values = new_job_values(
+            record.submission_id, record.kind, processing_round, self._clock()
+        )
+        self._jobs.setdefault(values["job_id"], values)
 
     def accept_submission(
         self, submission_id: str, generations: Mapping[str, str]
@@ -207,24 +237,12 @@ class FakeSubmissionStore:
                     record,
                     files=files_with_generations(record.files, generations),
                     status="queued",
+                    processing_round=1,
                     accepted_at=now,
                     updated_at=now,
                 )
                 self._submissions[submission_id] = record
-                job_id = derive_job_id(submission_id, record.kind)
-                self._jobs.setdefault(
-                    job_id,
-                    {
-                        "job_id": job_id,
-                        "submission_id": submission_id,
-                        "status": "queued",
-                        "attempts": 0,
-                        "enqueued_at": None,
-                        "lease_holder": None,
-                        "lease_expires_at": None,
-                        "last_error": None,
-                    },
-                )
+                self._add_job(record, 1)
             return self._with_job(record)
 
     def reject_submission(
@@ -244,11 +262,18 @@ class FakeSubmissionStore:
                 self._submissions[submission_id] = record
             return self._with_job(record)
 
-    def mark_job_enqueued(self, job_id: str) -> None:
+    def record_dispatch(self, job_id: str, dispatch_number: int) -> None:
         with self._lock:
             job = self._jobs.get(job_id)
-            if job is not None and job["enqueued_at"] is None:
-                job["enqueued_at"] = self._clock()
+            if (
+                job is not None
+                and job["dispatch_count"] < dispatch_number
+                and job["status"] not in FINAL_STATUSES
+            ):
+                now = self._clock()
+                job.update(
+                    dispatch_count=dispatch_number, dispatched_at=now, updated_at=now
+                )
 
     def _set_submission(self, job: dict[str, Any], **changes: Any) -> None:
         submission_id = job["submission_id"]
@@ -263,19 +288,33 @@ class FakeSubmissionStore:
         result: dict[str, Any] | None,
         rejection: dict[str, Any] | None,
     ) -> None:
+        now = self._clock()
         job.update(
             status=status,
             lease_holder=None,
             lease_expires_at=None,
-            last_error=rejection,
+            last_error=deepcopy(rejection),
+            result=deepcopy(result),
+            updated_at=now,
+            finished_at=now,
         )
         self._set_submission(
             job,
             status=status,
             result=deepcopy(result),
             rejection=deepcopy(rejection),
-            finished_at=self._clock(),
+            finished_at=now,
         )
+
+    def _requeue(self, job: dict[str, Any], error: dict[str, Any] | None) -> None:
+        job.update(
+            status="queued",
+            lease_holder=None,
+            lease_expires_at=None,
+            last_error=deepcopy(error),
+            updated_at=self._clock(),
+        )
+        self._set_submission(job, status="queued")
 
     def claim_job(
         self, job_id: str, *, holder: str, lease_seconds: float
@@ -285,15 +324,13 @@ class FakeSubmissionStore:
             if job is None:
                 return None
             now = self._clock()
-            claimable = job["status"] == "queued" or (
-                job["status"] == "running"
-                and (
-                    job["lease_holder"] == holder
-                    or job["lease_expires_at"] is None
-                    or job["lease_expires_at"] <= now
-                )
-            )
-            if not claimable:
+            if not job_is_claimable(
+                job["status"],
+                job["lease_holder"],
+                job["lease_expires_at"],
+                holder=holder,
+                now=now,
+            ):
                 return None
             if job["attempts"] >= MAX_JOB_ATTEMPTS:
                 self._finish(job, "failed", None, ATTEMPTS_EXHAUSTED)
@@ -303,6 +340,7 @@ class FakeSubmissionStore:
                 attempts=job["attempts"] + 1,
                 lease_holder=holder,
                 lease_expires_at=now + timedelta(seconds=lease_seconds),
+                updated_at=now,
             )
             self._set_submission(job, status="processing")
             return ClaimedJob(
@@ -310,6 +348,14 @@ class FakeSubmissionStore:
                 attempt=job["attempts"],
                 submission=self._with_job(self._submissions[job["submission_id"]]),
             )
+
+    def _held_job(self, job_id: str, holder: str) -> dict[str, Any] | None:
+        job = self._jobs.get(job_id)
+        if job is None or job["status"] != "running":
+            return None
+        if job["lease_holder"] != holder:
+            return None
+        return job
 
     def finish_job(
         self,
@@ -321,29 +367,99 @@ class FakeSubmissionStore:
         rejection: dict[str, Any] | None,
     ) -> bool:
         with self._lock:
-            job = self._jobs.get(job_id)
-            if job is None or job["status"] != "running":
-                return False
-            if job["lease_holder"] != holder:
+            job = self._held_job(job_id, holder)
+            if job is None:
                 return False
             self._finish(job, status, result, rejection)
             return True
 
     def release_job(self, job_id: str, *, holder: str, error: dict[str, Any]) -> bool:
         with self._lock:
-            job = self._jobs.get(job_id)
-            if job is None or job["status"] != "running":
+            job = self._held_job(job_id, holder)
+            if job is None:
                 return False
-            if job["lease_holder"] != holder:
-                return False
-            job.update(
-                status="queued",
-                lease_holder=None,
-                lease_expires_at=None,
-                last_error=deepcopy(error),
-            )
-            self._set_submission(job, status="queued")
+            self._requeue(job, error)
             return True
+
+    def _is_stalled(self, job: dict[str, Any], idle_seconds: float) -> bool:
+        return job_is_stalled(
+            job["status"],
+            job["lease_expires_at"],
+            job["updated_at"],
+            now=self._clock(),
+            idle_seconds=idle_seconds,
+        )
+
+    def stalled_job_ids(self, *, idle_seconds: float) -> list[str]:
+        with self._lock:
+            stalled = [
+                job
+                for job in self._jobs.values()
+                if self._is_stalled(job, idle_seconds)
+            ]
+            return [
+                job["job_id"]
+                for job in sorted(
+                    stalled, key=lambda job: (job["updated_at"], job["job_id"])
+                )
+            ]
+
+    def recover_job(self, job_id: str, *, idle_seconds: float) -> JobRecovery:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or not self._is_stalled(job, idle_seconds):
+                return JobRecovery(job_id, "none")
+            action, rejection, dispatch_number = recovery_decision(
+                job["attempts"], job["dispatch_count"]
+            )
+            if action == "failed":
+                self._finish(job, "failed", None, rejection)
+                return JobRecovery(job_id, "failed")
+            abandoned = ATTEMPT_ABANDONED if job["status"] == "running" else None
+            self._requeue(job, abandoned or job["last_error"])
+            return JobRecovery(job_id, "dispatch", dispatch_number)
+
+    def reprocess_submission(self, submission_id: str) -> SubmissionRecord:
+        with self._lock:
+            record = self._submissions[submission_id]
+            if not is_reprocessable(record.status, record.processing_round):
+                raise SubmissionNotReprocessableError(
+                    f"{submission_id} is {record.status}."
+                )
+            record = replace(
+                record,
+                processing_round=record.processing_round + 1,
+                status="queued",
+                result=None,
+                rejection=None,
+                finished_at=None,
+                updated_at=self._clock(),
+            )
+            self._submissions[submission_id] = record
+            self._add_job(record, record.processing_round)
+            return self._with_job(record)
+
+    def reprocessable_submission_ids(
+        self, kind: str, *, intake_only: bool
+    ) -> list[str]:
+        with self._lock:
+            selected = [
+                record
+                for record in self._submissions.values()
+                if record.kind == kind
+                and is_reprocessable(record.status, record.processing_round)
+                and (
+                    not intake_only
+                    or (record.result or {}).get("processed_by") == INTAKE_ONLY_HANDLER
+                )
+            ]
+            return [
+                record.submission_id
+                for record in sorted(
+                    selected,
+                    key=lambda record: (record.created_at, record.submission_id),
+                )
+            ]
 
 
 class FakeIntakeObjectStore:
@@ -406,16 +522,21 @@ class FakeIntakeObjectStore:
 
 
 class FakeWorkerQueue:
-    """Records enqueued job IDs; ``available = False`` simulates an outage."""
+    """Records dispatches; ``available = False`` simulates an outage.
+
+    ``calls`` lists every attempted dispatch, and ``task_ids`` each task the
+    queue created, once, as Cloud Tasks does with task names.
+    """
 
     def __init__(self) -> None:
-        self.calls: list[str] = []
-        self.enqueued: list[str] = []
+        self.calls: list[tuple[str, int]] = []
+        self.task_ids: list[str] = []
         self.available = True
 
-    def enqueue(self, job_id: str) -> None:
-        self.calls.append(job_id)
+    def dispatch(self, job_id: str, dispatch_number: int) -> None:
+        self.calls.append((job_id, dispatch_number))
         if not self.available:
             raise WorkerQueueUnavailableError("The worker queue is unavailable.")
-        if job_id not in self.enqueued:
-            self.enqueued.append(job_id)
+        task_id = cloud_task_id(job_id, dispatch_number)
+        if task_id not in self.task_ids:
+            self.task_ids.append(task_id)

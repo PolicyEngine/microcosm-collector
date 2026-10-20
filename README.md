@@ -49,31 +49,57 @@ sending the same request again cannot succeed:
 
 Builds hand calibration diagnostics and Orrery inputs to the collector as
 submissions. [`docs/artifact-submissions.md`](docs/artifact-submissions.md) is
-the contract: kinds, file roles, provenance, identifiers, statuses, receipts and
-limits. File bytes go straight to a private bucket through signed upload URLs;
-`POST /v1/submissions/{id}/complete` checks the stored objects' sizes and
-recorded digests and enqueues a worker job through Cloud Tasks; the worker, a
-Cloud Run Job running `uv run --no-sync python -m telemetry_collector.worker`,
-recomputes every file's SHA-256 and runs the handler registered for the kind.
-Until the calibration-tree and Orrery workers register theirs, both kinds are
-only checked and kept.
+the contract: kinds, file roles, provenance, identifiers, statuses, answers,
+receipts and limits. File bytes go straight to a private bucket through signed
+upload URLs; `POST /v1/submissions/{id}/complete` checks the stored objects'
+sizes and recorded digests and dispatches a worker job through Cloud Tasks; the
+worker, a Cloud Run Job running
+`uv run --no-sync python -m telemetry_collector.worker`, recomputes every
+file's SHA-256 and runs the handler registered for the kind. Until the
+calibration-tree and Orrery workers register theirs, both kinds are only
+checked and kept.
 
 Intake is off unless `COLLECTOR_INTAKE_ENABLED` is exactly `1`. While it is
-off, the collector reads no other intake setting, the submission endpoints do
-not exist, and the token exchange answers 404 to `{"scope": "artifacts:submit"}`.
-`scripts/deploy.sh` sets none of these variables, so deploying this code
-changes nothing.
+off, the collector reads no other intake setting, and the token exchange for
+`{"scope": "artifacts:submit"}` and every `/v1/submissions` path answer 404 with
+the code `intake_not_enabled`. `scripts/deploy.sh` sets none of these
+variables, so deploying this code changes nothing.
 
 | Setting | Read by | Value |
 |---|---|---|
 | `COLLECTOR_INTAKE_ENABLED` | service | `1` switches intake on |
 | `COLLECTOR_INTAKE_BUCKET` | service, worker | the private intake bucket's name |
 | `COLLECTOR_INTAKE_SIGNING_SERVICE_ACCOUNT` | service | the runtime service account, which signs upload URLs through IAM `signBlob` |
-| `COLLECTOR_WORKER_QUEUE` | service | `projects/<project>/locations/<region>/queues/<queue>` |
-| `COLLECTOR_WORKER_JOB` | service | `projects/<project>/locations/<region>/jobs/<job>` |
-| `COLLECTOR_WORKER_INVOKER_SERVICE_ACCOUNT` | service | the account whose OAuth token each Cloud Task uses to run the worker job |
+| `COLLECTOR_WORKER_QUEUE` | service, operations | `projects/<project>/locations/<region>/queues/<queue>` |
+| `COLLECTOR_WORKER_JOB` | service, operations | `projects/<project>/locations/<region>/jobs/<job>` |
+| `COLLECTOR_WORKER_INVOKER_SERVICE_ACCOUNT` | service, operations | the account whose OAuth token each Cloud Task uses to run the worker job |
 | `COLLECTOR_WORKER_JOB_ID` | worker | set on each execution by its Cloud Task |
-| `DATABASE_URL` | worker | the runtime database secret, as for the service |
+| `DATABASE_URL` | worker, operations | the runtime database secret, as for the service |
+
+### Worker jobs and recovery
+
+- **The worker Cloud Run Job** runs one task, with two task retries
+  (`--max-retries 2`, so three attempts, matching `MAX_JOB_ATTEMPTS`) and a
+  one-hour task timeout (`--task-timeout 1h`, matching
+  `WORKER_TASK_TIMEOUT_SECONDS`). Each claim leases the job for 65 minutes
+  (`JOB_LEASE_SECONDS`), so a lease expires only after its attempt has ended.
+  A task retry is a new attempt under the same lease holder
+  (`CLOUD_RUN_EXECUTION`).
+- **Recovery** (`uv run --no-sync python -m telemetry_collector.operations
+  recover`) runs every 10 minutes, as an execution of a second Cloud Run Job
+  on the same image that Cloud Scheduler starts. It fails a job whose lease
+  expired after its third attempt (`attempts_exhausted`) or that would need a
+  fourth dispatch (`worker_unavailable`), and dispatches again a job whose
+  attempt ended early or that stayed queued for 30 minutes without being
+  claimed. Each dispatch is a Cloud Task named `<job_id>-<dispatch number>`.
+  Without recovery, a job whose last attempt was killed stays `processing`.
+- **Reprocessing** (`uv run --no-sync python -m telemetry_collector.operations
+  reprocess SUBMISSION_ID...`, or `reprocess --kind <kind> --intake-only`, with
+  `--dry-run` to list first) processes final submissions again in a new
+  processing round, for example after a handler is registered. An operator
+  runs it as an execution of the recovery job with its arguments overridden,
+  or locally through the Cloud SQL Auth Proxy with Application Default
+  Credentials that may enqueue on the queue and act as the invoker account.
 
 None of these values is secret. Switching intake on for an environment needs,
 in that environment's project and region:
@@ -82,20 +108,25 @@ in that environment's project and region:
   enforced, and no lifecycle deletion, so intake files stay available for
   back-building.
 - **A Cloud Tasks queue** for worker jobs.
-- **A worker Cloud Run Job** running the released image with the command above,
-  one task, two task retries (three attempts, matching the worker's limit) and
-  a one-hour task timeout, with the runtime database secret as `DATABASE_URL`,
+- **The worker Cloud Run Job** described above, running the released image
+  with the worker command, with the runtime database secret as `DATABASE_URL`,
   the Cloud SQL connection and `COLLECTOR_INTAKE_BUCKET`.
+- **The recovery Cloud Run Job** on the same image with the recovery command,
+  the runtime database secret as `DATABASE_URL`, the Cloud SQL connection and
+  the three `COLLECTOR_WORKER_*` queue settings, and a Cloud Scheduler job that
+  runs it every 10 minutes.
 - **Permissions:** the runtime service account may create and read objects in
   the bucket, sign as itself (`roles/iam.serviceAccountTokenCreator` on
   itself), enqueue on the queue, and act as the invoker account; the invoker
   account may run the worker job with overrides; the worker's service account
   may read the bucket, connect to Cloud SQL and read the runtime database
-  secret.
+  secret; the recovery job's service account may connect to Cloud SQL, read the
+  runtime database secret, enqueue on the queue and act as the invoker
+  account; Cloud Scheduler's account may run the recovery job.
 - **Deployment wiring:** `scripts/deploy.sh` passing the settings to the
-  service and updating the worker job's image on every release, from new
-  `staging` and `production` environment variables. That change is the one
-  that switches intake on.
+  service and updating both jobs' images on every release, from new `staging`
+  and `production` environment variables. That change is the one that
+  switches intake on.
 
 ## Local development
 

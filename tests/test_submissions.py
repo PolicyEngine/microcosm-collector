@@ -12,6 +12,8 @@ from telemetry_collector.submissions import (
     FINAL_STATUSES,
     JOB_STATUSES,
     MAX_FILES_PER_SUBMISSION,
+    MAX_JOB_ATTEMPTS,
+    MAX_JOB_DISPATCHES,
     SUBMISSION_STATUSES,
     SubmissionRequest,
     canonical_json,
@@ -173,13 +175,27 @@ def test_canonical_json_sorts_keys_and_escapes_non_ascii() -> None:
     assert canonical_json({"b": 1, "a": "é"}) == b'{"a":"\\u00e9","b":1}'
 
 
-def test_job_id_is_derived_from_submission_and_job_type() -> None:
-    first = derive_job_id("sub-1", "calibration-diagnostics")
+def test_job_id_is_derived_from_submission_job_type_and_processing_round() -> None:
+    first = derive_job_id("sub-1", "calibration-diagnostics", 1)
 
-    assert first == derive_job_id("sub-1", "calibration-diagnostics")
-    assert first != derive_job_id("sub-2", "calibration-diagnostics")
+    assert first == derive_job_id("sub-1", "calibration-diagnostics", 1)
+    assert first != derive_job_id("sub-2", "calibration-diagnostics", 1)
+    assert first != derive_job_id("sub-1", "calibration-diagnostics", 2)
     assert first.startswith("job-")
     assert len(first) == len("job-") + 32
+    documented_form = canonical_json(
+        {
+            "submission_id": "sub-1",
+            "job_type": "calibration-diagnostics",
+            "processing_round": 1,
+        }
+    )
+    assert first == "job-" + hashlib.sha256(documented_form).hexdigest()[:32]
+
+
+def test_each_processing_round_allows_three_attempts_and_three_dispatches() -> None:
+    assert MAX_JOB_ATTEMPTS == 3
+    assert MAX_JOB_DISPATCHES == 3
 
 
 def test_intake_object_name_places_files_under_their_submission() -> None:

@@ -301,15 +301,15 @@ def worker_queue(session: StandInSession) -> CloudTasksWorkerQueue:
     )
 
 
-def test_enqueue_creates_a_named_task_that_runs_the_worker_job() -> None:
+def test_dispatch_creates_a_task_named_by_job_and_dispatch_number() -> None:
     session = StandInSession()
 
-    worker_queue(session).enqueue("job-0123")
+    worker_queue(session).dispatch("job-0123", 2)
 
     [(url, body)] = session.requests
     assert url == f"https://cloudtasks.googleapis.com/v2/{QUEUE}/tasks"
     task = body["task"]
-    assert task["name"] == f"{QUEUE}/tasks/job-0123"
+    assert task["name"] == f"{QUEUE}/tasks/job-0123-2"
     http_request = task["httpRequest"]
     assert http_request["httpMethod"] == "POST"
     assert http_request["url"] == f"https://run.googleapis.com/v2/{WORKER_JOB}:run"
@@ -328,8 +328,8 @@ def test_enqueue_creates_a_named_task_that_runs_the_worker_job() -> None:
     }
 
 
-def test_enqueue_treats_an_existing_task_as_enqueued() -> None:
-    worker_queue(StandInSession(status_code=409)).enqueue("job-0123")
+def test_dispatch_treats_an_existing_task_as_dispatched() -> None:
+    worker_queue(StandInSession(status_code=409)).dispatch("job-0123", 1)
 
 
 @pytest.mark.parametrize(
@@ -340,9 +340,9 @@ def test_enqueue_treats_an_existing_task_as_enqueued() -> None:
         StandInSession(error=requests.ConnectionError("unreachable")),
     ],
 )
-def test_enqueue_reports_an_unavailable_queue(session: StandInSession) -> None:
+def test_dispatch_reports_an_unavailable_queue(session: StandInSession) -> None:
     with pytest.raises(WorkerQueueUnavailableError):
-        worker_queue(session).enqueue("job-0123")
+        worker_queue(session).dispatch("job-0123", 1)
 
 
 def test_a_reader_without_a_signing_account_cannot_sign_uploads() -> None:

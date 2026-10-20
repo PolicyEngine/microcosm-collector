@@ -197,6 +197,8 @@ class ArtifactSubmission(Base):
     )
     accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # 0 until completion records the first job; each reprocessing adds one.
+    processing_round: Mapped[int] = mapped_column(Integer, nullable=False)
 
     jobs: Mapped[list[ArtifactJob]] = relationship(
         back_populates="submission",
@@ -206,10 +208,17 @@ class ArtifactSubmission(Base):
 
 
 class ArtifactJob(Base):
-    """Worker job for a submission, also the record of whether it was enqueued."""
+    """One processing round of a submission, with its attempts and dispatches."""
 
     __tablename__ = "artifact_jobs"
-    __table_args__ = (CheckConstraint(_one_of("status", JOB_STATUSES), name="status"),)
+    __table_args__ = (
+        CheckConstraint(_one_of("status", JOB_STATUSES), name="status"),
+        UniqueConstraint(
+            "submission_id",
+            "processing_round",
+            name="artifact_jobs_submission_round_key",
+        ),
+    )
 
     job_id: Mapped[str] = mapped_column(Text, primary_key=True)
     submission_id: Mapped[str] = mapped_column(
@@ -222,24 +231,30 @@ class ArtifactJob(Base):
         nullable=False,
     )
     job_type: Mapped[str] = mapped_column(Text, nullable=False)
+    processing_round: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False)
     attempts: Mapped[int] = mapped_column(Integer, nullable=False)
-    # Null until Cloud Tasks accepted the job; completion retries enqueue it.
-    enqueued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Cloud Tasks accepted this many dispatches, each named by its number.
+    dispatch_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     lease_holder: Mapped[str | None] = mapped_column(Text)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
+    # Every claim, release, dispatch and recovery sets it; recovery uses it to
+    # find a queued job that nothing has touched.
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     submission: Mapped[ArtifactSubmission] = relationship(back_populates="jobs")
 
 
-Index("artifact_jobs_submission_idx", ArtifactJob.submission_id)
+Index("artifact_jobs_status_idx", ArtifactJob.status)
 Index(
     "telemetry_runs_country_registered_idx",
     TelemetryRun.country_code,

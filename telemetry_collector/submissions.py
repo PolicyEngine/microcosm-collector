@@ -29,7 +29,15 @@ GIBIBYTE = 1024 * MEBIBYTE
 MAX_FILES_PER_SUBMISSION = 256
 MAX_SUBMISSION_BYTES = 8 * GIBIBYTE
 UPLOAD_URL_LIFETIME_SECONDS = 30 * 60
+# Each processing round of a submission gets at most this many worker claims
+# and this many Cloud Tasks; recovery fails a job that would need more.
 MAX_JOB_ATTEMPTS = 3
+MAX_JOB_DISPATCHES = 3
+# Recovery dispatches a queued job again after this long without a claim,
+# release or dispatch.
+UNCLAIMED_JOB_IDLE_SECONDS = 30 * 60
+# The ``processed_by`` of the default handler, which only checks the bytes.
+INTAKE_ONLY_HANDLER = "intake-only"
 
 SubmissionKind = Literal["calibration-diagnostics", "orrery-inputs"]
 SubmissionStatus = Literal[
@@ -232,13 +240,19 @@ def derive_submission_id(request: SubmissionRequest) -> str:
     return "sub-" + _sha256_hex(document)[:32]
 
 
-def derive_job_id(submission_id: str, job_type: str) -> str:
-    """The identifier of the job that processes a submission."""
+def derive_job_id(submission_id: str, job_type: str, processing_round: int) -> str:
+    """The identifier of one processing round's job for a submission.
 
-    return (
-        "job-"
-        + _sha256_hex({"submission_id": submission_id, "job_type": job_type})[:32]
-    )
+    Round 1 is the job completion records; each reprocessing adds one, so a
+    stored submission can be processed again under a new job.
+    """
+
+    document = {
+        "submission_id": submission_id,
+        "job_type": job_type,
+        "processing_round": processing_round,
+    }
+    return "job-" + _sha256_hex(document)[:32]
 
 
 def intake_object_prefix(submission_id: str) -> str:

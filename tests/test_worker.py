@@ -9,6 +9,7 @@ import pytest
 
 from telemetry_collector import worker
 from telemetry_collector.auth import HuggingFacePrincipal
+from telemetry_collector.operations import recover_stalled_jobs
 from telemetry_collector.submissions import (
     MAX_JOB_ATTEMPTS,
     SubmissionRequest,
@@ -16,13 +17,16 @@ from telemetry_collector.submissions import (
 )
 from telemetry_collector.worker import (
     DEFAULT_HANDLERS,
+    JOB_LEASE_SECONDS,
+    WORKER_TASK_TIMEOUT_SECONDS,
     JobContext,
     JobOutcome,
     SubmissionRejectedError,
     exit_code,
     run_job,
 )
-from tests.fakes import FakeIntakeObjectStore, FakeSubmissionStore
+from tests.fakes import FakeIntakeObjectStore, FakeSubmissionStore, FakeWorkerQueue
+from tests.test_submission_store import SteppingClock
 from tests.test_submissions import calibration_submission
 
 DIAGNOSTICS_BYTES = b'{"schema_version": 8, "targets": []}'
@@ -39,6 +43,7 @@ class AcceptedSubmission:
     objects: FakeIntakeObjectStore
     submission_id: str
     job_id: str
+    clock: SteppingClock
 
     def run(self, handlers: dict[str, Any] | None = None, holder: str = "exec-1"):
         return run_job(
@@ -62,7 +67,8 @@ def accepted_submission(
     for file in submission["files"]:
         file["size"] = len(CONTENTS[file["name"]])
         file["sha256"] = hashlib.sha256(CONTENTS[file["name"]]).hexdigest()
-    submissions = FakeSubmissionStore()
+    clock = SteppingClock()
+    submissions = FakeSubmissionStore(clock=clock)
     objects = FakeIntakeObjectStore()
     record, _ = submissions.create_submission(
         SubmissionRequest.model_validate(submission),
@@ -78,9 +84,22 @@ def accepted_submission(
         )
     accepted = submissions.accept_submission(record.submission_id, generations)
     assert accepted.job_id is not None
+    submissions.record_dispatch(accepted.job_id, 1)
     return AcceptedSubmission(
-        submissions, objects, record.submission_id, accepted.job_id
+        submissions, objects, record.submission_id, accepted.job_id, clock
     )
+
+
+class SimulatedKill(BaseException):
+    """Ends an attempt the way a memory kill or task timeout does: no cleanup."""
+
+
+def killed_attempt(context: JobContext) -> dict[str, Any]:
+    raise SimulatedKill
+
+
+def failing_attempt(context: JobContext) -> dict[str, Any]:
+    raise RuntimeError("Storage hiccup.")
 
 
 def test_both_kinds_have_a_handler_that_keeps_files_in_intake_storage() -> None:
@@ -291,3 +310,53 @@ def test_the_worker_runs_the_named_job_as_its_cloud_run_execution(
         "job_id": "job-0123",
         "holder": "collector-worker-abc12",
     }
+
+
+def test_the_lease_outlives_the_worker_task_timeout() -> None:
+    assert JOB_LEASE_SECONDS > WORKER_TASK_TIMEOUT_SECONDS
+
+
+def test_an_attempt_at_the_limit_that_ends_without_finishing_fails_on_recovery() -> (
+    None
+):
+    accepted = accepted_submission()
+    worker_queue = FakeWorkerQueue()
+    for _ in range(MAX_JOB_ATTEMPTS - 1):
+        assert accepted.run({"calibration-diagnostics": failing_attempt}) is (
+            JobOutcome.RETRY
+        )
+    with pytest.raises(SimulatedKill):
+        accepted.run({"calibration-diagnostics": killed_attempt})
+    assert accepted.record().status == "processing"
+    assert accepted.record().job_attempts == MAX_JOB_ATTEMPTS
+
+    assert recover_stalled_jobs(accepted.submissions, worker_queue) == []
+    accepted.clock.advance(JOB_LEASE_SECONDS + 1)
+    [recovery] = recover_stalled_jobs(accepted.submissions, worker_queue)
+
+    assert recovery.action == "failed"
+    assert accepted.record().status == "failed"
+    assert accepted.record().rejection == {
+        "code": "attempts_exhausted",
+        "message": "The job's last attempt ended without recording a result.",
+    }
+    assert worker_queue.calls == []
+    assert accepted.run(holder="exec-2") is JobOutcome.SKIPPED
+
+
+def test_a_killed_attempt_below_the_limit_is_dispatched_again_and_finishes() -> None:
+    accepted = accepted_submission()
+    worker_queue = FakeWorkerQueue()
+    with pytest.raises(SimulatedKill):
+        accepted.run({"calibration-diagnostics": killed_attempt})
+    accepted.clock.advance(JOB_LEASE_SECONDS + 1)
+
+    [recovery] = recover_stalled_jobs(accepted.submissions, worker_queue)
+    outcome = accepted.run(holder="exec-2")
+
+    assert recovery.action == "dispatch"
+    assert worker_queue.calls == [(accepted.job_id, 2)]
+    assert outcome is JobOutcome.FINISHED
+    assert accepted.record().status == "succeeded"
+    assert accepted.record().job_attempts == 2
+    assert accepted.record().job_dispatch_count == 2

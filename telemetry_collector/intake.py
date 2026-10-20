@@ -26,10 +26,14 @@ QUEUE_PATTERN = r"^projects/[^/]+/locations/[^/]+/queues/[A-Za-z0-9-]{1,100}$"
 JOB_PATTERN = r"^projects/[^/]+/locations/[^/]+/jobs/[a-z][a-z0-9-]{0,62}$"
 
 
-def _setting(name: str, pattern: str) -> str:
+def resource_setting(
+    name: str, pattern: str, *, required_by: str = f"{INTAKE_SWITCH} is 1"
+) -> str:
+    """A Google Cloud resource name from the environment, checked by ``pattern``."""
+
     value = os.environ.get(name, "").strip()
     if not value:
-        raise RuntimeError(f"{name} is required when {INTAKE_SWITCH} is 1.")
+        raise RuntimeError(f"{name} is required when {required_by}.")
     if not re.fullmatch(pattern, value):
         raise RuntimeError(f"{name} is not a valid resource name.")
     return value
@@ -52,13 +56,13 @@ class IntakeSettings:
         if os.environ.get(INTAKE_SWITCH) != "1":
             return None
         return cls(
-            bucket=_setting("COLLECTOR_INTAKE_BUCKET", BUCKET_PATTERN),
-            signing_service_account=_setting(
+            bucket=resource_setting("COLLECTOR_INTAKE_BUCKET", BUCKET_PATTERN),
+            signing_service_account=resource_setting(
                 "COLLECTOR_INTAKE_SIGNING_SERVICE_ACCOUNT", SERVICE_ACCOUNT_PATTERN
             ),
-            worker_queue=_setting("COLLECTOR_WORKER_QUEUE", QUEUE_PATTERN),
-            worker_job=_setting("COLLECTOR_WORKER_JOB", JOB_PATTERN),
-            worker_invoker_service_account=_setting(
+            worker_queue=resource_setting("COLLECTOR_WORKER_QUEUE", QUEUE_PATTERN),
+            worker_job=resource_setting("COLLECTOR_WORKER_JOB", JOB_PATTERN),
+            worker_invoker_service_account=resource_setting(
                 "COLLECTOR_WORKER_INVOKER_SERVICE_ACCOUNT", SERVICE_ACCOUNT_PATTERN
             ),
         )
@@ -132,7 +136,7 @@ class IntakeObjectMissingError(LookupError):
 
 
 class WorkerQueueUnavailableError(RuntimeError):
-    """The worker queue did not accept the job; enqueueing can be retried."""
+    """The worker queue did not accept the dispatch; it can be repeated."""
 
 
 class IntakeObjectStore(Protocol):
@@ -152,9 +156,22 @@ class IntakeObjectStore(Protocol):
 
 
 class WorkerQueue(Protocol):
-    """Starts a worker job execution for a job ID, at most once per ID."""
+    """Starts one worker job execution per job ID and dispatch number."""
 
-    def enqueue(self, job_id: str) -> None: ...
+    def dispatch(self, job_id: str, dispatch_number: int) -> None:
+        """Start an execution; repeating the same dispatch starts no second one."""
+
+
+def dispatch_job(
+    submissions: SubmissionStore,
+    worker_queue: WorkerQueue,
+    job_id: str,
+    dispatch_number: int,
+) -> None:
+    """Dispatch a job, then record it; WorkerQueueUnavailableError if refused."""
+
+    worker_queue.dispatch(job_id, dispatch_number)
+    submissions.record_dispatch(job_id, dispatch_number)
 
 
 @dataclass(frozen=True)

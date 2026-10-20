@@ -42,6 +42,7 @@ def upgrade() -> None:
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("accepted_at", sa.DateTime(timezone=True)),
         sa.Column("finished_at", sa.DateTime(timezone=True)),
+        sa.Column("processing_round", sa.Integer(), nullable=False),
         sa.CheckConstraint(
             SUBMISSION_STATUSES, name=op.f("ck_artifact_submissions_status")
         ),
@@ -52,14 +53,18 @@ def upgrade() -> None:
         sa.Column("job_id", sa.Text(), nullable=False),
         sa.Column("submission_id", sa.Text(), nullable=False),
         sa.Column("job_type", sa.Text(), nullable=False),
+        sa.Column("processing_round", sa.Integer(), nullable=False),
         sa.Column("status", sa.Text(), nullable=False),
         sa.Column("attempts", sa.Integer(), nullable=False),
-        sa.Column("enqueued_at", sa.DateTime(timezone=True)),
+        sa.Column("dispatch_count", sa.Integer(), nullable=False),
+        sa.Column("dispatched_at", sa.DateTime(timezone=True)),
         sa.Column("lease_holder", sa.Text()),
         sa.Column("lease_expires_at", sa.DateTime(timezone=True)),
         sa.Column("last_error", postgresql.JSONB()),
+        sa.Column("result", postgresql.JSONB()),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("finished_at", sa.DateTime(timezone=True)),
         sa.CheckConstraint(JOB_STATUSES, name=op.f("ck_artifact_jobs_status")),
         sa.ForeignKeyConstraint(
             ["submission_id"],
@@ -68,8 +73,13 @@ def upgrade() -> None:
             ondelete="CASCADE",
         ),
         sa.PrimaryKeyConstraint("job_id", name="pk_artifact_jobs"),
+        sa.UniqueConstraint(
+            "submission_id",
+            "processing_round",
+            name="artifact_jobs_submission_round_key",
+        ),
     )
-    op.create_index("artifact_jobs_submission_idx", "artifact_jobs", ["submission_id"])
+    op.create_index("artifact_jobs_status_idx", "artifact_jobs", ["status"])
 
 
 def downgrade() -> None:

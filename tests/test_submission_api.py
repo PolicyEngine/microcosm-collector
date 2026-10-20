@@ -351,10 +351,14 @@ def test_the_status_reports_the_job_once_completion_records_it(
     record = harness.submissions.get_submission(SUBMISSION_ID)
     assert record is not None
     assert created["job"] is None
-    assert completed["job"] == {"job_id": record.job_id, "attempts": 0}
+    assert completed["job"] == {
+        "job_id": record.job_id,
+        "processing_round": 1,
+        "attempts": 0,
+    }
 
 
-def test_completion_queues_one_job_and_enqueues_it_once(
+def test_completion_queues_one_job_and_dispatches_it_once(
     harness: IntakeHarness,
 ) -> None:
     create(harness)
@@ -368,12 +372,12 @@ def test_completion_queues_one_job_and_enqueues_it_once(
     assert second.status_code == 202
     record = harness.submissions.get_submission(SUBMISSION_ID)
     assert record is not None
-    assert harness.worker_queue.calls == [record.job_id]
-    assert record.job_enqueued is True
+    assert harness.worker_queue.calls == [(record.job_id, 1)]
+    assert record.job_dispatch_count == 1
     assert create(harness).json()["uploads"] == []
 
 
-def test_completion_enqueues_again_after_the_queue_was_unavailable(
+def test_completion_dispatches_again_after_the_queue_was_unavailable(
     harness: IntakeHarness,
 ) -> None:
     create(harness)
@@ -393,7 +397,9 @@ def test_completion_enqueues_again_after_the_queue_was_unavailable(
     assert retried.status_code == 202
     record = harness.submissions.get_submission(SUBMISSION_ID)
     assert record is not None
-    assert harness.worker_queue.enqueued == [record.job_id]
+    assert harness.worker_queue.calls == [(record.job_id, 1), (record.job_id, 1)]
+    assert harness.worker_queue.task_ids == [f"{record.job_id}-1"]
+    assert record.job_dispatch_count == 1
 
 
 def finish_successfully(harness: IntakeHarness) -> None:

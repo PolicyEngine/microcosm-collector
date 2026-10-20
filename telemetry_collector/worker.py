@@ -29,10 +29,17 @@ from telemetry_collector.submission_store import (
     SubmissionRecord,
     SubmissionStore,
 )
-from telemetry_collector.submissions import MAX_JOB_ATTEMPTS, intake_object_name
+from telemetry_collector.submissions import (
+    INTAKE_ONLY_HANDLER,
+    MAX_JOB_ATTEMPTS,
+    intake_object_name,
+)
 
-# Matches the worker job's task timeout, so a lease outlives any one attempt.
-JOB_LEASE_SECONDS = 60 * 60
+# The worker Cloud Run Job's task timeout. A lease lasts longer, so it expires
+# only after its attempt has ended, and recovery never takes a job from a
+# running attempt.
+WORKER_TASK_TIMEOUT_SECONDS = 60 * 60
+JOB_LEASE_SECONDS = WORKER_TASK_TIMEOUT_SECONDS + 5 * 60
 MAX_ERROR_MESSAGE_CHARACTERS = 500
 
 
@@ -91,7 +98,10 @@ JobHandler = Callable[[JobContext], dict[str, Any]]
 def keep_in_intake_storage(context: JobContext) -> dict[str, Any]:
     """Default handler: the files are checked and stay in intake storage."""
 
-    return {"processed_by": "intake-only", "verified_files": len(context.files())}
+    return {
+        "processed_by": INTAKE_ONLY_HANDLER,
+        "verified_files": len(context.files()),
+    }
 
 
 DEFAULT_HANDLERS: Mapping[str, JobHandler] = {

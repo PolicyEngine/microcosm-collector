@@ -140,12 +140,19 @@ class GoogleCloudStorageIntake:
             ) from error
 
 
+def cloud_task_id(job_id: str, dispatch_number: int) -> str:
+    """The Cloud Task ID of one dispatch of a job."""
+
+    return f"{job_id}-{dispatch_number}"
+
+
 class CloudTasksWorkerQueue:
-    """Creates one named Cloud Task per job; the task starts the worker job.
+    """Creates one named Cloud Task per dispatch; the task starts the worker job.
 
     The task calls the Cloud Run Admin API's ``jobs.run`` with an OAuth token
     for the invoker service account, overriding the job ID variable. A task
-    name can be used once, so a repeated enqueue of the same job is a no-op.
+    name can be used once, so repeating a dispatch is a no-op, and recovery
+    dispatches again under the next number.
     """
 
     def __init__(
@@ -161,7 +168,7 @@ class CloudTasksWorkerQueue:
         self._invoker_service_account = invoker_service_account
         self._session = session or AuthorizedSession(_default_credentials())
 
-    def _task(self, job_id: str) -> dict[str, Any]:
+    def _task(self, job_id: str, dispatch_number: int) -> dict[str, Any]:
         run_request = {
             "overrides": {
                 "containerOverrides": [
@@ -171,7 +178,7 @@ class CloudTasksWorkerQueue:
             }
         }
         return {
-            "name": f"{self._queue}/tasks/{job_id}",
+            "name": f"{self._queue}/tasks/{cloud_task_id(job_id, dispatch_number)}",
             "httpRequest": {
                 "httpMethod": "POST",
                 "url": f"https://run.googleapis.com/v2/{self._worker_job}:run",
@@ -184,18 +191,18 @@ class CloudTasksWorkerQueue:
             },
         }
 
-    def enqueue(self, job_id: str) -> None:
+    def dispatch(self, job_id: str, dispatch_number: int) -> None:
         try:
             response = self._session.post(
                 f"https://cloudtasks.googleapis.com/v2/{self._queue}/tasks",
-                json={"task": self._task(job_id)},
+                json={"task": self._task(job_id, dispatch_number)},
                 timeout=QUEUE_REQUEST_TIMEOUT_SECONDS,
             )
         except (requests.RequestException, GoogleAuthError) as error:
             raise WorkerQueueUnavailableError(
                 "The worker queue could not be reached."
             ) from error
-        # 409 means a task with this name already exists: the job is enqueued.
+        # 409 means a task with this name already exists: this dispatch happened.
         if response.status_code not in {200, 409}:
             raise WorkerQueueUnavailableError(
                 f"The worker queue answered HTTP {response.status_code}."
