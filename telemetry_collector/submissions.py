@@ -10,7 +10,7 @@ import json
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 from pydantic import (
     BaseModel,
@@ -32,12 +32,28 @@ UPLOAD_URL_LIFETIME_SECONDS = 30 * 60
 MAX_JOB_ATTEMPTS = 3
 
 SubmissionKind = Literal["calibration-diagnostics", "orrery-inputs"]
+SubmissionStatus = Literal[
+    "awaiting_upload", "queued", "processing", "succeeded", "rejected", "failed"
+]
+JobStatus = Literal["queued", "running", "succeeded", "rejected", "failed"]
+FinalStatus = Literal["succeeded", "rejected", "failed"]
+# The one definition of each status set; the tables' check constraints and the
+# endpoints use these.
+SUBMISSION_STATUSES: tuple[SubmissionStatus, ...] = get_args(SubmissionStatus)
+JOB_STATUSES: tuple[JobStatus, ...] = get_args(JobStatus)
+FINAL_STATUSES: frozenset[str] = frozenset(get_args(FinalStatus))
+
 FILE_NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$"
 SHA256_PATTERN = r"^[0-9a-f]{64}$"
-HUGGINGFACE_REPO_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$"
+# The emitter interface's safe_identifier rule, for builds, releases and
+# Hugging Face folder segments.
+BUILD_IDENTIFIER = r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
+BUILD_IDENTIFIER_PATTERN = rf"^{BUILD_IDENTIFIER}$"
+HUGGINGFACE_REPO_PART = r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}"
+HUGGINGFACE_REPO_PATTERN = rf"^{HUGGINGFACE_REPO_PART}/{HUGGINGFACE_REPO_PART}$"
 GIT_COMMIT_PATTERN = r"^[0-9a-f]{40}$"
-# Relative path segments; the validator also refuses "." and ".." segments.
-REPO_FOLDER_PATTERN = r"^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$"
+HUGGINGFACE_FOLDER_PATTERN = rf"^{BUILD_IDENTIFIER}(/{BUILD_IDENTIFIER})*$"
+MAX_HUGGINGFACE_FOLDER_CHARACTERS = 512
 
 
 @dataclass(frozen=True)
@@ -70,31 +86,37 @@ class HuggingFaceLocation(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    repo: str = Field(pattern=HUGGINGFACE_REPO_PATTERN, max_length=200)
+    repo: str = Field(pattern=HUGGINGFACE_REPO_PATTERN)
+    # The commit that added the folder, never a later commit, branch or tag.
     commit: str = Field(pattern=GIT_COMMIT_PATTERN)
-    folder: str = Field(pattern=REPO_FOLDER_PATTERN, max_length=512)
-
-    @model_validator(mode="after")
-    def refuse_relative_segments(self) -> HuggingFaceLocation:
-        if any(segment in {".", ".."} for segment in self.folder.split("/")):
-            raise ValueError("folder must not contain '.' or '..' segments")
-        return self
+    # Each segment starts with a letter or digit, so "." and ".." cannot occur.
+    folder: str = Field(
+        pattern=HUGGINGFACE_FOLDER_PATTERN,
+        max_length=MAX_HUGGINGFACE_FOLDER_CHARACTERS,
+    )
 
 
 class SubmissionProvenance(BaseModel):
-    """The build that produced a submission's files."""
+    """The build that produced a submission's files.
+
+    Every field is required; ``release`` and ``huggingface`` may be null but
+    not left out, so the hashed form always holds all five keys.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     run_id: str = Field(pattern=SAFE_IDENTIFIER)
-    build_id: str = Field(pattern=SAFE_IDENTIFIER)
+    build_id: str = Field(pattern=BUILD_IDENTIFIER_PATTERN)
     country_code: str = Field(pattern=r"^[A-Z]{2}$")
-    release: str | None = Field(pattern=SAFE_IDENTIFIER)
+    release: str | None = Field(pattern=BUILD_IDENTIFIER_PATTERN)
     huggingface: HuggingFaceLocation | None
 
 
 class SubmittedFile(BaseModel):
-    """One inventory entry: a file's name, role, exact size and SHA-256."""
+    """One inventory entry: a file's name, role, exact size and SHA-256.
+
+    ``size`` is the number the emitter's file entries call ``bytes``.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -187,8 +209,12 @@ def _file_values(files: Iterable[SubmittedFile | Mapping[str, Any]]) -> list[dic
     return sorted(values, key=lambda file: file["name"])
 
 
-def inventory_digest(files: Iterable[SubmittedFile | Mapping[str, Any]]) -> str:
-    """SHA-256 of the inventory, sorted by file name."""
+def files_digest(files: Iterable[SubmittedFile | Mapping[str, Any]]) -> str:
+    """SHA-256 of the files, sorted by name: a submission's ``files_sha256``.
+
+    It differs from the emitter's ``inventory_sha256``, which also covers its
+    inventory's version and publication ID.
+    """
 
     return _sha256_hex(_file_values(files))
 
@@ -215,10 +241,16 @@ def derive_job_id(submission_id: str, job_type: str) -> str:
     )
 
 
+def intake_object_prefix(submission_id: str) -> str:
+    """The intake bucket prefix that holds every file of a submission."""
+
+    return f"submissions/{submission_id}/"
+
+
 def intake_object_name(submission_id: str, file_name: str) -> str:
     """Where a submitted file is stored in the intake bucket."""
 
-    return f"submissions/{submission_id}/{file_name}"
+    return intake_object_prefix(submission_id) + file_name
 
 
 def receipt_digest(receipt: Mapping[str, Any]) -> str:

@@ -34,7 +34,7 @@ def upgrade() -> None:
         sa.Column("licensed_data", sa.Boolean(), nullable=False),
         sa.Column("provenance", postgresql.JSONB(), nullable=False),
         sa.Column("files", postgresql.JSONB(), nullable=False),
-        sa.Column("inventory_sha256", sa.Text(), nullable=False),
+        sa.Column("files_sha256", sa.Text(), nullable=False),
         sa.Column("status", sa.Text(), nullable=False),
         sa.Column("rejection", postgresql.JSONB()),
         sa.Column("result", postgresql.JSONB()),

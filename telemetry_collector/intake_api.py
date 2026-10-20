@@ -28,13 +28,14 @@ from telemetry_collector.submission_store import (
 )
 from telemetry_collector.submissions import (
     CONTRACT_VERSION,
+    FINAL_STATUSES,
     UPLOAD_URL_LIFETIME_SECONDS,
     SubmissionRequest,
     intake_object_name,
+    intake_object_prefix,
     receipt_digest,
 )
 
-FINAL_STATUSES = frozenset({"succeeded", "rejected", "failed"})
 QUEUE_RETRY_AFTER_SECONDS = 30
 
 
@@ -60,7 +61,7 @@ def status_document(
         "submission_id": record.submission_id,
         "kind": record.kind,
         "status": record.status,
-        "inventory_sha256": record.inventory_sha256,
+        "files_sha256": record.files_sha256,
         "created_at": _timestamp(record.created_at),
         "updated_at": _timestamp(record.updated_at),
         "accepted_at": _timestamp(record.accepted_at),
@@ -91,7 +92,7 @@ def receipt_document(record: SubmissionRecord) -> dict[str, Any]:
         "status": record.status,
         "licensed_data": record.licensed_data,
         "provenance": record.provenance,
-        "inventory_sha256": record.inventory_sha256,
+        "files_sha256": record.files_sha256,
         "files": record.files,
         "submitted_by": record.owner_hf_username,
         "created_at": _timestamp(record.created_at),
@@ -152,7 +153,7 @@ def submission_router(
         return record
 
     def stored_objects(record: SubmissionRecord) -> dict[str, StoredObject]:
-        return objects.list_objects(f"submissions/{record.submission_id}/")
+        return objects.list_objects(intake_object_prefix(record.submission_id))
 
     @router.post("", status_code=status.HTTP_201_CREATED)
     def create_submission(

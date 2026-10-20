@@ -31,7 +31,6 @@ from telemetry_collector.storage import (
 from telemetry_collector.submission_store import (
     ATTEMPTS_EXHAUSTED,
     ClaimedJob,
-    FinalJobStatus,
     SubmissionOwnershipError,
     SubmissionRecord,
     files_with_generations,
@@ -39,6 +38,7 @@ from telemetry_collector.submission_store import (
 )
 from telemetry_collector.submissions import (
     MAX_JOB_ATTEMPTS,
+    FinalStatus,
     SubmissionRequest,
     derive_job_id,
 )
@@ -243,7 +243,7 @@ class FakeSubmissionStore:
     def _finish(
         self,
         job: dict[str, Any],
-        status: FinalJobStatus,
+        status: FinalStatus,
         result: dict[str, Any] | None,
         rejection: dict[str, Any] | None,
     ) -> None:
@@ -300,7 +300,7 @@ class FakeSubmissionStore:
         job_id: str,
         *,
         holder: str,
-        status: FinalJobStatus,
+        status: FinalStatus,
         result: dict[str, Any] | None,
         rejection: dict[str, Any] | None,
     ) -> bool:

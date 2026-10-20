@@ -20,7 +20,7 @@ from telemetry_collector.submissions import (
     SubmissionRequest,
     derive_job_id,
     derive_submission_id,
-    inventory_digest,
+    files_digest,
 )
 from tests.fakes import FakeSubmissionStore
 from tests.test_submissions import calibration_submission
@@ -101,7 +101,7 @@ def test_creating_a_submission_records_it_awaiting_upload(
         "build_manifest.json",
         "calibration_diagnostics.json",
     ]
-    assert record.inventory_sha256 == inventory_digest(request.files)
+    assert record.files_sha256 == files_digest(request.files)
     assert record.job_id is None
     assert store.get_submission(record.submission_id) == record
 

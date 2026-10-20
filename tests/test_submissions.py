@@ -9,13 +9,17 @@ import pytest
 from pydantic import ValidationError
 
 from telemetry_collector.submissions import (
+    FINAL_STATUSES,
+    JOB_STATUSES,
     MAX_FILES_PER_SUBMISSION,
+    SUBMISSION_STATUSES,
     SubmissionRequest,
     canonical_json,
     derive_job_id,
     derive_submission_id,
+    files_digest,
     intake_object_name,
-    inventory_digest,
+    intake_object_prefix,
     receipt_digest,
 )
 
@@ -155,12 +159,12 @@ def test_submission_id_hashes_the_documented_canonical_fields() -> None:
     assert derive_submission_id(request) == "sub-" + expected_digest[:32]
 
 
-def test_inventory_digest_hashes_files_sorted_by_name() -> None:
+def test_files_digest_hashes_files_sorted_by_name() -> None:
     request = SubmissionRequest.model_validate(calibration_submission())
     sorted_files = sorted(calibration_submission()["files"], key=lambda f: f["name"])
 
     assert (
-        inventory_digest(request.files)
+        files_digest(request.files)
         == hashlib.sha256(canonical_json(sorted_files)).hexdigest()
     )
 
@@ -179,10 +183,25 @@ def test_job_id_is_derived_from_submission_and_job_type() -> None:
 
 
 def test_intake_object_name_places_files_under_their_submission() -> None:
+    assert intake_object_prefix("sub-1") == "submissions/sub-1/"
     assert (
         intake_object_name("sub-1", "calibration_diagnostics.json")
         == "submissions/sub-1/calibration_diagnostics.json"
     )
+
+
+def test_status_sets_have_one_definition() -> None:
+    assert SUBMISSION_STATUSES == (
+        "awaiting_upload",
+        "queued",
+        "processing",
+        "succeeded",
+        "rejected",
+        "failed",
+    )
+    assert JOB_STATUSES == ("queued", "running", "succeeded", "rejected", "failed")
+    assert frozenset({"succeeded", "rejected", "failed"}) == FINAL_STATUSES
+    assert set(SUBMISSION_STATUSES) & set(JOB_STATUSES) >= FINAL_STATUSES
 
 
 def test_receipt_digest_excludes_its_own_field() -> None:
@@ -340,3 +359,117 @@ def test_contract_version_must_be_the_integer_one(contract_version: object) -> N
         SubmissionRequest.model_validate(
             calibration_submission(contract_version=contract_version)
         )
+
+
+BUILD_IDENTIFIER_LIMIT = 128
+
+
+@pytest.mark.parametrize("field", ["build_id", "release"])
+@pytest.mark.parametrize(
+    "value",
+    ["attempt:1", "a" * (BUILD_IDENTIFIER_LIMIT + 1), "-attempt", "attempt/1", ""],
+)
+def test_build_and_release_use_the_emitter_identifier_syntax(
+    field: str, value: str
+) -> None:
+    submission = calibration_submission()
+    submission["provenance"][field] = value
+
+    with pytest.raises(ValidationError):
+        SubmissionRequest.model_validate(submission)
+
+
+@pytest.mark.parametrize("field", ["build_id", "release"])
+def test_build_and_release_accept_128_characters(field: str) -> None:
+    submission = calibration_submission()
+    submission["provenance"][field] = "a" * BUILD_IDENTIFIER_LIMIT
+
+    SubmissionRequest.model_validate(submission)
+
+
+@pytest.mark.parametrize(
+    "folder",
+    [
+        "staged/.hidden",
+        "staged/" + "a" * (BUILD_IDENTIFIER_LIMIT + 1),
+        "staged/run:1",
+        "staged/run/",
+    ],
+)
+def test_huggingface_folder_segments_use_the_identifier_syntax(folder: str) -> None:
+    submission = calibration_submission()
+    submission["provenance"]["huggingface"]["folder"] = folder
+
+    with pytest.raises(ValidationError):
+        SubmissionRequest.model_validate(submission)
+
+
+def test_huggingface_folder_is_at_most_512_characters() -> None:
+    longest_folder = "/".join(["a" * 127] * 4) + "b"
+    assert len(longest_folder) == 512
+    submission = calibration_submission()
+    submission["provenance"]["huggingface"]["folder"] = longest_folder
+    SubmissionRequest.model_validate(submission)
+
+    too_long_folder = "/".join(["a" * 100] * 6)
+    assert len(too_long_folder) > 512
+    submission["provenance"]["huggingface"]["folder"] = too_long_folder
+    with pytest.raises(ValidationError):
+        SubmissionRequest.model_validate(submission)
+
+
+@pytest.mark.parametrize(
+    "repo",
+    [
+        "policyengine/" + "a" * 97,
+        "a" * 97 + "/populace-uk-staging",
+        "policyengine/populace/uk",
+        "policyengine/.hidden",
+    ],
+)
+def test_huggingface_repo_parts_are_at_most_96_characters(repo: str) -> None:
+    submission = calibration_submission()
+    submission["provenance"]["huggingface"]["repo"] = repo
+
+    with pytest.raises(ValidationError):
+        SubmissionRequest.model_validate(submission)
+
+
+def test_huggingface_repo_parts_accept_96_characters() -> None:
+    submission = calibration_submission()
+    submission["provenance"]["huggingface"]["repo"] = "a" * 96 + "/" + "b" * 96
+
+    SubmissionRequest.model_validate(submission)
+
+
+@pytest.mark.parametrize("missing_key", ["release", "huggingface"])
+def test_nullable_provenance_keys_are_still_required(missing_key: str) -> None:
+    submission = calibration_submission()
+    del submission["provenance"][missing_key]
+
+    with pytest.raises(ValidationError):
+        SubmissionRequest.model_validate(submission)
+
+
+def test_null_provenance_fields_are_hashed_as_json_null() -> None:
+    submission = orrery_submission()
+    expected_document = {
+        "contract_version": 1,
+        "kind": "orrery-inputs",
+        "licensed_data": True,
+        "provenance": {
+            "run_id": "uk-run-1",
+            "build_id": "uk-frs-calibration-attempt-1",
+            "country_code": "UK",
+            "release": None,
+            "huggingface": None,
+        },
+        "files": sorted(submission["files"], key=lambda file: file["name"]),
+    }
+    hashed_form = canonical_json(expected_document)
+
+    assert b'"huggingface":null' in hashed_form
+    assert b'"release":null' in hashed_form
+    assert derive_submission_id(SubmissionRequest.model_validate(submission)) == (
+        "sub-" + hashlib.sha256(hashed_form).hexdigest()[:32]
+    )

@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal, Protocol
+from typing import Any, Protocol, cast
 
 from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert
@@ -20,13 +20,15 @@ from telemetry_collector.database import (
 )
 from telemetry_collector.submissions import (
     MAX_JOB_ATTEMPTS,
+    FinalStatus,
+    SubmissionKind,
     SubmissionRequest,
+    SubmissionStatus,
     derive_job_id,
     derive_submission_id,
-    inventory_digest,
+    files_digest,
 )
 
-FinalJobStatus = Literal["succeeded", "rejected", "failed"]
 Clock = Callable[[], datetime]
 ATTEMPTS_EXHAUSTED = {
     "code": "attempts_exhausted",
@@ -43,14 +45,14 @@ class SubmissionRecord:
     """A submission and the state of its job, as the API and worker see them."""
 
     submission_id: str
-    kind: str
+    kind: SubmissionKind
     owner_hf_id: str
     owner_hf_username: str
     licensed_data: bool
     provenance: dict[str, Any]
     files: list[dict[str, Any]]
-    inventory_sha256: str
-    status: str
+    files_sha256: str
+    status: SubmissionStatus
     rejection: dict[str, Any] | None
     result: dict[str, Any] | None
     created_at: datetime
@@ -98,7 +100,7 @@ class SubmissionStore(Protocol):
         job_id: str,
         *,
         holder: str,
-        status: FinalJobStatus,
+        status: FinalStatus,
         result: dict[str, Any] | None,
         rejection: dict[str, Any] | None,
     ) -> bool:
@@ -125,7 +127,7 @@ def new_submission_values(
         "licensed_data": request.licensed_data,
         "provenance": request.provenance.model_dump(mode="json"),
         "files": request.sorted_files(),
-        "inventory_sha256": inventory_digest(request.files),
+        "files_sha256": files_digest(request.files),
         "status": "awaiting_upload",
         "rejection": None,
         "result": None,
@@ -152,14 +154,14 @@ def _record(
 ) -> SubmissionRecord:
     return SubmissionRecord(
         submission_id=submission.submission_id,
-        kind=submission.kind,
+        kind=cast(SubmissionKind, submission.kind),
         owner_hf_id=submission.owner_hf_id,
         owner_hf_username=submission.owner_hf_username,
         licensed_data=submission.licensed_data,
         provenance=dict(submission.provenance),
         files=[dict(file) for file in submission.files],
-        inventory_sha256=submission.inventory_sha256,
-        status=submission.status,
+        files_sha256=submission.files_sha256,
+        status=cast(SubmissionStatus, submission.status),
         rejection=submission.rejection,
         result=submission.result,
         created_at=submission.created_at,
@@ -318,7 +320,7 @@ class PostgresSubmissionStore:
         job_id: str,
         *,
         holder: str,
-        status: FinalJobStatus,
+        status: FinalStatus,
         result: dict[str, Any] | None,
         rejection: dict[str, Any] | None,
     ) -> bool:
@@ -356,7 +358,7 @@ def _finish(
     job: ArtifactJob,
     submission: ArtifactSubmission,
     now: datetime,
-    status: FinalJobStatus,
+    status: FinalStatus,
     result: dict[str, Any] | None,
     rejection: dict[str, Any] | None,
 ) -> None:

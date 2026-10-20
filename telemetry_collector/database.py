@@ -30,6 +30,8 @@ from sqlalchemy.orm import (
 )
 from sqlalchemy.sql import func
 
+from telemetry_collector.submissions import JOB_STATUSES, SUBMISSION_STATUSES
+
 DB_POOL_SIZE = 2
 DB_MAX_OVERFLOW = 3
 DB_POOL_TIMEOUT_SECONDS = 10
@@ -163,17 +165,6 @@ class TelemetryEvent(Base):
     producer: Mapped[TelemetryProducer] = relationship(back_populates="events")
 
 
-SUBMISSION_STATUSES = (
-    "awaiting_upload",
-    "queued",
-    "processing",
-    "succeeded",
-    "rejected",
-    "failed",
-)
-JOB_STATUSES = ("queued", "running", "succeeded", "rejected", "failed")
-
-
 def _one_of(column: str, values: tuple[str, ...]) -> str:
     return f"{column} IN ({', '.join(repr(value) for value in values)})"
 
@@ -194,7 +185,7 @@ class ArtifactSubmission(Base):
     provenance: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     # The inventory sorted by name; acceptance adds each object's generation.
     files: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
-    inventory_sha256: Mapped[str] = mapped_column(Text, nullable=False)
+    files_sha256: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False)
     rejection: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     result: Mapped[dict[str, Any] | None] = mapped_column(JSONB)

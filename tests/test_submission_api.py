@@ -13,6 +13,7 @@ from telemetry_collector.intake import IntakeServices
 from telemetry_collector.submissions import (
     SubmissionRequest,
     derive_submission_id,
+    files_digest,
     intake_object_name,
     receipt_digest,
 )
@@ -395,6 +396,8 @@ def test_the_receipt_records_files_generations_result_and_its_digest(
     assert receipt["job"]["attempts"] == 1
     assert receipt["result"] == {"verified_files": 2}
     assert receipt["rejection"] is None
+    assert receipt["files_sha256"] == files_digest(receipt["files"])
+    assert "inventory_sha256" not in receipt
     assert receipt["receipt_sha256"] == receipt_digest(receipt)
 
 
@@ -407,7 +410,10 @@ def test_status_reports_progress_without_upload_urls(
 
     assert status["status"] == "awaiting_upload"
     assert "uploads" not in status
-    assert status["inventory_sha256"]
+    assert status["files_sha256"] == files_digest(
+        submission_with_real_digests()["files"]
+    )
+    assert "inventory_sha256" not in status
 
 
 class StandInIntakeAdapter:
