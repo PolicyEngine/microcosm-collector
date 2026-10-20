@@ -251,3 +251,130 @@ def test_settings_still_refuse_a_short_hs256_secret(
 
     with pytest.raises(RuntimeError, match="at least 32 characters"):
         CollectorSettings.from_environment()
+
+
+def exchange(client: TestClient) -> str:
+    response = client.post(
+        "/v1/auth/huggingface/exchange",
+        headers={"Authorization": "Bearer hf_example"},
+    )
+    assert response.status_code == 200
+    return response.json()["access_token"]
+
+
+def telemetry_event() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "event_id": "evt-1",
+        "run_id": "run-1",
+        "producer_id": "producer-1",
+        "sequence": 1,
+        "timestamp": datetime.now(UTC).isoformat(),
+        "event_type": "stage",
+        "stage_id": "target_compilation",
+        "status": "started",
+        "message": "Compiling targets.",
+        "details": {},
+    }
+
+
+@pytest.mark.parametrize(
+    "hs256_secret", [HS256_SECRET, None], ids=["switch-window", "hs256-retired"]
+)
+def test_exchange_issues_an_es256_token_naming_the_signing_key(
+    hs256_secret: str | None,
+) -> None:
+    private_key, signing_key = generated_signing_key()
+    client = collector_client(signing_key=signing_key, hs256_secret=hs256_secret)
+
+    session_token = exchange(client)
+
+    assert jwt.get_unverified_header(session_token) == {
+        "alg": "ES256",
+        "kid": signing_key.key_id,
+        "typ": "JWT",
+    }
+    claims = jwt.decode(
+        session_token,
+        private_key.public_key(),
+        algorithms=["ES256"],
+        issuer=ISSUER,
+        audience=AUDIENCE,
+    )
+    assert claims["sub"] == "hf-user-1"
+    assert claims["scope"] == "telemetry:write"
+
+
+def test_exchange_issues_hs256_tokens_until_a_signing_key_is_configured() -> None:
+    client = collector_client(signing_key=None, hs256_secret=HS256_SECRET)
+
+    session_token = exchange(client)
+
+    assert jwt.get_unverified_header(session_token)["alg"] == "HS256"
+    claims = jwt.decode(
+        session_token,
+        HS256_SECRET,
+        algorithms=["HS256"],
+        issuer=ISSUER,
+        audience=AUDIENCE,
+    )
+    assert claims["scope"] == "telemetry:write"
+
+
+def test_es256_session_token_registers_runs_and_ingests_events() -> None:
+    _, signing_key = generated_signing_key()
+    client = collector_client(signing_key=signing_key, hs256_secret=None)
+    session_token = exchange(client)
+
+    registration = register_run(client, session_token)
+    ingestion = client.post(
+        "/v1/runs/run-1/events",
+        headers={"Authorization": f"Bearer {session_token}"},
+        json={"events": [telemetry_event()]},
+    )
+
+    assert registration.status_code == 201
+    assert ingestion.status_code == 202
+    assert ingestion.json() == {"accepted": 1, "duplicates": 0}
+
+
+def test_jwks_publishes_the_signing_public_key_without_credentials() -> None:
+    _, signing_key = generated_signing_key()
+    client = collector_client(signing_key=signing_key, hs256_secret=HS256_SECRET)
+
+    response = client.get("/.well-known/jwks.json")
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "public, max-age=300"
+    assert response.json() == {"keys": [signing_key.public_jwk()]}
+    assert "d" not in response.json()["keys"][0]
+
+
+def test_jwks_is_empty_until_a_signing_key_is_configured() -> None:
+    client = collector_client(signing_key=None, hs256_secret=HS256_SECRET)
+
+    response = client.get("/.well-known/jwks.json")
+
+    assert response.status_code == 200
+    assert response.json() == {"keys": []}
+
+
+def test_a_verifier_holding_only_the_jwks_accepts_issued_tokens() -> None:
+    _, signing_key = generated_signing_key()
+    client = collector_client(signing_key=signing_key, hs256_secret=HS256_SECRET)
+    session_token = exchange(client)
+    published_keys = jwt.PyJWKSet.from_dict(client.get("/.well-known/jwks.json").json())
+
+    header = jwt.get_unverified_header(session_token)
+    published_key = next(
+        key for key in published_keys.keys if key.key_id == header["kid"]
+    )
+    claims = jwt.decode(
+        session_token,
+        published_key,
+        algorithms=["ES256"],
+        issuer=ISSUER,
+        audience=AUDIENCE,
+    )
+
+    assert claims["sub"] == "hf-user-1"

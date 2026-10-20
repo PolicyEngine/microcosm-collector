@@ -134,3 +134,29 @@ def verify_session_token(
         audience=audience,
         options={"require": REQUIRED_CLAIMS},
     )
+
+
+def sign_session_token(
+    claims: dict[str, Any],
+    *,
+    signing_key: SessionSigningKey | None,
+    hs256_secret: str | None,
+) -> str:
+    """Sign with ES256 once a signing key is configured, otherwise with HS256."""
+
+    if signing_key is not None:
+        return jwt.encode(
+            claims,
+            signing_key.private_key,
+            algorithm=ES256,
+            headers={"kid": signing_key.key_id},
+        )
+    if hs256_secret is not None:
+        return jwt.encode(claims, hs256_secret, algorithm=HS256)
+    raise ValueError("Session tokens need a signing key or an HS256 secret.")
+
+
+def json_web_key_set(signing_key: SessionSigningKey | None) -> dict[str, Any]:
+    """The JWKS that verifies the collector's ES256 tokens; empty before ES256."""
+
+    return {"keys": [] if signing_key is None else [signing_key.public_jwk()]}

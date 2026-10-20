@@ -24,6 +24,8 @@ from jwt.algorithms import ECAlgorithm
 from telemetry_collector.session_tokens import (
     SIGNING_KEY_VARIABLE,
     SessionSigningKey,
+    json_web_key_set,
+    sign_session_token,
     verify_session_token,
 )
 from tests.signing_keys import (
@@ -387,3 +389,51 @@ def test_malformed_token_is_refused() -> None:
 
     with pytest.raises(InvalidTokenError):
         verify("not-a-token", signing_key=signing_key, hs256_secret=HS256_SECRET)
+
+
+@pytest.mark.parametrize(
+    "hs256_secret", [HS256_SECRET, None], ids=["switch-window", "hs256-retired"]
+)
+def test_new_tokens_are_es256_naming_the_key_once_a_signing_key_is_configured(
+    hs256_secret: str | None,
+) -> None:
+    signing_key = SessionSigningKey.from_pem(p256_private_key_pem())
+
+    token = sign_session_token(
+        session_claims(), signing_key=signing_key, hs256_secret=hs256_secret
+    )
+
+    assert jwt.get_unverified_header(token) == {
+        "alg": "ES256",
+        "kid": signing_key.key_id,
+        "typ": "JWT",
+    }
+    assert verify(token, signing_key=signing_key, hs256_secret=None)["sub"] == (
+        "hf-user-1"
+    )
+
+
+def test_new_tokens_are_hs256_until_a_signing_key_is_configured() -> None:
+    token = sign_session_token(
+        session_claims(), signing_key=None, hs256_secret=HS256_SECRET
+    )
+
+    assert jwt.get_unverified_header(token) == {"alg": "HS256", "typ": "JWT"}
+    assert verify(token, signing_key=None, hs256_secret=HS256_SECRET)["sub"] == (
+        "hf-user-1"
+    )
+
+
+def test_signing_needs_a_signing_key_or_an_hs256_secret() -> None:
+    with pytest.raises(ValueError, match="signing key or an HS256 secret"):
+        sign_session_token(session_claims(), signing_key=None, hs256_secret=None)
+
+
+def test_key_set_lists_the_signing_public_key() -> None:
+    signing_key = SessionSigningKey.from_pem(p256_private_key_pem())
+
+    assert json_web_key_set(signing_key) == {"keys": [signing_key.public_jwk()]}
+
+
+def test_key_set_is_empty_until_a_signing_key_is_configured() -> None:
+    assert json_web_key_set(None) == {"keys": []}

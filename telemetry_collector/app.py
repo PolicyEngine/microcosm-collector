@@ -13,8 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
-import jwt
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response, status
 from fastapi.responses import JSONResponse
 from jwt import InvalidTokenError
 from pydantic import ValidationError
@@ -35,6 +34,8 @@ from telemetry_collector.models import (
 from telemetry_collector.session_tokens import (
     SIGNING_KEY_VARIABLE,
     SessionSigningKey,
+    json_web_key_set,
+    sign_session_token,
     verify_session_token,
 )
 from telemetry_collector.storage import (
@@ -261,7 +262,7 @@ def _issue_session_token(
 ) -> CollectorToken:
     now = datetime.now(UTC)
     expires = now + timedelta(seconds=settings.session_token_ttl_seconds)
-    encoded = jwt.encode(
+    encoded = sign_session_token(
         {
             "iss": settings.collector_issuer,
             "aud": settings.collector_audience,
@@ -272,8 +273,8 @@ def _issue_session_token(
             "iat": now,
             "exp": expires,
         },
-        settings.jwt_secret,
-        algorithm="HS256",
+        signing_key=settings.signing_key,
+        hs256_secret=settings.jwt_secret,
     )
     return CollectorToken(
         access_token=encoded,
@@ -382,6 +383,13 @@ def create_app(
                 detail="Telemetry database is unavailable or not fully migrated.",
             )
         return {"status": "ok"}
+
+    @application.get("/.well-known/jwks.json")
+    def session_token_key_set(response: Response) -> dict[str, Any]:
+        """Public keys that verify session tokens, by their ``kid``."""
+
+        response.headers["Cache-Control"] = "public, max-age=300"
+        return json_web_key_set(settings.signing_key)
 
     @application.post(
         "/v1/auth/huggingface/exchange",
