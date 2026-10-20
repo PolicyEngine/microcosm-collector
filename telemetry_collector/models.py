@@ -131,8 +131,14 @@ class TokenExchangeRequest(BaseModel):
 
 
 class CollectorToken(BaseModel):
-    """Short-lived token returned after Hugging Face verification."""
+    """Short-lived token returned after Hugging Face verification.
+
+    ``scope`` repeats the token's scope, so a client can tell that a collector
+    without intake answered an ``artifacts:submit`` request with a
+    ``telemetry:write`` token.
+    """
 
     access_token: str
     token_type: Literal["bearer"] = "bearer"
     expires_in: int
+    scope: SessionScope

@@ -85,6 +85,7 @@ def test_exchange_without_a_body_still_issues_a_telemetry_token() -> None:
 
     assert response.status_code == 200
     assert token_scope(response.json()["access_token"]) == "telemetry:write"
+    assert response.json()["scope"] == "telemetry:write"
 
 
 def test_exchange_with_an_empty_object_still_issues_a_telemetry_token() -> None:
@@ -92,6 +93,7 @@ def test_exchange_with_an_empty_object_still_issues_a_telemetry_token() -> None:
 
     assert response.status_code == 200
     assert token_scope(response.json()["access_token"]) == "telemetry:write"
+    assert response.json()["scope"] == "telemetry:write"
 
 
 def test_exchange_for_artifact_submission_is_not_found_while_intake_is_off() -> None:
@@ -100,7 +102,10 @@ def test_exchange_for_artifact_submission_is_not_found_while_intake_is_off() -> 
     )
 
     assert response.status_code == 404
-    assert response.json() == {"detail": "Artifact intake is not enabled."}
+    assert response.json() == {
+        "detail": "Artifact intake is not enabled on this collector.",
+        "code": "intake_not_enabled",
+    }
 
 
 def test_exchange_for_artifact_submission_issues_a_submit_token() -> None:
@@ -111,6 +116,13 @@ def test_exchange_for_artifact_submission_issues_a_submit_token() -> None:
 
     assert response.status_code == 200
     assert token_scope(response.json()["access_token"]) == "artifacts:submit"
+    assert set(response.json()) == {
+        "access_token",
+        "token_type",
+        "expires_in",
+        "scope",
+    }
+    assert response.json()["scope"] == "artifacts:submit"
 
 
 @pytest.mark.parametrize(

@@ -27,7 +27,13 @@ from telemetry_collector.auth import (
     HuggingFacePrincipal,
 )
 from telemetry_collector.intake import IntakeServices, IntakeSettings
-from telemetry_collector.intake_api import submission_router
+from telemetry_collector.intake_api import (
+    IntakeProblemError,
+    intake_not_enabled,
+    intake_not_enabled_router,
+    intake_problem_response,
+    submission_router,
+)
 from telemetry_collector.models import (
     CollectorToken,
     EventBatch,
@@ -261,6 +267,7 @@ def _issue_session_token(
     return CollectorToken(
         access_token=encoded,
         expires_in=settings.session_token_ttl_seconds,
+        scope=scope,
     )
 
 
@@ -369,12 +376,15 @@ def create_app(
     ) -> SessionTokenClaims:
         return _decode_session_token(settings, authorization, "artifacts:submit")
 
+    application.add_exception_handler(IntakeProblemError, intake_problem_response)
     if settings.intake is not None and intake_services is not None:
         application.include_router(
             submission_router(
                 services=intake_services, submitter_claims=submitter_claims
             )
         )
+    else:
+        application.include_router(intake_not_enabled_router())
 
     @application.get("/health")
     def health() -> dict[str, str]:
@@ -400,9 +410,7 @@ def create_app(
         opaque_token = _bearer_token(authorization)
         scope = (exchange_request or TokenExchangeRequest()).scope
         if scope == "artifacts:submit" and settings.intake is None:
-            raise HTTPException(
-                status_code=404, detail="Artifact intake is not enabled."
-            )
+            raise intake_not_enabled()
         try:
             principal = huggingface_authenticator.authenticate(
                 opaque_token,

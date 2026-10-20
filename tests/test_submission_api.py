@@ -142,9 +142,18 @@ def test_submission_endpoints_do_not_exist_while_intake_is_off() -> None:
         )
     )
 
-    assert client.post("/v1/submissions", json={}).status_code == 404
-    assert client.get("/v1/submissions/sub-1").status_code == 404
-    assert client.post("/v1/submissions/sub-1/complete").status_code == 404
+    for method, path in [
+        ("POST", "/v1/submissions"),
+        ("GET", "/v1/submissions/sub-1"),
+        ("POST", "/v1/submissions/sub-1/complete"),
+        ("GET", "/v1/submissions/sub-1/receipt"),
+    ]:
+        response = client.request(method, path, json={})
+        assert response.status_code == 404, path
+        assert response.json() == {
+            "detail": "Artifact intake is not enabled on this collector.",
+            "code": "intake_not_enabled",
+        }
     assert not any(
         path.startswith("/v1/submissions")
         for path in client.get("/openapi.json").json()["paths"]
@@ -234,13 +243,19 @@ def test_another_user_cannot_create_read_or_complete_a_submission(
     create(harness)
     harness.authenticator.user_id = "hf-user-2"
 
-    assert create(harness).status_code == 403
-    assert harness.call("GET", f"/v1/submissions/{SUBMISSION_ID}").status_code == 403
-    assert complete(harness).status_code == 403
-    assert (
-        harness.call("GET", f"/v1/submissions/{SUBMISSION_ID}/receipt").status_code
-        == 403
-    )
+    responses = [
+        create(harness),
+        harness.call("GET", f"/v1/submissions/{SUBMISSION_ID}"),
+        complete(harness),
+        harness.call("GET", f"/v1/submissions/{SUBMISSION_ID}/receipt"),
+    ]
+
+    for response in responses:
+        assert response.status_code == 403
+        assert response.json() == {
+            "detail": "Submission belongs to another Hugging Face user.",
+            "code": "submission_owned_by_another_user",
+        }
 
 
 def test_completion_lists_missing_and_mismatched_files(
@@ -258,6 +273,7 @@ def test_completion_lists_missing_and_mismatched_files(
     assert response.status_code == 409
     assert response.json() == {
         "detail": "Some files are not stored as declared.",
+        "code": "files_missing",
         "problems": [
             {"name": "build_manifest.json", "problem": "missing"},
             {"name": "calibration_diagnostics.json", "problem": "size_mismatch"},
@@ -316,6 +332,10 @@ def test_completion_enqueues_again_after_the_queue_was_unavailable(
 
     assert unavailable.status_code == 503
     assert unavailable.headers["Retry-After"] == "30"
+    assert unavailable.json() == {
+        "detail": "The worker queue is unavailable; retry completion.",
+        "code": "worker_queue_unavailable",
+    }
     assert retried.status_code == 202
     record = harness.submissions.get_submission(SUBMISSION_ID)
     assert record is not None
@@ -352,13 +372,17 @@ def test_completion_of_a_finished_submission_returns_200(
 def test_status_and_receipt_of_an_unknown_submission_are_not_found(
     harness: IntakeHarness,
 ) -> None:
-    for path in ("/v1/submissions/sub-unknown", "/v1/submissions/sub-unknown/receipt"):
-        response = harness.call("GET", path)
+    for method, path in [
+        ("GET", "/v1/submissions/sub-unknown"),
+        ("GET", "/v1/submissions/sub-unknown/receipt"),
+        ("POST", "/v1/submissions/sub-unknown/complete"),
+    ]:
+        response = harness.call(method, path)
         assert response.status_code == 404
-        assert response.json() == {"detail": "Submission was not found."}
-    assert (
-        harness.call("POST", "/v1/submissions/sub-unknown/complete").status_code == 404
-    )
+        assert response.json() == {
+            "detail": "Submission was not found.",
+            "code": "submission_not_found",
+        }
 
 
 def test_the_receipt_is_refused_until_the_submission_is_final(
@@ -371,6 +395,7 @@ def test_the_receipt_is_refused_until_the_submission_is_final(
     assert response.status_code == 409
     assert response.json() == {
         "detail": "Submission is not final yet.",
+        "code": "submission_not_final",
         "status": "awaiting_upload",
     }
 

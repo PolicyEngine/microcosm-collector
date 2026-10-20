@@ -1,7 +1,9 @@
-"""HTTP endpoints for artifact submissions, mounted only while intake is on.
+"""HTTP endpoints for artifact submissions.
 
-File bytes never pass through these endpoints: clients upload to signed URLs,
-and completion reads only object metadata, so every request stays within the
+The endpoints are mounted only while intake is on; while it is off, every
+submission path answers 404 with the code ``intake_not_enabled``. File bytes
+never pass through these endpoints: clients upload to signed URLs, and
+completion reads only object metadata, so every request stays within the
 API's 1 MiB body limit, 512 MiB of memory and 30 s timeout.
 """
 
@@ -11,7 +13,7 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import Any, Protocol
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, Request, Response, status
 from fastapi.responses import JSONResponse
 
 from telemetry_collector.auth import HuggingFacePrincipal
@@ -37,6 +39,64 @@ from telemetry_collector.submissions import (
 )
 
 QUEUE_RETRY_AFTER_SECONDS = 30
+INTAKE_NOT_ENABLED_DETAIL = "Artifact intake is not enabled on this collector."
+SUBMISSION_PATHS = ("/v1/submissions", "/v1/submissions/{submission_path:path}")
+ALL_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"]
+
+
+class IntakeProblemError(Exception):
+    """An intake answer with a machine-readable ``code`` beside its ``detail``.
+
+    The contract's client rules depend on these codes, for example to tell an
+    unknown submission (``submission_not_found``) from a collector without
+    intake (``intake_not_enabled``).
+    """
+
+    def __init__(
+        self,
+        status_code: int,
+        code: str,
+        detail: str,
+        *,
+        headers: dict[str, str] | None = None,
+        **fields: Any,
+    ) -> None:
+        super().__init__(detail)
+        self.status_code = status_code
+        self.code = code
+        self.detail = detail
+        self.headers = headers
+        self.fields = fields
+
+
+async def intake_problem_response(request: Request, problem: Exception) -> JSONResponse:
+    """Render an ``IntakeProblemError`` as ``{"detail", "code", ...}``."""
+
+    assert isinstance(problem, IntakeProblemError)
+    return JSONResponse(
+        status_code=problem.status_code,
+        content={"detail": problem.detail, "code": problem.code, **problem.fields},
+        headers=problem.headers,
+    )
+
+
+def intake_not_enabled() -> IntakeProblemError:
+    """The answer of a collector whose intake is switched off."""
+
+    return IntakeProblemError(404, "intake_not_enabled", INTAKE_NOT_ENABLED_DETAIL)
+
+
+def intake_not_enabled_router() -> APIRouter:
+    """Answer every submission path while intake is off, outside the schema."""
+
+    router = APIRouter()
+
+    def refuse(submission_path: str = "") -> None:
+        raise intake_not_enabled()
+
+    for path in SUBMISSION_PATHS:
+        router.add_api_route(path, refuse, methods=ALL_METHODS, include_in_schema=False)
+    return router
 
 
 class SubmitterClaims(Protocol):
@@ -144,11 +204,14 @@ def submission_router(
     ) -> SubmissionRecord:
         record = submissions.get_submission(submission_id)
         if record is None:
-            raise HTTPException(status_code=404, detail="Submission was not found.")
+            raise IntakeProblemError(
+                404, "submission_not_found", "Submission was not found."
+            )
         if record.owner_hf_id != claims.subject:
-            raise HTTPException(
-                status_code=403,
-                detail="Submission belongs to another Hugging Face user.",
+            raise IntakeProblemError(
+                403,
+                "submission_owned_by_another_user",
+                "Submission belongs to another Hugging Face user.",
             )
         return record
 
@@ -169,7 +232,9 @@ def submission_router(
         try:
             record, created = submissions.create_submission(submission, principal)
         except SubmissionOwnershipError as error:
-            raise HTTPException(status_code=403, detail=str(error)) from error
+            raise IntakeProblemError(
+                403, "submission_owned_by_another_user", str(error)
+            ) from error
         response.status_code = 201 if created else 200
         uploads: list[SignedUpload] = []
         if record.status == "awaiting_upload":
@@ -205,12 +270,11 @@ def submission_router(
             stored = stored_objects(record)
             problems = storage_problems(record, stored)
             if problems:
-                return JSONResponse(
-                    status_code=409,
-                    content={
-                        "detail": "Some files are not stored as declared.",
-                        "problems": problems,
-                    },
+                raise IntakeProblemError(
+                    409,
+                    "files_missing",
+                    "Some files are not stored as declared.",
+                    problems=problems,
                 )
             record = submissions.accept_submission(
                 submission_id,
@@ -226,9 +290,10 @@ def submission_router(
             try:
                 services.worker_queue.enqueue(record.job_id)
             except WorkerQueueUnavailableError as error:
-                raise HTTPException(
-                    status_code=503,
-                    detail="The worker queue is unavailable; retry completion.",
+                raise IntakeProblemError(
+                    503,
+                    "worker_queue_unavailable",
+                    "The worker queue is unavailable; retry completion.",
                     headers={"Retry-After": str(QUEUE_RETRY_AFTER_SECONDS)},
                 ) from error
             submissions.mark_job_enqueued(record.job_id)
@@ -250,12 +315,11 @@ def submission_router(
     ) -> Any:
         record = owned_submission(submission_id, claims)
         if record.status not in FINAL_STATUSES:
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "detail": "Submission is not final yet.",
-                    "status": record.status,
-                },
+            raise IntakeProblemError(
+                409,
+                "submission_not_final",
+                "Submission is not final yet.",
+                status=record.status,
             )
         return receipt_document(record)
 
