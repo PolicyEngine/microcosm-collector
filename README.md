@@ -78,6 +78,43 @@ they are skipped. CI runs them against PostgreSQL 16 and also runs
 `python -m telemetry_collector.migrate` and `alembic check` against that
 database.
 
+## Orrery projection
+
+`telemetry_collector/orrery/projection` is a copy of Microcosm's Orrery
+projection. `orrery_json_from_schema(schema, execution=overlay)` turns a
+build's saved compiler schema (`graph.schema.json`) and execution overlay
+(`graph.execution.json`) into the Orrery JSON that Microcosm's projection
+writes from them, byte for byte. It needs only the standard library. Nothing
+in the service calls it yet; the collector's Orrery worker will.
+
+`provenance.py` records the Microcosm commit the modules were copied from,
+each source file's git blob ID, and what the one changed module,
+`orrery.py`, leaves out. The adapter identifier written at
+`metadata.adapter`, `microcosm.graph.orrery.v1`, is Microcosm's and is kept
+unchanged. `tests/test_orrery_projection.py` compares the copy's output with
+Orrery JSON saved from Microcosm's projection at that commit.
+
+Until Microcosm removes its own copy, its projection is the source: the
+modules named in `provenance.py`, in
+`packages/microcosm-graph/src/microcosm/graph/` on PolicyEngine/microcosm's
+`main`. To take a later version:
+
+1. Copy those modules from a Microcosm commit, remove from `orrery.py` what
+   `provenance.py` lists, and record the commit and the new blob IDs.
+2. From the root of that Microcosm checkout, with no uncommitted changes and
+   using its Python environment, regenerate the saved inputs and outputs:
+
+   ```bash
+   .venv/bin/python ../microcosm-collector/tools/generate-orrery-projection-fixtures.py \
+     ../microcosm-collector/tests/fixtures/orrery_projection
+   ```
+
+3. Run `uv run pytest tests/test_orrery_projection.py
+   tests/test_orrery_projection_provenance.py`.
+
+Once Microcosm hands its Orrery inputs to the collector and removes its copy,
+this copy is the only one, and changes to the projection are made here.
+
 ## Releases
 
 Every pull request needs a changelog fragment, `changelog.d/<name>.<type>.md`,
