@@ -233,3 +233,65 @@ def test_downgrading_artifact_intake_keeps_the_telemetry_schema(
         )
     finally:
         engine.dispose()
+
+
+RUNTIME_ROLE = "collector_runtime_grant_test"
+UNGRANTED_ROLE = "collector_ungranted_grant_test"
+TABLE_PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "DELETE")
+
+
+def _drop_test_roles(connection: sa.Connection) -> None:
+    for role in (RUNTIME_ROLE, UNGRANTED_ROLE):
+        exists = connection.scalar(
+            sa.text("SELECT 1 FROM pg_roles WHERE rolname = :role"), {"role": role}
+        )
+        if exists:
+            connection.execute(sa.text(f"DROP OWNED BY {role}"))
+            connection.execute(sa.text(f"DROP ROLE {role}"))
+
+
+def _table_privileges(connection: sa.Connection, role: str) -> dict[str, set[str]]:
+    return {
+        table: {
+            privilege
+            for privilege in TABLE_PRIVILEGES
+            if connection.scalar(
+                sa.text("SELECT has_table_privilege(:role, :table, :privilege)"),
+                {"role": role, "table": table, "privilege": privilege},
+            )
+        }
+        for table in sorted(ARTIFACT_TABLES)
+    }
+
+
+def test_artifact_intake_grants_the_runtime_role_its_telemetry_access(
+    postgres_url: str,
+) -> None:
+    engine = create_database_engine(postgres_url)
+    config = alembic_config()
+    try:
+        with engine.begin() as connection:
+            _drop_test_roles(connection)
+            connection.execute(sa.text(f"CREATE ROLE {RUNTIME_ROLE} NOLOGIN"))
+            connection.execute(sa.text(f"CREATE ROLE {UNGRANTED_ROLE} NOLOGIN"))
+            config.attributes["connection"] = connection
+            command.upgrade(config, "0001_initial_schema")
+            # The runtime user's access as the deployment granted it, outside
+            # the migrations, plus a PUBLIC grant the migration must not copy.
+            connection.execute(
+                sa.text(
+                    f"GRANT SELECT, INSERT, UPDATE ON telemetry_runs TO {RUNTIME_ROLE}"
+                )
+            )
+            connection.execute(sa.text("GRANT SELECT ON telemetry_runs TO PUBLIC"))
+            command.upgrade(config, "head")
+            runtime_privileges = _table_privileges(connection, RUNTIME_ROLE)
+            ungranted_privileges = _table_privileges(connection, UNGRANTED_ROLE)
+        assert runtime_privileges == {
+            table: {"SELECT", "INSERT", "UPDATE"} for table in ARTIFACT_TABLES
+        }
+        assert ungranted_privileges == {table: set() for table in ARTIFACT_TABLES}
+    finally:
+        with engine.begin() as connection:
+            _drop_test_roles(connection)
+        engine.dispose()

@@ -76,6 +76,24 @@ variables, so deploying this code changes nothing.
 | `COLLECTOR_WORKER_JOB_ID` | worker | set on each execution by its Cloud Task |
 | `DATABASE_URL` | worker, operations | the runtime database secret, as for the service |
 
+The two service-account settings accept only user-managed accounts,
+`<name>@<project>.iam.gserviceaccount.com`. The collector refuses to start
+with the default Compute Engine account
+(`<number>-compute@developer.gserviceaccount.com`), so the runtime and invoker
+accounts must be user-managed ones.
+
+### Database access
+
+The migration job's database user owns the tables it creates; the service,
+the worker and the operator commands connect as the runtime database user.
+Migration `0002_artifact_intake` copies every grant on `telemetry_runs`
+(`SELECT`, `INSERT`, `UPDATE` and `DELETE`, to any role except its owner and
+`PUBLIC`) to `artifact_submissions` and `artifact_jobs`, so the runtime user
+gets the same access to the intake tables as to the telemetry tables, whether
+it was granted explicitly or through default privileges. The intake code needs
+`SELECT`, `INSERT` and `UPDATE`; row locks (`SELECT ... FOR UPDATE`) need
+`UPDATE`.
+
 ### Worker jobs and recovery
 
 - **The worker Cloud Run Job** runs one task, with two task retries
@@ -115,6 +133,9 @@ in that environment's project and region:
   the runtime database secret as `DATABASE_URL`, the Cloud SQL connection and
   the three `COLLECTOR_WORKER_*` queue settings, and a Cloud Scheduler job that
   runs it every 10 minutes.
+- **Database access:** after the migration, the runtime database user has
+  `SELECT`, `INSERT` and `UPDATE` on `artifact_submissions` and
+  `artifact_jobs` (see "Database access").
 - **Permissions:** the runtime service account may create and read objects in
   the bucket, sign as itself (`roles/iam.serviceAccountTokenCreator` on
   itself), enqueue on the queue, and act as the invoker account; the invoker
