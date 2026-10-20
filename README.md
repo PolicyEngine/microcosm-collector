@@ -55,6 +55,14 @@ token for `expires_in` seconds and exchanges again after a 401.
 
 ### Switching from HS256 to ES256
 
+Every deployed revision mounts the signing key, as `TELEMETRY_JWT_SIGNING_KEY`,
+from the Secret Manager secret named by the `TELEMETRY_JWT_SIGNING_KEY_SECRET_NAME`
+variable of the `staging` and `production` environments. Without that
+variable, deployment stops at its first step, its configuration check, and it
+checks that the secret exists before changing traffic. As for the other secrets, the runtime service account
+needs to access the secret's versions and the deployment identity needs to read
+its metadata. Each environment has its own key.
+
 The switch window starts with the first deployment that mounts the signing key
 and ends with the change that stops mounting `TELEMETRY_JWT_SECRET`. During
 the window the collector issues ES256 tokens and accepts both kinds, so HS256
@@ -214,8 +222,8 @@ one image identified by the commit SHA. It first applies the migration to the
 persistent staging PostgreSQL database, verifies both the Alembic revision and
 the complete SQLAlchemy metadata, and deploys the staging collector. Production receives that exact image only when the staging sequence
 succeeds. Before either environment changes, deployment checks only that its
-runtime database, migration database, JWT signing, and read-token secret
-resources exist. It does not access their payloads or test their values. The
+runtime database, migration database, HS256 JWT secret, ES256 signing key and
+read-token secret resources exist. It does not access their payloads or test their values. The
 previous HF authentication and write/read deployment qualification is removed.
 
 Each deployment first routes traffic to a verified maintenance revision that

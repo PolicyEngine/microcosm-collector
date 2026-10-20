@@ -2,6 +2,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOY_SCRIPT = ROOT / "scripts" / "deploy.sh"
 
@@ -50,7 +52,7 @@ def test_require_configuration_lists_every_missing_variable() -> None:
         "ARTIFACT_REGISTRY_NAME CLOUD_SQL_CONNECTION RUNTIME_SERVICE_ACCOUNT "
         "MIGRATION_SERVICE_ACCOUNT SERVICE MIGRATION_JOB IMAGE_NAME "
         "DATABASE_SECRET_NAME MIGRATION_DATABASE_SECRET_NAME JWT_SECRET_NAME "
-        "READ_SECRET_NAME DEPLOYMENT_ENVIRONMENT "
+        "JWT_SIGNING_KEY_SECRET_NAME READ_SECRET_NAME DEPLOYMENT_ENVIRONMENT "
         "PRODUCTION_CLOUD_SQL_CONNECTION PRODUCTION_SERVICE\n"
     )
 
@@ -71,6 +73,7 @@ def test_require_configuration_accepts_complete_environment() -> None:
             "DATABASE_SECRET_NAME": "database-secret",
             "MIGRATION_DATABASE_SECRET_NAME": "migration-database-secret",
             "JWT_SECRET_NAME": "jwt-secret",
+            "JWT_SIGNING_KEY_SECRET_NAME": "jwt-signing-key-secret",
             "READ_SECRET_NAME": "read-secret",
             "DEPLOYMENT_ENVIRONMENT": "staging",
             "PRODUCTION_CLOUD_SQL_CONNECTION": "project:region:production",
@@ -249,3 +252,99 @@ def test_unknown_command_fails_with_usage() -> None:
     assert result.returncode == 2
     assert "Unknown deployment command: not-a-command" in result.stderr
     assert "Usage: deploy.sh COMMAND" in result.stderr
+
+
+def revision_environment(stub_directory: Path, command_log: Path) -> dict[str, str]:
+    return {
+        "PATH": f"{stub_directory}:{os.environ['PATH']}",
+        "COMMAND_LOG": str(command_log),
+        "SERVICE": "microcosm-telemetry",
+        "PROJECT_ID": "example-project",
+        "REGION": "us-central1",
+        "IMAGE_URI": "registry/image:sha",
+        "RUNTIME_SERVICE_ACCOUNT": "runtime@example.invalid",
+        "CLOUD_SQL_CONNECTION": "example-project:us-central1:telemetry",
+        "DATABASE_SECRET_NAME": "database-secret",
+        "JWT_SECRET_NAME": "jwt-secret",
+        "JWT_SIGNING_KEY_SECRET_NAME": "jwt-signing-key-secret",
+        "READ_SECRET_NAME": "read-secret",
+    }
+
+
+def install_logging_gcloud(stub_directory: Path) -> None:
+    install_command_stub(
+        stub_directory,
+        "gcloud",
+        "printf 'gcloud' >> \"$COMMAND_LOG\"\n"
+        'printf \' <%s>\' "$@" >> "$COMMAND_LOG"\n'
+        "printf '\\n' >> \"$COMMAND_LOG\"",
+    )
+
+
+@pytest.mark.parametrize("command", ["deploy-maintenance", "deploy-candidate"])
+def test_every_revision_mounts_the_signing_key_beside_the_hs256_secret(
+    tmp_path: Path, command: str
+) -> None:
+    command_log = tmp_path / "commands.log"
+    install_logging_gcloud(tmp_path)
+
+    result = run_deploy(
+        command, environment=revision_environment(tmp_path, command_log)
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (
+        "<--set-secrets> <DATABASE_URL=database-secret:latest,"
+        "TELEMETRY_JWT_SECRET=jwt-secret:latest,"
+        "TELEMETRY_JWT_SIGNING_KEY=jwt-signing-key-secret:latest,"
+        "TELEMETRY_READ_TOKEN=read-secret:latest>"
+    ) in command_log.read_text()
+
+
+@pytest.mark.parametrize("command", ["deploy-maintenance", "deploy-candidate"])
+def test_no_revision_deploys_without_the_signing_key_secret_name(
+    tmp_path: Path, command: str
+) -> None:
+    command_log = tmp_path / "commands.log"
+    install_logging_gcloud(tmp_path)
+    environment = revision_environment(tmp_path, command_log)
+    del environment["JWT_SIGNING_KEY_SECRET_NAME"]
+
+    result = run_deploy(command, environment=environment)
+
+    assert result.returncode == 1
+    assert result.stderr == (
+        "Missing telemetry deployment configuration: JWT_SIGNING_KEY_SECRET_NAME\n"
+    )
+    assert not command_log.exists()
+
+
+def test_secret_check_confirms_the_signing_key_secret_exists(tmp_path: Path) -> None:
+    command_log = tmp_path / "commands.log"
+    install_command_stub(tmp_path, "gcloud", 'printf "%s\\n" "$*" >> "$COMMAND_LOG"')
+
+    result = run_deploy(
+        "check-secrets-exist",
+        environment={
+            "PATH": f"{tmp_path}:{os.environ['PATH']}",
+            "COMMAND_LOG": str(command_log),
+            "PROJECT_ID": "example-project",
+            "DATABASE_SECRET_NAME": "database-secret",
+            "MIGRATION_DATABASE_SECRET_NAME": "migration-database-secret",
+            "JWT_SECRET_NAME": "jwt-secret",
+            "JWT_SIGNING_KEY_SECRET_NAME": "jwt-signing-key-secret",
+            "READ_SECRET_NAME": "read-secret",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert command_log.read_text().splitlines() == [
+        f"secrets describe {secret_name} --project example-project --format=none"
+        for secret_name in (
+            "database-secret",
+            "migration-database-secret",
+            "jwt-secret",
+            "jwt-signing-key-secret",
+            "read-secret",
+        )
+    ]
