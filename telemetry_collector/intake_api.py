@@ -10,7 +10,7 @@ API's 1 MiB body limit, 512 MiB of memory and 30 s timeout.
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from fastapi import APIRouter, Depends, Request, Response, status
@@ -109,7 +109,9 @@ class SubmitterClaims(Protocol):
 
 
 def _timestamp(value: datetime | None) -> str | None:
-    return None if value is None else value.isoformat()
+    """ISO 8601 in UTC with an explicit ``+00:00`` offset, as the contract says."""
+
+    return None if value is None else value.astimezone(UTC).isoformat()
 
 
 def _job_summary(record: SubmissionRecord) -> dict[str, Any] | None:
@@ -147,7 +149,7 @@ def status_document(
                 "method": upload.method,
                 "url": upload.url,
                 "headers": upload.headers,
-                "expires_at": upload.expires_at.isoformat(),
+                "expires_at": _timestamp(upload.expires_at),
             }
             for upload in uploads
         ]

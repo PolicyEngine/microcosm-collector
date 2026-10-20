@@ -530,3 +530,21 @@ def test_the_deployed_app_mounts_intake_only_when_switched_on(
 
     assert ("/v1/submissions" in paths) is mounted
     assert ("/v1/submissions/{submission_id}/complete" in paths) is mounted
+
+
+def test_timestamps_are_reported_in_utc_with_an_explicit_offset() -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from telemetry_collector.intake_api import receipt_document, status_document
+
+    four_hours_east = timezone(timedelta(hours=4))
+    submissions = FakeSubmissionStore(
+        clock=lambda: datetime(2026, 10, 20, 13, 0, tzinfo=four_hours_east)
+    )
+    record, _ = submissions.create_submission(
+        SubmissionRequest.model_validate(submission_with_real_digests()),
+        HuggingFacePrincipal("hf-user-1", "builder", ("policyengine",)),
+    )
+
+    assert status_document(record)["created_at"] == "2026-10-20T09:00:00+00:00"
+    assert receipt_document(record)["created_at"] == "2026-10-20T09:00:00+00:00"
