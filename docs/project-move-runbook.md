@@ -86,8 +86,8 @@ DEPLOY_SERVICE_ACCOUNT="collector-deploy@$NEW_PROJECT_ID.iam.gserviceaccount.com
 EXPORT_BUCKET="gs://$NEW_PROJECT_ID-collector-move"
 ```
 
-`DATABASE_NAME`, `RUNTIME_DATABASE_USER` and `MIGRATION_DATABASE_USER` come
-from the old instance in step 3.2.
+`DATABASE_NAME`, `RUNTIME_DATABASE_USER`, `MIGRATION_DATABASE_USER` and
+`OTHER_DATABASE_USERS` come from the old instance in step 3.2.
 
 ## 3. Before the windows
 
@@ -131,9 +131,27 @@ For each environment (read-only):
   flags, and IP and SSL configuration.
 - The database and its users:
   `gcloud sql databases list` and `gcloud sql users list` with
-  `--instance "$OLD_INSTANCE" --project "$OLD_PROJECT_ID"`. Set
-  `DATABASE_NAME`, `RUNTIME_DATABASE_USER` and `MIGRATION_DATABASE_USER` from
-  them.
+  `--instance "$OLD_INSTANCE" --project "$OLD_PROJECT_ID"`. On 2026-10-20
+  both instances held the databases `postgres` and `telemetry`, and listed
+  these users:
+
+  | Environment | Users |
+  |---|---|
+  | staging | `postgres`, `telemetry_migrator`, `telemetry_runtime` |
+  | production | `postgres`, `telemetry_app`, `telemetry_migrator`, `telemetry_runtime` |
+
+  Set `DATABASE_NAME`, `RUNTIME_DATABASE_USER` and `MIGRATION_DATABASE_USER`
+  from them. Set `OTHER_DATABASE_USERS` to every other role the roles query
+  below lists, apart from `postgres`; as on 2026-10-20:
+
+  ```bash
+  case "$ENVIRONMENT_NAME" in
+    production) OTHER_DATABASE_USERS=(telemetry_app) ;;
+    *) OTHER_DATABASE_USERS=() ;;
+  esac
+  ```
+
+  Change it if the record shows otherwise.
 - **The database's roles and privileges.** Connect as the migration user
   through Cloud SQL Studio, or with `psql` through the Cloud SQL Auth Proxy,
   and save the output of `\l`, `\dn+ public`, `\dp public.*` and `\ddp`, and
@@ -333,9 +351,10 @@ Create every user the step 3.2 record lists, except `postgres`, with the
 **same names** as on the old instance and new random passwords. Google's import
 guide says every user that owns objects or was granted permissions on objects
 in the dumped database must exist on the target instance, or the import
-fails. Besides the migration and runtime users, production's instance lists
-`telemetry_app` today, which the collector doesn't use; give it a random
-password that isn't kept.
+fails. Besides the migration and runtime users, create each role in
+`OTHER_DATABASE_USERS` (step 3.2: `telemetry_app` for production today, which
+the collector doesn't use, and none for staging), with a random password that
+isn't kept.
 
 ```bash
 migration_password="$(openssl rand -hex 32)"
@@ -344,9 +363,7 @@ gcloud sql users create "$MIGRATION_DATABASE_USER" --instance "$NEW_INSTANCE" \
   --project "$NEW_PROJECT_ID" --password "$migration_password"
 gcloud sql users create "$RUNTIME_DATABASE_USER" --instance "$NEW_INSTANCE" \
   --project "$NEW_PROJECT_ID" --password "$runtime_password"
-# Every other user the record lists: (telemetry_app) for production today, () for staging.
-other_database_users=(telemetry_app)
-for other_database_user in "${other_database_users[@]}"; do
+for other_database_user in "${OTHER_DATABASE_USERS[@]}"; do   # none for staging
   gcloud sql users create "$other_database_user" --instance "$NEW_INSTANCE" \
     --project "$NEW_PROJECT_ID" --password "$(openssl rand -hex 32)"
 done
