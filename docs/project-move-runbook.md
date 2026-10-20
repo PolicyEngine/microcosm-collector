@@ -671,8 +671,8 @@ instance), import it into the new instance as in step 6.3, and note both
 durations. Then delete and re-create the new database
 (`gcloud sql databases delete`, then `create`), so the window's import starts
 empty, and repeat step 5.2's "Before any import" steps (privileges, then
-owners): deleting the database drops them. Staging's window gives the same timings for staging's
-size.
+owners): deleting the database drops them. Staging's window gives the same
+timings for staging's size.
 
 ## 6. The window
 
@@ -1230,8 +1230,9 @@ after an agreed holding period:
 | Dashboard settings | calibration-diagnostics GitHub `Production` environment and the Vercel project | see section 8.1 | see section 8.1 |
 | `PRODUCTION_COLLECTOR_URL`, `TRUSTED_COLLECTOR_ORIGINS` | emitter source (`core/constants.py`) | every emitter service module | the hostname, by an emitter release |
 
-**Unverified before the staging window.** Nothing in this runbook has been
-run against Cloud SQL or the new project. Still open:
+**Unverified before the staging window.** Apart from some read-only
+commands against `policyengine-api`, nothing in this runbook has been run.
+Still open:
 
 - **Whether `postgres` may change a user Cloud SQL made** with `ALTER ROLE`,
   which PostgreSQL 16 allows only with `ADMIN OPTION` on that user. Step
