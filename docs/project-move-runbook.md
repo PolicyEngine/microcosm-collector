@@ -104,7 +104,10 @@ from the old instance in step 3.2.
   - #12's artifact intake: a Cloud Tasks queue, the worker job, the recovery
     job and its Cloud Scheduler job, the invoker account and their
     permissions, as in the README's "Artifact intake" section. Its bucket
-    stays in the old project (step 5.3);
+    stays in the old project (step 5.3), which ties the collector's files to
+    `policyengine-api` (the memo's D2 B). Intake was off on 2026-10-20: the
+    Cloud Tasks and Cloud Scheduler APIs weren't enabled there, and no intake
+    bucket existed. Switching it on only after the move avoids this;
   - S1's Hugging Face read token (#13, PR #18);
   - C5's session signing key (#16), a fifth Secret Manager secret per
     environment;
@@ -159,7 +162,12 @@ For each environment (read-only):
     `gcloud run jobs describe` with `--region "$REGION"` for the worker job
     and the recovery job; `gcloud scheduler jobs describe RECOVERY_SCHEDULE --location "$REGION"`;
     the bucket's roles with `gcloud storage buckets get-iam-policy gs://INTAKE_BUCKET`;
-    the invoker account's with `gcloud iam service-accounts get-iam-policy`.
+    the invoker account's with `gcloud iam service-accounts get-iam-policy`;
+    and the project-level roles of the old runtime, worker and recovery
+    accounts, with the `gcloud projects get-iam-policy` command shown below for
+    the deployment account. #12's deployment wiring isn't written, so its
+    storage grants may be on the project rather than on the bucket, and the
+    bucket's policy wouldn't show them.
   - #19: `gcloud run jobs describe "$HF_CHECK_JOB" --region "$REGION"`;
     `gcloud scheduler jobs describe HF_CHECK_SCHEDULE --location "$REGION"`,
     which shows the account it starts the job as; the two alert policies'
@@ -468,12 +476,29 @@ The dashboard's access to the read secret is set in section 8.1.
   completed, the collector records each stored object's generation number in
   the submission's row, and the worker reads every file at that generation.
   Cloud Storage assigns generation numbers, and they can't be set, so a copy
-  in another bucket has different ones and the worker couldn't read any
-  accepted submission's files. Grant the new runtime account and the new
-  worker job's account the roles on the old bucket that step 3.2 recorded for
-  the old accounts. `COLLECTOR_INTAKE_BUCKET` keeps its value. Moving the
-  bucket later needs a code change that records the copies' generations;
-  none is written.
+  in another bucket has different ones, and the worker would reject every
+  accepted submission as `object_missing`. On the old bucket, grant the new
+  runtime account `storage.objects.create` (its signed upload URLs create
+  the objects) and `storage.objects.list` (completion lists them), and the
+  new worker job's account `storage.objects.get` (it reads each file); the
+  recovery job doesn't use the bucket. Use the roles step 3.2 recorded for the
+  old accounts, whether they were granted on the bucket or on the project,
+  and grant them on the bucket, for example `roles/storage.objectCreator` and
+  `roles/storage.objectViewer` for the runtime account and
+  `roles/storage.objectViewer` for the worker's:
+
+  ```bash
+  gcloud storage buckets add-iam-policy-binding gs://INTAKE_BUCKET --project "$OLD_PROJECT_ID" \
+    --member "serviceAccount:$RUNTIME_SERVICE_ACCOUNT" --role ROLE
+  ```
+
+  `COLLECTOR_INTAKE_BUCKET` keeps its value. This ties the collector's files
+  to `policyengine-api`: their storage cost, data-access audit logs and
+  administration stay there, and shutting that project down, or removing its
+  billing, makes them unreadable (the memo's D2 B). Moving the bucket later
+  needs a one-off change that copies the files, checks their SHA-256 values
+  again and rewrites each submission's recorded generation numbers; none is
+  written.
 - **S2's daily check (#19), production only:** the worker service account
   (the one that may read S1's token), with `roles/iam.serviceAccountUser` on
   it for the deployment account; `roles/secretmanager.viewer` on S1's secret
@@ -974,6 +999,16 @@ For each environment:
 - If #19 has merged: step 6.7's execution of the check job succeeded, the
   old project's two alert policies are disabled, and its check schedule is
   paused.
+- If #12's intake is switched on:
+  `gcloud storage buckets get-iam-policy gs://INTAKE_BUCKET --project "$OLD_PROJECT_ID"`
+  lists the new runtime and worker accounts with the roles from step 5.3, and
+  one small test submission, made through the flow in #12's
+  `docs/artifact-submissions.md` (token exchange for `artifacts:submit`,
+  create, upload, complete), reaches the status `succeeded` at
+  `GET /v1/submissions/{submission_id}`. That shows the new runtime account
+  can sign uploads and list the bucket, the new queue starts the new worker
+  job, and that job can read the files. The test files stay in the bucket,
+  which has no lifecycle deletion.
 
 ## 10. Rollback
 
@@ -1002,8 +1037,10 @@ after an agreed holding period:
   if merged), and the old runtime, migration and worker service accounts.
 - If #12 merged: the queue (with any tasks still in it), the worker and
   recovery jobs, the recovery schedule and the account it used, the invoker
-  account, and the old accounts' roles on the intake bucket. Keep the bucket:
-  it holds every submission's files and is still in use (step 5.3).
+  account, and the old accounts' roles on the intake bucket, or on the
+  project if step 3.2 found them there. Keep the bucket: it holds every
+  submission's files and is still in use (step 5.3). So `policyengine-api`
+  has to stay active, and billed, for as long as the collector reads them.
 - If #19 merged: the old check job, its schedule and the account the
   schedule used, both alert policies and the notification channel. Step 6.7
   already disabled the policies and paused the schedule.

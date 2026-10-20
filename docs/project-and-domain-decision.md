@@ -20,7 +20,8 @@ end.
 Taken from this repo's deployment code, the GitHub environment settings (names
 compared, values not printed), the Vercel project settings (names only), and
 calibration-diagnostics#233's read-only checks of the live resources. The live
-Google Cloud resources were not re-read for this memo.
+Google Cloud resources were not re-read for this memo, except for whether
+#12's intake is switched on (see "Order and timing").
 
 | What | Where |
 |---|---|
@@ -49,13 +50,15 @@ Where the address appears:
 | Option | Cost | Risks and limits |
 |---|---|---|
 | **A. Stay in `policyengine-api`** | Nothing new. | The collector's deployment identity is the service account calibration-diagnostics also uses, in the project that runs the Public API, so a mistake in the collector's permissions, quotas or deployments can reach the Public API, and the other way round. Billing and audit logs stay mixed. Everything the collector adds next goes into that project too: S1's Hugging Face read token (#13), C5's signing key, and #12's intake bucket, Cloud Tasks queue and worker jobs. The address doesn't change, so D3 becomes optional. |
-| **B. A dedicated project, moved in one maintenance window per environment** (the plan's recommendation) | Recurring cost stays about the same: the same Cloud Run, Cloud SQL, Secret Manager and image storage, billed to the new project. One-off: until the old resources are deleted, both projects run a Cloud SQL instance for each environment, and the old Cloud Run services each keep one instance running (`--min 1`). A small export bucket. People's time. | **Downtime:** telemetry ingestion and the dashboard's collector reads pause while each database is exported and imported and the service is redeployed, and the dashboard's reads stay down until its own settings change is deployed. The export and import take minutes; the redeploy is a full release (two Push runs, then staging's and production's deployments), whose length depends on the queue for GitHub's runners. In all, about 40 minutes on a quiet day, 2 to 3 hours when runners are queued, as on 2026-10-19 and 2026-10-20 (the runbook's section 6 gives the measurements). The staging rehearsal measures it. **The database move:** the database roles and their privileges were provisioned by scripts kept outside this repo, so they have to be read from the old instance and recreated by hand before the import. **Every project-specific setting changes:** in each GitHub environment, five of the 15 variables (the project, both Cloud SQL connections and both service accounts) and both secrets, while the other ten can keep their values if the new resources reuse the old names; up to three Vercel settings; and the dashboard's read-secret check. **The default address changes,** so without D3 the emitter needs a release and builds on older emitters lose delivery. |
+| **B. A dedicated project, moved in one maintenance window per environment** (the plan's recommendation) | Recurring cost stays about the same: the same Cloud Run, Cloud SQL, Secret Manager and image storage, billed to the new project (except #12's intake bucket, if intake is switched on before the move). One-off: until the old resources are deleted, both projects run a Cloud SQL instance for each environment, and the old Cloud Run services each keep one instance running (`--min 1`). A small export bucket. People's time. | **Downtime:** telemetry ingestion and the dashboard's collector reads pause while each database is exported and imported and the service is redeployed, and the dashboard's reads stay down until its own settings change is deployed. The export and import take minutes; the redeploy is a full release (two Push runs, then staging's and production's deployments), whose length depends on the queue for GitHub's runners. In all, about 40 minutes on a quiet day, 2 to 3 hours when runners are queued, as on 2026-10-19 and 2026-10-20 (the runbook's section 6 gives the measurements). The staging rehearsal measures it. **The database move:** the database roles and their privileges were provisioned by scripts kept outside this repo, so they have to be read from the old instance and recreated by hand before the import. **Every project-specific setting changes:** in each GitHub environment, five of the 15 variables (the project, both Cloud SQL connections and both service accounts) and both secrets, while the other ten can keep their values if the new resources reuse the old names; up to three Vercel settings; and the dashboard's read-secret check. **The default address changes,** so without D3 the emitter needs a release and builds on older emitters lose delivery. **If #12's intake is switched on before the move,** its bucket can't move (see "Order and timing"), so its storage cost, its data-access audit logs and its administration stay in `policyengine-api`, and anyone who administers storage there can change or delete the collector's files. Shutting that project down, or removing its billing, would then make every submission's files unreadable: Google's "Delete and restore projects" page says "Shutting down a project stops all billing and resource usage", and that Cloud Storage "might delete resources much sooner" than the 30-day recovery period. |
 | **C. A dedicated project, with the database moved later** (Cloud Run in the new project connects to Cloud SQL in the old one for a while) | As B, spread over two windows. | Needs deployment-script changes first: `create-database-backup` refuses a Cloud SQL connection whose project isn't `PROJECT_ID`. Needs cross-project grants for Cloud SQL and Secret Manager. It shortens the first window but adds a second one, and leaves the collector split over two projects in between. Worth it only if one window of B is too long. |
 
 What a dedicated project gives: its own permissions (a deployment identity
 that can reach only the collector), its own quotas and billing, audit logs
 that contain only the collector, and room for the intake and worker resources
-without adding them to the Public API's project.
+without adding them to the Public API's project. For intake's bucket this holds
+only if intake is switched on after the move; otherwise the bucket and the
+collector's stored files stay in the Public API's project.
 
 ## D3: which address
 
@@ -204,8 +207,14 @@ The plan's constraints:
 - If #12's intake is switched on before the move, its bucket stays in
   `policyengine-api`: each accepted submission's row records its files'
   Cloud Storage generation numbers, which a copy into a new bucket doesn't
-  keep (the runbook's step 5.3). Switching intake on after the move creates
-  the bucket in the new project from the start.
+  keep (the runbook's step 5.3). The collector's files then depend on that
+  project for good, as D2 B's row says. Moving them later needs a one-off
+  change, not yet written, that copies the files, checks their SHA-256 values
+  again and rewrites each submission's recorded generation numbers.
+- Recommended, if D2 is B or C: switch intake on only after the move, which
+  creates the bucket in the new project from the start. Intake is off today: a read-only check of
+  `policyengine-api` on 2026-10-20 found the Cloud Tasks and Cloud Scheduler
+  APIs not enabled, and none of its six buckets is an intake bucket.
 
 If both D2 and D3 are adopted, there are two orders:
 
