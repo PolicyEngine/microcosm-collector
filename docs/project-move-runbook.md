@@ -123,8 +123,21 @@ For each environment (read-only):
   record is the only specification of them.
 - Who may read each secret:
   `gcloud secrets get-iam-policy SECRET --project "$OLD_PROJECT_ID" --format=yaml`
-  for each of the four secret names. The read secret's policy names the
-  dashboard's Vercel identity.
+  for each secret the environment uses: the four named above, and, if
+  merged, #16's signing-key secret and S1's Hugging Face token secret. The
+  read secret's policy names the dashboard's Vercel identity.
+- What the open collector PRs added, if merged (step 3.1), each command with
+  `--project "$OLD_PROJECT_ID"`:
+  - #12: `gcloud tasks queues describe WORKER_QUEUE --location "$REGION"`;
+    `gcloud run jobs describe` with `--region "$REGION"` for the worker job
+    and the recovery job; `gcloud scheduler jobs describe RECOVERY_SCHEDULE --location "$REGION"`;
+    the bucket's roles with `gcloud storage buckets get-iam-policy gs://INTAKE_BUCKET`;
+    the invoker account's with `gcloud iam service-accounts get-iam-policy`.
+  - #19: `gcloud run jobs describe "$HF_CHECK_JOB" --region "$REGION"`;
+    `gcloud scheduler jobs describe HF_CHECK_SCHEDULE --location "$REGION"`,
+    which shows the account it starts the job as; the two alert policies'
+    names with `gcloud monitoring policies list --format='value(name,displayName,enabled)'`;
+    the notification channel with `gcloud beta monitoring channels list`.
 - The deployment account's roles. Its email is the
   `TELEMETRY_GCP_DEPLOY_SERVICE_ACCOUNT` secret, which GitHub can't show. It is
   the account whose IAM policy grants `roles/iam.workloadIdentityUser` to this
@@ -917,8 +930,16 @@ after an agreed holding period:
 - The old Cloud SQL instances: export a last copy into the bucket if wanted,
   then `gcloud sql instances patch "$OLD_INSTANCE" --project "$OLD_PROJECT_ID" --no-deletion-protection`
   and `gcloud sql instances delete`.
-- The old Cloud Run services and migration jobs, the four secrets per
-  environment, and the old runtime and migration service accounts.
+- The old Cloud Run services and migration jobs, every secret step 3.2
+  recorded (the four per environment, and #16's signing key and S1's token
+  if merged), and the old runtime, migration and worker service accounts.
+- If #12 merged: the queue (with any tasks still in it), the worker and
+  recovery jobs, the recovery schedule and the account it used, the invoker
+  account, and the old accounts' roles on the intake bucket. Keep the bucket:
+  it holds every submission's files and is still in use (step 5.3).
+- If #19 merged: the old check job, its schedule and the account the
+  schedule used, both alert policies and the notification channel. Step 6.7
+  already disabled the policies and paused the schedule.
 - The collector's images in the old Artifact Registry store (only the
   collector's image name, unless the store holds nothing else).
 - The two `roles/artifactregistry.reader` bindings on the new project from
@@ -932,7 +953,8 @@ after an agreed holding period:
 - The export bucket and every dump in it.
 - calibration-diagnostics' leftover collector settings, as listed in
   calibration-diagnostics#233's "Manual steps".
-- S1's old Hugging Face token, if it was rotated.
+- S1's old Hugging Face token, if it was rotated. If #19 merged, revoke it
+  only after step 6.7 has paused the old check, which uses it.
 
 ## 12. Settings this runbook changes
 
