@@ -249,3 +249,102 @@ def test_unknown_command_fails_with_usage() -> None:
     assert result.returncode == 2
     assert "Unknown deployment command: not-a-command" in result.stderr
     assert "Usage: deploy.sh COMMAND" in result.stderr
+
+
+HUGGINGFACE_CHECK_ENVIRONMENT = {
+    "PROJECT_ID": "project",
+    "REGION": "region",
+    "IMAGE_URI": "registry/image:sha",
+    "HF_CHECK_JOB": "hugging-face-check",
+    "WORKER_SERVICE_ACCOUNT": "worker@example.invalid",
+    "HF_READ_SECRET_NAME": "hugging-face-read-token",
+}
+
+
+def install_logging_gcloud(directory: Path, *, failing_command: str = "") -> Path:
+    command_log = directory / "commands.log"
+    install_command_stub(
+        directory,
+        "gcloud",
+        "printf 'gcloud' >> \"$COMMAND_LOG\"\n"
+        'printf \' <%s>\' "$@" >> "$COMMAND_LOG"\n'
+        "printf '\\n' >> \"$COMMAND_LOG\"\n"
+        f'[[ "$1 $2" != "{failing_command}" ]]',
+    )
+    return command_log
+
+
+def test_huggingface_check_job_runs_the_check_with_only_the_read_token(
+    tmp_path: Path,
+) -> None:
+    command_log = install_logging_gcloud(tmp_path)
+
+    result = run_deploy(
+        "configure-huggingface-check-job",
+        environment={
+            "PATH": f"{tmp_path}:{os.environ['PATH']}",
+            "COMMAND_LOG": str(command_log),
+            **HUGGINGFACE_CHECK_ENVIRONMENT,
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    secret_check, job_deploy = command_log.read_text().splitlines()
+    assert secret_check == (
+        "gcloud <secrets> <describe> <hugging-face-read-token> "
+        "<--project> <project> <--format=none>"
+    )
+    assert job_deploy == (
+        "gcloud <run> <jobs> <deploy> <hugging-face-check> "
+        "<--project> <project> <--region> <region> "
+        "<--image> <registry/image:sha> "
+        "<--service-account> <worker@example.invalid> "
+        "<--set-secrets> <COLLECTOR_HF_READ_TOKEN=hugging-face-read-token:latest> "
+        "<--command> <uv> "
+        "<--args> <run,--no-sync,python,-m,telemetry_collector.huggingface_check> "
+        "<--tasks> <1> <--max-retries> <0> <--task-timeout> <30m> "
+        "<--cpu> <1> <--memory> <512Mi> <--quiet>"
+    )
+
+
+def test_huggingface_check_job_requires_its_configuration(tmp_path: Path) -> None:
+    command_log = install_logging_gcloud(tmp_path)
+
+    result = run_deploy(
+        "configure-huggingface-check-job",
+        environment={
+            "PATH": f"{tmp_path}:{os.environ['PATH']}",
+            "COMMAND_LOG": str(command_log),
+            "PROJECT_ID": "project",
+            "REGION": "region",
+            "IMAGE_URI": "registry/image:sha",
+        },
+    )
+
+    assert result.returncode == 1
+    assert result.stderr == (
+        "Missing telemetry deployment configuration: HF_CHECK_JOB "
+        "WORKER_SERVICE_ACCOUNT HF_READ_SECRET_NAME\n"
+    )
+    assert not command_log.exists()
+
+
+def test_huggingface_check_job_is_not_changed_when_its_secret_is_missing(
+    tmp_path: Path,
+) -> None:
+    command_log = install_logging_gcloud(tmp_path, failing_command="secrets describe")
+
+    result = run_deploy(
+        "configure-huggingface-check-job",
+        environment={
+            "PATH": f"{tmp_path}:{os.environ['PATH']}",
+            "COMMAND_LOG": str(command_log),
+            **HUGGINGFACE_CHECK_ENVIRONMENT,
+        },
+    )
+
+    assert result.returncode != 0
+    assert "hugging-face-read-token" in result.stderr
+    assert [
+        logged.split(" <")[1] for logged in command_log.read_text().splitlines()
+    ] == ["secrets>"]

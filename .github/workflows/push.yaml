@@ -205,6 +205,11 @@ jobs:
       READ_SECRET_NAME: ${{ vars.TELEMETRY_READ_SECRET_NAME }}
       PRODUCTION_CLOUD_SQL_CONNECTION: ${{ vars.TELEMETRY_PRODUCTION_CLOUD_SQL_CONNECTION }}
       PRODUCTION_SERVICE: ${{ vars.TELEMETRY_PRODUCTION_SERVICE }}
+      # Only production runs the daily Hugging Face check: there is one read
+      # token and one schedule.
+      HF_CHECK_JOB: ${{ vars.TELEMETRY_HF_CHECK_JOB }}
+      WORKER_SERVICE_ACCOUNT: ${{ vars.TELEMETRY_WORKER_SERVICE_ACCOUNT }}
+      HF_READ_SECRET_NAME: ${{ vars.TELEMETRY_HF_READ_SECRET_NAME }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -225,6 +230,11 @@ jobs:
 
       - name: Check required Secret Manager entries exist
         run: scripts/deploy.sh check-secrets-exist
+
+      - name: Configure the daily Hugging Face check job
+        run: scripts/deploy.sh configure-huggingface-check-job
+        env:
+          IMAGE_URI: ${{ needs.deploy-staging.outputs.image_uri }}
 
       - name: Deploy an isolated maintenance revision
         run: scripts/deploy.sh deploy-maintenance
