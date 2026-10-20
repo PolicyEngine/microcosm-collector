@@ -13,22 +13,28 @@ in a worker job (Cloud Run Jobs), which has its own memory and time limits.
 ## Flow
 
 1. **Credential.** `POST /v1/auth/huggingface/exchange` with the body
-   `{"scope": "artifacts:submit"}` returns a collector session token whose
-   `scope` claim is `artifacts:submit`. An exchange without a body, or with
-   `{}`, still returns a `telemetry:write` token, as today. Each scope works
-   only on its own endpoints.
+   `{"scope": "artifacts:submit"}`. A collector with intake switched on
+   returns a session token whose `scope` claim is `artifacts:submit`, and the
+   response's `scope` field says so (see "Token exchange"). An exchange without
+   a body, or with `{}`, still returns a `telemetry:write` token, as before.
+   Each scope works only on its own endpoints.
 2. **Create.** `POST /v1/submissions` with the submission (below). The
    collector validates it, derives the submission ID, records it, and returns
-   its status with one signed upload URL for each file that is not yet stored.
+   its status with one signed upload instruction for each file that is not
+   yet stored.
 3. **Upload.** The client sends each file with `PUT` to its URL, with exactly
-   the headers the response lists. An object can be created only once, so a
-   repeated upload of a stored file gets 412, which means it is already there.
+   the headers the instruction lists, plus `Content-Length`. An object can be
+   created only once, so a repeated upload of a stored file gets 412, which
+   means it is already there.
 4. **Complete.** `POST /v1/submissions/{submission_id}/complete`. The collector
    lists the submission's stored objects and checks that every inventory file
    exists, has the declared size, and carries the declared SHA-256 in its
-   metadata. It records each object's generation, so later overwrites cannot
-   change what is processed, then records a job and enqueues it (Cloud Tasks
-   starts a worker job execution).
+   metadata. A missing file gets a 409, so the client uploads it and completes
+   again. A stored object with another size or SHA-256 rejects the submission,
+   because stored objects are never replaced. Otherwise the collector records
+   each object's generation, so later overwrites cannot change what is
+   processed, then records a job and dispatches it: a Cloud Task starts a
+   worker job execution.
 5. **Process.** The worker claims the job, reads each file at its recorded
    generation and recomputes its SHA-256, then runs the kind's handler.
 6. **Result.** The client polls `GET /v1/submissions/{submission_id}` and,
@@ -37,6 +43,46 @@ in a worker job (Cloud Run Jobs), which has its own memory and time limits.
 The API checks sizes and recorded digests without reading file bytes; the
 worker checks the bytes. Hashing gigabytes inside a 30 s request is not safe,
 so the byte-level SHA-256 check belongs to the worker.
+
+## Token exchange
+
+The request body is absent, `{}`, `{"scope": "telemetry:write"}` or
+`{"scope": "artifacts:submit"}`. Any other field or scope is refused with 422.
+A successful exchange answers 200 with:
+
+```json
+{
+  "access_token": "…",
+  "token_type": "bearer",
+  "expires_in": 3600,
+  "scope": "artifacts:submit"
+}
+```
+
+`scope` repeats the scope of the token, and `expires_in` is its lifetime in
+seconds.
+
+### When intake is not available
+
+A collector may have no intake: one released before intake existed, or one
+with intake switched off. A client recognises both, and never mistakes either
+for an unknown submission:
+
+| Collector | Exchange for `artifacts:submit` | Any path under `/v1/submissions` |
+|---|---|---|
+| Released before intake | 200 with a `telemetry:write` token and no `scope` field | 404 without a `code` |
+| Intake switched off | 404 with `"code": "intake_not_enabled"` | 404 with `"code": "intake_not_enabled"` |
+| Intake switched on | 200 with `"scope": "artifacts:submit"` | as in "Responses" |
+
+**Client rule:** use a token for submissions only when the exchange answered
+200 with `"scope": "artifacts:submit"`. Any other 200 answer, a 404 from the
+exchange, or a 404 from a submission path without
+`"code": "submission_not_found"` means intake is not available. The client
+then keeps the files queued with their preserved copies, discards any
+`artifacts:submit` token, sends no further submission requests to that
+collector, and tries the exchange again later (for example, after an hour). It
+never treats this as a final refusal, and never creates the submission again
+because of it.
 
 ## The submission
 
@@ -168,11 +214,24 @@ an `orrery-inputs` submission only once its overlay exists as
 | Signed URL lifetime | 30 minutes | A client that runs out of time creates the submission again for fresh URLs; the request is idempotent. |
 | Job attempts | 3 | After the third failure that is not a rejection, the job is `failed`. |
 
-Each signed URL allows one `PUT` of one object. Its signature covers the
-headers `Content-Type: application/octet-stream`, `x-goog-meta-sha256: <sha256>`,
-`x-goog-content-length-range: <size>,<size>` and `x-goog-if-generation-match: 0`,
-so the storage service refuses an upload of any other size, and refuses to
-replace an object once it exists.
+### Signed uploads
+
+Each upload instruction allows one `PUT` of one object. Its `headers` list
+every header the signature covers, and the client sends exactly these,
+unchanged, plus `Content-Length: <size>`:
+
+| Header | Value |
+|---|---|
+| `Content-Type` | `application/octet-stream` |
+| `Host` | the URL's host, `storage.googleapis.com`, which HTTP clients send from the URL anyway |
+| `x-goog-content-length-range` | `<size>,<size>` |
+| `x-goog-if-generation-match` | `0` |
+| `x-goog-meta-sha256` | the file's declared SHA-256 |
+
+So the storage service refuses an upload of any other size, records the
+declared SHA-256 as object metadata, and refuses to replace an object once it
+exists. The client adds no other `x-goog-` header and does not follow
+redirects.
 
 ## Identifiers
 
@@ -205,23 +264,93 @@ creating the same submission gets 403.
 | `queued` | Completion found every object with the declared size and recorded digest; a job is recorded. Also the status between a failed attempt and the next one. | no |
 | `processing` | A worker holds the job. | no |
 | `succeeded` | The worker matched every file's SHA-256 and the kind's handler finished. | yes |
-| `rejected` | The bytes did not match the inventory, or the handler refused the content. Repeating the same submission cannot succeed. | yes |
+| `rejected` | A stored object or its bytes did not match the inventory, or the handler refused the content. Repeating the same submission cannot succeed. | yes |
 | `failed` | The handler failed for another reason on every attempt. An operator can re-run it. | yes |
 
 ## Responses
 
-| Request | Response | What the client does |
+### Response bodies
+
+Create, completion and status answer with the submission's status document:
+
+```json
+{
+  "contract_version": 1,
+  "submission_id": "sub-…",
+  "kind": "calibration-diagnostics",
+  "status": "awaiting_upload",
+  "files_sha256": "…",
+  "created_at": "2026-10-20T09:00:00.123456+00:00",
+  "updated_at": "2026-10-20T09:00:00.123456+00:00",
+  "accepted_at": null,
+  "finished_at": null,
+  "job": null,
+  "rejection": null,
+  "uploads": [
+    {
+      "name": "calibration_diagnostics.json",
+      "method": "PUT",
+      "url": "https://storage.googleapis.com/…",
+      "headers": {
+        "Content-Type": "application/octet-stream",
+        "Host": "storage.googleapis.com",
+        "x-goog-content-length-range": "18734221,18734221",
+        "x-goog-if-generation-match": "0",
+        "x-goog-meta-sha256": "…"
+      },
+      "expires_at": "2026-10-20T09:30:00.123456+00:00"
+    }
+  ]
+}
+```
+
+- **Timestamps** are ISO 8601 in UTC with an explicit `+00:00` offset.
+  `accepted_at` and `finished_at` stay `null` until the submission gets there.
+- **`job`** is `null` until completion records a job, then
+  `{"job_id": "job-…", "attempts": 0}`, counting the worker's attempts so far.
+- **`rejection`** is `null` unless the status is `rejected` or `failed`, and
+  then `{"code": …, "message": …}` (see "Receipt").
+- **`uploads`** is only in create responses. It holds one instruction for each
+  file not yet stored, in name order, and is empty once the status is past
+  `awaiting_upload`. Each instruction's `method` is `PUT`, its `headers` are
+  those in "Signed uploads", and `expires_at` is when its URL stops working,
+  30 minutes after signing.
+
+Every error body has a `detail` message. Errors specific to intake also have a
+`code`, which the tables below name.
+
+### Collector answers
+
+| Request | Answer | What the client does |
 |---|---|---|
-| Exchange for `artifacts:submit` | 404: intake is not enabled on this collector | Keep the files queued; retry later. |
-| Create | 201 (new) or 200 (exists), with the status and `uploads` | Upload each listed file. `uploads` is empty once the status is past `awaiting_upload`. |
-| Complete | 202 (`queued` or `processing`), 200 (final) | Poll the status. |
-| Complete | 409 with `problems`, each `{name, problem}` where `problem` is `missing`, `size_mismatch` or `sha256_mismatch` | Create again for fresh URLs, upload those files, complete again. |
-| Complete | 503: the worker queue is unavailable | Retry completion; the job stays recorded until it is enqueued. |
-| Receipt | 200 when final, 409 before | Poll the status first. |
-| Any | 401 | Exchange again. |
-| Any | 403: another user's submission, or a token without `artifacts:submit` | Final. |
-| Any | 404 on a submission path | The submission is unknown (for example after a database reset): create it again. |
-| Any | 413 or 422 | Final: the submission breaks this contract. |
+| Exchange | 200 with `"scope": "artifacts:submit"` | Use the token until shortly before `expires_in` runs out, then exchange again. |
+| Exchange | 200 with another `scope`, or none | Intake is not available (see "When intake is not available"). |
+| Exchange | 404 `intake_not_enabled` | Intake is not available. |
+| Exchange | 401 or 403 | Hugging Face refused the token (401), or its user is not a PolicyEngine organization member (403). Final for that Hugging Face token. |
+| Create | 201 (new) or 200 (exists) | Upload each listed file, then complete. |
+| Create | 403 `submission_owned_by_another_user` | Final. |
+| Complete | 202 (`queued` or `processing`) or 200 (final) | Poll the status. |
+| Complete | 200 with status `rejected` and the rejection code `stored_object_mismatch` | Final: a stored object has another size or recorded SHA-256, and stored objects are never replaced. |
+| Complete | 409 `files_missing`, with `problems`: one `{"name": …, "problem": "missing"}` for each file not stored | Create again for fresh URLs, upload those files, complete again. |
+| Complete | 503 `worker_queue_unavailable`, with `Retry-After: 30` | Retry completion after 30 seconds; the job stays recorded until it is dispatched. |
+| Receipt | 200 once final; before that, 409 `submission_not_final`, with `status` | Poll the status first. |
+| Complete, status or receipt | 404 `submission_not_found` | The collector has no such submission (for example after a database reset): create it again. |
+| Any submission path | 404 `intake_not_enabled`, or 404 without a `code` | Intake is not available. |
+| Any | 401 | The session token expired or was refused: exchange again. |
+| Any | 403 without a `code` | The token's scope does not allow the request: exchange again for `artifacts:submit`. Final if a fresh token is refused the same way. |
+| Any | 413 or 422 | Final: the request breaks this contract. |
+| Any | 429 | Too many requests, from Cloud Run or the collector: retry after `Retry-After` seconds when it is given, otherwise with exponential backoff. |
+| Any | 503 without a `code`, with `Retry-After: 60` | Maintenance mode: during a deployment the collector answers every path except `/health` this way. Retry after 60 seconds. |
+| Any | Another 5xx, a timeout or a connection error | Retry with exponential backoff, keeping the files queued. Every request in the flow can be repeated. |
+
+### Storage answers to an upload
+
+| Answer | Meaning | What the client does |
+|---|---|---|
+| 200 | Stored. | Upload the next file. |
+| 412 | The object already exists. | Treat it as stored; completion checks it. |
+| 408, 429, another 5xx, a timeout or a connection error | A transient failure. | Retry the same URL with exponential backoff until `expires_at`, then create again for fresh URLs. |
+| Another 4xx, such as 400 or 403 | The URL cannot be used: it expired, or the request does not match its signature. | Create again for fresh URLs (create signs only files not yet stored) and upload with those, without changing any header. Retry with exponential backoff, keeping the files queued. |
 
 ## Receipt
 
@@ -250,10 +379,18 @@ creating the same submission gets 403.
 ```
 
 `rejection` is `{code, message}` for a rejected or failed submission, and
-`result` is `null` then. The collector's own codes are `content_mismatch` and
-`object_missing` (rejected: the stored bytes differ from the inventory, or an
-object is gone), and `worker_error` and `attempts_exhausted` (failed); a
-handler may reject with its own code. The emitter stores the receipt beside
+`result` is `null` then. `job` is `null` for a submission rejected at
+completion, which never had a job. The collector's own codes are:
+
+| Code | Status | Meaning |
+|---|---|---|
+| `stored_object_mismatch` | `rejected` | At completion, a stored object had another size or recorded SHA-256. |
+| `content_mismatch` | `rejected` | The worker read bytes that differ from the inventory. |
+| `object_missing` | `rejected` | The worker found an object gone at its recorded generation. |
+| `worker_error` | `failed` | The last attempt failed with an error that was not a rejection. |
+| `attempts_exhausted` | `failed` | The job did not finish within its attempts. |
+
+A handler may reject with its own code. The emitter stores the receipt beside
 its queued upload.
 
 ## Disclosure
