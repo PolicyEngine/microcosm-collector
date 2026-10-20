@@ -199,10 +199,14 @@ summary entry. The job then exits 1, or 2 when the token setting itself is
 missing or unusable, so the execution fails. Two Cloud Monitoring alert
 policies email a person through a notification channel: one when an execution
 of the job fails, and one when no execution has succeeded for 23 hours, so a
-stopped schedule is noticed too. Cloud Monitoring limits how long a metric may
-be absent before it alerts to about a day, which is why the check runs twice
-a day: the second alert then means two runs in a row did not succeed. No log
-entry includes the token.
+stopped schedule is noticed too. Cloud Monitoring allows a metric-absence
+condition to wait at most 23.5 hours, which is why the check runs twice a day:
+with one run a day, the gap between successful runs would exceed 23 hours and
+the second alert would fire before every run. With runs 12 hours apart, it
+fires 23 hours after the last successful run, so one scheduled run that did
+not succeed is enough: after a failed 18:00 run, the failure alert fires
+straight away and the absence alert at about 05:00 the next day. No log entry
+includes the token.
 
 **Deployment.** The production deploy runs
 `scripts/deploy.sh configure-huggingface-check-job` before it changes the
