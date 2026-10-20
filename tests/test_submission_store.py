@@ -160,6 +160,42 @@ def test_accepting_again_keeps_the_first_generations(
     assert second == first
 
 
+def test_rejecting_at_completion_records_a_final_rejection_without_a_job(
+    store: SubmissionStore,
+) -> None:
+    record, _ = store.create_submission(submission_request(), builder())
+    rejection = {"code": "stored_object_mismatch", "message": "Sizes differ."}
+
+    rejected = store.reject_submission(record.submission_id, rejection)
+
+    assert rejected.status == "rejected"
+    assert rejected.rejection == rejection
+    assert rejected.finished_at is not None
+    assert rejected.job_id is None
+    assert store.get_submission(record.submission_id) == rejected
+    assert store.accept_submission(record.submission_id, generations()) == rejected
+
+
+def test_rejecting_an_accepted_submission_changes_nothing(
+    store: SubmissionStore,
+) -> None:
+    record, _ = store.create_submission(submission_request(), builder())
+    accepted = store.accept_submission(record.submission_id, generations())
+
+    unchanged = store.reject_submission(
+        record.submission_id, {"code": "stored_object_mismatch", "message": "x"}
+    )
+
+    assert unchanged == accepted
+
+
+def test_rejecting_an_unknown_submission_raises_key_error(
+    store: SubmissionStore,
+) -> None:
+    with pytest.raises(KeyError):
+        store.reject_submission("sub-unknown", {"code": "x", "message": "x"})
+
+
 def test_accepting_an_unknown_submission_raises_key_error(
     store: SubmissionStore,
 ) -> None:

@@ -228,6 +228,23 @@ class FakeSubmissionStore:
                 )
             return self._with_job(record)
 
+    def reject_submission(
+        self, submission_id: str, rejection: dict[str, Any]
+    ) -> SubmissionRecord:
+        with self._lock:
+            record = self._submissions[submission_id]
+            if record.status == "awaiting_upload":
+                now = self._clock()
+                record = replace(
+                    record,
+                    status="rejected",
+                    rejection=deepcopy(rejection),
+                    finished_at=now,
+                    updated_at=now,
+                )
+                self._submissions[submission_id] = record
+            return self._with_job(record)
+
     def mark_job_enqueued(self, job_id: str) -> None:
         with self._lock:
             job = self._jobs.get(job_id)

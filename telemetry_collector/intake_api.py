@@ -111,6 +111,12 @@ def _timestamp(value: datetime | None) -> str | None:
     return None if value is None else value.isoformat()
 
 
+def _job_summary(record: SubmissionRecord) -> dict[str, Any] | None:
+    if record.job_id is None:
+        return None
+    return {"job_id": record.job_id, "attempts": record.job_attempts}
+
+
 def status_document(
     record: SubmissionRecord, uploads: list[SignedUpload] | None = None
 ) -> dict[str, Any]:
@@ -126,6 +132,7 @@ def status_document(
         "updated_at": _timestamp(record.updated_at),
         "accepted_at": _timestamp(record.accepted_at),
         "finished_at": _timestamp(record.finished_at),
+        "job": _job_summary(record),
         "rejection": record.rejection,
     }
     if uploads is not None:
@@ -158,7 +165,7 @@ def receipt_document(record: SubmissionRecord) -> dict[str, Any]:
         "created_at": _timestamp(record.created_at),
         "accepted_at": _timestamp(record.accepted_at),
         "finished_at": _timestamp(record.finished_at),
-        "job": {"job_id": record.job_id, "attempts": record.job_attempts},
+        "job": _job_summary(record),
         "result": record.result,
         "rejection": record.rejection,
     }
@@ -169,7 +176,11 @@ def receipt_document(record: SubmissionRecord) -> dict[str, Any]:
 def storage_problems(
     record: SubmissionRecord, stored: dict[str, StoredObject]
 ) -> list[dict[str, str]]:
-    """Inventory files whose stored object is missing or differs from it."""
+    """Inventory files whose stored object is missing or differs from it.
+
+    ``missing`` can be fixed by uploading. ``size_mismatch`` and
+    ``sha256_mismatch`` cannot, because a stored object is never replaced.
+    """
 
     problems = []
     for file in record.files:
@@ -186,6 +197,24 @@ def storage_problems(
             continue
         problems.append({"name": file["name"], "problem": problem})
     return problems
+
+
+def stored_object_mismatch(problems: list[dict[str, str]]) -> dict[str, str] | None:
+    """The final rejection for objects that can never match, if there are any."""
+
+    mismatched = [problem for problem in problems if problem["problem"] != "missing"]
+    if not mismatched:
+        return None
+    listed = ", ".join(
+        f"{problem['name']} ({problem['problem']})" for problem in mismatched
+    )
+    return {
+        "code": "stored_object_mismatch",
+        "message": (
+            "Stored objects differ from the inventory and cannot be replaced: "
+            f"{listed}."
+        ),
+    }
 
 
 def submission_router(
@@ -241,6 +270,7 @@ def submission_router(
             missing_names = {
                 problem["name"]
                 for problem in storage_problems(record, stored_objects(record))
+                if problem["problem"] == "missing"
             }
             uploads = objects.sign_uploads(
                 [
@@ -269,6 +299,11 @@ def submission_router(
         if record.status == "awaiting_upload":
             stored = stored_objects(record)
             problems = storage_problems(record, stored)
+            rejection = stored_object_mismatch(problems)
+            if rejection is not None:
+                record = submissions.reject_submission(submission_id, rejection)
+                response.status_code = 200
+                return status_document(record)
             if problems:
                 raise IntakeProblemError(
                     409,

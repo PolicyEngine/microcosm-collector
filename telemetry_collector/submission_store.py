@@ -88,6 +88,15 @@ class SubmissionStore(Protocol):
     ) -> SubmissionRecord:
         """Record object generations and a queued job, once; KeyError if unknown."""
 
+    def reject_submission(
+        self, submission_id: str, rejection: dict[str, Any]
+    ) -> SubmissionRecord:
+        """Reject a submission still awaiting upload; KeyError if unknown.
+
+        Used when a stored object can never match its inventory entry. A
+        submission past ``awaiting_upload`` is returned unchanged.
+        """
+
     def mark_job_enqueued(self, job_id: str) -> None: ...
 
     def claim_job(
@@ -252,6 +261,26 @@ class PostgresSubmissionStore:
                     )
                     .on_conflict_do_nothing(index_elements=[ArtifactJob.job_id])
                 )
+                session.flush()
+            return _record(submission, self._job_for(session, submission))
+
+    def reject_submission(
+        self, submission_id: str, rejection: dict[str, Any]
+    ) -> SubmissionRecord:
+        now = self._clock()
+        with self._sessions.begin() as session:
+            submission = session.execute(
+                select(ArtifactSubmission)
+                .where(ArtifactSubmission.submission_id == submission_id)
+                .with_for_update()
+            ).scalar_one_or_none()
+            if submission is None:
+                raise KeyError(submission_id)
+            if submission.status == "awaiting_upload":
+                submission.status = "rejected"
+                submission.rejection = rejection
+                submission.finished_at = now
+                submission.updated_at = now
                 session.flush()
             return _record(submission, self._job_for(session, submission))
 

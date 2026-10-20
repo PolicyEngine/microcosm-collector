@@ -258,15 +258,17 @@ def test_another_user_cannot_create_read_or_complete_a_submission(
         }
 
 
-def test_completion_lists_missing_and_mismatched_files(
-    harness: IntakeHarness,
-) -> None:
-    create(harness)
+def upload_diagnostics(harness: IntakeHarness, content: bytes = DIAGNOSTICS_BYTES):
     harness.objects.upload(
         intake_object_name(SUBMISSION_ID, "calibration_diagnostics.json"),
-        DIAGNOSTICS_BYTES + b" ",
+        content,
         sha256=hashlib.sha256(DIAGNOSTICS_BYTES).hexdigest(),
     )
+
+
+def test_completion_lists_missing_files(harness: IntakeHarness) -> None:
+    create(harness)
+    upload_diagnostics(harness)
 
     response = complete(harness)
 
@@ -274,17 +276,42 @@ def test_completion_lists_missing_and_mismatched_files(
     assert response.json() == {
         "detail": "Some files are not stored as declared.",
         "code": "files_missing",
-        "problems": [
-            {"name": "build_manifest.json", "problem": "missing"},
-            {"name": "calibration_diagnostics.json", "problem": "size_mismatch"},
-        ],
+        "problems": [{"name": "build_manifest.json", "problem": "missing"}],
     }
     assert harness.worker_queue.calls == []
     status = harness.call("GET", f"/v1/submissions/{SUBMISSION_ID}").json()
     assert status["status"] == "awaiting_upload"
 
 
-def test_completion_refuses_an_object_recording_another_digest(
+def test_completion_rejects_a_stored_object_of_another_size(
+    harness: IntakeHarness,
+) -> None:
+    create(harness)
+    upload_diagnostics(harness, DIAGNOSTICS_BYTES + b" ")
+
+    response = complete(harness)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "rejected"
+    assert body["rejection"] == {
+        "code": "stored_object_mismatch",
+        "message": (
+            "Stored objects differ from the inventory and cannot be replaced: "
+            "calibration_diagnostics.json (size_mismatch)."
+        ),
+    }
+    assert body["finished_at"] is not None
+    assert body["job"] is None
+    assert harness.worker_queue.calls == []
+    assert complete(harness).json()["status"] == "rejected"
+    receipt = harness.call("GET", f"/v1/submissions/{SUBMISSION_ID}/receipt")
+    assert receipt.status_code == 200
+    assert receipt.json()["job"] is None
+    assert receipt.json()["rejection"]["code"] == "stored_object_mismatch"
+
+
+def test_completion_rejects_an_object_recording_another_digest(
     harness: IntakeHarness,
 ) -> None:
     create(harness)
@@ -294,10 +321,36 @@ def test_completion_refuses_an_object_recording_another_digest(
 
     response = complete(harness)
 
-    assert response.status_code == 409
-    assert response.json()["problems"] == [
-        {"name": "build_manifest.json", "problem": "sha256_mismatch"}
+    assert response.status_code == 200
+    assert response.json()["status"] == "rejected"
+    assert response.json()["rejection"]["message"].endswith(
+        "build_manifest.json (sha256_mismatch)."
+    )
+
+
+def test_creating_again_signs_only_missing_files(harness: IntakeHarness) -> None:
+    create(harness)
+    upload_diagnostics(harness, DIAGNOSTICS_BYTES + b" ")
+
+    response = create(harness)
+
+    assert [upload["name"] for upload in response.json()["uploads"]] == [
+        "build_manifest.json"
     ]
+
+
+def test_the_status_reports_the_job_once_completion_records_it(
+    harness: IntakeHarness,
+) -> None:
+    created = create(harness).json()
+    upload_everything(harness)
+
+    completed = complete(harness).json()
+
+    record = harness.submissions.get_submission(SUBMISSION_ID)
+    assert record is not None
+    assert created["job"] is None
+    assert completed["job"] == {"job_id": record.job_id, "attempts": 0}
 
 
 def test_completion_queues_one_job_and_enqueues_it_once(
