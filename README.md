@@ -47,6 +47,11 @@ token for `expires_in` seconds and exchanges again after a 401.
 - **Claims.** `iss`, `aud`, `sub` (the Hugging Face user ID), `username`,
   `organizations`, `scope`, `iat` and `exp`. A token lasts
   `TELEMETRY_SESSION_TOKEN_TTL_SECONDS`, one hour by default.
+- **Scopes.** `scope` is exactly one of `telemetry:write`, which registers runs
+  and sends their events, and `artifacts:submit`, which only the artifact
+  submission endpoints accept. Each endpoint requires its own scope and answers
+  403 to the other, so neither token works for the other's endpoints. An
+  exchange without a body issues a `telemetry:write` token.
 
 ### Switching from HS256 to ES256
 

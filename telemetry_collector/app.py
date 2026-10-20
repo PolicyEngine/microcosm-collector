@@ -30,6 +30,7 @@ from telemetry_collector.models import (
     EventBatch,
     PageCursor,
     RunRegistration,
+    SessionScope,
 )
 from telemetry_collector.session_tokens import (
     SIGNING_KEY_VARIABLE,
@@ -256,9 +257,16 @@ def _parse_page_cursor(value: str | None) -> tuple[datetime, str] | None:
     return timestamp, run_id
 
 
+SCOPE_REFUSALS: dict[str, str] = {
+    "telemetry:write": "Collector credential cannot write telemetry.",
+    "artifacts:submit": "Collector credential cannot submit artifacts.",
+}
+
+
 def _issue_session_token(
     settings: CollectorSettings,
     principal: HuggingFacePrincipal,
+    scope: SessionScope = "telemetry:write",
 ) -> CollectorToken:
     now = datetime.now(UTC)
     expires = now + timedelta(seconds=settings.session_token_ttl_seconds)
@@ -269,7 +277,7 @@ def _issue_session_token(
             "sub": principal.user_id,
             "username": principal.username,
             "organizations": list(principal.organizations),
-            "scope": "telemetry:write",
+            "scope": scope,
             "iat": now,
             "exp": expires,
         },
@@ -301,13 +309,16 @@ def _decode_token(
 
 
 def _decode_session_token(
-    settings: CollectorSettings, authorization: str | None
+    settings: CollectorSettings,
+    authorization: str | None,
+    required_scope: SessionScope = "telemetry:write",
 ) -> SessionTokenClaims:
     payload = _decode_token(settings, authorization)
-    if payload.get("scope") != "telemetry:write":
+    # Each token carries exactly one scope, and each endpoint accepts one.
+    if payload.get("scope") != required_scope:
         raise HTTPException(
             status_code=403,
-            detail="Collector credential cannot write telemetry.",
+            detail=SCOPE_REFUSALS[required_scope],
         )
     subject = payload.get("sub")
     username = payload.get("username")
