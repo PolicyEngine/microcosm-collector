@@ -41,6 +41,8 @@ is marked.
 
 ```bash
 OLD_PROJECT_ID=policyengine-api
+OLD_PROJECT_NUMBER=$(gcloud projects describe "$OLD_PROJECT_ID" --format='value(projectNumber)')
+OLD_DEPLOY_SERVICE_ACCOUNT=...   # the current deployment account, from step 3.2
 NEW_PROJECT_ID=...           # choice 2
 ENVIRONMENT_NAME=staging     # then production
 COLLECTOR_HOSTNAME=...       # choice 4, for this environment
@@ -119,7 +121,8 @@ For each environment (read-only):
   the account whose IAM policy grants `roles/iam.workloadIdentityUser` to this
   repo's principal set (calibration-diagnostics#233 checked that binding);
   `gcloud iam service-accounts get-iam-policy ACCOUNT --project "$OLD_PROJECT_ID"`
-  shows it. Then list its roles on the project with
+  shows it. Set `OLD_DEPLOY_SERVICE_ACCOUNT` to it. Then list its roles on the
+  project with
   `gcloud projects get-iam-policy "$OLD_PROJECT_ID" --flatten=bindings --filter="bindings.members:serviceAccount:DEPLOY_ACCOUNT" --format="value(bindings.role)"`,
   and its roles on individual resources (the runtime and migration accounts,
   the secrets and the Artifact Registry store) from their IAM policies.
@@ -161,6 +164,27 @@ for the store, which this repo's vocabulary test keeps out of documentation.
 `scripts/deploy.sh` pushes to
 `${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REGISTRY_NAME}/${IMAGE_NAME}`,
 so the store must be in the new project.
+
+**Let the old project's production deployments read it.** `deploy-staging`
+builds the image with staging's `PROJECT_ID`, and `deploy-production` deploys
+that same image. So from staging's window until production's window, production
+deploys an image from the new project's store into the old project. Cloud Run
+then needs both the deploying account and the deploying project's Cloud Run
+service agent to hold Artifact Registry Reader on that store. Without it,
+production's "Deploy an isolated maintenance revision" step fails (no traffic
+moves) in staging's window and on every merge until production's window. The
+new project holds only the collector's store, so grant the role on the project
+before staging's window:
+
+```bash
+for old_production_reader in "serviceAccount:$OLD_DEPLOY_SERVICE_ACCOUNT" \
+  "serviceAccount:service-$OLD_PROJECT_NUMBER@serverless-robot-prod.iam.gserviceaccount.com"; do
+  gcloud projects add-iam-policy-binding "$NEW_PROJECT_ID" \
+    --member "$old_production_reader" --role roles/artifactregistry.reader
+done
+```
+
+Remove both bindings in section 11.
 
 ### 4.2 The deployment account and Workload Identity Federation for this repo
 
@@ -376,6 +400,20 @@ empty. Staging's window gives the same timings for staging's size.
 
 Do staging end to end, verify it (section 9), then production.
 
+**How long it lasts:** from step 6.2 until the deployment in step 6.6
+finishes. Exporting and importing take minutes at today's size (10 GB disks).
+Most of the time is the release that step 6.6 starts: the merge's Push run
+(versioning), then the release commit's Push run (checks, tag, staging's
+deployment, then production's). From merge to tag this took 25 minutes on
+2026-10-15 and 88 minutes on 2026-10-19 and 2026-10-20, when the
+organization's runners were queued; on 2026-10-20, calibration-diagnostics'
+last collector deploy run took 2 hours 25 minutes in all, of which its staging
+and production deploy jobs ran for 4 and 6 minutes. So plan for about 30
+minutes on a quiet day and 2 to 3 hours when runners are queued, and measure
+it in staging's window. The dashboard's collector reads stay down until
+section 8.1's dashboard deployment finishes, unless the old service keeps
+serving (section 8.4).
+
 While the window lasts:
 
 - **Builds:** the emitter gets HTTP 503 from the collector and retries, with
@@ -463,10 +501,17 @@ their values if the new resources reused the old names (section 12).
 
 ### 6.6 Deploy
 
-Merge the C2 code PR (section 13). Its release runs the Push workflow, which
+Each window needs its own merge. Its release runs the Push workflow, which
 deploys staging and then production with the environments' current settings.
-In staging's window, production redeploys in the old project with unchanged
-code: a normal deployment, with its usual short maintenance phase.
+
+- **Staging's window:** merge the C2 code PR (section 13). Production then
+  redeploys in the old project with unchanged runtime code, from the image
+  staging built in the new project's store. That works only with the
+  Artifact Registry Reader grant in step 4.1; it is otherwise a normal
+  deployment, with its usual short maintenance phase.
+- **Production's window:** merge a second PR prepared for it, for example the
+  README update in section 13. This repo requires branches to be up to date
+  with `main`, so update it and let its checks pass before the window starts.
 
 Re-running the deployment jobs of the latest Push run might do the same
 without a merge, but whether a re-run reads the environments' changed values
@@ -696,6 +741,9 @@ after an agreed holding period:
   environment, and the old runtime and migration service accounts.
 - The collector's images in the old Artifact Registry store (only the
   collector's image name, unless the store holds nothing else).
+- The two `roles/artifactregistry.reader` bindings on the new project from
+  step 4.1 (the old deployment account and the old project's Cloud Run service
+  agent).
 - This repo's Workload Identity provider in `policyengine-api`
   (`github/microcosm-collector`) and the old deployment account's
   `roles/iam.workloadIdentityUser` binding for this repo's principal set.
@@ -718,6 +766,7 @@ after an agreed holding period:
 | `TELEMETRY_GCP_WIF_PROVIDER` | same (secret) | `google-github-actions/auth`, `workload_identity_provider` | the new provider's resource |
 | `TELEMETRY_GCP_DEPLOY_SERVICE_ACCOUNT` | same (secret) | `google-github-actions/auth`, `service_account` | the new deployment account |
 | `COLLECTOR_DEPLOY_ENABLED` | this repo's variable | the deployment jobs' `if:` | unchanged (`true`) |
+| `roles/artifactregistry.reader` on the new project for the old deployment account and the old project's Cloud Run service agent | Google Cloud IAM (step 4.1) | Cloud Run, when `deploy-production` deploys staging's image into the old project | removed in section 11 |
 | `DATABASE_URL`, `TELEMETRY_JWT_SECRET`, `TELEMETRY_READ_TOKEN` | Google Secret Manager in the new project | the service, through `--set-secrets` | new database URL; copied signing secret and read token |
 | `DATABASE_URL` (migration job) | Secret Manager in the new project | the migration job, through `--set-secrets` | new migration database URL |
 | `COLLECTOR_HF_READ_TOKEN` (if S1 merged) | Secret Manager in the new project | the worker jobs, through a secret mount | copied or rotated |
@@ -736,8 +785,13 @@ Whether a workflow re-run reads changed environment values is unchecked (step
 - **This repo:** a step after "Verify the stable service address" that checks
   `https://$PUBLIC_ORIGIN/ready`, from a new environment variable
   `TELEMETRY_PUBLIC_ORIGIN`, so every deployment proves the hostname reaches
-  the new revision. Its merge is the release that deploys into the new project
-  (step 6.6). The README's "Cloud Run deployment" and "Google Cloud access"
-  sections then describe the new project and the hostname.
+  the new revision. The step skips when the variable is unset: in the "both
+  together" order the hostname reaches the new service only after section 7,
+  so set the variable once section 7's checks pass. Its merge is the release
+  that deploys staging into the new project (step 6.6).
+- **This repo, for production's window:** the README's "Cloud Run deployment"
+  and "Google Cloud access" sections updated to describe the new project and
+  the hostname. Its merge is the release that deploys production into the new
+  project (step 6.6).
 - **The emitter:** the release in section 8.2.
 - **microcosm-runs:** section 8.3, if chosen.
