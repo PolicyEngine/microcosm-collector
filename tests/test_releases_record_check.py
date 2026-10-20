@@ -284,6 +284,16 @@ def test_a_manifest_without_a_usable_file_list_is_reported(
     assert codes(hub) == ["MANIFEST_FILES_UNREADABLE"]
 
 
+def test_a_manifest_nested_too_deeply_to_decode_is_reported(
+    hub: FakeHuggingFace,
+) -> None:
+    nesting_depth = 200_000
+    manifest_path = f"{folder(FIRST_BUILD)}/release_manifest.json"
+    uk_files(hub)[manifest_path] = b"[" * nesting_depth + b"]" * nesting_depth
+
+    assert codes(hub) == ["MANIFEST_FILES_UNREADABLE", "MANIFEST_MISMATCH"]
+
+
 def test_a_read_that_fails_during_the_check_is_reported(hub: FakeHuggingFace) -> None:
     answer_like_hugging_face = hub.handle
 
