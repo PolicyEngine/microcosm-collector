@@ -1,0 +1,1 @@
+Document the choices for moving the collector to its own Google Cloud project and a custom hostname (plan decisions D2 and D3) in `docs/project-and-domain-decision.md`, and the steps for the move, including the Postgres dump and restore and rollback, in `docs/project-move-runbook.md`.
