@@ -20,6 +20,90 @@ server retrieves this credential from Google Secret Manager at runtime. Vercel
 authenticates using its OIDC identity; the credential is never returned to the
 browser or passed through GitHub Actions.
 
+### Session tokens
+
+The collector signs its session tokens and is the only service that verifies
+them. The emitter treats a token as an opaque bearer credential: it keeps the
+token for `expires_in` seconds and exchanges again after a 401.
+
+- **Signing.** Once `TELEMETRY_JWT_SIGNING_KEY` holds an EC P-256 private key
+  (unencrypted PEM, PKCS #8 or SEC 1), new tokens are signed with ES256. Until
+  then they are signed with HS256 and `TELEMETRY_JWT_SECRET`.
+- **Key ID.** An ES256 token's header names its key in `kid`, the RFC 7638
+  SHA-256 thumbprint of the public key. The ID is derived from the key rather
+  than configured, so it cannot disagree with the key, and a new key always
+  has a new ID.
+- **Public key.** `GET /.well-known/jwks.json` publishes the public key as a
+  JSON Web Key Set, without credentials and with
+  `Cache-Control: public, max-age=300`:
+  `{"keys": [{"kty": "EC", "crv": "P-256", "x": "...", "y": "...", "kid": "...", "use": "sig", "alg": "ES256"}]}`.
+  Before a signing key is configured, `keys` is empty. Like every route but
+  `/health`, it answers 503 while the maintenance revision serves.
+- **Verification.** The header's `alg` chooses the key, and decoding then
+  allows only that algorithm. ES256 needs the configured key's `kid`. HS256
+  needs `TELEMETRY_JWT_SECRET` to be configured. Every other token, including
+  `none`, an unknown `kid` and an HS256 token keyed with the public key, gets
+  401.
+- **Claims.** `iss`, `aud`, `sub` (the Hugging Face user ID), `username`,
+  `organizations`, `scope`, `iat` and `exp`. A token lasts
+  `TELEMETRY_SESSION_TOKEN_TTL_SECONDS`, one hour by default.
+- **Scopes.** `scope` is exactly one of `telemetry:write`, which registers runs
+  and sends their events, and `artifacts:submit`, which only the artifact
+  submission endpoints accept. Each endpoint requires its own scope and answers
+  403 to the other, so neither token works for the other's endpoints. An
+  exchange without a body issues a `telemetry:write` token.
+
+### Switching from HS256 to ES256
+
+Every deployed revision mounts the signing key, as `TELEMETRY_JWT_SIGNING_KEY`,
+from the Secret Manager secret named by the `TELEMETRY_JWT_SIGNING_KEY_SECRET_NAME`
+variable of the `staging` and `production` environments. Without that
+variable, deployment stops at its first step, its configuration check. It also
+checks that the secret exists before changing traffic. Each environment has its
+own key in its own secret. As for the other secrets, grant two roles on the
+secret itself: `roles/secretmanager.secretAccessor` to the runtime service
+account, which reads the key, and `roles/secretmanager.viewer` to the
+deployment identity, whose existence check reads the secret's metadata.
+
+The switch window starts with the first deployment that mounts the signing key
+and ends with the change that stops mounting `TELEMETRY_JWT_SECRET`. During
+the window the collector issues ES256 tokens and accepts both kinds, so HS256
+tokens issued before the deployment keep working until they expire. The window
+must last at least one token lifetime after the last revision that issued
+HS256 tokens stopped serving. Keep it open until rolling back to such a
+revision is no longer wanted.
+
+A revision from before the signing key answers 401 to ES256 tokens. After a
+rollback to one, the emitter exchanges again, receives an HS256 token and
+carries on after one retry.
+
+To retire HS256:
+
+1. Stop mounting `TELEMETRY_JWT_SECRET`: remove it from both `--set-secrets`
+   lists in `scripts/deploy.sh`, and remove `JWT_SECRET_NAME` from every list
+   of variables the script requires, from its secret check and from
+   `.github/workflows/push.yaml`. Without the secret, the collector refuses to
+   start unless the signing key is set, and it refuses HS256 tokens.
+2. Once that release has deployed to both environments, delete the
+   `TELEMETRY_JWT_SECRET_NAME` variables and the HS256 secrets.
+
+To rotate the signing key, put the new key in a new secret. Don't add a
+version to the secret the service already mounts. Cloud Run reads a secret
+mounted as an environment variable when each instance starts, so a new
+version would reach every instance the serving revision starts from then on,
+while its running instances keep the old key. Until the next deployment, a
+token signed by one instance would get 401 from another, and
+`/.well-known/jwks.json` would answer with whichever key the instance holds.
+
+1. Generate the new key straight into a new secret, and grant it the same two
+   roles as the first key.
+2. Set `TELEMETRY_JWT_SIGNING_KEY_SECRET_NAME` in that environment to the new
+   secret's name. The serving revision keeps reading the old secret.
+3. Deploy. The new revision signs with, and publishes, only the new key.
+   Tokens signed with the previous key get 401 and are exchanged again.
+4. Delete the old secret once rolling back to a revision that mounts it is no
+   longer wanted, since such a revision can't start without it.
+
 ## Responses a producer acts on
 
 Microcosm's delivery service (from PolicyEngine/microcosm#1147) treats any 4xx
@@ -53,10 +137,13 @@ uv run uvicorn telemetry_collector.app:create_app_from_environment \
   --factory --host 127.0.0.1 --port 8080 --no-access-log
 ```
 
-Before running the migration or service, provide the database connection, JWT
-signing secret, and dashboard read credential through the documented runtime
-environment variables. Use at least 32 random characters for the JWT signing
-secret and at least 24 for the dashboard read credential. Use Microcosm's
+Before running the migration or service, provide the database connection, a
+session signing key, and the dashboard read credential through the documented
+runtime environment variables. Generate a P-256 key for local use with
+`openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256` and pass the
+PEM text as `TELEMETRY_JWT_SIGNING_KEY`. `TELEMETRY_JWT_SECRET`, at least 32
+random characters, is needed only to issue or accept HS256 tokens. Use at
+least 24 random characters for the dashboard read credential. Use Microcosm's
 loopback-only development option when testing ingestion. Production Microcosm
 builds use the fixed collector origin shipped by the package and do not accept
 a destination environment variable.
@@ -152,8 +239,8 @@ one image identified by the commit SHA. It first applies the migration to the
 persistent staging PostgreSQL database, verifies both the Alembic revision and
 the complete SQLAlchemy metadata, and deploys the staging collector. Production receives that exact image only when the staging sequence
 succeeds. Before either environment changes, deployment checks only that its
-runtime database, migration database, JWT signing, and read-token secret
-resources exist. It does not access their payloads or test their values. The
+runtime database, migration database, HS256 JWT secret, ES256 signing key and
+read-token secret resources exist. It does not access their payloads or test their values. The
 previous HF authentication and write/read deployment qualification is removed.
 
 Each deployment first routes traffic to a verified maintenance revision that
