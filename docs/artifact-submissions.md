@@ -386,7 +386,8 @@ Every error body has a `detail` message. Errors specific to intake also have a
 
 `rejection` is `{code, message}` for a rejected or failed submission, and
 `result` is `null` then. `job` is `null` for a submission rejected at
-completion, which never had a job. The collector's own codes are:
+completion, which never had a job, and its `files` have no `generation`,
+because completion recorded none. The collector's own codes are:
 
 | Code | Status | Meaning |
 |---|---|---|
