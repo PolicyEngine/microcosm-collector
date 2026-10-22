@@ -115,6 +115,54 @@ modules named in `provenance.py`, in
 Once Microcosm hands its Orrery inputs to the collector and removes its copy,
 this copy is the only one, and changes to the projection are made here.
 
+## Hugging Face read access
+
+Only the collector's worker jobs read Hugging Face, for backfills, old
+releases and back-building. The service itself holds no Hugging Face
+credential: a build's own token reaches it only at the token exchange, and is
+never stored. The worker jobs read with one purpose-specific, fine-grained
+read token, never a generic `HF_TOKEN`:
+
+| Setting | Read by | Provider |
+|---|---|---|
+| `COLLECTOR_HF_READ_TOKEN` | worker jobs that read Hugging Face | a Google Secret Manager secret, mounted by Cloud Run into each such job |
+
+`HuggingFaceReader.from_environment()` in
+`telemetry_collector/huggingface_read.py` reads it when a job starts. A
+missing or malformed token stops the job with a message naming the variable.
+`HF_TOKEN`, `HUGGINGFACE_TOKEN` and `HUGGING_FACE_HUB_TOKEN`, which Hugging
+Face's own tools read without being asked, are refused if set, so a job
+cannot fall back to a token with another scope. No message includes a token,
+and the reader sends it only to `huggingface.co`.
+
+The datasets the worker jobs read are listed once, in `HUGGINGFACE_DATASETS`:
+
+| Dataset | Holds | In the token's scope |
+|---|---|---|
+| `policyengine/populace-us` | US releases | no: it is public |
+| `policyengine/populace-uk-private` | UK releases | yes |
+| `policyengine/populace-be-private` | Belgian releases | yes |
+| `policyengine/populace-us-staging` | US staging builds and run files | yes |
+| `policyengine/populace-uk-staging` | UK staging builds and run files | yes |
+
+Setting up the token is a manual step, repeated whenever a dataset is added
+here:
+
+1. **Token:** a fine-grained Hugging Face token whose only permission is
+   "Read access to contents of selected repos", for every dataset in the
+   token's scope above. It has no write, organization, inference or webhook
+   permission.
+2. **Secret:** the token is the latest version of one Secret Manager secret in
+   the collector's Google Cloud project. It is never copied into GitHub.
+3. **Access:** only the collector's worker service account may read the
+   secret's value, through `roles/secretmanager.secretAccessor` on that secret
+   alone.
+4. **Mount:** each worker job that reads Hugging Face mounts the secret as
+   `COLLECTOR_HF_READ_TOKEN`, for example with
+   `gcloud run jobs update JOB --update-secrets COLLECTOR_HF_READ_TOKEN=SECRET:latest`.
+   A command that sets a job's secrets with `--set-secrets` replaces all of
+   its mounts, so any such command for these jobs must list this one too.
+
 ## Releases
 
 Every pull request needs a changelog fragment, `changelog.d/<name>.<type>.md`,
