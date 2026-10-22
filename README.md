@@ -63,9 +63,11 @@ Intake is off unless `COLLECTOR_INTAKE_ENABLED` is exactly `1`. While it is
 off, the collector reads no other intake setting, and the token exchange for
 `{"scope": "artifacts:submit"}` and every `/v1/submissions` path answer 404 with
 the code `intake_not_enabled`. `scripts/deploy.sh` sets none of these
-variables, so a deployment leaves intake off. It still changes two things: the
-migration job applies `0002_artifact_intake`, which adds the two intake
-tables, and token responses gain `scope`.
+variables, so a deployment leaves intake off. It still changes three things:
+the migration job applies `0002_artifact_intake`, which adds the two intake
+tables; token responses gain `scope`; and the token exchange, which used to
+ignore its request body, now answers 422 for unknown fields and 404
+`intake_not_enabled` for `{"scope": "artifacts:submit"}`.
 
 Once `0002_artifact_intake` is applied, an image without it cannot run against
 the database. That includes every earlier collector release and the old copy in
@@ -73,9 +75,12 @@ calibration-diagnostics' `telemetry-service/`. Its migration job fails with
 "Can't locate revision identified by '0002_artifact_intake'", and its `/ready`
 check fails. To roll back to such an image, first run
 `alembic downgrade 0001_initial_schema`, which drops both intake tables and
-every submission and job in them. That is an exception to the rule below that
-downgrades are for disposable test databases; while intake is off, both
-tables stay empty.
+every submission and job in them. Run it with this release's code, for
+example as its migration job with overridden arguments, and as the migration
+database user, before deploying the older image: the older code can't find
+the revision either, and the runtime user doesn't own the tables. That is an
+exception to the rule below that downgrades are for disposable test databases;
+while intake is off, both tables stay empty.
 
 | Setting | Read by | Value |
 |---|---|---|
