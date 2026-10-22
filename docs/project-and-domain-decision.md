@@ -19,14 +19,16 @@ end.
 
 Taken from this repo's deployment code, the GitHub environment settings (names
 compared, values not printed), the Vercel project settings (names only), and
-calibration-diagnostics#233's read-only checks of the live resources. The live
-Google Cloud resources were not re-read for this memo, except for whether
-#12's intake is switched on (see "Order and timing").
+calibration-diagnostics#233's read-only checks of the live resources. On
+2026-10-22 a read-only check of `policyengine-api` (`describe`, `list` and
+`get-iam-policy`) found the services, migration jobs, instances, accounts,
+secret names, image store and Workload Identity providers as described here,
+and #12's intake still off (see "Order and timing").
 
 | What | Where |
 |---|---|
 | Google Cloud project | `policyengine-api`, which also hosts the Public API. Both GitHub environments, `staging` and `production`, name it. |
-| Per environment | a Cloud Run service, a Cloud Run migration job, a Cloud SQL for PostgreSQL instance, a runtime service account, a migration service account, and four Secret Manager secrets: the runtime database URL, the migration database URL, the session-token signing secret and the dashboard's read token |
+| Per environment | a Cloud Run service, a Cloud Run migration job, a Cloud SQL for PostgreSQL instance, a runtime service account, a migration service account, and four Secret Manager secrets: the runtime database URL, the migration database URL, the session-token signing secret and the dashboard's read token. Production also keeps an older database URL secret that no deployment uses. |
 | Shared by both environments | one Artifact Registry Docker store and image name; the deployment service account, which calibration-diagnostics also uses; the Workload Identity providers for calibration-diagnostics and for this repo |
 | The dashboard's Google identity | a Workload Identity provider for Vercel's OIDC tokens, in the same project, named by its project number |
 | Address | Cloud Run's default address for the production service (`https://<service>-<project number>.<region>.run.app`). The project number in it is `policyengine-api`'s. |

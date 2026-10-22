@@ -180,6 +180,13 @@ For each environment (read-only):
   for each secret the environment uses: the four named above, and, if
   merged, #16's signing-key secret and S1's Hugging Face token secret. The
   read secret's policy names the dashboard's Vercel identity.
+- Collector secrets that no deployment uses. On 2026-10-22, production also
+  had `microcosm-telemetry-database-url`, a database URL secret made four days
+  before the runtime one that the service mounts. No GitHub variable names it
+  and no service or job mounts it, but production's runtime account may read
+  it. List the old project's secrets
+  (`gcloud secrets list --project "$OLD_PROJECT_ID"`), note any such secret,
+  and don't copy it; section 11 deletes it.
 - What the open collector PRs added, if merged (step 3.1), each command with
   `--project "$OLD_PROJECT_ID"`:
   - #12: `gcloud tasks queues describe WORKER_QUEUE --location "$REGION"`;
@@ -1224,8 +1231,9 @@ after an agreed holding period:
   then `gcloud sql instances patch "$OLD_INSTANCE" --project "$OLD_PROJECT_ID" --no-deletion-protection`
   and `gcloud sql instances delete`.
 - The old Cloud Run services and migration jobs, every secret step 3.2
-  recorded (the four per environment, and #16's signing key and S1's token
-  if merged), and the old runtime, migration and worker service accounts.
+  recorded (the four per environment, the unused ones such as production's
+  older database URL secret, and #16's signing key and S1's token if merged),
+  and the old runtime, migration and worker service accounts.
 - If #12 merged: the queue (with any tasks still in it), the worker and
   recovery jobs, the recovery schedule and the account it used, the invoker
   account, and the old accounts' roles on the intake bucket, or on the
