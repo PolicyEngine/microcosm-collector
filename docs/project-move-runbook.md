@@ -375,8 +375,12 @@ example, an IAM condition on the instance name), repeat that here.
 
 ### 5.2 Cloud SQL
 
-Create the instance with the settings recorded in step 3.2. Keep deletion
-protection on.
+Create the instance with the settings recorded in step 3.2, except deletion
+protection, which is on for both new instances: on 2026-10-22 staging's
+instance had it, but production's didn't. Where the record shows automated
+backups off, as staging's did on 2026-10-22, use `--no-backup` instead of
+`--backup-start-time`; only production's deployment takes a backup
+(`create-database-backup`).
 
 ```bash
 gcloud sql instances create "$NEW_INSTANCE" --project "$NEW_PROJECT_ID" --region "$REGION" \
