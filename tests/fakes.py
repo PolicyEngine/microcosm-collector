@@ -1,14 +1,24 @@
-"""In-memory protocol fake for HTTP contract unit tests."""
+"""In-memory protocol fakes for HTTP contract and worker unit tests."""
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from copy import deepcopy
-from datetime import datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from threading import RLock
 from typing import Any
 
 from telemetry_collector.auth import HuggingFacePrincipal
+from telemetry_collector.google_cloud import cloud_task_id
+from telemetry_collector.intake import (
+    IntakeObjectMissingError,
+    PlannedUpload,
+    SignedUpload,
+    StoredObject,
+    WorkerQueueUnavailableError,
+    upload_instruction_headers,
+)
 from telemetry_collector.models import RunRegistration, TelemetryEvent
 from telemetry_collector.storage import (
     RunRegistrationConflictError,
@@ -17,6 +27,30 @@ from telemetry_collector.storage import (
     materialize_run,
     run_documents,
     run_summary,
+)
+from telemetry_collector.submission_store import (
+    ATTEMPT_ABANDONED,
+    ATTEMPTS_EXHAUSTED,
+    ClaimedJob,
+    JobRecovery,
+    SubmissionNotReprocessableError,
+    SubmissionOwnershipError,
+    SubmissionRecord,
+    files_with_generations,
+    is_reprocessable,
+    job_is_claimable,
+    job_is_stalled,
+    new_job_values,
+    new_submission_values,
+    recovery_decision,
+)
+from telemetry_collector.submissions import (
+    FINAL_STATUSES,
+    INTAKE_ONLY_HANDLER,
+    MAX_JOB_ATTEMPTS,
+    FinalStatus,
+    SubmissionRequest,
+    derive_job_id,
 )
 
 
@@ -128,3 +162,381 @@ class FakeTelemetryStore:
 
     def is_ready(self) -> bool:
         return True
+
+
+class FakeSubmissionStore:
+    """In-memory implementation of the submission store protocol.
+
+    It shares the PostgreSQL store's decisions (``job_is_claimable``,
+    ``job_is_stalled``, ``recovery_decision``, ``is_reprocessable``), and the
+    store contract tests run against both.
+    """
+
+    def __init__(self, *, clock: Callable[[], datetime] | None = None) -> None:
+        self._clock = clock or (lambda: datetime.now(UTC))
+        self._submissions: dict[str, SubmissionRecord] = {}
+        self._jobs: dict[str, dict[str, Any]] = {}
+        self._lock = RLock()
+
+    def _with_job(self, record: SubmissionRecord) -> SubmissionRecord:
+        job = (
+            None
+            if record.processing_round == 0
+            else self._jobs.get(
+                derive_job_id(
+                    record.submission_id, record.kind, record.processing_round
+                )
+            )
+        )
+        return deepcopy(
+            replace(
+                record,
+                job_id=None if job is None else job["job_id"],
+                job_attempts=0 if job is None else job["attempts"],
+                job_dispatch_count=0 if job is None else job["dispatch_count"],
+            )
+        )
+
+    def create_submission(
+        self, request: SubmissionRequest, principal: HuggingFacePrincipal
+    ) -> tuple[SubmissionRecord, bool]:
+        with self._lock:
+            values = new_submission_values(request, principal, self._clock())
+            existing = self._submissions.get(values["submission_id"])
+            if existing is not None:
+                if existing.owner_hf_id != principal.user_id:
+                    raise SubmissionOwnershipError(
+                        "Submission belongs to another Hugging Face user."
+                    )
+                return self._with_job(existing), False
+            record = SubmissionRecord(
+                **values, job_id=None, job_attempts=0, job_dispatch_count=0
+            )
+            self._submissions[record.submission_id] = record
+            return self._with_job(record), True
+
+    def get_submission(self, submission_id: str) -> SubmissionRecord | None:
+        with self._lock:
+            record = self._submissions.get(submission_id)
+            return None if record is None else self._with_job(record)
+
+    def _add_job(self, record: SubmissionRecord, processing_round: int) -> None:
+        values = new_job_values(
+            record.submission_id, record.kind, processing_round, self._clock()
+        )
+        self._jobs.setdefault(values["job_id"], values)
+
+    def accept_submission(
+        self, submission_id: str, generations: Mapping[str, str]
+    ) -> SubmissionRecord:
+        with self._lock:
+            record = self._submissions[submission_id]
+            if record.status == "awaiting_upload":
+                now = self._clock()
+                record = replace(
+                    record,
+                    files=files_with_generations(record.files, generations),
+                    status="queued",
+                    processing_round=1,
+                    accepted_at=now,
+                    updated_at=now,
+                )
+                self._submissions[submission_id] = record
+                self._add_job(record, 1)
+            return self._with_job(record)
+
+    def reject_submission(
+        self, submission_id: str, rejection: dict[str, Any]
+    ) -> SubmissionRecord:
+        with self._lock:
+            record = self._submissions[submission_id]
+            if record.status == "awaiting_upload":
+                now = self._clock()
+                record = replace(
+                    record,
+                    status="rejected",
+                    rejection=deepcopy(rejection),
+                    finished_at=now,
+                    updated_at=now,
+                )
+                self._submissions[submission_id] = record
+            return self._with_job(record)
+
+    def record_dispatch(self, job_id: str, dispatch_number: int) -> None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if (
+                job is not None
+                and job["dispatch_count"] < dispatch_number
+                and job["status"] not in FINAL_STATUSES
+            ):
+                now = self._clock()
+                job.update(
+                    dispatch_count=dispatch_number, dispatched_at=now, updated_at=now
+                )
+
+    def _set_submission(self, job: dict[str, Any], **changes: Any) -> None:
+        submission_id = job["submission_id"]
+        self._submissions[submission_id] = replace(
+            self._submissions[submission_id], updated_at=self._clock(), **changes
+        )
+
+    def _finish(
+        self,
+        job: dict[str, Any],
+        status: FinalStatus,
+        result: dict[str, Any] | None,
+        rejection: dict[str, Any] | None,
+    ) -> None:
+        now = self._clock()
+        job.update(
+            status=status,
+            lease_holder=None,
+            lease_expires_at=None,
+            last_error=deepcopy(rejection),
+            result=deepcopy(result),
+            updated_at=now,
+            finished_at=now,
+        )
+        self._set_submission(
+            job,
+            status=status,
+            result=deepcopy(result),
+            rejection=deepcopy(rejection),
+            finished_at=now,
+        )
+
+    def _requeue(self, job: dict[str, Any], error: dict[str, Any] | None) -> None:
+        job.update(
+            status="queued",
+            lease_holder=None,
+            lease_expires_at=None,
+            last_error=deepcopy(error),
+            updated_at=self._clock(),
+        )
+        self._set_submission(job, status="queued")
+
+    def claim_job(
+        self, job_id: str, *, holder: str, lease_seconds: float
+    ) -> ClaimedJob | None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            now = self._clock()
+            if not job_is_claimable(
+                job["status"],
+                job["lease_holder"],
+                job["lease_expires_at"],
+                holder=holder,
+                now=now,
+            ):
+                return None
+            if job["attempts"] >= MAX_JOB_ATTEMPTS:
+                self._finish(job, "failed", None, ATTEMPTS_EXHAUSTED)
+                return None
+            job.update(
+                status="running",
+                attempts=job["attempts"] + 1,
+                lease_holder=holder,
+                lease_expires_at=now + timedelta(seconds=lease_seconds),
+                updated_at=now,
+            )
+            self._set_submission(job, status="processing")
+            return ClaimedJob(
+                job_id=job_id,
+                attempt=job["attempts"],
+                submission=self._with_job(self._submissions[job["submission_id"]]),
+            )
+
+    def _held_job(self, job_id: str, holder: str) -> dict[str, Any] | None:
+        job = self._jobs.get(job_id)
+        if job is None or job["status"] != "running":
+            return None
+        if job["lease_holder"] != holder:
+            return None
+        return job
+
+    def finish_job(
+        self,
+        job_id: str,
+        *,
+        holder: str,
+        status: FinalStatus,
+        result: dict[str, Any] | None,
+        rejection: dict[str, Any] | None,
+    ) -> bool:
+        with self._lock:
+            job = self._held_job(job_id, holder)
+            if job is None:
+                return False
+            self._finish(job, status, result, rejection)
+            return True
+
+    def release_job(self, job_id: str, *, holder: str, error: dict[str, Any]) -> bool:
+        with self._lock:
+            job = self._held_job(job_id, holder)
+            if job is None:
+                return False
+            self._requeue(job, error)
+            return True
+
+    def _is_stalled(self, job: dict[str, Any], idle_seconds: float) -> bool:
+        return job_is_stalled(
+            job["status"],
+            job["lease_expires_at"],
+            job["updated_at"],
+            now=self._clock(),
+            idle_seconds=idle_seconds,
+        )
+
+    def stalled_job_ids(self, *, idle_seconds: float) -> list[str]:
+        with self._lock:
+            stalled = [
+                job
+                for job in self._jobs.values()
+                if self._is_stalled(job, idle_seconds)
+            ]
+            return [
+                job["job_id"]
+                for job in sorted(
+                    stalled, key=lambda job: (job["updated_at"], job["job_id"])
+                )
+            ]
+
+    def recover_job(self, job_id: str, *, idle_seconds: float) -> JobRecovery:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or not self._is_stalled(job, idle_seconds):
+                return JobRecovery(job_id, "none")
+            action, rejection, dispatch_number = recovery_decision(
+                job["attempts"], job["dispatch_count"]
+            )
+            if action == "failed":
+                self._finish(job, "failed", None, rejection)
+                return JobRecovery(job_id, "failed")
+            abandoned = ATTEMPT_ABANDONED if job["status"] == "running" else None
+            self._requeue(job, abandoned or job["last_error"])
+            return JobRecovery(job_id, "dispatch", dispatch_number)
+
+    def reprocess_submission(self, submission_id: str) -> SubmissionRecord:
+        with self._lock:
+            record = self._submissions[submission_id]
+            if not is_reprocessable(record.status, record.processing_round):
+                raise SubmissionNotReprocessableError(
+                    f"{submission_id} is {record.status}."
+                )
+            record = replace(
+                record,
+                processing_round=record.processing_round + 1,
+                status="queued",
+                result=None,
+                rejection=None,
+                finished_at=None,
+                updated_at=self._clock(),
+            )
+            self._submissions[submission_id] = record
+            self._add_job(record, record.processing_round)
+            return self._with_job(record)
+
+    def reprocessable_submission_ids(
+        self, kind: str, *, intake_only: bool
+    ) -> list[str]:
+        with self._lock:
+            selected = [
+                record
+                for record in self._submissions.values()
+                if record.kind == kind
+                and is_reprocessable(record.status, record.processing_round)
+                and (
+                    not intake_only
+                    or (record.result or {}).get("processed_by") == INTAKE_ONLY_HANDLER
+                )
+            ]
+            return [
+                record.submission_id
+                for record in sorted(
+                    selected,
+                    key=lambda record: (record.created_at, record.submission_id),
+                )
+            ]
+
+
+class FakeIntakeObjectStore:
+    """In-memory intake bucket; ``upload`` stands in for a client's PUT."""
+
+    def __init__(self, *, clock: Callable[[], datetime] | None = None) -> None:
+        self._clock = clock or (lambda: datetime.now(UTC))
+        self.objects: dict[str, tuple[bytes, str | None, str]] = {}
+        self.signed: list[PlannedUpload] = []
+        self.unreadable: set[str] = set()
+        self._next_generation = 1000
+
+    def upload(self, object_name: str, content: bytes, *, sha256: str | None) -> str:
+        self._next_generation += 1
+        generation = str(self._next_generation)
+        self.objects[object_name] = (content, sha256, generation)
+        return generation
+
+    def sign_uploads(
+        self, uploads: Sequence[PlannedUpload], *, lifetime_seconds: int
+    ) -> list[SignedUpload]:
+        self.signed.extend(uploads)
+        expires_at = self._clock() + timedelta(seconds=lifetime_seconds)
+        return [
+            SignedUpload(
+                name=upload.name,
+                url=f"https://storage.example.test/{upload.object_name}?signed=1",
+                method="PUT",
+                headers=upload_instruction_headers(
+                    upload.size, upload.sha256, "storage.example.test"
+                ),
+                expires_at=expires_at,
+            )
+            for upload in uploads
+        ]
+
+    def list_objects(self, prefix: str) -> dict[str, StoredObject]:
+        return {
+            name: StoredObject(
+                object_name=name,
+                size=len(content),
+                generation=generation,
+                sha256=sha256,
+            )
+            for name, (content, sha256, generation) in self.objects.items()
+            if name.startswith(prefix)
+        }
+
+    def read_chunks(
+        self, object_name: str, generation: str, *, chunk_size: int = 4
+    ) -> Iterator[bytes]:
+        if object_name in self.unreadable:
+            raise OSError("Storage is unavailable.")
+        stored = self.objects.get(object_name)
+        if stored is None or stored[2] != generation:
+            raise IntakeObjectMissingError(object_name)
+        content = stored[0]
+        for offset in range(0, len(content), chunk_size):
+            yield content[offset : offset + chunk_size]
+
+
+class FakeWorkerQueue:
+    """Records dispatches; ``available = False`` simulates an outage.
+
+    ``calls`` lists every attempted dispatch, and ``task_ids`` each task the
+    queue created, once, as Cloud Tasks does with task names.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, int]] = []
+        self.task_ids: list[str] = []
+        self.available = True
+
+    def dispatch(self, job_id: str, dispatch_number: int) -> None:
+        self.calls.append((job_id, dispatch_number))
+        if not self.available:
+            raise WorkerQueueUnavailableError("The worker queue is unavailable.")
+        task_id = cloud_task_id(job_id, dispatch_number)
+        if task_id not in self.task_ids:
+            self.task_ids.append(task_id)

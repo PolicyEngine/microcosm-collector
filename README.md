@@ -1,8 +1,9 @@
 # Microcosm telemetry collector
 
 This service accepts live build telemetry from Microcosm and exposes a
-read-only API to the calibration dashboard. It does not store dataset artifacts
-or Hugging Face credentials.
+read-only API to the calibration dashboard. It never stores Hugging Face
+credentials, and it stores build artifacts only when artifact intake is
+switched on (see "Artifact intake").
 
 ## Authentication
 
@@ -43,6 +44,127 @@ sending the same request again cannot succeed:
 - `422`: the request does not match the event schema, including a `blocked`
   event without a valid block (a safe-identifier `phase`, a
   `blocking_failure_count` of at least 1, and `blocking_gate_ids`).
+
+## Artifact intake
+
+Builds hand calibration diagnostics and Orrery inputs to the collector as
+submissions. [`docs/artifact-submissions.md`](docs/artifact-submissions.md) is
+the contract: kinds, file roles, provenance, identifiers, statuses, answers,
+receipts and limits. File bytes go straight to a private bucket through signed
+upload URLs; `POST /v1/submissions/{id}/complete` checks the stored objects'
+sizes and recorded digests and dispatches a worker job through Cloud Tasks; the
+worker, a Cloud Run Job running
+`uv run --no-sync python -m telemetry_collector.worker`, recomputes every
+file's SHA-256 and runs the handler registered for the kind. Until the
+calibration-tree and Orrery workers register theirs, both kinds are only
+checked and kept.
+
+Intake is off unless `COLLECTOR_INTAKE_ENABLED` is exactly `1`. While it is
+off, the collector reads no other intake setting, and the token exchange for
+`{"scope": "artifacts:submit"}` and every `/v1/submissions` path answer 404 with
+the code `intake_not_enabled`. `scripts/deploy.sh` sets none of these
+variables, so a deployment leaves intake off. It still changes three things:
+the migration job applies `0002_artifact_intake`, which adds the two intake
+tables; token responses gain `scope`; and the token exchange, which used to
+ignore its request body, now answers 422 for unknown fields and 404
+`intake_not_enabled` for `{"scope": "artifacts:submit"}`.
+
+Once `0002_artifact_intake` is applied, an image without it cannot run against
+the database. That includes every earlier collector release and the old copy in
+calibration-diagnostics' `telemetry-service/`. Its migration job fails with
+"Can't locate revision identified by '0002_artifact_intake'", and its `/ready`
+check fails. To roll back to such an image, first run
+`alembic downgrade 0001_initial_schema`, which drops both intake tables and
+every submission and job in them. Run it with this release's code, for
+example as its migration job with overridden arguments, and as the migration
+database user, before deploying the older image: the older code can't find
+the revision either, and the runtime user doesn't own the tables. That is an
+exception to the rule below that downgrades are for disposable test databases;
+while intake is off, both tables stay empty.
+
+| Setting | Read by | Value |
+|---|---|---|
+| `COLLECTOR_INTAKE_ENABLED` | service | `1` switches intake on |
+| `COLLECTOR_INTAKE_BUCKET` | service, worker | the private intake bucket's name |
+| `COLLECTOR_INTAKE_SIGNING_SERVICE_ACCOUNT` | service | the runtime service account, which signs upload URLs through IAM `signBlob` |
+| `COLLECTOR_WORKER_QUEUE` | service, operations | `projects/<project>/locations/<region>/queues/<queue>` |
+| `COLLECTOR_WORKER_JOB` | service, operations | `projects/<project>/locations/<region>/jobs/<job>` |
+| `COLLECTOR_WORKER_INVOKER_SERVICE_ACCOUNT` | service, operations | the account whose OAuth token each Cloud Task uses to run the worker job |
+| `COLLECTOR_WORKER_JOB_ID` | worker | set on each execution by its Cloud Task |
+| `DATABASE_URL` | worker, operations | the runtime database secret, as for the service |
+
+The two service-account settings accept only user-managed accounts,
+`<name>@<project>.iam.gserviceaccount.com`. The collector refuses to start
+with the default Compute Engine account
+(`<number>-compute@developer.gserviceaccount.com`), so the runtime and invoker
+accounts must be user-managed ones.
+
+### Database access
+
+The migration job's database user owns the tables it creates; the service,
+the worker and the operator commands connect as the runtime database user.
+Migration `0002_artifact_intake` copies every grant on `telemetry_runs`
+(`SELECT`, `INSERT`, `UPDATE` and `DELETE`, to any role except its owner and
+`PUBLIC`) to `artifact_submissions` and `artifact_jobs`, so the runtime user
+gets the same access to the intake tables as to the telemetry tables, whether
+it was granted explicitly or through default privileges. The intake code needs
+`SELECT`, `INSERT` and `UPDATE`; row locks (`SELECT ... FOR UPDATE`) need
+`UPDATE`.
+
+### Worker jobs and recovery
+
+- **The worker Cloud Run Job** runs one task, with two task retries
+  (`--max-retries 2`, so three attempts, matching `MAX_JOB_ATTEMPTS`) and a
+  one-hour task timeout (`--task-timeout 1h`, matching
+  `WORKER_TASK_TIMEOUT_SECONDS`). Each claim leases the job for 65 minutes
+  (`JOB_LEASE_SECONDS`), so a lease expires only after its attempt has ended.
+  A task retry is a new attempt under the same lease holder
+  (`CLOUD_RUN_EXECUTION`).
+- **Recovery** (`uv run --no-sync python -m telemetry_collector.operations
+  recover`) runs every 10 minutes, as an execution of a second Cloud Run Job
+  on the same image that Cloud Scheduler starts. It fails a job whose lease
+  expired after its third attempt (`attempts_exhausted`) or that would need a
+  fourth dispatch (`worker_unavailable`), and dispatches again a job whose
+  attempt ended early or that stayed queued for 30 minutes without being
+  claimed. Each dispatch is a Cloud Task named `<job_id>-<dispatch number>`.
+  Without recovery, a job whose last attempt was killed stays `processing`.
+- **Reprocessing** (`uv run --no-sync python -m telemetry_collector.operations
+  reprocess SUBMISSION_ID...`, or `reprocess --kind <kind> --intake-only`, with
+  `--dry-run` to list first) processes final submissions again in a new
+  processing round, for example after a handler is registered. An operator
+  runs it as an execution of the recovery job with its arguments overridden,
+  or locally through the Cloud SQL Auth Proxy with Application Default
+  Credentials that may enqueue on the queue and act as the invoker account.
+
+None of these values is secret. Switching intake on for an environment needs,
+in that environment's project and region:
+
+- **A bucket** with uniform bucket-level access, public access prevention
+  enforced, and no lifecycle deletion, so intake files stay available for
+  back-building.
+- **A Cloud Tasks queue** for worker jobs.
+- **The worker Cloud Run Job** described above, running the released image
+  with the worker command, with the runtime database secret as `DATABASE_URL`,
+  the Cloud SQL connection and `COLLECTOR_INTAKE_BUCKET`.
+- **The recovery Cloud Run Job** on the same image with the recovery command,
+  the runtime database secret as `DATABASE_URL`, the Cloud SQL connection and
+  the three `COLLECTOR_WORKER_*` queue settings, and a Cloud Scheduler job that
+  runs it every 10 minutes.
+- **Database access:** after the migration, the runtime database user has
+  `SELECT`, `INSERT` and `UPDATE` on `artifact_submissions` and
+  `artifact_jobs` (see "Database access").
+- **Permissions:** the runtime service account may create and read objects in
+  the bucket, sign as itself (`roles/iam.serviceAccountTokenCreator` on
+  itself), enqueue on the queue, and act as the invoker account; the invoker
+  account may run the worker job with overrides; the worker's service account
+  may read the bucket, connect to Cloud SQL and read the runtime database
+  secret; the recovery job's service account may connect to Cloud SQL, read the
+  runtime database secret, enqueue on the queue and act as the invoker
+  account; Cloud Scheduler's account may run the recovery job.
+- **Deployment wiring:** `scripts/deploy.sh` passing the settings to the
+  service and updating both jobs' images on every release, from new `staging`
+  and `production` environment variables. That change is the one that
+  switches intake on.
 
 ## Local development
 

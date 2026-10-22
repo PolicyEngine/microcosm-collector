@@ -16,6 +16,10 @@ from telemetry_collector.migrate import (
     verify_database,
 )
 
+HEAD_REVISION = "0002_artifact_intake"
+TELEMETRY_TABLES = {"telemetry_runs", "telemetry_producers", "telemetry_events"}
+ARTIFACT_TABLES = {"artifact_submissions", "artifact_jobs"}
+
 
 def _current_revision(database_url: str) -> tuple[str | None, str | None]:
     engine = create_database_engine(database_url)
@@ -106,14 +110,10 @@ def test_upgrades_empty_postgres_database_to_head(postgres_url: str) -> None:
     try:
         assert set(inspect(engine).get_table_names()) == {
             "alembic_version",
-            "telemetry_runs",
-            "telemetry_producers",
-            "telemetry_events",
+            *TELEMETRY_TABLES,
+            *ARTIFACT_TABLES,
         }
-        assert _current_revision(postgres_url) == (
-            "0001_initial_schema",
-            "0001_initial_schema",
-        )
+        assert _current_revision(postgres_url) == (HEAD_REVISION, HEAD_REVISION)
     finally:
         engine.dispose()
 
@@ -164,9 +164,8 @@ def test_hard_cutover_replaces_populated_unversioned_database(
         inspector = inspect(engine)
         assert set(inspector.get_table_names()) == {
             "alembic_version",
-            "telemetry_runs",
-            "telemetry_producers",
-            "telemetry_events",
+            *TELEMETRY_TABLES,
+            *ARTIFACT_TABLES,
         }
         metadata = sa.MetaData()
         runs = sa.Table("telemetry_runs", metadata, autoload_with=engine)
@@ -176,10 +175,7 @@ def test_hard_cutover_replaces_populated_unversioned_database(
             assert (
                 connection.scalar(sa.select(sa.func.count()).select_from(events)) == 0
             )
-        assert _current_revision(postgres_url) == (
-            "0001_initial_schema",
-            "0001_initial_schema",
-        )
+        assert _current_revision(postgres_url) == (HEAD_REVISION, HEAD_REVISION)
     finally:
         engine.dispose()
 
@@ -195,10 +191,7 @@ def test_migration_chain_downgrades_and_reupgrades_in_test_database(
             config.attributes["connection"] = connection
             command.downgrade(config, "base")
             command.upgrade(config, "head")
-        assert _current_revision(postgres_url) == (
-            "0001_initial_schema",
-            "0001_initial_schema",
-        )
+        assert _current_revision(postgres_url) == (HEAD_REVISION, HEAD_REVISION)
     finally:
         engine.dispose()
 
@@ -218,3 +211,87 @@ def test_verification_rejects_schema_drift_at_alembic_head(
 
     with pytest.raises(RuntimeError, match="differs from SQLAlchemy metadata"):
         verify_database(postgres_url)
+
+
+def test_downgrading_artifact_intake_keeps_the_telemetry_schema(
+    postgres_url: str,
+) -> None:
+    upgrade_database(postgres_url)
+    engine = create_database_engine(postgres_url)
+    config = alembic_config()
+    try:
+        with engine.begin() as connection:
+            config.attributes["connection"] = connection
+            command.downgrade(config, "0001_initial_schema")
+        assert set(inspect(engine).get_table_names()) == {
+            "alembic_version",
+            *TELEMETRY_TABLES,
+        }
+        assert _current_revision(postgres_url) == (
+            "0001_initial_schema",
+            HEAD_REVISION,
+        )
+    finally:
+        engine.dispose()
+
+
+RUNTIME_ROLE = "collector_runtime_grant_test"
+UNGRANTED_ROLE = "collector_ungranted_grant_test"
+TABLE_PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "DELETE")
+
+
+def _drop_test_roles(connection: sa.Connection) -> None:
+    for role in (RUNTIME_ROLE, UNGRANTED_ROLE):
+        exists = connection.scalar(
+            sa.text("SELECT 1 FROM pg_roles WHERE rolname = :role"), {"role": role}
+        )
+        if exists:
+            connection.execute(sa.text(f"DROP OWNED BY {role}"))
+            connection.execute(sa.text(f"DROP ROLE {role}"))
+
+
+def _table_privileges(connection: sa.Connection, role: str) -> dict[str, set[str]]:
+    return {
+        table: {
+            privilege
+            for privilege in TABLE_PRIVILEGES
+            if connection.scalar(
+                sa.text("SELECT has_table_privilege(:role, :table, :privilege)"),
+                {"role": role, "table": table, "privilege": privilege},
+            )
+        }
+        for table in sorted(ARTIFACT_TABLES)
+    }
+
+
+def test_artifact_intake_grants_the_runtime_role_its_telemetry_access(
+    postgres_url: str,
+) -> None:
+    engine = create_database_engine(postgres_url)
+    config = alembic_config()
+    try:
+        with engine.begin() as connection:
+            _drop_test_roles(connection)
+            connection.execute(sa.text(f"CREATE ROLE {RUNTIME_ROLE} NOLOGIN"))
+            connection.execute(sa.text(f"CREATE ROLE {UNGRANTED_ROLE} NOLOGIN"))
+            config.attributes["connection"] = connection
+            command.upgrade(config, "0001_initial_schema")
+            # The runtime user's access as the deployment granted it, outside
+            # the migrations, plus a PUBLIC grant the migration must not copy.
+            connection.execute(
+                sa.text(
+                    f"GRANT SELECT, INSERT, UPDATE ON telemetry_runs TO {RUNTIME_ROLE}"
+                )
+            )
+            connection.execute(sa.text("GRANT SELECT ON telemetry_runs TO PUBLIC"))
+            command.upgrade(config, "head")
+            runtime_privileges = _table_privileges(connection, RUNTIME_ROLE)
+            ungranted_privileges = _table_privileges(connection, UNGRANTED_ROLE)
+        assert runtime_privileges == {
+            table: {"SELECT", "INSERT", "UPDATE"} for table in ARTIFACT_TABLES
+        }
+        assert ungranted_privileges == {table: set() for table in ARTIFACT_TABLES}
+    finally:
+        with engine.begin() as connection:
+            _drop_test_roles(connection)
+        engine.dispose()
