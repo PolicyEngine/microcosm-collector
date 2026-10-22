@@ -28,6 +28,8 @@ class FakeDataset:
     head_commit: str = "0" * 40
     #: Answer every request for this dataset with this status instead.
     forced_status: int | None = None
+    #: Report these SHA-256 values for LFS files instead of their content's.
+    reported_lfs_sha256: dict[str, str] = field(default_factory=dict)
 
 
 class FakeHuggingFace:
@@ -156,7 +158,9 @@ class FakeHuggingFace:
             }
             if file_path in dataset.lfs_paths:
                 entry["lfs"] = {
-                    "oid": hashlib.sha256(content).hexdigest(),
+                    "oid": dataset.reported_lfs_sha256.get(
+                        file_path, hashlib.sha256(content).hexdigest()
+                    ),
                     "size": len(content),
                     "pointerSize": LFS_POINTER_BYTES,
                 }
