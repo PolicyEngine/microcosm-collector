@@ -1310,13 +1310,14 @@ Still open:
   to the old intake bucket (step 5.3), and the old project's image reads from
   the new Artifact Registry store (step 4.1). Checking needs
   organization-level access.
-- **Organization policies:** the new project inherits its parent's.
-  `policyengine-api` belongs to the same organization and lets `allUsers`
-  invoke the collector, which `--allow-unauthenticated` needs, but whether
-  the chosen parent or `policyengine-api` itself sets a different policy,
-  such as domain-restricted sharing, wasn't checked: the Organization Policy
-  API isn't enabled in `policyengine-api`. If the new project refuses
-  `allUsers`, step 6.6's deployment can't reach its maintenance revision.
+- **Organization policies:** the new project inherits the policies of the
+  parent chosen in choice 2. In `policyengine-api`, which sits directly under
+  an organization, both collector services grant `roles/run.invoker` to
+  `allUsers`, as `--allow-unauthenticated` needs. Whether the chosen parent
+  sets a different policy, such as domain-restricted sharing, wasn't checked:
+  the Organization Policy API isn't enabled in `policyengine-api`. If the new
+  project refuses `allUsers`, step 6.6's deployment can't reach its
+  maintenance revision.
 - **Project liens:** whether `policyengine-api` has a lien that stops it being
   deleted, which matters if the intake bucket stays there. Listing liens needs
   `gcloud alpha resource-manager liens list`.

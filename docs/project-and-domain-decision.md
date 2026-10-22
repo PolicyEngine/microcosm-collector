@@ -226,11 +226,13 @@ If both D2 and D3 are adopted, there are two orders:
    and wait until builds use it (after H2a, and after Microcosm leaves the
    0.2.1 pin), as the runbook's step 3.4 describes. Then move the project
    behind the hostname: only the hostname's target changes, and the old
-   default address can be retired, because no build uses it. With the load balancer (D3 C), the certificate is issued in
-   the new project before the DNS change, through a per-project DNS
-   authorization whose record doesn't clash with the old project's. With domain mapping (D3 B), the
-   mapping is re-created in the new project, and requests fail TLS checks
-   until the new certificate is issued (the emitter retries).
+   default address can be retired, because no build uses it. With the load
+   balancer (D3 C), the certificate is issued in the new project before the
+   DNS change, through a per-project DNS authorization whose record doesn't
+   clash with the old project's. With domain mapping (D3 B), the old project's
+   mapping is deleted and the mapping created again in the new project, and
+   requests fail TLS checks until the new certificate is issued (the emitter
+   retries).
 2. **Together.** Create the new project and the hostname, move each database
    in one window, then release the emitter. Builds keep the old address until
    they start a newer emitter, and builds pinned to 0.2.1 keep it until
