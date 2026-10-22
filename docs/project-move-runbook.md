@@ -1011,13 +1011,24 @@ can take up to 24 hours."
 ```bash
 gcloud compute addresses create collector-address --global --project "$NEW_PROJECT_ID"
 gcloud certificate-manager dns-authorizations create collector-hostname \
-  --domain "$COLLECTOR_HOSTNAME" --project "$NEW_PROJECT_ID"
+  --domain "$COLLECTOR_HOSTNAME" --type=PER_PROJECT_RECORD --project "$NEW_PROJECT_ID"
 gcloud certificate-manager dns-authorizations describe collector-hostname \
   --project "$NEW_PROJECT_ID" --format='yaml(dnsResourceRecord)'
 ```
 
 Add that CNAME at the DNS provider. It authorizes the certificate and moves no
-traffic. Then:
+traffic. The authorization is per project (`--type=PER_PROJECT_RECORD`), so the
+CNAME's name carries a suffix for the project
+(`_acme-challenge_SUFFIX.HOSTNAME`, as `describe` shows) instead of the fixed
+`_acme-challenge.HOSTNAME`. In the hostname-first order, step 3.4's
+authorization in the old project and this one therefore have separate records
+and can both exist, so the new certificate is issued before the `A` record
+changes. A fixed-name authorization in both projects would need two different
+CNAME records at one name, which DNS doesn't allow. Certificate Manager's DNS
+authorization page says per-project authorizations "are self-contained and
+don't interact with those in other projects", and that for them it supports
+only certificates issued by Google Trust Services (`pki.goog`, which the CAA
+note above allows). Then:
 
 ```bash
 gcloud certificate-manager certificates create collector-certificate \
@@ -1046,10 +1057,7 @@ Wait until
 prints `ACTIVE`. Then point the hostname's `A` record at the address
 (`gcloud compute addresses describe collector-address --global --project "$NEW_PROJECT_ID" --format='value(address)'`).
 Lower the record's TTL to 300 seconds a day before, so a rollback propagates
-quickly. In the hostname-first order, the old project's certificate
-authorization record may still exist at the same name; Certificate Manager's
-per-project DNS authorizations (`--type=PER_PROJECT_RECORD`) let both exist at
-once. Check its documentation before relying on that.
+quickly.
 
 ### Check the hostname
 
