@@ -1,6 +1,6 @@
 [project]
 name = "microcosm-collector"
-version = "0.3.2"
+version = "0.3.3"
 description = "Authenticated ingestion and query API for Microcosm build telemetry"
 requires-python = ">=3.13"
 license = "MIT"
