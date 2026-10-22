@@ -1001,10 +1001,20 @@ can take up to 24 hours."
   time after the first deployment, and wait for the certificate before the
   emitter release (section 8.2).
 - **Hostname first:** step 3.4 already mapped the hostname to the old
-  project's service. Re-create the mapping in the new project with `--force-override`
-  inside production's window, after the deployment. That moves the hostname
-  at once, and requests fail TLS checks until the new certificate is issued;
-  the emitter retries.
+  project's service. Inside production's window, after the deployment, delete
+  that mapping, then create the mapping in the new project with the commands
+  above:
+
+  ```bash
+  gcloud beta run domain-mappings delete --domain "$COLLECTOR_HOSTNAME" \
+    --region "$REGION" --project "$OLD_PROJECT_ID" --quiet
+  ```
+
+  The DNS records stay as they are. Requests fail until the new certificate
+  is issued; the emitter retries. `domain-mappings create --force-override`
+  maps a domain "even if it is already mapped to another service" (its
+  `--help`), but neither the help nor the domain mapping page says whether
+  that includes a service in another project, so don't rely on it.
 
 ### D3 C: load balancer
 
@@ -1202,7 +1212,7 @@ the moment the old service entered maintenance mode.
 | A deployment into the new project fails | As in calibration-diagnostics#233: before the migration step, fix and re-run the failed jobs. The new service isn't in use yet, so the first row also applies. |
 | After the dashboard switched (8.1), before the emitter release (8.2) | Builds still use only the old address. If the old service was in maintenance mode the whole time, nothing new is in the new database: do the first row, then set the dashboard's settings back and redeploy it. If the old service was kept serving against the new database (8.4), new events are in the new database: do the next row. |
 | After the emitter release | New events are in the new database. Put the new service in maintenance mode (step 6.2's commands with the new project), export the new database, import it into a fresh database on the old instance (drop and re-create the old database first, or import under a new name and update the old runtime database secret), route the old service back to the revision step 6.1 recorded in production's window (if a release with a migration has deployed in the new project since, that revision's code is older than the imported schema: set the GitHub values back first, and let the next merge deploy the current release to the old project instead), and set the GitHub and dashboard settings back. Then reverse step 6.7: in the new project, pause #19's check schedule and disable the new alert policies (step 6.2's commands have already paused #12's queue and recovery schedule there); in the old project, resume #12's queue and recovery schedule, resume #19's check schedule, enable the old alert policies again and run the old check job once, as in the first row. Last, release the emitter with the old `PRODUCTION_COLLECTOR_URL` (the old origin is still trusted, so only that constant changes). Builds that started on the new default keep it until they finish, and keep their events locally while the new service is in maintenance mode. |
-| The hostname | D3 B: delete the mapping, or map the hostname back to the old project's service with `--force-override`. D3 C: point the `A` record back to what it named before, if anything. |
+| The hostname | D3 B: delete the new project's mapping; in the hostname-first order, then create the mapping in the old project again (section 7's commands with `--project "$OLD_PROJECT_ID"`) and wait for its certificate. D3 C: point the `A` record back to what it named before, if anything. |
 
 ## 11. Retire the old resources
 
@@ -1235,9 +1245,9 @@ after an agreed holding period:
   `roles/iam.workloadIdentityUser` binding for this repo's principal set.
   Keep calibration-diagnostics' provider and the shared deployment account:
   the dashboard's deployment still uses them.
-- In the hostname-first order, the domain mapping or the load balancer's
-  resources that step 3.4 created in `policyengine-api`, once the hostname
-  points at the new project.
+- In the hostname-first order with D3 C, the load balancer's resources that
+  step 3.4 created in `policyengine-api`, once the hostname points at the new
+  project. (With D3 B, section 7 already deleted the old project's mapping.)
 - The export bucket and every dump in it.
 - calibration-diagnostics' leftover collector settings, as listed in
   calibration-diagnostics#233's "Manual steps".
