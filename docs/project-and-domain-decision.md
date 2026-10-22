@@ -222,9 +222,9 @@ If both D2 and D3 are adopted, there are two orders:
 1. **Hostname first.** Point the custom hostname at today's service in
    `policyengine-api`, release the emitter with the hostname as its default,
    and wait until builds use it (after H2a, and after Microcosm leaves the
-   0.2.1 pin). Then move the project behind the hostname: only the hostname's
-   target changes, and the old default address can be retired, because no
-   build uses it. With the load balancer (D3 C), the certificate is issued in
+   0.2.1 pin), as the runbook's step 3.4 describes. Then move the project
+   behind the hostname: only the hostname's target changes, and the old
+   default address can be retired, because no build uses it. With the load balancer (D3 C), the certificate is issued in
    the new project before the DNS change. With domain mapping (D3 B), the
    mapping is re-created in the new project, and requests fail TLS checks
    until the new certificate is issued (the emitter retries).

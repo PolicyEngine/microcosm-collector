@@ -218,6 +218,36 @@ One for staging, one for production (choice 8). From the start of a window
 until its verification passes, nothing merges to this repo's `main`: every
 merge deploys.
 
+### 3.4 Hostname first only: put the hostname in front of today's service
+
+In the hostname-first order (choice 6), builds move to the hostname before the
+project moves, so that none of them still uses the default address when step
+6.2 puts the old service in maintenance mode. Skip this step in the "both
+together" order. Before section 4:
+
+1. Do section 7 for each environment against today's service: run its
+   commands with `--project "$OLD_PROJECT_ID"` wherever they say
+   `--project "$NEW_PROJECT_ID"`. For D3 C, this puts the load balancer's
+   resources in `policyengine-api` (its Compute Engine and Certificate Manager
+   APIs were already enabled on 2026-10-22) until section 11 removes them.
+   Then run section 7's hostname checks.
+2. Do section 8.2: release the emitter with the hostname as
+   `PRODUCTION_COLLECTOR_URL`, keeping the default address in
+   `TRUSTED_COLLECTOR_ORIGINS`.
+3. Optionally point the dashboard's `MICROCOSM_TELEMETRY_COLLECTOR_URL` at the
+   hostname now (the first two rows of section 8.1's settings table). Section
+   8.1 then changes only the secret settings.
+4. Wait until builds use the hostname. Emitter 0.2.1 has the default address
+   built in, with no setting that changes it, so Microcosm has to have left
+   its `microcosm-emitter==0.2.1` pin; and the machines and build images that
+   start the separately installed emitter need the new release. Builds that
+   still use the default address when a window starts are handled as choice 7
+   says.
+
+Then continue with section 4. Section 8.2 is then already done, and section 7
+is done again in the new project inside production's window, as its "Hostname
+first" notes say.
+
 ## 4. Create the project (once, no downtime)
 
 ```bash
@@ -970,8 +1000,8 @@ can take up to 24 hours."
 - **Both together (choice 6):** nothing uses the hostname yet, so map it any
   time after the first deployment, and wait for the certificate before the
   emitter release (section 8.2).
-- **Hostname first:** the hostname is already mapped to the old project's
-  service. Re-create the mapping in the new project with `--force-override`
+- **Hostname first:** step 3.4 already mapped the hostname to the old
+  project's service. Re-create the mapping in the new project with `--force-override`
   inside production's window, after the deployment. That moves the hostname
   at once, and requests fail TLS checks until the new certificate is issued;
   the emitter retries.
@@ -1197,6 +1227,9 @@ after an agreed holding period:
   `roles/iam.workloadIdentityUser` binding for this repo's principal set.
   Keep calibration-diagnostics' provider and the shared deployment account:
   the dashboard's deployment still uses them.
+- In the hostname-first order, the domain mapping or the load balancer's
+  resources that step 3.4 created in `policyengine-api`, once the hostname
+  points at the new project.
 - The export bucket and every dump in it.
 - calibration-diagnostics' leftover collector settings, as listed in
   calibration-diagnostics#233's "Manual steps".
