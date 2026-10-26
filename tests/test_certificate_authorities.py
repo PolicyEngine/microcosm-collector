@@ -3,8 +3,12 @@
 On 2026-10-20 eight eMudhra (emSign) intermediate CA certificates were found to
 have private keys that anyone can recover from the public certificates
 (https://emudhra.we-have-a-problem.com). They chain to "emSign ECC Root CA - G3"
-and, through Sectigo's cross-signatures, to "AAA Certificate Services". certifi
-2026.10.19 is the first release without the emSign root.
+and, through Sectigo's cross-signatures, to "AAA Certificate Services".
+
+certifi 2026.10.18 removed all four emSign roots, and 2026.10.19 restored the
+three that the compromised intermediates do not chain to. Advisory
+GHSA-6q48-6c7w-9gw2 names 2026.10.19 as the first fixed version
+(https://github.com/advisories/GHSA-6q48-6c7w-9gw2).
 """
 
 import hashlib
@@ -21,9 +25,13 @@ from telemetry_collector.auth import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
-FIRST_CERTIFI_WITHOUT_EMSIGN_ECC_ROOT = (2026, 10, 19)
-# SHA-256 fingerprints of the DER-encoded root certificates, as macOS's system
-# roots, Debian's ca-certificates and certifi 2026.7.22 all report them.
+# The first fixed version in advisory GHSA-6q48-6c7w-9gw2, whose affected range
+# is ">= 2019.03.09, < 2026.10.19". certifi 2026.10.18 already lacks "emSign ECC
+# Root CA - G3", but that range still includes it.
+FIRST_PATCHED_CERTIFI = (2026, 10, 19)
+# SHA-256 fingerprints of the DER-encoded root certificates, as both macOS's
+# system roots and Debian's ca-certificates 20230311 report them. certifi
+# 2026.7.22 holds the same emSign certificate.
 COMPROMISED_CHAIN_ROOTS = {
     "86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b": (
         "emSign ECC Root CA - G3"
@@ -73,9 +81,9 @@ def locked_version(package_name: str) -> tuple[int, ...]:
     return tuple(int(part) for part in version.split("."))
 
 
-def test_image_locks_a_certifi_without_the_emsign_ecc_root() -> None:
+def test_image_locks_a_patched_certifi() -> None:
     # The Dockerfile installs exactly these versions with `uv sync --frozen`.
-    assert locked_version("certifi") >= FIRST_CERTIFI_WITHOUT_EMSIGN_ECC_ROOT
+    assert locked_version("certifi") >= FIRST_PATCHED_CERTIFI
 
 
 def test_hugging_face_check_trusts_no_compromised_root(monkeypatch) -> None:
