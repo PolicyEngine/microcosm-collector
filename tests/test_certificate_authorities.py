@@ -7,14 +7,60 @@ and, through Sectigo's cross-signatures, to "AAA Certificate Services". certifi
 2026.10.19 is the first release without the emSign root.
 """
 
+import hashlib
+import ssl
 import tomllib
 from pathlib import Path
 
-import httpx
+import httpcore
+import pytest
+
+from telemetry_collector.auth import (
+    HuggingFaceAuthenticationUnavailableError,
+    HuggingFaceAuthenticator,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 FIRST_CERTIFI_WITHOUT_EMSIGN_ECC_ROOT = (2026, 10, 19)
-COMPROMISED_CHAIN_ROOTS = {"emSign ECC Root CA - G3", "AAA Certificate Services"}
+# SHA-256 fingerprints of the DER-encoded root certificates, as macOS's system
+# roots, Debian's ca-certificates and certifi 2026.7.22 all report them.
+COMPROMISED_CHAIN_ROOTS = {
+    "86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b": (
+        "emSign ECC Root CA - G3"
+    ),
+    "d7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4": (
+        "AAA Certificate Services"
+    ),
+}
+# These change which roots httpx trusts or which host it connects to. Neither
+# the image nor scripts/deploy.sh sets any of them.
+VARIABLES_UNSET_IN_DEPLOYMENT = (
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+)
+
+
+class StreamThatStopsBeforeHandshake(httpcore.NetworkStream):
+    """A TCP stream that records the TLS settings it is given, then fails."""
+
+    def __init__(self, handshakes: list[tuple[ssl.SSLContext, str | None]]) -> None:
+        self._handshakes = handshakes
+
+    def start_tls(
+        self,
+        ssl_context: ssl.SSLContext,
+        server_hostname: str | None = None,
+        timeout: float | None = None,
+    ) -> httpcore.NetworkStream:
+        self._handshakes.append((ssl_context, server_hostname))
+        raise httpcore.ConnectError("The test stops before the TLS handshake.")
+
+    def close(self) -> None:
+        pass
 
 
 def locked_version(package_name: str) -> tuple[int, ...]:
@@ -27,28 +73,44 @@ def locked_version(package_name: str) -> tuple[int, ...]:
     return tuple(int(part) for part in version.split("."))
 
 
-def common_names(certificate: dict) -> set[str]:
-    return {
-        value
-        for relative_name in certificate["subject"]
-        for attribute, value in relative_name
-        if attribute == "commonName"
-    }
-
-
 def test_image_locks_a_certifi_without_the_emsign_ecc_root() -> None:
     # The Dockerfile installs exactly these versions with `uv sync --frozen`.
     assert locked_version("certifi") >= FIRST_CERTIFI_WITHOUT_EMSIGN_ECC_ROOT
 
 
-def test_hugging_face_requests_trust_no_compromised_root(monkeypatch) -> None:
-    # `httpx.get`, which HuggingFaceAuthenticator calls, verifies certificates
-    # against this context: certifi's bundle unless SSL_CERT_FILE or
-    # SSL_CERT_DIR is set, and neither the image nor the deployment sets them.
-    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
-    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
-    trusted_roots = httpx.create_ssl_context().get_ca_certs()
-    trusted_names = set().union(*(common_names(root) for root in trusted_roots))
+def test_hugging_face_check_trusts_no_compromised_root(monkeypatch) -> None:
+    # Run the authenticator's own request, replacing only the TCP connection, and
+    # keep the SSL context its connection hands to the TLS handshake.
+    for variable in VARIABLES_UNSET_IN_DEPLOYMENT:
+        monkeypatch.delenv(variable, raising=False)
+    connections: list[tuple[str, int]] = []
+    handshakes: list[tuple[ssl.SSLContext, str | None]] = []
 
-    assert len(trusted_roots) > 100
-    assert trusted_names & COMPROMISED_CHAIN_ROOTS == set()
+    def open_connection(backend, host, port, **connection_options):
+        connections.append((host, port))
+        return StreamThatStopsBeforeHandshake(handshakes)
+
+    monkeypatch.setattr(httpcore.SyncBackend, "connect_tcp", open_connection)
+
+    with pytest.raises(HuggingFaceAuthenticationUnavailableError):
+        HuggingFaceAuthenticator().authenticate("hf-test-token", "policyengine")
+
+    [(ssl_context, server_hostname)] = handshakes
+    # get_ca_certs lists the roots loaded from files; roots in a hashed
+    # certificate directory would load only during a handshake.
+    trusted_fingerprints = {
+        hashlib.sha256(certificate).hexdigest()
+        for certificate in ssl_context.get_ca_certs(binary_form=True)
+    }
+    trusted_compromised_roots = {
+        name
+        for fingerprint, name in COMPROMISED_CHAIN_ROOTS.items()
+        if fingerprint in trusted_fingerprints
+    }
+
+    assert connections == [("huggingface.co", 443)]
+    assert server_hostname == "huggingface.co"
+    assert ssl_context.verify_mode == ssl.CERT_REQUIRED
+    assert ssl_context.check_hostname
+    assert len(trusted_fingerprints) > 100
+    assert trusted_compromised_roots == set()
