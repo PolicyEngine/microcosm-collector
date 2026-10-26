@@ -18,8 +18,10 @@ permissions:
 # is 'true'. They then deploy one image to staging and, only after staging
 # succeeds, the same image to production. The staging and production
 # environments accept only main, and Google Cloud's Workload Identity provider
-# accepts this repo's tokens only for refs/heads/main, so both jobs also check
-# that they run for a push to main.
+# accepts this repo's tokens only for refs/heads/main. Both jobs also check for
+# a push to main. This workflow runs only for pushes to main, so that check is
+# always true; it keeps a trigger added later (tags, manual dispatch) from
+# reaching authentication.
 jobs:
   versioning:
     name: Update versioning
