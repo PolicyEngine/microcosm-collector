@@ -119,6 +119,9 @@ class EventBatch(BaseModel):
     events: list[TelemetryEvent] = Field(max_length=200)
 
 
+SessionScope = Literal["telemetry:write", "artifacts:submit"]
+
+
 class CollectorToken(BaseModel):
     """Short-lived token returned after Hugging Face verification."""
 

@@ -13,8 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
-import jwt
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response, status
 from fastapi.responses import JSONResponse
 from jwt import InvalidTokenError
 from pydantic import ValidationError
@@ -31,6 +30,14 @@ from telemetry_collector.models import (
     EventBatch,
     PageCursor,
     RunRegistration,
+    SessionScope,
+)
+from telemetry_collector.session_tokens import (
+    SIGNING_KEY_VARIABLE,
+    SessionSigningKey,
+    json_web_key_set,
+    sign_session_token,
+    verify_session_token,
 )
 from telemetry_collector.storage import (
     PostgresTelemetryStore,
@@ -43,8 +50,12 @@ from telemetry_collector.storage import (
 class CollectorSettings:
     """Secrets and policy read once when the collector starts."""
 
-    jwt_secret: str
+    # The HS256 secret. It signs new session tokens only while no signing key
+    # is configured, and verifies HS256 tokens for as long as it is configured.
+    jwt_secret: str | None
     read_token: str
+    # The ES256 key that signs new session tokens once it is configured.
+    signing_key: SessionSigningKey | None = None
     required_huggingface_org: str = "policyengine"
     collector_issuer: str = "policyengine-telemetry"
     collector_audience: str = "microcosm-telemetry-collector"
@@ -53,9 +64,14 @@ class CollectorSettings:
 
     @classmethod
     def from_environment(cls) -> CollectorSettings:
-        jwt_secret = _required_environment("TELEMETRY_JWT_SECRET")
+        jwt_secret = _optional_environment("TELEMETRY_JWT_SECRET")
+        signing_key_pem = _optional_environment(SIGNING_KEY_VARIABLE)
         read_token = _required_environment("TELEMETRY_READ_TOKEN")
-        if len(jwt_secret) < 32:
+        if jwt_secret is None and signing_key_pem is None:
+            raise RuntimeError(
+                f"{SIGNING_KEY_VARIABLE} or TELEMETRY_JWT_SECRET is required."
+            )
+        if jwt_secret is not None and len(jwt_secret) < 32:
             raise RuntimeError(
                 "TELEMETRY_JWT_SECRET must contain at least 32 characters."
             )
@@ -63,9 +79,18 @@ class CollectorSettings:
             raise RuntimeError(
                 "TELEMETRY_READ_TOKEN must contain at least 24 characters."
             )
+        try:
+            signing_key = (
+                None
+                if signing_key_pem is None
+                else SessionSigningKey.from_pem(signing_key_pem)
+            )
+        except ValueError as error:
+            raise RuntimeError(str(error)) from None
         return cls(
             jwt_secret=jwt_secret,
             read_token=read_token,
+            signing_key=signing_key,
             required_huggingface_org=os.environ.get("TELEMETRY_HF_ORG", "policyengine"),
             collector_issuer=os.environ.get(
                 "TELEMETRY_JWT_ISSUER", "policyengine-telemetry"
@@ -78,6 +103,10 @@ class CollectorSettings:
             ),
             maintenance_mode=os.environ.get("TELEMETRY_MAINTENANCE_MODE") == "1",
         )
+
+    def __post_init__(self) -> None:
+        if self.signing_key is None and self.jwt_secret is None:
+            raise ValueError("Session tokens need a signing key or an HS256 secret.")
 
 
 @dataclass(frozen=True)
@@ -177,10 +206,14 @@ class MaintenanceModeMiddleware:
 
 
 def _required_environment(name: str) -> str:
-    value = os.environ.get(name, "").strip()
-    if not value:
+    value = _optional_environment(name)
+    if value is None:
         raise RuntimeError(f"{name} is required.")
     return value
+
+
+def _optional_environment(name: str) -> str | None:
+    return os.environ.get(name, "").strip() or None
 
 
 def _bearer_token(value: str | None) -> str:
@@ -224,25 +257,32 @@ def _parse_page_cursor(value: str | None) -> tuple[datetime, str] | None:
     return timestamp, run_id
 
 
+SCOPE_REFUSALS: dict[str, str] = {
+    "telemetry:write": "Collector credential cannot write telemetry.",
+    "artifacts:submit": "Collector credential cannot submit artifacts.",
+}
+
+
 def _issue_session_token(
     settings: CollectorSettings,
     principal: HuggingFacePrincipal,
+    scope: SessionScope = "telemetry:write",
 ) -> CollectorToken:
     now = datetime.now(UTC)
     expires = now + timedelta(seconds=settings.session_token_ttl_seconds)
-    encoded = jwt.encode(
+    encoded = sign_session_token(
         {
             "iss": settings.collector_issuer,
             "aud": settings.collector_audience,
             "sub": principal.user_id,
             "username": principal.username,
             "organizations": list(principal.organizations),
-            "scope": "telemetry:write",
+            "scope": scope,
             "iat": now,
             "exp": expires,
         },
-        settings.jwt_secret,
-        algorithm="HS256",
+        signing_key=settings.signing_key,
+        hs256_secret=settings.jwt_secret,
     )
     return CollectorToken(
         access_token=encoded,
@@ -255,13 +295,12 @@ def _decode_token(
 ) -> dict[str, Any]:
     token = _bearer_token(authorization)
     try:
-        return jwt.decode(
+        return verify_session_token(
             token,
-            settings.jwt_secret,
-            algorithms=["HS256"],
+            signing_key=settings.signing_key,
+            hs256_secret=settings.jwt_secret,
             issuer=settings.collector_issuer,
             audience=settings.collector_audience,
-            options={"require": ["aud", "exp", "iat", "iss", "scope", "sub"]},
         )
     except InvalidTokenError as error:
         raise HTTPException(
@@ -270,13 +309,16 @@ def _decode_token(
 
 
 def _decode_session_token(
-    settings: CollectorSettings, authorization: str | None
+    settings: CollectorSettings,
+    authorization: str | None,
+    required_scope: SessionScope = "telemetry:write",
 ) -> SessionTokenClaims:
     payload = _decode_token(settings, authorization)
-    if payload.get("scope") != "telemetry:write":
+    # Each token carries exactly one scope, and each endpoint accepts one.
+    if payload.get("scope") != required_scope:
         raise HTTPException(
             status_code=403,
-            detail="Collector credential cannot write telemetry.",
+            detail=SCOPE_REFUSALS[required_scope],
         )
     subject = payload.get("sub")
     username = payload.get("username")
@@ -352,6 +394,13 @@ def create_app(
                 detail="Telemetry database is unavailable or not fully migrated.",
             )
         return {"status": "ok"}
+
+    @application.get("/.well-known/jwks.json")
+    def session_token_key_set(response: Response) -> dict[str, Any]:
+        """Public keys that verify session tokens, by their ``kid``."""
+
+        response.headers["Cache-Control"] = "public, max-age=300"
+        return json_web_key_set(settings.signing_key)
 
     @application.post(
         "/v1/auth/huggingface/exchange",
