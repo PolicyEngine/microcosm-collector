@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import re
+from dataclasses import dataclass
+
 import pytest
 import sqlalchemy as sa
 from alembic import command
@@ -235,13 +238,31 @@ def test_downgrading_artifact_intake_keeps_the_telemetry_schema(
         engine.dispose()
 
 
-RUNTIME_ROLE = "collector_runtime_grant_test"
-UNGRANTED_ROLE = "collector_ungranted_grant_test"
+MIGRATION_ROLE = "collector_migration_privilege_test"
+RUNTIME_ROLE = "collector_runtime_privilege_test"
+TELEMETRY_ONLY_ROLE = "collector_telemetry_only_privilege_test"
+UNGRANTED_ROLE = "collector_ungranted_privilege_test"
+TEST_ROLES = (RUNTIME_ROLE, TELEMETRY_ONLY_ROLE, UNGRANTED_ROLE, MIGRATION_ROLE)
 TABLE_PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "DELETE")
+# The one-time manual step in the README's "Database access": every table the
+# migration user creates in public is granted to the runtime user.
+RUNTIME_DEFAULT_PRIVILEGES = (
+    f"ALTER DEFAULT PRIVILEGES FOR ROLE {MIGRATION_ROLE} IN SCHEMA public "
+    f"GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {RUNTIME_ROLE}"
+)
+GRANT_STATEMENT = re.compile(r"^\s*GRANT\b", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class IntakeUpgrade:
+    """What upgrading from the telemetry schema to the intake schema did."""
+
+    statements: list[str]
+    privileges_by_role: dict[str, dict[str, set[str]]]
 
 
 def _drop_test_roles(connection: sa.Connection) -> None:
-    for role in (RUNTIME_ROLE, UNGRANTED_ROLE):
+    for role in TEST_ROLES:
         exists = connection.scalar(
             sa.text("SELECT 1 FROM pg_roles WHERE rolname = :role"), {"role": role}
         )
@@ -264,34 +285,94 @@ def _table_privileges(connection: sa.Connection, role: str) -> dict[str, set[str
     }
 
 
-def test_artifact_intake_grants_the_runtime_role_its_telemetry_access(
-    postgres_url: str,
-) -> None:
+def _upgrade_to_intake_with_default_privileges(postgres_url: str) -> IntakeUpgrade:
+    """Upgrade as a deployed database is upgraded, recording what 0002 runs.
+
+    The migration role owns the tables, as the migration user does. The
+    telemetry tables are granted by hand, as the deployments' were, to the
+    runtime role and to a role the default privileges don't name; then the
+    migration role's default privileges are set as the manual step sets them.
+    """
+
     engine = create_database_engine(postgres_url)
     config = alembic_config()
+    statements: list[str] = []
+
+    def record_statement(
+        executing_connection: sa.Connection,
+        cursor: object,
+        statement: str,
+        parameters: object,
+        context: object,
+        executemany: bool,
+    ) -> None:
+        statements.append(statement)
+
     try:
         with engine.begin() as connection:
             _drop_test_roles(connection)
-            connection.execute(sa.text(f"CREATE ROLE {RUNTIME_ROLE} NOLOGIN"))
-            connection.execute(sa.text(f"CREATE ROLE {UNGRANTED_ROLE} NOLOGIN"))
+            for role in TEST_ROLES:
+                connection.execute(sa.text(f"CREATE ROLE {role} NOLOGIN"))
+            connection.execute(
+                sa.text(f"GRANT CREATE ON SCHEMA public TO {MIGRATION_ROLE}")
+            )
+            connection.execute(sa.text(f"SET LOCAL ROLE {MIGRATION_ROLE}"))
             config.attributes["connection"] = connection
             command.upgrade(config, "0001_initial_schema")
-            # The runtime user's access as the deployment granted it, outside
-            # the migrations, plus a PUBLIC grant the migration must not copy.
             connection.execute(
                 sa.text(
-                    f"GRANT SELECT, INSERT, UPDATE ON telemetry_runs TO {RUNTIME_ROLE}"
+                    "GRANT SELECT, INSERT, UPDATE, DELETE ON telemetry_runs, "
+                    f"telemetry_producers, telemetry_events TO {RUNTIME_ROLE}"
                 )
             )
-            connection.execute(sa.text("GRANT SELECT ON telemetry_runs TO PUBLIC"))
-            command.upgrade(config, "head")
-            runtime_privileges = _table_privileges(connection, RUNTIME_ROLE)
-            ungranted_privileges = _table_privileges(connection, UNGRANTED_ROLE)
-        assert runtime_privileges == {
-            table: {"SELECT", "INSERT", "UPDATE"} for table in ARTIFACT_TABLES
-        }
-        assert ungranted_privileges == {table: set() for table in ARTIFACT_TABLES}
+            connection.execute(
+                sa.text(
+                    "GRANT SELECT, INSERT, UPDATE, DELETE ON telemetry_runs "
+                    f"TO {TELEMETRY_ONLY_ROLE}"
+                )
+            )
+            connection.execute(sa.text(RUNTIME_DEFAULT_PRIVILEGES))
+            sa.event.listen(connection, "before_cursor_execute", record_statement)
+            try:
+                command.upgrade(config, "head")
+            finally:
+                sa.event.remove(connection, "before_cursor_execute", record_statement)
+            privileges_by_role = {
+                role: _table_privileges(connection, role)
+                for role in (RUNTIME_ROLE, TELEMETRY_ONLY_ROLE, UNGRANTED_ROLE)
+            }
+        return IntakeUpgrade(statements, privileges_by_role)
     finally:
         with engine.begin() as connection:
             _drop_test_roles(connection)
         engine.dispose()
+
+
+def test_artifact_intake_migration_issues_no_grant(postgres_url: str) -> None:
+    upgrade = _upgrade_to_intake_with_default_privileges(postgres_url)
+
+    assert any("CREATE TABLE artifact_jobs" in sql for sql in upgrade.statements)
+    assert [sql for sql in upgrade.statements if GRANT_STATEMENT.match(sql)] == []
+
+
+def test_default_privileges_give_the_runtime_role_the_intake_tables(
+    postgres_url: str,
+) -> None:
+    upgrade = _upgrade_to_intake_with_default_privileges(postgres_url)
+
+    assert upgrade.privileges_by_role[RUNTIME_ROLE] == {
+        table: set(TABLE_PRIVILEGES) for table in ARTIFACT_TABLES
+    }
+    assert upgrade.privileges_by_role[UNGRANTED_ROLE] == {
+        table: set() for table in ARTIFACT_TABLES
+    }
+
+
+def test_artifact_intake_gives_telemetry_grantees_no_intake_access(
+    postgres_url: str,
+) -> None:
+    upgrade = _upgrade_to_intake_with_default_privileges(postgres_url)
+
+    assert upgrade.privileges_by_role[TELEMETRY_ONLY_ROLE] == {
+        table: set() for table in ARTIFACT_TABLES
+    }
