@@ -305,9 +305,7 @@ source tree. The source tree intentionally contains no bootstrap script or
 mutable infrastructure template.
 
 `.github/workflows/pr.yaml` runs actionlint and `.github/workflows/ci.yml`
-(tests, migration checks, Ruff, a container build, and a check that no
-certificate file in the built image holds a removed root,
-`tools/check-image-certificates.py`) on every pull request,
+(tests, migration checks, Ruff and a container build) on every pull request,
 and reports one "Required checks" status that the main ruleset requires.
 `.github/workflows/push.yaml` runs the same checks on `main`. When deployment
 is enabled, it then authenticates to Google Cloud with GitHub OIDC and pushes

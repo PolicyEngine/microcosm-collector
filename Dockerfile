@@ -1,8 +1,6 @@
 # Astral rebuilds this tag from python:3.13-slim-trixie with each uv release.
-# Its build of 2026-10-27 has Debian's ca-certificates 20250419+deb13u1, which
-# drops "emSign ECC Root CA - G3" and "AAA Certificate Services", and pip 26.2.2,
-# whose vendored certifi 2026.10.19 lacks the first. CI fails if a built image
-# holds either root (tools/check-image-certificates.py).
+# Since Debian's ca-certificates 20250419+deb13u1, its certificate store holds
+# neither "emSign ECC Root CA - G3" nor "AAA Certificate Services".
 FROM ghcr.io/astral-sh/uv:python3.13-trixie-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
