@@ -12,6 +12,7 @@ GHSA-6q48-6c7w-9gw2 names 2026.10.19 as the first fixed version
 """
 
 import hashlib
+import runpy
 import ssl
 import tomllib
 from pathlib import Path
@@ -31,15 +32,11 @@ ROOT = Path(__file__).resolve().parents[1]
 FIRST_PATCHED_CERTIFI = (2026, 10, 19)
 # SHA-256 fingerprints of the DER-encoded root certificates, as both macOS's
 # system roots and Debian's ca-certificates 20230311 report them. certifi
-# 2026.7.22 holds the same emSign certificate.
-COMPROMISED_CHAIN_ROOTS = {
-    "86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b": (
-        "emSign ECC Root CA - G3"
-    ),
-    "d7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4": (
-        "AAA Certificate Services"
-    ),
-}
+# 2026.7.22 holds the same emSign certificate. CI checks the built image's
+# certificate files for the same roots with this script.
+COMPROMISED_CHAIN_ROOTS = runpy.run_path(
+    str(ROOT / "tools" / "check-image-certificates.py")
+)["REMOVED_ROOTS"]
 # These change which roots httpx trusts or which host it connects to. Neither
 # the image nor scripts/deploy.sh sets any of them.
 VARIABLES_UNSET_IN_DEPLOYMENT = (
