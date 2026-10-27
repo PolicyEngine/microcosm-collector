@@ -188,9 +188,11 @@ a destination environment variable.
 ```bash
 uv sync --locked --dev
 uv run pytest -q
-uv run ruff check .
-uv run ruff format --check .
+bash tools/check-quality.sh
 ```
+
+`tools/check-quality.sh` runs Ruff's lint and format checks and syntax-checks
+every shell script in `tools/` and `scripts/` with `bash -n`, as CI does.
 
 The PostgreSQL integration tests and the migration checks need a disposable
 database whose name contains `test`, given as `TEST_DATABASE_URL`. Without it
@@ -247,14 +249,14 @@ bumps `pyproject.toml`, collects the fragments into `CHANGELOG.md`, updates
 `uv.lock`, and commits the result as "Update microcosm-collector" with the
 PolicyEngine GitHub App, which may bypass the main ruleset. The second run, on
 that commit, verifies it, tags it with the bare version (for example `0.2.0`),
-and then runs the gated deployment described below.
+and then runs the deployment described below, if it is enabled.
 
 ## Cloud Run deployment
 
 This service was developed in `telemetry-service/` inside
 PolicyEngine/calibration-diagnostics, and its history was extracted here.
 calibration-diagnostics deploys production until this repo takes over (see
-"Deployment gate" below). The Docker build context is the root of this repo.
+"Enabling deployment" below). The Docker build context is the root of this repo.
 Cloud Run assigns the production service address. Microcosm fixes that origin
 in its delivery service; the address is intentionally not repeated in
 documentation.
@@ -312,47 +314,86 @@ assertion.repository=='PolicyEngine/microcosm-collector' && assertion.ref=='refs
 The service account grants `roles/iam.workloadIdentityUser` to this repo's
 principal set (`attribute.repository/PolicyEngine/microcosm-collector`). A job
 running for a tag, a pull request or any other branch cannot obtain Google
-credentials. Both deployment jobs therefore also require
-`github.event_name == 'push' && github.ref == 'refs/heads/main'`, so that such a
-run skips them instead of failing at authentication. No other job requests an
-OIDC token.
+credentials. No other job requests an OIDC token.
 
-### Deployment gate
+Both deployment jobs also require
+`github.event_name == 'push' && github.ref == 'refs/heads/main'`. The Push
+workflow runs only for pushes to `main`, so this condition is always true
+today. It guards only against a later change to the workflow's triggers, such
+as adding tags or manual dispatch: the deployment jobs would skip those runs
+instead of reaching authentication.
+
+### Enabling deployment
 
 Both deployment jobs run only when the repo variable `COLLECTOR_DEPLOY_ENABLED`
-is `true`. Leave it unset until the cutover from calibration-diagnostics is
-complete:
+is `true`. It is unset, so releases from `main` are tagged but not deployed.
 
-1. Google Cloud trusts this repo's GitHub OIDC identity, as described above.
-2. The `staging` and `production` environments hold the same secrets and
-   variables, by name, as the calibration-diagnostics `staging` and
-   `Production` environments: the secrets `TELEMETRY_GCP_WIF_PROVIDER` (this
-   repo's provider) and `TELEMETRY_GCP_DEPLOY_SERVICE_ACCOUNT`, and every
-   `TELEMETRY_*` variable read by `.github/workflows/push.yaml`.
-3. calibration-diagnostics no longer deploys this service.
+The deployment's access and configuration are already provisioned:
+
+- The `microcosm-collector` Workload Identity provider and the deployment
+  service account's binding for this repo exist, as described above.
+- The `staging` and `production` environments each hold the secrets
+  `TELEMETRY_GCP_WIF_PROVIDER` (this repo's provider) and
+  `TELEMETRY_GCP_DEPLOY_SERVICE_ACCOUNT`, and the 15 `TELEMETRY_*` variables
+  that `.github/workflows/push.yaml` reads, copied by name and value from the
+  calibration-diagnostics `staging` and `Production` environments.
+
+What remains is the cutover from calibration-diagnostics, in this order:
+
+1. Carry over every `telemetry-service/` change merged in calibration-diagnostics
+   (see below).
+2. Stop calibration-diagnostics from deploying this service through its
+   `telemetry-service.yml` workflow.
+3. Set `COLLECTOR_DEPLOY_ENABLED` to `true`. The next release from `main` then
+   deploys to staging and, if that succeeds, to production.
 
 ### Carrying over changes from calibration-diagnostics
 
 Until cutover, changes to `telemetry-service/` can still merge in
 calibration-diagnostics. `tools/extraction-source.env` records the
-calibration-diagnostics commit that this history was extracted from. To carry
-later changes over, from the root of a clean checkout of `main`:
+calibration-diagnostics commit that this history was extracted from, and the
+commit it was rewritten to here. To carry later changes over, from the root of
+a clean, up-to-date checkout of `main`:
 
 ```bash
+git switch -c carry-over-telemetry-service
 tools/extract-from-calibration-diagnostics.sh ../collector-extraction \
   tools/extraction-source.env
-git switch -c carry-over-telemetry-service
 git fetch ../collector-extraction main
 git merge FETCH_HEAD
 ```
 
 The script needs git and uv. git-filter-repo rewrites unchanged source
-commits to the same commits, so the merge adds only the newer ones. The
-script refuses to continue if the previously extracted commit is not part of
-the new history, because merging that history would duplicate this one rather
-than extend it. Resolve any conflicts with changes made here, such as paths in
-tests, then add a changelog fragment and open a pull request that includes the
-updated record.
+commits to the same commits, so the merge adds only the newer ones. Resolve
+any conflicts with changes made here, such as paths in tests, then add a
+changelog fragment and open a pull request that includes the updated record.
+
+Merge a carry-over pull request with a merge commit ("Create a merge commit"),
+never with "Squash and merge" or "Rebase and merge". Squash and rebase merges
+put the carried-over changes on `main` under new commits, so `main` no longer
+contains the commits the record names, and the next carry-over would add them
+a second time, conflicting with the copies of their changes already there.
+
+The script refuses to continue, without writing the record, in either case
+where merging its output would duplicate this history rather than extend it:
+
+- The recorded extracted commit is not in the history of `HEAD` in the
+  checkout that runs the script. Either an earlier carry-over pull request was
+  squash-merged or rebase-merged, or the script ran from a checkout other than
+  the collector's `main` or a branch created from it.
+- The recorded extracted commit is not part of the new extraction, because
+  the source history or the filter changed.
+
+To recover from a squash-merged or rebase-merged carry-over pull request
+(number `<number>` below), merge its original head into the next carry-over
+branch with the `ours` strategy, which records those commits as merged without
+changing any file, then run the remaining steps above on that branch:
+
+```bash
+git switch -c carry-over-telemetry-service
+git fetch origin "pull/<number>/head"
+git merge -s ours FETCH_HEAD
+```
 
 ## Dashboard runtime access
 
