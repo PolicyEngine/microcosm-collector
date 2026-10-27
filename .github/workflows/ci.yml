@@ -39,3 +39,8 @@ jobs:
       - run: DATABASE_URL="$TEST_DATABASE_URL" uv run alembic check
       - run: bash tools/check-quality.sh
       - run: docker build --tag microcosm-collector:validation .
+      # Runs in the image's own Python, so it reads the image's certificate files.
+      - name: Check the image's certificate files for removed roots
+        run: >-
+          docker run --rm -i microcosm-collector:validation python -I - /
+          < tools/check-image-certificates.py
