@@ -106,8 +106,7 @@ the worker and the operator commands connect as the runtime database user.
 The migrations grant nothing. The runtime user's access to the telemetry
 tables was granted by hand when each database was set up, outside this
 repo. Its access to every table created since then comes from the
-migration user's default privileges, which each environment sets once by
-hand, before `0002_artifact_intake` is applied:
+migration user's default privileges, set once by hand in each environment:
 
 ```sql
 ALTER DEFAULT PRIVILEGES FOR ROLE <migration_role> IN SCHEMA public
@@ -120,6 +119,16 @@ the user in the runtime database secret, named by
 `TELEMETRY_DATABASE_SECRET_NAME`. Default privileges apply only to tables that
 role creates in `public` after they are set.
 
+- **Where it is set:** staging and production both have these default
+  privileges already (checked read-only through each environment's
+  migration job on 2026-10-27). Before merging a change that adds tables,
+  check with `\ddp` that the entry is still there; there is nothing to run.
+- **When to run it again:** when the database users are recreated, as the
+  project move in PolicyEngine/microcosm-collector#21 does. An entry belongs
+  to the role itself, not its name, so a recreated migration user has one
+  only if the import or the statement creates it: check `\ddp` in the new
+  database before a migration job runs there, and run the statement if the
+  entry is missing.
 - **Who can run it:** the migration user itself, or a role that is a member
   of it with the `INHERIT` option. PostgreSQL 16 refuses the statement for a
   member with only `ADMIN` or `SET`. A role that Cloud SQL's `postgres`
@@ -179,9 +188,9 @@ in that environment's project and region:
   the three `COLLECTOR_WORKER_*` queue settings, and a Cloud Scheduler job that
   runs it every 10 minutes.
 - **Database access:** after the migration, the runtime database user has
-  `SELECT`, `INSERT` and `UPDATE` on `artifact_submissions` and
-  `artifact_jobs`, through the migration user's default privileges (see
-  "Database access").
+  `SELECT`, `INSERT`, `UPDATE` and `DELETE` on `artifact_submissions` and
+  `artifact_jobs`, through the migration user's default privileges, which
+  both environments already have (see "Database access").
 - **Permissions:** the runtime service account may create and read objects in
   the bucket, sign as itself (`roles/iam.serviceAccountTokenCreator` on
   itself), enqueue on the queue, and act as the invoker account; the invoker
