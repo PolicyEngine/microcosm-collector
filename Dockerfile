@@ -1,23 +1,14 @@
-FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim
+# Pinned by digest, so CI and the deployment build from the same base. This
+# build (2026-10-27) has Debian's ca-certificates 20250419+deb13u1, which drops
+# "emSign ECC Root CA - G3" and "AAA Certificate Services", and pip 26.2.2, whose
+# vendored certifi 2026.10.19 lacks the first. CI fails if the built image holds
+# either root (tools/check-image-certificates.py).
+FROM ghcr.io/astral-sh/uv:0.13.6-python3.13-trixie-slim@sha256:e586c1c65b7071aec78f02c5587c76c5011159cd76b3d6f1255f40e48e850abc
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy
-
-# The base image's ca-certificates 20230311+deb12u1 trusts "emSign ECC Root CA -
-# G3" and "AAA Certificate Services", the roots that the compromised eMudhra
-# intermediates chain to, and its pip 25.3 vendors certifi 2025.10.5, which holds
-# the first. Debian's ca-certificates 20250419~deb12u2 (bookworm-security) removes
-# both roots, and pip 26.2.2 vendors certifi 2026.10.19, which lacks it. CI, and
-# the deployment before it pushes its own build, fail if the image holds either
-# root (tools/check-image-certificates.py).
-RUN apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
-        ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && python -m pip install --no-cache-dir --root-user-action=ignore \
-        --disable-pip-version-check --upgrade "pip>=26.2.2"
 
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
