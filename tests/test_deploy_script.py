@@ -4,6 +4,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOY_SCRIPT = ROOT / "scripts" / "deploy.sh"
+CERTIFICATE_CHECK_SCRIPT = ROOT / "tools" / "check-image-certificates.py"
+PUSHED_IMAGE = "us-central1-docker.pkg.dev/example-project/containers/collector:abc123"
 
 
 def run_deploy(
@@ -81,23 +83,30 @@ def test_require_configuration_accepts_complete_environment() -> None:
     assert result.returncode == 0, result.stderr
 
 
-def test_build_and_push_image_records_the_immutable_uri(tmp_path: Path) -> None:
-    command_log = tmp_path / "commands.log"
-    github_output = tmp_path / "github-output"
+def build_and_push_image_with_docker_stub(
+    tmp_path: Path, *, certificate_check_exit_code: int
+) -> subprocess.CompletedProcess[str]:
+    # The stub logs every docker command. For `docker run` it also keeps the
+    # script piped to the container and exits as the certificate check would.
     install_command_stub(
         tmp_path,
         "docker",
         "printf 'docker' >> \"$COMMAND_LOG\"\n"
         'printf \' <%s>\' "$@" >> "$COMMAND_LOG"\n'
-        "printf '\\n' >> \"$COMMAND_LOG\"",
+        "printf '\\n' >> \"$COMMAND_LOG\"\n"
+        'if [[ "$1" == run ]]; then\n'
+        '  cat > "$CONTAINER_INPUT"\n'
+        '  exit "$CERTIFICATE_CHECK_EXIT_CODE"\n'
+        "fi",
     )
-
-    result = run_deploy(
+    return run_deploy(
         "build-and-push-image",
         environment={
             "PATH": f"{tmp_path}:{os.environ['PATH']}",
-            "COMMAND_LOG": str(command_log),
-            "GITHUB_OUTPUT": str(github_output),
+            "COMMAND_LOG": str(tmp_path / "commands.log"),
+            "CONTAINER_INPUT": str(tmp_path / "container-input"),
+            "CERTIFICATE_CHECK_EXIT_CODE": str(certificate_check_exit_code),
+            "GITHUB_OUTPUT": str(tmp_path / "github-output"),
             "GITHUB_SHA": "abc123",
             "REGION": "us-central1",
             "PROJECT_ID": "example-project",
@@ -106,13 +115,39 @@ def test_build_and_push_image_records_the_immutable_uri(tmp_path: Path) -> None:
         },
     )
 
-    image = "us-central1-docker.pkg.dev/example-project/containers/collector:abc123"
+
+def test_build_and_push_image_records_the_immutable_uri(tmp_path: Path) -> None:
+    result = build_and_push_image_with_docker_stub(
+        tmp_path, certificate_check_exit_code=0
+    )
+
     assert result.returncode == 0, result.stderr
-    assert command_log.read_text().splitlines() == [
-        f"docker <build> <--file> <Dockerfile> <--tag> <{image}> <.>",
-        f"docker <push> <{image}>",
+    assert (tmp_path / "commands.log").read_text().splitlines() == [
+        f"docker <build> <--file> <Dockerfile> <--tag> <{PUSHED_IMAGE}> <.>",
+        f"docker <run> <--rm> <-i> <{PUSHED_IMAGE}> <python> <-I> <-> </>",
+        f"docker <push> <{PUSHED_IMAGE}>",
     ]
-    assert github_output.read_text() == f"uri={image}\n"
+    # The deployment builds its own image rather than pushing the one CI
+    # checked, so it runs the same certificate check on that build.
+    assert (tmp_path / "container-input").read_bytes() == (
+        CERTIFICATE_CHECK_SCRIPT.read_bytes()
+    )
+    assert (tmp_path / "github-output").read_text() == f"uri={PUSHED_IMAGE}\n"
+
+
+def test_build_and_push_image_pushes_no_image_that_holds_a_removed_root(
+    tmp_path: Path,
+) -> None:
+    result = build_and_push_image_with_docker_stub(
+        tmp_path, certificate_check_exit_code=1
+    )
+
+    assert result.returncode == 1
+    assert (tmp_path / "commands.log").read_text().splitlines() == [
+        f"docker <build> <--file> <Dockerfile> <--tag> <{PUSHED_IMAGE}> <.>",
+        f"docker <run> <--rm> <-i> <{PUSHED_IMAGE}> <python> <-I> <-> </>",
+    ]
+    assert not (tmp_path / "github-output").exists()
 
 
 def test_route_service_traffic_passes_the_requested_revision(
