@@ -1,15 +1,19 @@
 [project]
 name = "microcosm-collector"
-version = "0.3.0"
+version = "0.5.0"
 description = "Authenticated ingestion and query API for Microcosm build telemetry"
 requires-python = ">=3.13"
 license = "MIT"
 dependencies = [
   "alembic>=1.16,<2",
   "fastapi>=0.115,<1",
+  "google-api-core>=2.20,<3",
+  "google-auth>=2.35,<3",
+  "google-cloud-storage>=3,<4",
   "httpx>=0.28,<1",
   "psycopg[binary]>=3.2,<4",
   "pyjwt>=2.10,<3",
+  "requests>=2.32,<3",
   "sqlalchemy>=2.0,<3",
   "uvicorn[standard]>=0.34,<1",
 ]
@@ -37,6 +41,7 @@ ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
 "telemetry_collector/app.py" = ["B008"]
+"telemetry_collector/intake_api.py" = ["B008"]
 
 [tool.towncrier]
 directory = "changelog.d"

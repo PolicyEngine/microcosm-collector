@@ -119,9 +119,26 @@ class EventBatch(BaseModel):
     events: list[TelemetryEvent] = Field(max_length=200)
 
 
+SessionScope = Literal["telemetry:write", "artifacts:submit"]
+
+
+class TokenExchangeRequest(BaseModel):
+    """Optional body of the token exchange; omitting it asks for telemetry."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scope: SessionScope = "telemetry:write"
+
+
 class CollectorToken(BaseModel):
-    """Short-lived token returned after Hugging Face verification."""
+    """Short-lived token returned after Hugging Face verification.
+
+    ``scope`` repeats the token's scope, so a client can tell that a collector
+    without intake answered an ``artifacts:submit`` request with a
+    ``telemetry:write`` token.
+    """
 
     access_token: str
     token_type: Literal["bearer"] = "bearer"
     expires_in: int
+    scope: SessionScope

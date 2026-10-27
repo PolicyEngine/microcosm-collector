@@ -7,10 +7,13 @@ from typing import Any
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
     Index,
+    Integer,
     MetaData,
     Text,
     UniqueConstraint,
@@ -26,6 +29,8 @@ from sqlalchemy.orm import (
     sessionmaker,
 )
 from sqlalchemy.sql import func
+
+from telemetry_collector.submissions import JOB_STATUSES, SUBMISSION_STATUSES
 
 DB_POOL_SIZE = 2
 DB_MAX_OVERFLOW = 3
@@ -160,6 +165,96 @@ class TelemetryEvent(Base):
     producer: Mapped[TelemetryProducer] = relationship(back_populates="events")
 
 
+def _one_of(column: str, values: tuple[str, ...]) -> str:
+    return f"{column} IN ({', '.join(repr(value) for value in values)})"
+
+
+class ArtifactSubmission(Base):
+    """One build's hand-over of files, stored in the private intake bucket."""
+
+    __tablename__ = "artifact_submissions"
+    __table_args__ = (
+        CheckConstraint(_one_of("status", SUBMISSION_STATUSES), name="status"),
+    )
+
+    submission_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    owner_hf_id: Mapped[str] = mapped_column(Text, nullable=False)
+    owner_hf_username: Mapped[str] = mapped_column(Text, nullable=False)
+    licensed_data: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    provenance: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    # The inventory sorted by name; acceptance adds each object's generation.
+    files: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
+    files_sha256: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    rejection: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # 0 until completion records the first job; each reprocessing adds one.
+    processing_round: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    jobs: Mapped[list[ArtifactJob]] = relationship(
+        back_populates="submission",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+
+class ArtifactJob(Base):
+    """One processing round of a submission, with its attempts and dispatches."""
+
+    __tablename__ = "artifact_jobs"
+    __table_args__ = (
+        CheckConstraint(_one_of("status", JOB_STATUSES), name="status"),
+        UniqueConstraint(
+            "submission_id",
+            "processing_round",
+            name="artifact_jobs_submission_round_key",
+        ),
+    )
+
+    job_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    submission_id: Mapped[str] = mapped_column(
+        Text,
+        ForeignKey(
+            "artifact_submissions.submission_id",
+            name="fk_artifact_jobs_submission_id_artifact_submissions",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+    )
+    job_type: Mapped[str] = mapped_column(Text, nullable=False)
+    processing_round: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Cloud Tasks accepted this many dispatches, each named by its number.
+    dispatch_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_holder: Mapped[str | None] = mapped_column(Text)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    # Every claim, release, dispatch and recovery sets it; recovery uses it to
+    # find a queued job that nothing has touched.
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    submission: Mapped[ArtifactSubmission] = relationship(back_populates="jobs")
+
+
+Index("artifact_jobs_status_idx", ArtifactJob.status)
 Index(
     "telemetry_runs_country_registered_idx",
     TelemetryRun.country_code,
