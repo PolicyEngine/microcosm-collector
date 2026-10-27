@@ -99,6 +99,10 @@ build_and_push_image() {
     --file Dockerfile \
     --tag "$image" \
     .
+  # This is a separate build from the image CI checked, so check its own
+  # certificate files the same way before pushing it.
+  docker run --rm -i "$image" python -I - / \
+    < "$(dirname "$0")/../tools/check-image-certificates.py"
   docker push "$image"
   printf 'uri=%s\n' "$image" >> "$GITHUB_OUTPUT"
 }

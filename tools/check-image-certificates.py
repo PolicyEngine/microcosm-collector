@@ -6,6 +6,9 @@ it reads the image's files, not the runner's:
     docker run --rm -i microcosm-collector:validation python -I - / \
         < tools/check-image-certificates.py
 
+The deployment builds its own image, so `scripts/deploy.sh build-and-push-image`
+runs this script the same way on that image, and pushes it only if it passes.
+
 It reads every file named *.pem, *.crt or *.cer, following symbolic links to
 files, and compares the SHA-256 fingerprint of each PEM certificate in it with
 REMOVED_ROOTS. That covers Debian's trust store (/etc/ssl/certs and the

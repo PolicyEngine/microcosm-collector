@@ -308,8 +308,10 @@ mutable infrastructure template.
 (tests, migration checks, Ruff and a container build) on every pull request,
 and reports one "Required checks" status that the main ruleset requires.
 `.github/workflows/push.yaml` runs the same checks on `main`. When deployment
-is enabled, it then authenticates to Google Cloud with GitHub OIDC and pushes
-one image identified by the commit SHA. It first applies the migration to the
+is enabled, it then authenticates to Google Cloud with GitHub OIDC, builds
+the image again, and pushes it, identified by the commit SHA, only if none of
+its certificate files holds a removed root (`tools/check-image-certificates.py`,
+which CI also runs on its own build). It first applies the migration to the
 persistent staging PostgreSQL database, verifies both the Alembic revision and
 the complete SQLAlchemy metadata, and deploys the staging collector. Production receives that exact image only when the staging sequence
 succeeds. Before either environment changes, deployment checks only that its
