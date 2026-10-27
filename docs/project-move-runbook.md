@@ -1,47 +1,61 @@
-# Moving the collector to its own project and hostname (runbook)
+# The collector's hostname and project move (runbook)
 
-This is plan item C2. Use it only when both of these hold:
+This runbook carries out the decisions recorded in
+[`project-and-domain-decision.md`](project-and-domain-decision.md) (the
+numbered choices there are called "choice N" below). It covers two plan
+items:
 
-- **The collector deploy switch-over (C1) is verified:** this repo deploys
-  staging and production, and every check in the "Verify the deployment from
-  microcosm-collector" section of calibration-diagnostics#233 has passed.
-- **Decisions D2 and D3 are made.** See
-  [`project-and-domain-decision.md`](project-and-domain-decision.md); the
-  numbered choices there are referred to below as "choice N".
+- **C2, the hostname:** each environment gets a global external Application
+  Load Balancer, built in the new project from the start, with a
+  Google-managed certificate. Until the environment moves, the load balancer
+  sends requests across projects to today's service, through a backend
+  service and a serverless network endpoint group left in the current
+  project. The dashboard then reads the collector through the hostname.
+- **C5, the move:** each environment's database is copied into the new
+  project with a dump and restore, staging first as the rehearsal. The
+  service runs in the new project, and the load balancer's URL map is changed
+  to send requests to it. The DNS records don't change.
 
-The runbook assumes D2 option B (a dedicated project, one maintenance window
-per environment) and a custom hostname (D3 B, Cloud Run domain mapping, or D3
-C, a load balancer). Steps that depend on a choice say so. It hasn't been
-rehearsed. Moving staging first is the rehearsal, so check each command against
-the decided names there before running it for production.
+Between them come C3 (the emitter release with the production hostname as its
+default) and C4 (builds run that release). Production's copy waits for C4.
+After the move come S1 and S2, switching intake on, C6 and C7, in that order,
+each created once in the new project (section 12).
 
-No command here prints a secret value. Values are generated in the shell and
-piped into Secret Manager, or piped from one Secret Manager secret into
-another.
+Use it only when the collector deploy switch-over (C1) is verified: this repo
+deploys staging and production, and every check in the "Verify the
+deployment from microcosm-collector" section of calibration-diagnostics#233
+has passed.
+
+Nothing here has been run. Staging goes first in every section, so check each
+command there before running it for production.
+
+**No concrete values.** This runbook names no hostname, domain, IP address,
+project ID or number, organization or billing account ID, instance, database
+or user name, connection name, service-account email or secret value. Section
+2 sets each one from where it is kept, or from a placeholder in angle brackets
+that the operator replaces and records. No command here prints a secret
+value: values are generated in the shell and piped into Secret Manager, or
+piped from one Secret Manager secret into another.
 
 ## 1. People and access
 
 - **Google Cloud, the new project:** permission to create a project under the
-  chosen parent and link the billing account; then the owner role on the new
-  project.
-- **Google Cloud, `policyengine-api`:** the steps change resources there, not
-  only read them. The project owner role covers all of these, if that is
-  simpler for the windows:
+  current project's organization (Project Creator) and to link its billing
+  account (Billing Account User). The new project has one owner.
+- **Google Cloud, the current project:** the steps change resources there,
+  not only read them. The project owner role covers all of these:
 
-  | Steps | What they do in `policyengine-api` | Role |
+  | Steps | What they do in the current project | Role |
   |---|---|---|
-  | 2, 3.2, 6.1, 9 | read resources and their IAM policies | `roles/viewer` and `roles/iam.securityReviewer` |
-  | 3.2, 5.3 | read the collector's secret values (step 3.2's database connection uses the migration user's password) | `roles/secretmanager.secretAccessor` on the collector's secrets |
-  | 3.2, 5.2, 5.5, 6.3, 11 | connect to and export the old databases; delete the old instances | `roles/cloudsql.admin` |
-  | 5.3, 11 | change the intake bucket's IAM policy (#12) | `roles/storage.admin` on that bucket |
-  | 6.2, 8.4, 10, 11 | update the old service and its traffic; run and cancel job executions; delete the old services and jobs | `roles/run.admin`, and `roles/iam.serviceAccountUser` on the old runtime account, because a service update deploys a revision that runs as it |
-  | 6.2, 10, 11 | pause, resume and delete #12's queue | `roles/cloudtasks.queueAdmin` |
-  | 6.2, 6.7, 10, 11 | pause, resume and delete #12's and #19's schedules | `roles/cloudscheduler.admin` |
-  | 6.7, 10, 11 | disable, enable and delete #19's alert policies; delete its notification channel | `roles/monitoring.alertPolicyEditor` and `roles/monitoring.notificationChannelEditor` |
-  | 11 | delete secrets, service accounts, this repo's Workload Identity provider and the collector's images | `roles/secretmanager.admin`, `roles/iam.serviceAccountAdmin`, `roles/iam.workloadIdentityPoolAdmin` and `roles/artifactregistry.repoAdmin` |
-- **DNS:** edit access to the chosen zone (choice 5). For D3 B only, a Google
-  account that is a verified owner of the base domain in Search Console; D3
-  C's certificate needs only a DNS record.
+  | 3, 8.1, 10 | read resources and their IAM policies | `roles/viewer` and `roles/iam.securityReviewer` |
+  | 3, 7.3 | read the collector's secret values (step 3's database connection uses the migration user's password; step 7.3 copies two secrets) | `roles/secretmanager.secretAccessor` on the collector's secrets |
+  | 3, 7.2, 8.3, 13 | connect to and export the old databases; delete the old instances | `roles/cloudsql.admin` |
+  | 5.1, 13 | create and delete the serverless network endpoint group and backend service for today's service, and grant a role on that backend service | `roles/compute.loadBalancerAdmin`, and `compute.backendServices.setIamPolicy` for the grant |
+  | 5.2, 8.8, 11 | use that backend service from the new project's URL map | `roles/compute.loadBalancerServiceUser` on that backend service (step 5.1 grants it) |
+  | 8.2, 11, 13 | update the old service and its traffic; delete the old services and jobs | `roles/run.admin`, and `roles/iam.serviceAccountUser` on the old runtime account, because a service update deploys a revision that runs as it |
+  | 13 | delete secrets, service accounts, this repo's Workload Identity provider and the collector's images | `roles/secretmanager.admin`, `roles/iam.serviceAccountAdmin`, `roles/iam.workloadIdentityPoolAdmin` and `roles/artifactregistry.repoAdmin` |
+- **DNS:** the domain's DNS is managed outside Google Cloud. Anthony adds the
+  records by hand (step 5.3).
 - **GitHub:** an admin of PolicyEngine/microcosm-collector (environment
   settings), and someone who can change the calibration-diagnostics
   `Production` environment and merge in both repos.
@@ -51,16 +65,20 @@ another.
 
 ## 2. Names used below
 
-Set these once per environment, in a `bash` shell. Every name a choice decides
-is marked.
+Set these once per environment, in a `bash` shell, before that environment's
+part of each section. Step 8.6 changes some of the GitHub variables read
+here, so keep the shell open through a copy, or write the values in the
+copy's notes, which rollback (section 11) needs.
 
 ```bash
-OLD_PROJECT_ID=policyengine-api
+OLD_PROJECT_ID='<current project ID>'    # TELEMETRY_GCP_PROJECT_ID in both environments until their copies; recorded by the operator
 OLD_PROJECT_NUMBER=$(gcloud projects describe "$OLD_PROJECT_ID" --format='value(projectNumber)')
-OLD_DEPLOY_SERVICE_ACCOUNT=...   # the current deployment account, from step 3.2
-NEW_PROJECT_ID=...           # choice 2
-ENVIRONMENT_NAME=staging     # then production
-COLLECTOR_HOSTNAME=...       # choice 4, for this environment
+OLD_DEPLOY_SERVICE_ACCOUNT='<current deployment account email>'   # the TELEMETRY_GCP_DEPLOY_SERVICE_ACCOUNT secret; found in step 3
+NEW_PROJECT_ID='<new project ID>'        # chosen in section 4; recorded by the operator
+NEW_PROJECT_NUMBER=$(gcloud projects describe "$NEW_PROJECT_ID" --format='value(projectNumber)')   # after section 4 creates it
+OPERATOR_ACCOUNT='<operator Google account email>'   # the account that runs these steps
+ENVIRONMENT_NAME=staging                 # then production
+COLLECTOR_HOSTNAME='<staging hostname>'  # '<production hostname>' for production; recorded by the operator, and in the dashboard's MICROCOSM_TELEMETRY_COLLECTOR_URL after step 5.5
 
 collector_variable() {
   gh api "repos/PolicyEngine/microcosm-collector/environments/$ENVIRONMENT_NAME/variables/$1" --jq .value
@@ -69,13 +87,18 @@ REGION=$(collector_variable TELEMETRY_GCP_REGION)
 SERVICE=$(collector_variable TELEMETRY_SERVICE)
 MIGRATION_JOB=$(collector_variable TELEMETRY_MIGRATION_JOB)
 ARTIFACT_REGISTRY_NAME=$(collector_variable TELEMETRY_ARTIFACT_REGISTRY_NAME)
-OLD_CLOUD_SQL_CONNECTION=$(collector_variable TELEMETRY_CLOUD_SQL_CONNECTION)
+OLD_CLOUD_SQL_CONNECTION=$(collector_variable TELEMETRY_CLOUD_SQL_CONNECTION)   # read before step 8.6
 OLD_INSTANCE=${OLD_CLOUD_SQL_CONNECTION##*:}
 DATABASE_SECRET_NAME=$(collector_variable TELEMETRY_DATABASE_SECRET_NAME)
 MIGRATION_DATABASE_SECRET_NAME=$(collector_variable TELEMETRY_MIGRATION_DATABASE_SECRET_NAME)
 JWT_SECRET_NAME=$(collector_variable TELEMETRY_JWT_SECRET_NAME)
 READ_SECRET_NAME=$(collector_variable TELEMETRY_READ_SECRET_NAME)
-HF_CHECK_JOB=$(collector_variable TELEMETRY_HF_CHECK_JOB)   # production, once #19 has merged
+
+# From step 3's record: the names in the database URL secrets, which `gcloud sql users list` also lists.
+DATABASE_NAME='<database name>'
+MIGRATION_DATABASE_USER='<migration user>'
+RUNTIME_DATABASE_USER='<runtime user>'
+ADMIN_DATABASE_USER='<admin user>'       # Cloud SQL's built-in admin user
 
 # Names are scoped to a project, so the new resources can reuse the old ones.
 NEW_INSTANCE=$OLD_INSTANCE
@@ -84,46 +107,33 @@ RUNTIME_SERVICE_ACCOUNT="collector-runtime-$ENVIRONMENT_NAME@$NEW_PROJECT_ID.iam
 MIGRATION_SERVICE_ACCOUNT="collector-migration-$ENVIRONMENT_NAME@$NEW_PROJECT_ID.iam.gserviceaccount.com"
 DEPLOY_SERVICE_ACCOUNT="collector-deploy@$NEW_PROJECT_ID.iam.gserviceaccount.com"
 EXPORT_BUCKET="gs://$NEW_PROJECT_ID-collector-move"
+
+# Load balancer resources, one set per environment. Google recommends that a
+# backend service's name differs between projects, so the console tells them apart.
+OLD_ENDPOINT_GROUP="collector-current-endpoints-$ENVIRONMENT_NAME"   # in the current project
+OLD_BACKEND="collector-current-backend-$ENVIRONMENT_NAME"            # in the current project
+OLD_BACKEND_PATH="projects/$OLD_PROJECT_ID/global/backendServices/$OLD_BACKEND"
+NEW_ENDPOINT_GROUP="collector-endpoints-$ENVIRONMENT_NAME"
+NEW_BACKEND="collector-backend-$ENVIRONMENT_NAME"
+ADDRESS="collector-address-$ENVIRONMENT_NAME"
+DNS_AUTHORIZATION="collector-hostname-$ENVIRONMENT_NAME"
+CERTIFICATE="collector-certificate-$ENVIRONMENT_NAME"
+CERTIFICATE_MAP="collector-certificates-$ENVIRONMENT_NAME"
+CERTIFICATE_MAP_ENTRY="collector-hostname-$ENVIRONMENT_NAME"
+URL_MAP="collector-routes-$ENVIRONMENT_NAME"
+HTTPS_PROXY="collector-proxy-$ENVIRONMENT_NAME"
+FORWARDING_RULE="collector-https-$ENVIRONMENT_NAME"
 ```
 
-`DATABASE_NAME`, `RUNTIME_DATABASE_USER`, `MIGRATION_DATABASE_USER` and
-`OTHER_DATABASE_USERS` come from the old instance in step 3.2.
+## 3. Record the current state (read-only)
 
-## 3. Before the windows
-
-### 3.1 Check the prerequisites
-
-- `COLLECTOR_DEPLOY_ENABLED` is `true`, and C1 is verified.
-- calibration-diagnostics#234 has merged, or everyone has agreed never to
-  dispatch calibration-diagnostics' `telemetry-service.yml` again. Its settings
-  name the old project.
-- PolicyEngine/microcosm-emitter#29 has merged, so changing the emitter's
-  default is a constant change (section 8.2).
-- List what has merged here that needs its own resources in the new project,
-  and add those steps where this runbook marks them:
-  - #12's artifact intake: a Cloud Tasks queue, the worker job, the recovery
-    job and its Cloud Scheduler job, the invoker account and their
-    permissions, as in the README's "Artifact intake" section. Its bucket
-    stays in the old project (step 5.3), which ties the collector's files to
-    `policyengine-api` (the memo's D2 B). Intake was off on 2026-10-20: the
-    Cloud Tasks and Cloud Scheduler APIs weren't enabled there, and no intake
-    bucket existed. Switching it on only after the move avoids this;
-  - S1's Hugging Face read token (#13, PR #18);
-  - C5's session signing key (#16), a fifth Secret Manager secret per
-    environment;
-  - S2's daily check (#19): production's check job, its Cloud Scheduler job
-    and the account that job runs as, a notification channel and two Cloud
-    Monitoring alert policies, and three production variables.
-
-### 3.2 Record the current state
-
-For each environment (read-only):
+For each environment, before section 5. Write everything in the operator's
+notes; the later steps compare against them.
 
 - The service's URL, serving revision, image, Cloud SQL connection and secret
   names: the `gcloud run services describe` command in step 0 of
   calibration-diagnostics#233. This serving revision isn't the rollback
-  target: production redeploys between the windows, so step 6.1 records the
-  target again just before each window's changes.
+  target: step 8.1 records that just before each copy.
 - The instance's settings:
   `gcloud sql instances describe "$OLD_INSTANCE" --project "$OLD_PROJECT_ID" --format=yaml`.
   Keep the database version, edition, tier, disk size, availability type,
@@ -131,37 +141,25 @@ For each environment (read-only):
   flags, and IP and SSL configuration.
 - The database and its users:
   `gcloud sql databases list` and `gcloud sql users list` with
-  `--instance "$OLD_INSTANCE" --project "$OLD_PROJECT_ID"`. On 2026-10-20
-  both instances held the databases `postgres` and `telemetry`, and listed
-  these users:
-
-  | Environment | Users |
-  |---|---|
-  | staging | `postgres`, `telemetry_migrator`, `telemetry_runtime` |
-  | production | `postgres`, `telemetry_app`, `telemetry_migrator`, `telemetry_runtime` |
-
-  Set `DATABASE_NAME`, `RUNTIME_DATABASE_USER` and `MIGRATION_DATABASE_USER`
-  from them. Set `OTHER_DATABASE_USERS` to every other role the roles query
-  below lists, apart from `postgres`; as on 2026-10-20:
-
-  ```bash
-  case "$ENVIRONMENT_NAME" in
-    production) OTHER_DATABASE_USERS=(telemetry_app) ;;
-    *) OTHER_DATABASE_USERS=() ;;
-  esac
-  ```
-
-  Change it if the record shows otherwise.
+  `--instance "$OLD_INSTANCE" --project "$OLD_PROJECT_ID"`. Expect Cloud SQL's
+  built-in admin user, the migration user and the runtime user, and no other:
+  production's unused third user was dropped on 2026-10-27. The copy
+  recreates only the migration and runtime users. Set `DATABASE_NAME`,
+  `MIGRATION_DATABASE_USER`, `RUNTIME_DATABASE_USER` and
+  `ADMIN_DATABASE_USER` from the record.
 - **The database's roles and privileges.** Connect as the migration user
   through Cloud SQL Studio, or with `psql` through the Cloud SQL Auth Proxy,
   and save the output of `\l`, `\dn+ public`, `\dp public.*` and `\ddp`, and
   of the roles query below. Note which role owns the tables and what the
   runtime user is granted. These were provisioned by scripts kept outside
-  this repo, so this record is the only specification of them. The roles
-  query lists every role's attributes and memberships in one result, since
-  psql 16 and later no longer show memberships in `\du`. Each membership
-  carries its PostgreSQL 16 options (`admin`, `inherit`, `set`, from
-  `pg_auth_members`), which show how each role was made (step 5.2):
+  this repo, so this record is the only specification of them. `\ddp` must
+  show the migration user's default privileges for the runtime user (the
+  README's "Database access" section); both environments had them on
+  2026-10-27. The roles query lists every role's attributes and memberships
+  in one result, since psql 16 and later no longer show memberships in
+  `\du`. Each membership carries its PostgreSQL 16 options (`admin`,
+  `inherit`, `set`, from `pg_auth_members`), which show how each role was
+  made (step 7.2):
 
   ```sql
   SELECT r.rolname, r.rolcanlogin, r.rolcreaterole, r.rolcreatedb, r.rolinherit,
@@ -177,33 +175,14 @@ For each environment (read-only):
   ```
 - Who may read each secret:
   `gcloud secrets get-iam-policy SECRET --project "$OLD_PROJECT_ID" --format=yaml`
-  for each secret the environment uses: the four named above, and, if
-  merged, #16's signing-key secret and S1's Hugging Face token secret. The
-  read secret's policy names the dashboard's Vercel identity.
-- Collector secrets that no deployment uses. On 2026-10-22, production also
-  had `microcosm-telemetry-database-url`, a database URL secret made four days
-  before the runtime one that the service mounts. No GitHub variable names it
-  and no service or job mounts it, but production's runtime account may read
-  it. List the old project's secrets
-  (`gcloud secrets list --project "$OLD_PROJECT_ID"`), note any such secret,
-  and don't copy it; section 11 deletes it.
-- What the open collector PRs added, if merged (step 3.1), each command with
-  `--project "$OLD_PROJECT_ID"`:
-  - #12: `gcloud tasks queues describe WORKER_QUEUE --location "$REGION"`;
-    `gcloud run jobs describe` with `--region "$REGION"` for the worker job
-    and the recovery job; `gcloud scheduler jobs describe RECOVERY_SCHEDULE --location "$REGION"`;
-    the bucket's roles with `gcloud storage buckets get-iam-policy gs://INTAKE_BUCKET`;
-    the invoker account's with `gcloud iam service-accounts get-iam-policy`;
-    and the project-level roles of the old runtime, worker and recovery
-    accounts, with the `gcloud projects get-iam-policy` command shown below for
-    the deployment account. #12's deployment wiring isn't written, so its
-    storage grants may be on the project rather than on the bucket, and the
-    bucket's policy wouldn't show them.
-  - #19: `gcloud run jobs describe "$HF_CHECK_JOB" --region "$REGION"`;
-    `gcloud scheduler jobs describe HF_CHECK_SCHEDULE --location "$REGION"`,
-    which shows the account it starts the job as; the two alert policies'
-    names with `gcloud monitoring policies list --format='value(name,displayName,enabled)'`;
-    the notification channel with `gcloud beta monitoring channels list`.
+  for each of the four secrets named above. The read secret's policy names
+  the dashboard's Vercel identity for that environment (step 7.3 grants it
+  the same access in the new project).
+- Collector secrets that no deployment uses: list the current project's
+  secrets (`gcloud secrets list --project "$OLD_PROJECT_ID"`). Production
+  has an older database URL secret that no GitHub variable names and no
+  service or job mounts; its only version was disabled on 2026-10-27. Note
+  any such secret and don't copy it; section 13 deletes it.
 - The deployment account's roles. Its email is the
   `TELEMETRY_GCP_DEPLOY_SERVICE_ACCOUNT` secret, which GitHub can't show. It is
   the account whose IAM policy grants `roles/iam.workloadIdentityUser` to this
@@ -211,67 +190,44 @@ For each environment (read-only):
   `gcloud iam service-accounts get-iam-policy ACCOUNT --project "$OLD_PROJECT_ID"`
   shows it. Set `OLD_DEPLOY_SERVICE_ACCOUNT` to it. Then list its roles on the
   project with
-  `gcloud projects get-iam-policy "$OLD_PROJECT_ID" --flatten=bindings --filter="bindings.members:serviceAccount:DEPLOY_ACCOUNT" --format="value(bindings.role)"`,
+  `gcloud projects get-iam-policy "$OLD_PROJECT_ID" --flatten=bindings --filter="bindings.members:serviceAccount:$OLD_DEPLOY_SERVICE_ACCOUNT" --format="value(bindings.role)"`,
   and its roles on individual resources (the runtime and migration accounts,
   the secrets and the Artifact Registry store) from their IAM policies.
+- The dashboard's settings: the current values of
+  `MICROCOSM_TELEMETRY_COLLECTOR_URL` (calibration-diagnostics' GitHub
+  `Production` environment, and Vercel Production and Preview) and
+  `MICROCOSM_TELEMETRY_READ_SECRET_VERSION` (Vercel Production and Preview).
+  Rolling back step 5.5 or section 9 sets them back.
 - The dashboard's Vercel identity provider: the resource named by the Vercel
   setting `MICROCOSM_TELEMETRY_GOOGLE_IDENTITY_PROVIDER`, read with
   `gcloud iam workload-identity-pools providers describe` (issuer, allowed
-  audiences, attribute mapping and condition).
-
-### 3.3 Agree the windows
-
-One for staging, one for production (choice 8). From the start of a window
-until its verification passes, nothing merges to this repo's `main`: every
-merge deploys.
-
-### 3.4 Hostname first only: put the hostname in front of today's service
-
-In the hostname-first order (choice 6), builds move to the hostname before the
-project moves, so that none of them still uses the default address when step
-6.2 puts the old service in maintenance mode. Skip this step in the "both
-together" order. Before section 4:
-
-1. Do section 7 for each environment against today's service: run its
-   commands with `--project "$OLD_PROJECT_ID"` wherever they say
-   `--project "$NEW_PROJECT_ID"`. For D3 C, this puts the load balancer's
-   resources in `policyengine-api` (its Compute Engine and Certificate Manager
-   APIs were already enabled on 2026-10-22) until section 11 removes them.
-   Then run section 7's hostname checks.
-2. Do section 8.2: release the emitter with the hostname as
-   `PRODUCTION_COLLECTOR_URL`, keeping the default address in
-   `TRUSTED_COLLECTOR_ORIGINS`.
-3. Optionally point the dashboard's `MICROCOSM_TELEMETRY_COLLECTOR_URL` at the
-   hostname now (the first two rows of section 8.1's settings table). Section
-   8.1 then changes only the secret settings.
-4. Wait until builds use the hostname. Emitter 0.2.1 has the default address
-   built in, with no setting that changes it, so Microcosm has to have left
-   its `microcosm-emitter==0.2.1` pin; and the machines and build images that
-   start the separately installed emitter need the new release. Builds that
-   still use the default address when a window starts are handled as choice 7
-   says.
-
-Then continue with section 4. Section 8.2 is then already done, and section 7
-is done again in the new project inside production's window, as its "Hostname
-first" notes say.
+  audiences, attribute mapping and condition). It stays where it is (choice
+  10).
 
 ## 4. Create the project (once, no downtime)
 
+The new project goes directly under the organization that holds the current
+project, as the current project does, and uses the same billing account
+(choice 2). Read
+both from the current project, so neither value is typed:
+
 ```bash
-gcloud projects create "$NEW_PROJECT_ID" --name "DISPLAY_NAME" --organization ORGANIZATION_ID   # or --folder FOLDER_ID
-gcloud billing projects link "$NEW_PROJECT_ID" --billing-account BILLING_ACCOUNT_ID
-NEW_PROJECT_NUMBER=$(gcloud projects describe "$NEW_PROJECT_ID" --format='value(projectNumber)')
+gcloud projects describe "$OLD_PROJECT_ID" --format='value(parent.type)'   # must print organization
+ORGANIZATION_ID=$(gcloud projects describe "$OLD_PROJECT_ID" --format='value(parent.id)')
+BILLING_ACCOUNT=$(gcloud billing projects describe "$OLD_PROJECT_ID" --format='value(billingAccountName)')
+gcloud projects create "$NEW_PROJECT_ID" --name '<display name>' --organization "$ORGANIZATION_ID"
+gcloud billing projects link "$NEW_PROJECT_ID" --billing-account "${BILLING_ACCOUNT#billingAccounts/}"
 gcloud services enable run.googleapis.com sqladmin.googleapis.com \
   secretmanager.googleapis.com artifactregistry.googleapis.com iam.googleapis.com \
   iamcredentials.googleapis.com sts.googleapis.com storage.googleapis.com \
+  compute.googleapis.com certificatemanager.googleapis.com \
   --project "$NEW_PROJECT_ID"
 ```
 
-Also enable `compute.googleapis.com` and `certificatemanager.googleapis.com`
-for a load balancer (D3 C); `cloudtasks.googleapis.com` and
-`cloudscheduler.googleapis.com` if #12's intake is switched on; and
-`cloudscheduler.googleapis.com` and `monitoring.googleapis.com` if #19's daily
-check has merged.
+A project ID can't be changed later, and can't be reused even after its
+project is deleted. Record it. A budget alert on the new project, at the
+collector's current cost plus the load balancers, shows an unexpected cost
+early.
 
 ### 4.1 Artifact Registry
 
@@ -285,16 +241,17 @@ for the store, which this repo's vocabulary test keeps out of documentation.
 `${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REGISTRY_NAME}/${IMAGE_NAME}`,
 so the store must be in the new project.
 
-**Let the old project's production deployments read it.** `deploy-staging`
-builds the image with staging's `PROJECT_ID`, and `deploy-production` deploys
-that same image. So from staging's window until production's window, production
-deploys an image from the new project's store into the old project. Cloud Run
-then needs both the deploying account and the deploying project's Cloud Run
-service agent to hold Artifact Registry Reader on that store. Without it,
-production's "Deploy an isolated maintenance revision" step fails (no traffic
-moves) in staging's window and on every merge until production's window. The
-new project holds only the collector's store, so grant the role on the project
-before staging's window:
+**Let the current project's production deployments read it.**
+`deploy-staging` builds the image with staging's `PROJECT_ID`, and
+`deploy-production` deploys that same image. So from staging's copy until
+production's copy, which waits for C4 and may be weeks later, production
+deploys an image from the new project's store into the current project.
+Cloud Run then needs both the deploying account and the deploying project's
+Cloud Run service agent to hold Artifact Registry Reader on that store.
+Without it, production's "Deploy an isolated maintenance revision" step fails
+(no traffic moves) on every merge from staging's copy on. The new project
+holds only the collector's store, so grant the role on the project before
+staging's copy:
 
 ```bash
 for old_production_reader in "serviceAccount:$OLD_DEPLOY_SERVICE_ACCOUNT" \
@@ -304,12 +261,12 @@ for old_production_reader in "serviceAccount:$OLD_DEPLOY_SERVICE_ACCOUNT" \
 done
 ```
 
-Remove both bindings in section 11.
+Section 13 removes both bindings.
 
 ### 4.2 The deployment account and Workload Identity Federation for this repo
 
 The new project gets a deployment account used only by this repo. The dashboard
-keeps its own deployment identity in `policyengine-api`.
+keeps its own deployment identity in the current project.
 
 ```bash
 gcloud iam service-accounts create collector-deploy --project "$NEW_PROJECT_ID" \
@@ -332,31 +289,212 @@ secret, is
 `projects/$NEW_PROJECT_NUMBER/locations/global/workloadIdentityPools/github/providers/microcosm-collector`.
 
 What `scripts/deploy.sh` needs the deployment account to do, and the role that
-allows it. Compare with the record from step 3.2 before granting:
+allows it. Compare with the record from section 3 before granting:
 
 | `deploy.sh` command | Needs | Grant |
 |---|---|---|
 | `gcloud run deploy`, `run jobs deploy` and `execute`, `services describe`, `update-traffic`, `--allow-unauthenticated` | Cloud Run administration | `roles/run.admin` on the project |
-| `--service-account` for the service and the migration job | acting as those accounts | `roles/iam.serviceAccountUser` on each runtime and migration account (step 5.1) |
+| `--service-account` for the service and the migration job | acting as those accounts | `roles/iam.serviceAccountUser` on each runtime and migration account (step 7.1) |
 | `build-and-push-image` | pushing images | `roles/artifactregistry.writer` on the store |
-| `check-secrets-exist` (`gcloud secrets describe`) | reading secret metadata | `roles/secretmanager.viewer` on each secret (step 5.3) |
+| `check-secrets-exist` (`gcloud secrets describe`) | reading secret metadata | `roles/secretmanager.viewer` on each secret (step 7.3) |
 | `create-database-backup` (production) | `cloudsql.backupRuns.create` | `roles/cloudsql.editor` on the project, or a custom role with `cloudsql.backupRuns.create` and `cloudsql.instances.get` |
+
+The deployment account needs nothing on the load balancers: the operator
+creates and changes them.
 
 ### 4.3 The export bucket
 
 It will hold complete copies of the telemetry databases, so it is private and
-is deleted after the move (section 11).
+is deleted after the move (section 13).
 
 ```bash
 gcloud storage buckets create "$EXPORT_BUCKET" --project "$NEW_PROJECT_ID" \
   --location "$REGION" --uniform-bucket-level-access --public-access-prevention
 ```
 
-## 5. Create each environment's resources (no downtime)
+## 5. C2: put the hostname in front of today's service (no downtime)
 
-Staging first. Production's can be created days before its window.
+Staging first: its load balancer is the first test of the cross-project
+backend service (section 15). Production's follows once staging's hostname
+checks pass.
 
-### 5.1 Service accounts
+### 5.1 In the current project: a backend service for today's service
+
+A serverless network endpoint group has to be in the same project as its
+Cloud Run service, so these two resources stay in the current project until
+section 13 deletes them. Its Compute Engine API was already enabled on
+2026-10-22.
+
+```bash
+gcloud compute network-endpoint-groups create "$OLD_ENDPOINT_GROUP" --region "$REGION" \
+  --network-endpoint-type serverless --cloud-run-service "$SERVICE" --project "$OLD_PROJECT_ID"
+gcloud compute backend-services create "$OLD_BACKEND" --global \
+  --load-balancing-scheme EXTERNAL_MANAGED --project "$OLD_PROJECT_ID"
+gcloud compute backend-services add-backend "$OLD_BACKEND" --global \
+  --network-endpoint-group "$OLD_ENDPOINT_GROUP" --network-endpoint-group-region "$REGION" \
+  --project "$OLD_PROJECT_ID"
+gcloud compute backend-services add-iam-policy-binding "$OLD_BACKEND" --global \
+  --member "user:$OPERATOR_ACCOUNT" --role roles/compute.loadBalancerServiceUser \
+  --project "$OLD_PROJECT_ID"
+```
+
+The last command lets the operator's account use this backend service from
+another project's URL map. Google's external Application Load Balancer
+overview says the role "can be granted at the project level or at the
+resource level"; this grants it on the backend service only. Keep it until
+section 13: step 8.8's rollback and section 11 use it to point the URL map
+back here.
+
+### 5.2 In the new project: the load balancer and its certificate
+
+```bash
+gcloud compute addresses create "$ADDRESS" --global --project "$NEW_PROJECT_ID"
+gcloud certificate-manager dns-authorizations create "$DNS_AUTHORIZATION" \
+  --domain "$COLLECTOR_HOSTNAME" --type per-project-record --project "$NEW_PROJECT_ID"
+gcloud certificate-manager certificates create "$CERTIFICATE" \
+  --domains "$COLLECTOR_HOSTNAME" --dns-authorizations "$DNS_AUTHORIZATION" --project "$NEW_PROJECT_ID"
+gcloud certificate-manager maps create "$CERTIFICATE_MAP" --project "$NEW_PROJECT_ID"
+gcloud certificate-manager maps entries create "$CERTIFICATE_MAP_ENTRY" --map "$CERTIFICATE_MAP" \
+  --certificates "$CERTIFICATE" --hostname "$COLLECTOR_HOSTNAME" --project "$NEW_PROJECT_ID"
+gcloud compute url-maps create "$URL_MAP" --global \
+  --default-service "$OLD_BACKEND_PATH" --project "$NEW_PROJECT_ID"
+gcloud compute target-https-proxies create "$HTTPS_PROXY" --url-map "$URL_MAP" \
+  --certificate-map "$CERTIFICATE_MAP" --global --project "$NEW_PROJECT_ID"
+gcloud compute forwarding-rules create "$FORWARDING_RULE" --global \
+  --load-balancing-scheme EXTERNAL_MANAGED --address "$ADDRESS" \
+  --target-https-proxy "$HTTPS_PROXY" --ports 443 --project "$NEW_PROJECT_ID"
+```
+
+The URL map's default service is the current project's backend service, named
+by its full path. Google: for global external Application Load Balancers, the
+frontend and URL map can reference backend services "from any project within
+the same organization. No VPC network restrictions apply." The load
+balancer's charges go to the new project, where the forwarding rule is.
+
+The DNS authorization is per project: its `CNAME` has a name with a suffix
+for the project, instead of a fixed name, so it never clashes with an
+authorization for the same hostname in another project. For per-project
+authorizations Certificate Manager issues only Google Trust Services
+certificates.
+
+### 5.3 The DNS records
+
+Print what Anthony adds for this environment:
+
+```bash
+gcloud certificate-manager dns-authorizations describe "$DNS_AUTHORIZATION" \
+  --project "$NEW_PROJECT_ID" --format='value(dnsResourceRecord.name,dnsResourceRecord.type,dnsResourceRecord.data)'
+gcloud compute addresses describe "$ADDRESS" --global --project "$NEW_PROJECT_ID" --format='value(address)'
+```
+
+Anthony adds these records by hand at the domain's DNS provider, outside
+Google Cloud. Four in all, two per environment:
+
+| Environment | Type | Name | Value |
+|---|---|---|---|
+| staging | `CNAME` | `<staging DNS authorization name>`: the `dnsResourceRecord.name` printed above, which starts with `_acme-challenge_` and ends with the staging hostname | `<staging DNS authorization target>`: the `dnsResourceRecord.data` printed above |
+| staging | `A` | `<staging hostname>` | `<staging load balancer IP>`: the address printed above |
+| production | `CNAME` | `<production DNS authorization name>`, as for staging | `<production DNS authorization target>` |
+| production | `A` | `<production hostname>` | `<production load balancer IP>` |
+
+- **Plain records:** no proxying, forwarding or redirection in front of
+  them. A proxy would end TLS for requests that carry Hugging Face tokens,
+  and would hide the `CNAME` from Google.
+- **Names:** if the provider's form adds the domain itself, enter only the
+  part of each name before `.<PolicyEngine domain>`. A trailing dot at the
+  end of a printed name marks it as complete; leave it out if the form
+  doesn't accept it.
+- **Both records at once:** nothing uses the hostname until step 5.5, so the
+  `A` record can go in before the certificate is issued.
+- **They stay for good.** Certificate Manager uses the `CNAME` for renewals
+  as well as the first issue, and the `A` record doesn't change during the
+  move, because the static IP is already in the new project. The default TTL
+  is fine.
+- **CAA records:** the domain had none when checked. Any added later must
+  allow Google Trust Services.
+
+Then wait until the certificate is issued:
+
+```bash
+gcloud certificate-manager certificates describe "$CERTIFICATE" --project "$NEW_PROJECT_ID" \
+  --format='value(managed.state)'
+```
+
+It must print `ACTIVE`. While it doesn't, `--format=yaml` shows
+`managed.authorizationAttemptInfo`, which says whether Google found the
+`CNAME`.
+
+### 5.4 Check the hostname
+
+```bash
+curl -fsS "https://$COLLECTOR_HOSTNAME/ready"
+curl --silent --output /dev/null --write-out '%{http_code}\n' \
+  --request POST "https://$COLLECTOR_HOSTNAME/v1/auth/huggingface/exchange"
+```
+
+The first must succeed. The second must print `401` (no credential sent),
+which shows the request reached the application through the load balancer
+and its certificate. A new load balancer can take a few minutes to answer
+after its certificate becomes active.
+
+### 5.5 Point the dashboard at the hostname
+
+Once both environments pass step 5.4:
+
+| Setting | Where | New value |
+|---|---|---|
+| `MICROCOSM_TELEMETRY_COLLECTOR_URL` | calibration-diagnostics GitHub environment `Production` (variable) | `https://<production hostname>` |
+| `MICROCOSM_TELEMETRY_COLLECTOR_URL` | Vercel project calibration-diagnostics, Production | `https://<production hostname>` |
+| `MICROCOSM_TELEMETRY_COLLECTOR_URL` | Vercel project calibration-diagnostics, Preview | `https://<staging hostname>` |
+
+Settings take effect on the next deployment: merge calibration-diagnostics'
+next PR, and open a new Preview deployment. The build monitor should then
+list collector runs as before. The read token doesn't change. To undo, set
+the three values back to section 3's record and deploy again.
+
+`MICROCOSM_TELEMETRY_COLLECTOR_URL` doesn't change again: the move changes only
+what the hostname reaches.
+
+## 6. C3 and C4: the emitter and builds
+
+Done in the emitter and Microcosm, not here; this section says what must hold
+before production's copy.
+
+- **C3:** an emitter release from PolicyEngine/microcosm-emitter#29 and one
+  constant change, in `src/microcosm_emitter/core/constants.py`:
+  `https://<production hostname>` is added to `TRUSTED_COLLECTOR_ORIGINS` and
+  becomes `PRODUCTION_COLLECTOR_URL`. The old default address stays in
+  `TRUSTED_COLLECTOR_ORIGINS` until the old service is deleted (section 13).
+  It needs only C2: the hostname already reaches today's service.
+- **C4:** builds run that release. Builds that start the separately
+  installed emitter pick it up at their next start, once it is installed on
+  that machine or in that build image, the Modal image included. Builds
+  pinned to `microcosm-emitter==0.2.1` keep the old address, which 0.2.1 has
+  built in with no setting to change it, until Microcosm leaves that pin
+  (H2a).
+
+**Production's copy waits for C4.** Check that Microcosm's
+`packages/microcosm-build/pyproject.toml` on `main` no longer pins 0.2.1, and
+that the Modal image carries the release. In Cloud Monitoring, compare the
+production service's request count (`run.googleapis.com/request_count`) with
+its load balancer's (`loadbalancing.googleapis.com/https/request_count`):
+once builds use the hostname, nearly every request to the service comes
+through the load balancer. Requests still on the default address after
+production's copy get 503 (step 8.9).
+
+Staging's copy doesn't wait for C4: no build sends to staging by default.
+
+## 7. C5: prepare each environment in the new project (no downtime)
+
+Staging first. Production's resources can be created any time before its
+copy.
+
+**Before production's copy, merge none of these:** S1's and S2's PRs (#18,
+#19), intake's deployment wiring, C6, or C7's PR (#16). Each needs resources
+of its own, which section 12 creates once, in the new project, after the
+move. Merged earlier, each would need them in the current project too.
+
+### 7.1 Service accounts
 
 ```bash
 gcloud iam service-accounts create "collector-runtime-$ENVIRONMENT_NAME" --project "$NEW_PROJECT_ID"
@@ -370,12 +508,12 @@ for service_account in "$RUNTIME_SERVICE_ACCOUNT" "$MIGRATION_SERVICE_ACCOUNT"; 
 done
 ```
 
-If the record from step 3.2 shows these accounts limited further today (for
+If the record from section 3 shows these accounts limited further today (for
 example, an IAM condition on the instance name), repeat that here.
 
-### 5.2 Cloud SQL
+### 7.2 Cloud SQL
 
-Create the instance with the settings recorded in step 3.2, except deletion
+Create the instance with the settings recorded in section 3, except deletion
 protection, which is on for both new instances: on 2026-10-22 staging's
 instance had it, but production's didn't. Where the record shows automated
 backups off, as staging's did on 2026-10-22, use `--no-backup` instead of
@@ -394,18 +532,16 @@ Match the record's IP configuration (Cloud Run connects through the Cloud SQL
 connector, so a public IP needs no authorized networks), SSL mode, database
 flags, maintenance window and point-in-time recovery.
 
-Create every role the step 3.2 roles query lists, except `postgres`, with the
-**same names** as on the old instance and new random passwords. Google's import
-guide says every user that owns objects or was granted permissions on objects
-in the dumped database must exist on the target instance, or the import
-fails. Besides the migration and runtime users, create each role in
-`OTHER_DATABASE_USERS` (step 3.2: `telemetry_app` for production today, which
-the collector doesn't use, and none for staging), with a random password that
-isn't kept.
+**Create the migration user and the runtime user,** with the **same names**
+as on the old instance and new random passwords. Google's import guide says
+every user that owns objects or was granted permissions on objects in the
+dumped database must exist on the target instance, or the import fails. These
+two are the only ones: production's unused third user was dropped on
+2026-10-27, and the admin user exists on every new instance.
 
-**Make each role the way its old one was made.** An export carries no roles,
+**Make each user the way its old one was made.** An export carries no roles,
 so nothing corrects a role's attributes or memberships later. Made the same
-way, each role's row and its creator's row match the record, so step 6.4's
+way, each user's row and its creator's row match the record, so step 8.5's
 comparison of the roles query shows real differences only. The record shows
 how each was made:
 
@@ -413,25 +549,27 @@ how each was made:
   "About PostgreSQL users and roles" and "Create and manage users" say a user
   created with `gcloud sql users create` is a member of `cloudsqlsuperuser`,
   with the `CREATEROLE`, `CREATEDB` and `LOGIN` attributes. Create it that way.
-  If its row lacks one of those attributes, see the staging check below.
+  If its row lacks one of those attributes, see "If a recorded user lacks an
+  attribute" below.
 - **Its row doesn't list `cloudsqlsuperuser`:** it was made in SQL, or its
   membership was taken away later. On PostgreSQL 16, a role made by a role
-  that isn't a superuser, such as Cloud SQL's `postgres`, "is automatically
+  that isn't a superuser, such as Cloud SQL's admin user, "is automatically
   granted back to the creating user, just as if the bootstrap superuser had
   executed the command `GRANT created_user TO creating_user WITH ADMIN TRUE,
   SET FALSE, INHERIT FALSE`" (PostgreSQL 16, "Role Attributes"). The roles
   query shows that grant as `ROLE (admin)` in the creator's `member_of`,
-  normally `postgres`'s. Create the role in SQL, connected as that creator,
-  with exactly the attributes its row shows. PostgreSQL then makes the same
-  grant, so both rows match the record, and nothing has to be removed
-  afterwards. If no role lists it as `(admin)`, create it as `postgres`;
-  step 6.4 then accepts that one extra entry in `postgres`'s row.
+  normally the admin user's. Create the user in SQL, connected as that
+  creator, with exactly the attributes its row shows. PostgreSQL then makes
+  the same grant, so both rows match the record, and nothing has to be
+  removed afterwards. If no role lists it as `(admin)`, create it as the
+  admin user; step 8.5 then accepts that one extra entry in the admin user's
+  row.
 
 For the SQL, run `psql` through the Cloud SQL Auth Proxy
 (`cloud-sql-proxy "$NEW_CLOUD_SQL_CONNECTION"` in another shell, listening on
-127.0.0.1:5432). First set `postgres`'s password on the new instance, typed
-rather than printed:
-`gcloud sql users set-password postgres --instance "$NEW_INSTANCE" --project "$NEW_PROJECT_ID" --prompt-for-password`.
+port 5432 on this machine). First set the admin user's password on the new
+instance, typed rather than printed:
+`gcloud sql users set-password "$ADMIN_DATABASE_USER" --instance "$NEW_INSTANCE" --project "$NEW_PROJECT_ID" --prompt-for-password`.
 
 ```bash
 migration_password="$(openssl rand -hex 32)"
@@ -440,19 +578,15 @@ create_user_with_cloud_sql() {   # USER PASSWORD
   gcloud sql users create "$1" --instance "$NEW_INSTANCE" --project "$NEW_PROJECT_ID" --password "$2"
 }
 create_user_in_sql() {           # CREATOR USER PASSWORD 'ATTRIBUTES'
-  psql "host=127.0.0.1 port=5432 dbname=postgres user=$1" --set ON_ERROR_STOP=1 \
+  psql "host=localhost port=5432 dbname=$DATABASE_NAME user=$1" --set ON_ERROR_STOP=1 \
     --set user_name="$2" --set user_password="$3" --set attributes="$4" <<'SQL'
 CREATE ROLE :"user_name" WITH :attributes PASSWORD :'user_password';
 SQL
 }
-# The calls below are examples: for each role, make the one call its step 3.2 row
-# calls for, with the attributes its row shows. Until the placeholder in the loop
-# is replaced, PostgreSQL refuses each call there and creates nothing.
+# Examples: for each user, make the one call its section 3 row calls for, with
+# the attributes its row shows.
 create_user_with_cloud_sql "$MIGRATION_DATABASE_USER" "$migration_password"
-create_user_in_sql postgres "$RUNTIME_DATABASE_USER" "$runtime_password" 'LOGIN NOCREATEROLE NOCREATEDB INHERIT'
-for other_database_user in "${OTHER_DATABASE_USERS[@]}"; do   # none for staging
-  create_user_in_sql postgres "$other_database_user" "$(openssl rand -hex 32)" 'ATTRIBUTES FROM ITS ROW'
-done
+create_user_in_sql "$ADMIN_DATABASE_USER" "$RUNTIME_DATABASE_USER" "$runtime_password" 'LOGIN NOCREATEROLE NOCREATEDB INHERIT'
 ```
 
 psql puts the variables' values into the statement, quoted as a name
@@ -460,58 +594,59 @@ psql puts the variables' values into the statement, quoted as a name
 (`:attributes`), so neither the shell's history nor psql's holds a password.
 PostgreSQL's `CREATE ROLE` page warns that a password in the statement "might
 also be logged in ... the server log": the server logs it if the statement
-fails, or if the `log_statement` flag recorded in step 3.2 is `ddl` or `all`.
-Keep the two password variables in this shell for step 5.3. Then grant the
-other memberships the rows show, and run the roles query on the new instance:
-it must already match the record, apart from the differences this step names.
+fails, or if the `log_statement` flag recorded in section 3 is `ddl` or
+`all`. Keep the two password variables in this shell for step 7.3. Then grant
+the other memberships the rows show, and run the roles query on the new
+instance: it must already match the record, apart from the differences this
+step names.
 
-**Check once, on staging's new instance, whether `postgres` can change a user
-Cloud SQL made.** PostgreSQL 16's `ALTER ROLE` page says a role with
-`CREATEROLE` that isn't a superuser, as Cloud SQL's `postgres` is, can change
-another role's attributes "only for non-superuser and non-replication roles
-for which they have been granted `ADMIN OPTION`". Cloud SQL's pages say "You
-can change the attributes of any user using the ALTER ROLE command", but not
-whether `postgres` holds `ADMIN OPTION` on users Cloud SQL makes. So don't
-rely on it until this check has passed, in staging's pass and before
-production's step 5.2:
+**If a recorded user lacks an attribute.** This matters only for a row that
+lists `cloudsqlsuperuser` but lacks `CREATEROLE`, `CREATEDB` or `LOGIN`. The
+admin user would then have to remove that attribute with `ALTER ROLE`.
+PostgreSQL 16's `ALTER ROLE` page allows that, for a role with `CREATEROLE`
+that isn't a superuser, "only for non-superuser and non-replication roles for
+which they have been granted `ADMIN OPTION`". Cloud SQL's pages say "You can
+change the attributes of any user using the ALTER ROLE command", but not
+whether the admin user holds `ADMIN OPTION` on users Cloud SQL makes. So check
+it once, on staging's new instance, with a throwaway user, before relying on
+it:
 
 ```bash
-gcloud sql users create move_check --instance "$NEW_INSTANCE" --project "$NEW_PROJECT_ID" \
+throwaway_user='<throwaway user name>'   # any name the record doesn't use
+gcloud sql users create "$throwaway_user" --instance "$NEW_INSTANCE" --project "$NEW_PROJECT_ID" \
   --password "$(openssl rand -hex 32)"
-psql "host=127.0.0.1 port=5432 dbname=postgres user=postgres" <<'SQL'
+psql "host=localhost port=5432 dbname=$DATABASE_NAME user=$ADMIN_DATABASE_USER" \
+  --set user_name="$throwaway_user" <<'SQL'
 SELECT g.rolname AS holder, m.admin_option, m.inherit_option, m.set_option
 FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.member
-WHERE m.roleid = 'move_check'::regrole;
-ALTER ROLE move_check NOCREATEROLE NOCREATEDB NOLOGIN;
+WHERE m.roleid = :'user_name'::regrole;
+ALTER ROLE :"user_name" NOCREATEROLE NOCREATEDB NOLOGIN;
 SQL
-gcloud sql users delete move_check --instance "$NEW_INSTANCE" --project "$NEW_PROJECT_ID" --quiet
+gcloud sql users delete "$throwaway_user" --instance "$NEW_INSTANCE" --project "$NEW_PROJECT_ID" --quiet
 ```
 
-Write the result in the window notes. It matters only for a row that lists
-`cloudsqlsuperuser` but lacks `CREATEROLE`, `CREATEDB` or `LOGIN`:
-
 - **`ALTER ROLE` succeeds:** create that user with `gcloud sql users create`,
-  then remove what its row lacks with `ALTER ROLE` as `postgres`, for example
-  `ALTER ROLE telemetry_app NOLOGIN;`.
+  then remove what its row lacks with `ALTER ROLE` as the admin user.
 - **It fails** with "permission denied to alter role": create that user in
-  SQL as `postgres` instead, with the attributes its row shows, so that
-  `postgres` holds `ADMIN OPTION` on it. Its row then lacks
-  `cloudsqlsuperuser`, and `postgres`'s row lists it as `(admin)`; step 6.4
-  accepts exactly these two differences for that user. It then has less
-  privilege than its record. The README asks no more of the two users the
-  collector uses: the migration credential needs "schema-modification
-  access", and the runtime credential "only the data access required by the
-  application". If that user is the importing user, the "Before any import"
-  steps below must also grant it `CREATE` on `public`, and step 6.4 accepts
+  SQL as the admin user instead, with the attributes its row shows. Its row
+  then lacks `cloudsqlsuperuser`, and the admin user's row lists it as
+  `(admin)`; step 8.5 accepts exactly these two differences for that user. It
+  then has less privilege than its record. The README asks no more of the
+  two users: the migration credential needs "schema-modification access",
+  and the runtime credential "only the data access required by the
+  application". If that user is the migration user, the "Before any import"
+  steps below must also grant it `CREATE` on `public`, and step 8.5 accepts
   that difference too.
 
-**Before any import into the new database** (step 5.5's rehearsal and step
-6.3), give it the record's privileges and owners. An export doesn't carry the
-database-level privileges. And the importing user (normally the migration
-user) can create the tables only if it may create objects in schema `public`:
-on PostgreSQL 15 and later, `public` belongs to `pg_database_owner`, that is
-to the database's owner, and other users no longer have `CREATE` on it
-(PostgreSQL 15 release notes). On the old database the importing user had it
+Write the result in the copy's notes.
+
+**Before any import into the new database** (step 7.6's timing run and step
+8.3), give it the record's privileges and owners. An export doesn't carry the
+database-level privileges. And the importing user (the migration user) can
+create the tables only if it may create objects in schema `public`: on
+PostgreSQL 15 and later, `public` belongs to `pg_database_owner`, that is to
+the database's owner, and other users no longer have `CREATE` on it
+(PostgreSQL 15 release notes). On the old database the migration user had it
 in one of three ways, which the `\l` and `\dn+ public` records show: it owns
 the database or is a member of its owner (as every `cloudsqlsuperuser` member
 is, if `cloudsqlsuperuser` owns it); it owns `public`; or it was granted
@@ -521,15 +656,16 @@ the importing user what those tables need. Cloud SQL's users pages don't say
 who owns a database that `gcloud sql databases create` makes, so compare
 first.
 
-Connected to the new database as `postgres`, compare `\l "$DATABASE_NAME"` and
-`\dn+ public` with the record, then apply what differs, in this order:
+Connected to the new database as the admin user, compare
+`\l "$DATABASE_NAME"` and `\dn+ public` with the record, then apply what
+differs, in this order:
 
 1. **Privileges:** the database-level ones from `\l` (`GRANT CONNECT`,
    `GRANT CREATE ON DATABASE`) and `public`'s from `\dn+ public`
-   (`GRANT USAGE, CREATE ON SCHEMA public TO ...`). `postgres` may grant them
-   while it acts as the owner, which it does through `cloudsqlsuperuser` if
-   that owns the new database. Grant them before changing an owner: after
-   that, `postgres` no longer acts as the owner.
+   (`GRANT USAGE, CREATE ON SCHEMA public TO ...`). The admin user may grant
+   them while it acts as the owner, which it does through `cloudsqlsuperuser`
+   if that owns the new database. Grant them before changing an owner: after
+   that, the admin user no longer acts as the owner.
 2. **Owners:** `ALTER DATABASE ... OWNER TO ...` or
    `ALTER SCHEMA public OWNER TO ...`. PostgreSQL 16's `ALTER DATABASE` page
    says: "To alter the owner, you must be able to `SET ROLE` to the new owning
@@ -537,25 +673,28 @@ Connected to the new database as `postgres`, compare `\l "$DATABASE_NAME"` and
    - **If Cloud SQL made the new owner,** connect as that user: as a
      `cloudsqlsuperuser` member with `CREATEDB`, it can make itself the owner
      of a database that `cloudsqlsuperuser` owns.
-   - **If `postgres` made it,** `postgres` holds it only as `(admin)`, without
-     `SET`. The "Role Attributes" page says a creator "can gain access to the
-     created role by simply granting that role back to themselves with the
-     `INHERIT` and/or `SET` options", so grant `SET` for the change and revoke
-     it afterwards, for example:
+   - **If the admin user made it,** the admin user holds it only as
+     `(admin)`, without `SET`. The "Role Attributes" page says a creator "can
+     gain access to the created role by simply granting that role back to
+     themselves with the `INHERIT` and/or `SET` options", so grant `SET` for
+     the change and revoke it afterwards. With the names from section 2 in
+     place of the placeholders:
 
      ```sql
-     GRANT telemetry_migrator TO postgres WITH SET TRUE;
-     ALTER DATABASE telemetry OWNER TO telemetry_migrator;
-     REVOKE telemetry_migrator FROM postgres;
+     GRANT <migration user> TO <admin user> WITH SET TRUE;
+     ALTER DATABASE <database name> OWNER TO <migration user>;
+     REVOKE <migration user> FROM <admin user>;
      ```
 
-     The revoke removes only the grant `postgres` made; the same page says
-     the automatic grant "cannot be removed or changed by the `CREATEROLE`
-     user". The roles query's `postgres` row must match the record again.
+     The revoke removes only the grant the admin user made; the same page
+     says the automatic grant "cannot be removed or changed by the
+     `CREATEROLE` user". The roles query's admin user row must match the
+     record again.
 
-Table privileges and default privileges (`\dp`, `\ddp`) come with the export,
-provided the roles exist. Step 6.4 compares all four records after the
-import.
+Table privileges come with the export, provided the users exist. The
+migration user's default privileges are set after the import (step 8.4), so
+that they don't add privileges to the tables the import creates. Step 8.5
+compares all four records.
 
 Let both instances' service agents use the bucket. Google's export and import
 pages name `roles/storage.objectAdmin` for both:
@@ -569,7 +708,7 @@ for sql_service_agent in \
 done
 ```
 
-### 5.3 Secret Manager
+### 7.3 Secret Manager
 
 ```bash
 for secret_name in "$DATABASE_SECRET_NAME" "$MIGRATION_DATABASE_SECRET_NAME" "$JWT_SECRET_NAME" "$READ_SECRET_NAME"; do
@@ -578,7 +717,8 @@ done
 ```
 
 **The two database URLs are new:** the new instance and the new passwords.
-First see the form of the old value with its credentials hidden:
+First see the form of the old value with everything up to the last `@`
+hidden:
 
 ```bash
 gcloud secrets versions access latest --secret "$DATABASE_SECRET_NAME" --project "$OLD_PROJECT_ID" \
@@ -598,8 +738,9 @@ unset runtime_password migration_password
 ```
 
 **The signing secret and the read token are copied,** so session tokens issued
-before the move stay valid afterwards (which also lets the old service keep
-serving, choice 7), and the dashboard's credential doesn't change:
+before the copy stay valid afterwards, and the dashboard's credential doesn't
+change. The dashboard keeps reading the current project's copy of the read
+token until section 9:
 
 ```bash
 for secret_name in "$JWT_SECRET_NAME" "$READ_SECRET_NAME"; do
@@ -607,6 +748,8 @@ for secret_name in "$JWT_SECRET_NAME" "$READ_SECRET_NAME"; do
     | gcloud secrets versions add "$secret_name" --project "$NEW_PROJECT_ID" --data-file=-
 done
 ```
+
+Production's older, unused database URL secret (section 3) isn't copied.
 
 Who may read them:
 
@@ -623,77 +766,28 @@ for secret_name in "$DATABASE_SECRET_NAME" "$MIGRATION_DATABASE_SECRET_NAME" "$J
 done
 ```
 
-The dashboard's access to the read secret is set in section 8.1.
+**The dashboard's access to the new read secret** (choice 10). Its Workload
+Identity provider stays in the current project. Grant the principal (or
+principals) that section 3's record lists on the old read secret the same
+role on the new one, with the principal copied from the record:
 
-**If merged by now:**
+```bash
+gcloud secrets add-iam-policy-binding "$READ_SECRET_NAME" --project "$NEW_PROJECT_ID" \
+  --member '<principal from the record>' --role roles/secretmanager.secretAccessor
+```
 
-- **S1's Hugging Face read token (#13):** create the secret under the name S1
-  records, and copy its value with the same `versions access | versions add`
-  pipe, or rotate it: create a new fine-grained token with the same scope in
-  Hugging Face, store that, and revoke the old token in section 11. Grant
-  `roles/secretmanager.secretAccessor` only to the account the worker jobs run
-  as, and mount it into the worker jobs as `COLLECTOR_HF_READ_TOKEN`.
-- **C5's session signing key (#16):** create the secret named by
-  `TELEMETRY_JWT_SIGNING_KEY_SECRET_NAME` in the new project and copy its
-  value the same way, so tokens signed before the move verify afterwards and
-  the key ID published in the JWKS doesn't change. Add it to both grant loops
-  above: `roles/secretmanager.secretAccessor` for the runtime account and
-  `roles/secretmanager.viewer` for the deployment account. The deployment
-  checks that it exists and mounts it as `TELEMETRY_JWT_SIGNING_KEY` in both
-  environments, so without it that environment's deployment stops at "Check
-  required Secret Manager entries exist".
-- **#12's intake:** in the new project, the Cloud Tasks queue, the worker
-  job, the recovery job (its three `COLLECTOR_WORKER_*` settings naming the
-  new queue, worker job and invoker account), the invoker account, the
-  account Cloud Scheduler starts the recovery job as, and the permissions
-  from the README's "Artifact intake" section. Create the recovery job's
-  Cloud Scheduler job only in step 6.7: until the window's deployment, the
-  new database is empty or holds step 5.5's rehearsal copy, and a recovery
-  run would dispatch jobs from it.
+Production's Vercel identity gets only production's read secret, and Preview's
+only staging's. For production, also grant the dashboard's own deployment
+identity, the account in calibration-diagnostics' `Production` secret
+`TELEMETRY_GCP_DEPLOY_SERVICE_ACCOUNT`, `roles/secretmanager.viewer` on the
+new read secret, for its "Check collector read secret exists" step. These
+grants are removed when the dashboard switches to its Vercel OIDC token (C8).
 
-  **Keep the intake bucket in the old project.** When a submission is
-  completed, the collector records each stored object's generation number in
-  the submission's row, and the worker reads every file at that generation.
-  Cloud Storage assigns generation numbers, and they can't be set, so a copy
-  in another bucket has different ones, and the worker would reject every
-  accepted submission as `object_missing`. On the old bucket, grant the new
-  runtime account `storage.objects.create` (its signed upload URLs create
-  the objects) and `storage.objects.list` (completion lists them), and the
-  new worker job's account `storage.objects.get` (it reads each file); the
-  recovery job doesn't use the bucket. Use the roles step 3.2 recorded for the
-  old accounts, whether they were granted on the bucket or on the project,
-  and grant them on the bucket, for example `roles/storage.objectCreator` and
-  `roles/storage.objectViewer` for the runtime account and
-  `roles/storage.objectViewer` for the worker's:
-
-  ```bash
-  gcloud storage buckets add-iam-policy-binding gs://INTAKE_BUCKET --project "$OLD_PROJECT_ID" \
-    --member "serviceAccount:$RUNTIME_SERVICE_ACCOUNT" --role ROLE
-  ```
-
-  `COLLECTOR_INTAKE_BUCKET` keeps its value. This ties the collector's files
-  to `policyengine-api`: their storage cost, data-access audit logs and
-  administration stay there, and shutting that project down, or removing its
-  billing, makes them unreadable (the memo's D2 B). Moving the bucket later
-  needs a one-off change that copies the files, checks their SHA-256 values
-  again and rewrites each submission's recorded generation numbers; none is
-  written.
-- **S2's daily check (#19), production only:** the worker service account
-  (the one that may read S1's token), with `roles/iam.serviceAccountUser` on
-  it for the deployment account; `roles/secretmanager.viewer` on S1's secret
-  for the deployment account; the account Cloud Scheduler starts the check
-  as; the notification channel and both alert policies, as in the README.
-  Production's deployment configures the check job itself, before it changes
-  the service, and stops at that step without S1's secret, the worker
-  account, or either of the deployment account's two roles. The channel and
-  the policies don't affect the deployment. Create the schedule in step 6.7,
-  once the deployment has created the job.
-
-### 5.4 Create the Cloud Run service once
+### 7.4 Create the Cloud Run service once
 
 `deploy-maintenance` deploys with `--no-traffic`, which Cloud Run refuses when
 it creates a service. So create the service once with Google's sample image.
-Nothing uses its address yet, and the first deployment replaces the revision.
+Nothing reaches it yet, and the first deployment replaces the revision.
 
 ```bash
 gcloud run deploy "$SERVICE" --project "$NEW_PROJECT_ID" --region "$REGION" \
@@ -704,53 +798,69 @@ gcloud run deploy "$SERVICE" --project "$NEW_PROJECT_ID" --region "$REGION" \
 The migration job needs no step: `configure-migration-job` runs
 `gcloud run jobs deploy`, which creates it.
 
-### 5.5 Production only: time the database copy
+### 7.5 A backend service for the new service
 
-Before production's window, export the production database with `--offload`
+Created now, used by the URL map only in step 8.8:
+
+```bash
+gcloud compute network-endpoint-groups create "$NEW_ENDPOINT_GROUP" --region "$REGION" \
+  --network-endpoint-type serverless --cloud-run-service "$SERVICE" --project "$NEW_PROJECT_ID"
+gcloud compute backend-services create "$NEW_BACKEND" --global \
+  --load-balancing-scheme EXTERNAL_MANAGED --project "$NEW_PROJECT_ID"
+gcloud compute backend-services add-backend "$NEW_BACKEND" --global \
+  --network-endpoint-group "$NEW_ENDPOINT_GROUP" --network-endpoint-group-region "$REGION" \
+  --project "$NEW_PROJECT_ID"
+```
+
+### 7.6 Production only: time the database copy
+
+Before production's copy, export the production database with `--offload`
 (a serverless export, billed separately, which doesn't load the serving
-instance), import it into the new instance as in step 6.3, and note both
+instance), import it into the new instance as in step 8.3, and note both
 durations. Then delete and re-create the new database
-(`gcloud sql databases delete`, then `create`), so the window's import starts
-empty, and repeat step 5.2's "Before any import" steps (privileges, then
-owners): deleting the database drops them. Staging's window gives the same
+(`gcloud sql databases delete`, then `create`), so the copy's import starts
+empty, and repeat step 7.2's "Before any import" steps (privileges, then
+owners): deleting the database drops them. Staging's copy gives the same
 timings for staging's size.
 
-## 6. The window
+## 8. C5: copy each environment
 
-Do staging end to end, verify it (section 9), then production.
+Staging first, end to end, verified (section 10). Production's copy follows
+once C4 holds (section 6). Nothing is scheduled or announced in advance: the
+operator starts each copy when ready. From step 8.1 until step 8.8's checks
+pass, nothing else merges to this repo's `main`, because every merge
+deploys.
 
-**How long it lasts:** from step 6.2 until the deployment in step 6.6
-finishes. Exporting and importing take minutes at today's size (10 GB disks).
-Most of the time is the release that step 6.6 starts: the merge's Push run
-(versioning), then the release commit's Push run (checks, tag, staging's
-deployment, then production's). From merge to tag this took 25 minutes on
-2026-10-15 and 88 minutes on 2026-10-19 and 2026-10-20, when the
+**How long the service is in maintenance mode:** from step 8.2 until step
+8.8's URL map change. Exporting and importing take minutes at today's size
+(10 GB disks). Most of the time is the release that step 8.7 starts: the
+merge's Push run (versioning), then the release commit's Push run (checks,
+tag, staging's deployment, then production's). From merge to tag this took
+25 minutes on 2026-10-15 and 88 minutes on 2026-10-19 and 2026-10-20, when the
 organization's runners were queued; on 2026-10-20, calibration-diagnostics'
 last collector deploy run took 2 hours 25 minutes in all, of which its staging
-and production deploy jobs ran for 4 and 6 minutes. So plan for about 40
+and production deploy jobs ran for 4 and 6 minutes. So expect about 40
 minutes on a quiet day (25 minutes to the tag, about 10 for the two deploy
-jobs, and the export and import) and 2 to 3 hours when runners are queued,
-and measure it in staging's window. If #12's intake is switched on, add the
-wait for its worker executions in step 6.2, up to about 3 hours, unless they
-are cancelled or the queue is paused early. The dashboard's collector reads
-stay down until section 8.1's dashboard deployment finishes, unless the old
-service keeps serving (section 8.4).
+jobs, and the export and import) and 2 to 3 hours when runners are queued.
+Staging's copy measures it.
 
-While the window lasts:
+While it lasts, requests to that environment, through the hostname or the
+default address, get HTTP 503:
 
-- **Builds:** the emitter gets HTTP 503 from the collector and retries, with
-  a backoff of up to 60 seconds. Events wait on the build machine (kept for
-  seven days, up to 100 MiB). A machine discarded when its build ends, such as
-  a Modal container, loses the events not sent by then. A build never fails
-  because of telemetry.
+- **Builds** (production only): the emitter retries, with a backoff of up to
+  60 seconds. Events wait on the build machine (kept for seven days, up to
+  100 MiB). A machine discarded when its build ends, such as a Modal
+  container, loses the events not sent by then. A build never fails because
+  of telemetry.
 - **The dashboard:** the build monitor lists `collector` under "Runs that
-  could not be read" and still shows the Hugging Face runs.
+  could not be read" and still shows the Hugging Face runs. Its reads
+  recover at the URL map change, with no dashboard deployment.
 - **Orrery uploads:** the emitter gets their credential from the collector's
-  token exchange, so they wait during the window. They already wait today,
-  because microcosm-runs' authorization call needs a collector endpoint that
-  doesn't exist, so nothing changes for them.
+  token exchange, so they wait. They already wait today, because
+  microcosm-runs' authorization call needs a collector endpoint that doesn't
+  exist, so nothing changes for them.
 
-### 6.1 Check that no deployment is running, and record the rollback target
+### 8.1 Check that no deployment is running, and record the rollback target
 
 ```bash
 gh run list -R PolicyEngine/microcosm-collector --workflow push.yaml --status in_progress
@@ -758,7 +868,7 @@ gh run list -R PolicyEngine/microcosm-collector --workflow push.yaml --status qu
 ```
 
 Both must list nothing. Then record the revision the old service serves now.
-It is the rollback target (section 10). Every merge since step 3.2 has
+It is the rollback target (section 11). Every merge since section 3 has
 redeployed production, possibly with migrations, so an earlier revision may
 not match the database schema.
 
@@ -769,9 +879,9 @@ rollback_revision=$(gcloud run services describe "$SERVICE" --project "$OLD_PROJ
 echo "$rollback_revision"
 ```
 
-It must print one revision name. Write it in the window's notes too.
+It must print one revision name. Write it in the copy's notes too.
 
-### 6.2 Put the old service in maintenance mode
+### 8.2 Put the old service in maintenance mode
 
 `services update` makes a new revision from the serving one with only
 `TELEMETRY_MAINTENANCE_MODE` changed, so it keeps the same image, secrets and
@@ -782,66 +892,20 @@ gcloud run services update "$SERVICE" --project "$OLD_PROJECT_ID" --region "$REG
   --update-env-vars TELEMETRY_MAINTENANCE_MODE=1 --no-traffic --tag project-move --quiet
 gcloud run services update-traffic "$SERVICE" --project "$OLD_PROJECT_ID" --region "$REGION" \
   --to-tags project-move=100 --quiet
-old_service_url=$(gcloud run services describe "$SERVICE" --project "$OLD_PROJECT_ID" \
-  --region "$REGION" --format='value(status.url)')
 curl --silent --output /dev/null --write-out '%{http_code}\n' \
-  --request POST "$old_service_url/v1/auth/huggingface/exchange"
+  --request POST "https://$COLLECTOR_HOSTNAME/v1/auth/huggingface/exchange"
 sleep 35
 ```
 
-The `curl` must print `503`, as `resolve-and-verify-maintenance` checks. The
-pause outlasts the 30-second request timeout, so no request to the service is
-still writing.
+The `curl` must print `503`, as `resolve-and-verify-maintenance` checks, here
+through the hostname. The pause outlasts the 30-second request timeout, so no
+request to the service is still writing.
 
-**If #12's intake is switched on,** its worker job and its recovery job also
-write to the database, and maintenance mode doesn't stop them. In the old
-project, pause the queue and the recovery schedule together, then make sure
-no execution of either job is still running:
+Intake is off (#12 merged with it off, and its deployment wiring doesn't
+exist yet), so nothing else writes to the database. From here the old
+database doesn't change.
 
-```bash
-gcloud tasks queues pause WORKER_QUEUE --location "$REGION" --project "$OLD_PROJECT_ID"
-gcloud scheduler jobs pause RECOVERY_SCHEDULE --location "$REGION" --project "$OLD_PROJECT_ID"
-for intake_job in WORKER_JOB RECOVERY_JOB; do
-  gcloud run jobs executions list --job "$intake_job" --region "$REGION" \
-    --project "$OLD_PROJECT_ID" --format=json \
-    | jq -r '.[] | select(.status.completionTime == null) | .metadata.name'
-done
-```
-
-The loop prints the executions that haven't finished; repeat it until it
-prints nothing. It also lists an operator's `reprocess` run made as an
-execution of the recovery job. #12's README also allows running `reprocess`
-locally through the Cloud SQL Auth Proxy, which the loop can't see, so make
-sure nobody runs it that way during the window.
-
-- **A recovery execution** only updates job rows and creates Cloud Tasks.
-  Wait for it.
-- **A worker execution** can run for about 3 hours: three attempts
-  (`--max-retries 2`) of up to 1 hour each (`--task-timeout 1h`). Either wait,
-  which lengthens the window, or cancel it with
-  `gcloud run jobs executions cancel EXECUTION --region "$REGION" --project "$OLD_PROJECT_ID" --quiet`.
-  A cancelled attempt records no result. Its job stays `running` in the
-  copied database until its lease expires, up to 65 minutes after the attempt
-  started; then the new project's recovery job dispatches it again, or fails
-  it if it has used its three attempts or three dispatches.
-- **To keep the window short,** pause the queue and the schedule up to 3
-  hours before it starts, so worker executions finish first (resume both if
-  the window is called off). Submissions completed in the meantime wait in
-  the paused queue, and the new project's recovery job dispatches them after
-  the move (step 6.7).
-- **Never pause the queue alone.** Tasks can still be added to a paused
-  queue, and recovery dispatches a job again each time it has waited 30
-  minutes without a claim, and fails it after its third dispatch. With the
-  queue paused and recovery running, queued jobs fail about 90 minutes after
-  their first dispatch.
-
-Uploads in flight need nothing. A signed upload URL (valid for 30 minutes)
-names the bucket, which stays where it is (step 5.3), so a build's `complete`
-request to the new service finds the files there.
-
-From here the old database doesn't change.
-
-### 6.3 Export and import
+### 8.3 Export and import
 
 ```bash
 export_object="$EXPORT_BUCKET/$ENVIRONMENT_NAME-$(date -u +%Y%m%dT%H%M%SZ).sql.gz"
@@ -851,31 +915,63 @@ gcloud sql import sql "$NEW_INSTANCE" "$export_object" \
   --database "$DATABASE_NAME" --user "$MIGRATION_DATABASE_USER" --project "$NEW_PROJECT_ID" --quiet
 ```
 
-Import as the role that owns the tables in the step 3.2 record (normally the
-migration user), so the restored objects keep their owner. Step 5.2's "Before
-any import" steps let it create them in `public`. If #12's intake is
-switched on, its bucket isn't copied: it stays in the old project (step 5.3).
+Import as the migration user, which owns the tables in section 3's record, so
+the restored objects keep their owner. Step 7.2's "Before any import" steps
+let it create them in `public`.
 
-### 6.4 Check the copy
+### 8.4 Set the migration user's default privileges
+
+The migrations grant nothing: the runtime user gets access to every table a
+migration creates from the migration user's default privileges (the README's
+"Database access" section). Both environments have them today, but an entry
+belongs to the role, not to its name, and this one is new. Set them on the new
+database now, before step 8.7's deployment runs any migration there. If the
+import already carried the entry, running the statement again changes nothing.
+
+Connected to the new database as the admin user. On PostgreSQL 16 the admin
+user needs the `INHERIT` option on the migration user first, so grant it, set
+the default privileges, then revoke the grant. With the names from section 2
+in place of the placeholders:
+
+```sql
+GRANT <migration user> TO <admin user> WITH INHERIT TRUE;
+ALTER DEFAULT PRIVILEGES FOR ROLE <migration user> IN SCHEMA public
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO <runtime user>;
+REVOKE <migration user> FROM <admin user>;
+```
+
+The grant needs `ADMIN` on the migration user, which the admin user holds if
+it created that user in SQL (its row lists the migration user as `(admin)`).
+If it doesn't, connect as the migration user instead, whose password is in
+the new `$MIGRATION_DATABASE_SECRET_NAME` secret, and run only the
+`ALTER DEFAULT PRIVILEGES` statement.
+
+Then check with `\ddp`: it lists an entry owned by the migration user for
+schema `public` and type `table`, with
+`<runtime user>=arwd/<migration user>`, as in section 3's record.
+
+### 8.5 Check the copy
 
 On both instances, as the migration user:
 
-- `SELECT version_num FROM alembic_version;` gives the same revision.
+- `SELECT version_num FROM alembic_version;` gives the same revision
+  (`0002_artifact_intake` since #12).
 - `SELECT count(*)` on every table in the `public` schema gives the same
-  counts. At revision `0001` these are `telemetry_runs`, `telemetry_producers`
-  and `telemetry_events`; later migrations add more.
-- `\l`, `\dn+ public`, `\dp public.*` and `\ddp` match the step 3.2 record,
-  so the database's owner and privileges, `public`'s owner and privileges,
-  and the table and default privileges all came across.
-- The roles query from step 3.2 gives the same rows, `postgres`'s included,
-  so every role has the same attributes and the same memberships with the
-  same options. Step 5.2 already compared them before the window; the only
-  accepted differences are the ones it names for a role it had to make
-  differently, as written in the window notes.
+  counts. At revision `0002_artifact_intake` these are `telemetry_runs`,
+  `telemetry_producers`, `telemetry_events`, `artifact_submissions` and
+  `artifact_jobs`; the two intake tables are empty while intake is off.
+- `\l`, `\dn+ public`, `\dp public.*` and `\ddp` match section 3's record, so
+  the database's owner and privileges, `public`'s owner and privileges, and
+  the table and default privileges all came across.
+- The roles query from section 3 gives the same rows, the admin user's
+  included, so every role has the same attributes and the same memberships
+  with the same options. Step 7.2 already compared them before the copy; the
+  only accepted differences are the ones it names for a user it had to make
+  differently, as written in the copy's notes.
 
-If anything else differs, stop and roll back (section 10, first row).
+If anything else differs, stop and roll back (section 11, first row).
 
-### 6.5 Point the GitHub environment at the new project
+### 8.6 Point the GitHub environment at the new project
 
 ```bash
 collector_settings=(--repo PolicyEngine/microcosm-collector --env "$ENVIRONMENT_NAME")
@@ -888,43 +984,33 @@ gh secret set TELEMETRY_GCP_WIF_PROVIDER "${collector_settings[@]}" \
 gh secret set TELEMETRY_GCP_DEPLOY_SERVICE_ACCOUNT "${collector_settings[@]}" --body "$DEPLOY_SERVICE_ACCOUNT"
 ```
 
-In production's window, also set `TELEMETRY_PRODUCTION_CLOUD_SQL_CONNECTION`
-to production's new connection in **both** environments, since staging's
-`validate-environment-target` compares against it. If #19 has merged, also
-set production's `TELEMETRY_WORKER_SERVICE_ACCOUNT` to the new worker account.
-The other variables keep their values if the new resources reused the old
-names (section 12).
+In production's copy, also set `TELEMETRY_PRODUCTION_CLOUD_SQL_CONNECTION` to
+production's new connection in **both** environments, since staging's
+`validate-environment-target` compares against it. The other variables keep
+their values, because the new resources reuse the old names (section 14).
+If section 16's `TELEMETRY_PUBLIC_ORIGIN` check exists, unset that variable in
+this environment now: until step 8.8 the hostname reaches the old service,
+whose `/ready` answers 503 in maintenance mode.
 
-If #12's intake is switched on, point its settings at the new project, through
-whichever environment variables #12's deployment wiring reads (not yet
-written):
+### 8.7 Deploy
 
-- `COLLECTOR_WORKER_QUEUE` and `COLLECTOR_WORKER_JOB`:
-  `projects/$NEW_PROJECT_ID/locations/$REGION/queues/...` and `.../jobs/...`;
-- `COLLECTOR_INTAKE_SIGNING_SERVICE_ACCOUNT`: the new runtime account;
-- `COLLECTOR_WORKER_INVOKER_SERVICE_ACCOUNT`: the new invoker account.
-
-`COLLECTOR_INTAKE_BUCKET` keeps its value (step 5.3). With the old values, the
-new service would try to sign uploads as the old runtime account and enqueue
-into the old project's paused queue, so intake would stop.
-
-### 6.6 Deploy
-
-Each window needs its own merge. Its release runs the Push workflow, which
+Each copy needs its own merge. Its release runs the Push workflow, which
 deploys staging and then production with the environments' current settings.
+Prepare one PR for each copy in advance (section 16). This repo requires
+branches to be up to date with `main`, so update it and let its checks pass
+before step 8.1.
 
-- **Staging's window:** merge the C2 code PR (section 13). Production then
-  redeploys in the old project with unchanged runtime code, from the image
-  staging built in the new project's store. That works only with the
+- **Staging's copy:** staging deploys into the new project. Production then
+  redeploys in the current project with unchanged runtime code, from the
+  image staging built in the new project's store. That works only with the
   Artifact Registry Reader grant in step 4.1; it is otherwise a normal
   deployment, with its usual short maintenance phase.
-- **Production's window:** merge a second PR prepared for it, for example the
-  README update in section 13. This repo requires branches to be up to date
-  with `main`, so update it and let its checks pass before the window starts.
+- **Production's copy:** staging redeploys in the new project, then
+  production deploys into it.
 
 Re-running the deployment jobs of the latest Push run might do the same
 without a merge, but whether a re-run reads the environments' changed values
-hasn't been checked. In staging's window, confirm it from the run log (the
+hasn't been checked. In staging's copy, confirm it from the run log (the
 "Require deployment configuration" step shows `PROJECT_ID`) before relying on
 it for production. In production, a re-run that used the old values would take
 the old service out of maintenance mode, on the old database.
@@ -932,416 +1018,261 @@ the old service out of maintenance mode, on the old database.
 The first deployment replaces the sample revision with a maintenance revision,
 runs the migration job (the restored database is already at the current
 revision, and the job checks the schema against the SQLAlchemy metadata),
-deploys and checks a candidate revision, and moves traffic to it. In
+deploys and checks a candidate revision, moves traffic to it, and checks the
+service's default address ("Verify the stable service address"). In
 production it also takes a backup of the new instance first.
 
-### 6.7 Start the scheduled jobs in the new project
+### 8.8 Send the hostname to the new service
 
-After the deployment in step 6.6 has finished.
-
-**#12's intake, if switched on:** create the recovery job's schedule in the
-new project, every 10 minutes as the README says, as the account created for
-it in step 5.3:
+After the deployment has finished, change the URL map's default service to
+the new project's backend service:
 
 ```bash
-gcloud scheduler jobs create http RECOVERY_SCHEDULE --location "$REGION" --project "$NEW_PROJECT_ID" \
-  --schedule '*/10 * * * *' \
-  --uri "https://run.googleapis.com/v2/projects/$NEW_PROJECT_ID/locations/$REGION/jobs/RECOVERY_JOB:run" \
-  --http-method post --oauth-service-account-email RECOVERY_SCHEDULER_ACCOUNT
+gcloud compute url-maps set-default-service "$URL_MAP" --global \
+  --default-service "$NEW_BACKEND" --project "$NEW_PROJECT_ID"
 ```
 
-Compare its settings with the old schedule's record from step 3.2. Jobs that
-the old service queued before step 6.2 are still in the old, paused queue.
-The new recovery job dispatches each one again into the new queue once 30
-minutes have passed since its last dispatch, or fails it if it has already
-been dispatched three times. The old queue and schedule stay paused until
-section 11.
+Then run step 5.4's checks again: `/ready` must succeed and the token exchange
+must print `401`. A URL map change can take a few minutes to apply
+everywhere; until then some requests still reach the old service and get 503,
+which the emitter retries. The DNS records don't change.
 
-**S2's daily check (#19), in production's window:** production's deployment
-has created the check job in the new project. Create its schedule, then run
-the job once by hand and wait for it:
+If section 16's `TELEMETRY_PUBLIC_ORIGIN` check exists, set that variable
+again in this environment.
+
+**To undo this step** (section 11), point the URL map back:
 
 ```bash
-gcloud scheduler jobs create http HF_CHECK_SCHEDULE --location "$REGION" --project "$NEW_PROJECT_ID" \
-  --schedule '0 6,18 * * *' --time-zone Etc/UTC \
-  --uri "https://run.googleapis.com/v2/projects/$NEW_PROJECT_ID/locations/$REGION/jobs/$HF_CHECK_JOB:run" \
-  --http-method post --oauth-service-account-email HF_CHECK_SCHEDULER_ACCOUNT
-gcloud run jobs execute "$HF_CHECK_JOB" --region "$REGION" --project "$NEW_PROJECT_ID" --wait
+gcloud compute url-maps set-default-service "$URL_MAP" --global \
+  --default-service "$OLD_BACKEND_PATH" --project "$NEW_PROJECT_ID"
 ```
 
-The execution must succeed. The README says a metric-absence condition "is
-met only after the job writes at least one data point after the policy is
-created", so until this run the new "no successful execution for 23 hours"
-policy can't report a stopped schedule.
+### 8.9 The old service after the copy
 
-Then stop the old project's check, alerts first:
+It stays in maintenance mode (choice 7), so it answers 503 at its default
+address. After production's copy, builds still on that address, on emitter
+0.2.1 or on stale machines, keep their events locally and send them through
+a later emitter on the same machine; events on discarded machines, such as
+Modal containers, are lost. The old service keeps one instance running
+(`--min 1`) until section 13 deletes it.
 
-```bash
-for old_alert_policy in OLD_FAILURE_POLICY OLD_ABSENCE_POLICY; do
-  gcloud monitoring policies update "$old_alert_policy" --no-enabled --project "$OLD_PROJECT_ID"
-done
-gcloud scheduler jobs pause HF_CHECK_SCHEDULE --location "$REGION" --project "$OLD_PROJECT_ID"
-```
+**From the move on, never run calibration-diagnostics'
+`telemetry-service.yml`,** for rollback or anything else. Its settings name
+the old project, and its code predates migration `0002_artifact_intake`, so
+it can't run against either database. calibration-diagnostics#234 removes
+it.
 
-The two policy names are in the step 3.2 record. Disable the policies before
-pausing the schedule, and do both before section 11 removes the old check job
-or revokes S1's old token. Otherwise the old project emails false alerts:
-the failure policy at the next failed run, and the absence policy 23 hours
-after the last successful one.
+## 9. After each copy: the dashboard reads the new project's read secret
 
-## 7. The hostname and DNS
+In an ordinary dashboard deployment, not during a copy. Until then the
+dashboard reads the current project's copy of the read token, which has the
+same value. Step 7.3 has already granted the access this needs.
 
-Records at Cloudflare must be "DNS only". If the zone ever gets CAA records,
-they must allow `pki.goog` and `letsencrypt.org`.
+| Setting | Where | New value | When |
+|---|---|---|---|
+| `MICROCOSM_TELEMETRY_READ_SECRET_VERSION` | Vercel, Preview | staging's new read secret version, `projects/<new project>/secrets/<staging read secret name>/versions/<version>`, naming the project as section 3's recorded value does | after staging's copy |
+| `MICROCOSM_TELEMETRY_READ_SECRET_VERSION` | Vercel, Production | the same, for production's read secret | after production's copy |
+| `TELEMETRY_GCP_PROJECT_ID` | calibration-diagnostics GitHub environment `Production` (variable) | `<new project ID>` | with Vercel Production |
+| `TELEMETRY_READ_SECRET_NAME` | calibration-diagnostics GitHub environment `Production` (variable) | unchanged, because the name was reused | — |
 
-### D3 B: Cloud Run domain mapping
+The read secrets' names are this repo's `TELEMETRY_READ_SECRET_NAME`
+variables. Merge calibration-diagnostics' next PR, and open a new Preview
+deployment; the build monitor should still list collector runs.
+`MICROCOSM_TELEMETRY_GOOGLE_IDENTITY_PROVIDER`, `TELEMETRY_GCP_WIF_PROVIDER`
+and `TELEMETRY_GCP_DEPLOY_SERVICE_ACCOUNT` don't change. To undo, set the
+values back to section 3's record. Until this is done, section 13 keeps the
+old read secrets.
 
-```bash
-gcloud domains verify BASE_DOMAIN   # once, by the account that creates mappings
-gcloud beta run domain-mappings create --service "$SERVICE" --domain "$COLLECTOR_HOSTNAME" \
-  --region "$REGION" --project "$NEW_PROJECT_ID"
-gcloud beta run domain-mappings describe --domain "$COLLECTOR_HOSTNAME" --region "$REGION" \
-  --project "$NEW_PROJECT_ID" --format='yaml(status.resourceRecords,status.conditions)'
-```
+## 10. Verify
 
-Add the records `describe` lists at the DNS provider, then wait for the
-`CertificateProvisioned` condition to be `True`: "usually about 15 minutes but
-can take up to 24 hours."
-
-- **Both together (choice 6):** nothing uses the hostname yet, so map it any
-  time after the first deployment, and wait for the certificate before the
-  emitter release (section 8.2).
-- **Hostname first:** step 3.4 already mapped the hostname to the old
-  project's service. Inside production's window, after the deployment, delete
-  that mapping, then create the mapping in the new project with the commands
-  above:
-
-  ```bash
-  gcloud beta run domain-mappings delete --domain "$COLLECTOR_HOSTNAME" \
-    --region "$REGION" --project "$OLD_PROJECT_ID" --quiet
-  ```
-
-  The DNS records stay as they are. Requests fail until the new certificate
-  is issued; the emitter retries. `domain-mappings create --force-override`
-  maps a domain "even if it is already mapped to another service" (its
-  `--help`), but neither the help nor the domain mapping page says whether
-  that includes a service in another project, so don't rely on it.
-
-### D3 C: load balancer
-
-```bash
-gcloud compute addresses create collector-address --global --project "$NEW_PROJECT_ID"
-gcloud certificate-manager dns-authorizations create collector-hostname \
-  --domain "$COLLECTOR_HOSTNAME" --type=PER_PROJECT_RECORD --project "$NEW_PROJECT_ID"
-gcloud certificate-manager dns-authorizations describe collector-hostname \
-  --project "$NEW_PROJECT_ID" --format='yaml(dnsResourceRecord)'
-```
-
-Add that CNAME at the DNS provider. It authorizes the certificate and moves no
-traffic. The authorization is per project (`--type=PER_PROJECT_RECORD`), so the
-CNAME's name carries a suffix for the project
-(`_acme-challenge_SUFFIX.HOSTNAME`, as `describe` shows) instead of the fixed
-`_acme-challenge.HOSTNAME`. In the hostname-first order, step 3.4's
-authorization in the old project and this one therefore have separate records
-and can both exist, so the new certificate is issued before the `A` record
-changes. A fixed-name authorization in both projects would need two different
-CNAME records at one name, which DNS doesn't allow. Certificate Manager's DNS
-authorization page says per-project authorizations "are self-contained and
-don't interact with those in other projects", and that for them it supports
-only certificates issued by Google Trust Services (`pki.goog`, which the CAA
-note above allows). Then:
-
-```bash
-gcloud certificate-manager certificates create collector-certificate \
-  --domains "$COLLECTOR_HOSTNAME" --dns-authorizations collector-hostname --project "$NEW_PROJECT_ID"
-gcloud certificate-manager maps create collector-certificates --project "$NEW_PROJECT_ID"
-gcloud certificate-manager maps entries create collector-hostname --map collector-certificates \
-  --certificates collector-certificate --hostname "$COLLECTOR_HOSTNAME" --project "$NEW_PROJECT_ID"
-gcloud compute network-endpoint-groups create collector-endpoints --region "$REGION" \
-  --network-endpoint-type serverless --cloud-run-service "$SERVICE" --project "$NEW_PROJECT_ID"
-gcloud compute backend-services create collector-backend --global \
-  --load-balancing-scheme EXTERNAL_MANAGED --project "$NEW_PROJECT_ID"
-gcloud compute backend-services add-backend collector-backend --global \
-  --network-endpoint-group collector-endpoints --network-endpoint-group-region "$REGION" \
-  --project "$NEW_PROJECT_ID"
-gcloud compute url-maps create collector-routes --default-service collector-backend \
-  --global --project "$NEW_PROJECT_ID"
-gcloud compute target-https-proxies create collector-proxy --url-map collector-routes \
-  --certificate-map collector-certificates --global --project "$NEW_PROJECT_ID"
-gcloud compute forwarding-rules create collector-https --global \
-  --load-balancing-scheme EXTERNAL_MANAGED --address collector-address \
-  --target-https-proxy collector-proxy --ports 443 --project "$NEW_PROJECT_ID"
-```
-
-Wait until
-`gcloud certificate-manager certificates describe collector-certificate --project "$NEW_PROJECT_ID" --format='value(managed.state)'`
-prints `ACTIVE`. Then point the hostname's `A` record at the address
-(`gcloud compute addresses describe collector-address --global --project "$NEW_PROJECT_ID" --format='value(address)'`).
-Lower the record's TTL to 300 seconds a day before, so a rollback propagates
-quickly.
-
-### Check the hostname
-
-```bash
-curl -fsS "https://$COLLECTOR_HOSTNAME/ready"
-curl --silent --output /dev/null --write-out '%{http_code}\n' \
-  --request POST "https://$COLLECTOR_HOSTNAME/v1/auth/huggingface/exchange"
-```
-
-The first must succeed. The second must print `401` (no credential sent), which
-shows the request reached the application rather than a maintenance revision.
-
-## 8. Point the consumers at the new collector
-
-### 8.1 The calibration dashboard
-
-**Give the dashboard's identity access to the new read secrets first** (choice
-10):
-
-- **Keep its provider in `policyengine-api`:** grant the principal (or
-  principals) that the step 3.2 record lists on the old read secret the same
-  role on the new one:
-  `gcloud secrets add-iam-policy-binding "$READ_SECRET_NAME" --project "$NEW_PROJECT_ID" --member "PRINCIPAL" --role roles/secretmanager.secretAccessor`.
-  Production's identity gets only production's read secret, and Preview's only
-  staging's.
-- **A new provider in the new project:** create a pool and provider with the
-  issuer, allowed audiences, attribute mapping and condition recorded in step
-  3.2, grant its principals as above, and set the Vercel setting
-  `MICROCOSM_TELEMETRY_GOOGLE_IDENTITY_PROVIDER` to the new provider's
-  resource.
-- **C6 done:** nothing; the dashboard no longer reads Secret Manager for the
-  collector.
-
-The dashboard's deployment checks that its read secret exists ("Check
-collector read secret exists" in `deploy.yml`). Grant its own deployment
-identity, the account in calibration-diagnostics' `Production` secret
-`TELEMETRY_GCP_DEPLOY_SERVICE_ACCOUNT`, `roles/secretmanager.viewer` on
-production's new read secret.
-
-**Then change the settings:**
-
-| Setting | Where | New value |
-|---|---|---|
-| `MICROCOSM_TELEMETRY_COLLECTOR_URL` | calibration-diagnostics GitHub environment `Production` | `https://$COLLECTOR_HOSTNAME` for production |
-| `MICROCOSM_TELEMETRY_COLLECTOR_URL` | Vercel project calibration-diagnostics, Production and Preview | production's and staging's addresses |
-| `MICROCOSM_TELEMETRY_READ_SECRET_VERSION` | Vercel, Production and Preview | `projects/$NEW_PROJECT_ID/secrets/READ_SECRET/versions/VERSION`, for production's and staging's read secrets, in the form used today |
-| `TELEMETRY_GCP_PROJECT_ID` | calibration-diagnostics GitHub environment `Production` | `$NEW_PROJECT_ID` |
-| `TELEMETRY_READ_SECRET_NAME` | calibration-diagnostics GitHub environment `Production` | unchanged if the name was reused |
-
-Settings take effect on the next deployment. Merge calibration-diagnostics'
-next PR, and open a new Preview deployment. Re-running its latest "Deploy
-production" run may also work, but whether a re-run reads the changed GitHub
-variable is the unchecked question from step 6.6. The build monitor should
-then list collector runs from before the move.
-
-### 8.2 The emitter
-
-In PolicyEngine/microcosm-emitter, one PR: add `https://COLLECTOR_HOSTNAME`
-(production's) to `TRUSTED_COLLECTOR_ORIGINS` and point
-`PRODUCTION_COLLECTOR_URL` at it in `src/microcosm_emitter/core/constants.py`.
-Keep the old origin in the set while the old address serves. Merging it
-publishes the release.
-
-- Builds that start the separately installed emitter pick it up at their next
-  start, once it is installed on that machine or in that build image. A
-  running build keeps the emitter it started with.
-- Builds pinned to `microcosm-emitter==0.2.1` keep the old address until
-  Microcosm moves off that pin.
-
-### 8.3 microcosm-runs (choice 11)
-
-Either change `PRODUCTION_COLLECTOR_ORIGIN` in `lib/auth.ts` and the value in
-`.env.example`, or leave both for O7, which removes the upload API that uses
-them. Its Vercel project sets no `ORRERY_COLLECTOR_ORIGIN`.
-
-### 8.4 The old service (choice 7)
-
-- **Keep serving, connected to the new database:** grant the old runtime
-  account `roles/cloudsql.client` in the new project and
-  `roles/secretmanager.secretAccessor` on the new runtime database secret.
-  Then update the old service, which keeps the image it ran before the move:
-
-  ```bash
-  gcloud run services update "$SERVICE" --project "$OLD_PROJECT_ID" --region "$REGION" \
-    --set-cloudsql-instances "$NEW_CLOUD_SQL_CONNECTION" \
-    --update-secrets "DATABASE_URL=projects/$NEW_PROJECT_NUMBER/secrets/$DATABASE_SECRET_NAME:latest" \
-    --update-env-vars TELEMETRY_MAINTENANCE_MODE=0 --no-traffic --tag new-database --quiet
-  ```
-
-  Check `/ready` on the `new-database` tag's address, then route traffic to it
-  with `update-traffic --to-tags new-database=100`. Retire it before any
-  migration that its older code can't work with, and as soon as no build uses
-  emitter 0.2.1.
-- **Stay in maintenance mode:** nothing to do. Builds still on the old address
-  keep their telemetry locally.
-- **Delete it:** see section 11.
-
-## 9. Verify
-
-For each environment:
+For each environment, after its copy:
 
 - `gcloud run services describe "$SERVICE" --project "$NEW_PROJECT_ID" --region "$REGION" --format=json`
   shows an image in the new store, tagged with this repo's release commit (whose
   message is "Update microcosm-collector"), the new Cloud SQL connection, and
-  the four secret names (five once #16 has merged).
+  the four secret names.
 - `curl -fsS "$(gcloud run services describe "$SERVICE" --project "$NEW_PROJECT_ID" --region "$REGION" --format='value(status.url)')/ready"`
-  succeeds, and so do the hostname checks in section 7.
+  succeeds, and so do step 5.4's hostname checks.
+- `gcloud compute url-maps describe "$URL_MAP" --global --project "$NEW_PROJECT_ID" --format='value(defaultService)'`
+  ends with `$NEW_BACKEND`.
 - `gcloud run jobs executions list --job "$MIGRATION_JOB" --project "$NEW_PROJECT_ID" --region "$REGION" --limit 1`
   shows a successful execution.
 - Production: `gcloud sql backups list --instance "$NEW_INSTANCE" --project "$NEW_PROJECT_ID" --limit 1 --format='table(id,windowStartTime,status,description)'`
   shows `telemetry-release-RUN_ID-ATTEMPT` for the Push run. The default
   columns leave out the description.
-- The row counts from step 6.4 still match.
-- After section 8.1: the build monitor lists runs from before the move and
-  doesn't list `collector` under "Runs that could not be read".
-- After section 8.2: the next build that starts the new emitter shows its
-  events in the build monitor.
-- The old service answers as choice 7 says: `503` in maintenance mode, or
-  `/ready` when kept serving.
-- If #19 has merged: step 6.7's execution of the check job succeeded, the
-  old project's two alert policies are disabled, and its check schedule is
-  paused.
-- If #12's intake is switched on:
-  `gcloud storage buckets get-iam-policy gs://INTAKE_BUCKET --project "$OLD_PROJECT_ID"`
-  lists the new runtime and worker accounts with the roles from step 5.3, and
-  one small test submission, made through the flow in #12's
-  `docs/artifact-submissions.md` (token exchange for `artifacts:submit`,
-  create, upload, complete), reaches the status `succeeded` at
-  `GET /v1/submissions/{submission_id}`. That shows the new runtime account
-  can sign uploads and list the bucket, the new queue starts the new worker
-  job, and that job can read the files. The test files stay in the bucket,
-  which has no lifecycle deletion.
+- The row counts from step 8.5 still match, and `\ddp` still shows step
+  8.4's entry.
+- The build monitor lists runs from before the copy and doesn't list
+  `collector` under "Runs that could not be read".
+- After production's copy: the next build that starts the C3 emitter shows
+  its events in the build monitor.
+- The old service answers `503` at its default address.
 
-## 10. Rollback
+## 11. Rollback
 
-Keep every old resource until section 11. The old database is unchanged from
-the moment the old service entered maintenance mode.
+Keep every old resource until section 13. The old database is unchanged from
+the moment the old service entered maintenance mode. Rollback never changes
+the DNS records or the dashboard's `MICROCOSM_TELEMETRY_COLLECTOR_URL`.
 
 | Situation | What to do |
 |---|---|
-| In the window, before section 8 | Route the old service back: `gcloud run services update-traffic "$SERVICE" --project "$OLD_PROJECT_ID" --region "$REGION" --to-revisions "$rollback_revision=100"`, with the revision step 6.1 recorded in this window. Set back, to the step 3.2 record, only the GitHub values step 6.5 changed in this window: in staging's window, staging's; in production's window, production's and `TELEMETRY_PRODUCTION_CLOUD_SQL_CONNECTION` in staging's environment. Staging's other values stay pointed at the new project, where its database now is. If step 6.2 paused #12's queue and recovery schedule, resume them (`gcloud tasks queues resume`, `gcloud scheduler jobs resume`). If step 6.7 ran, pause the schedules it created in the new project, with the new queue, and disable the new alert policies; for #19, resume the old check schedule, enable the old policies again (`--enabled`), then run the old check job once by hand and wait for it to succeed: `gcloud run jobs execute "$HF_CHECK_JOB" --region "$REGION" --project "$OLD_PROJECT_ID" --wait`. #19's README says the absence condition is met only after a successful run that follows the policy being "created or changed", and enabling it again changes it. Builds kept their events and deliver them to the old service, except builds on a machine discarded when the build ended, such as a Modal container, which lost the events not sent by then. |
-| A deployment into the new project fails | As in calibration-diagnostics#233: before the migration step, fix and re-run the failed jobs. The new service isn't in use yet, so the first row also applies. |
-| After the dashboard switched (8.1), before the emitter release (8.2) | Builds still use only the old address. If the old service was in maintenance mode the whole time, nothing new is in the new database: do the first row, then set the dashboard's settings back and redeploy it. If the old service was kept serving against the new database (8.4), new events are in the new database: do the next row. |
-| After the emitter release | New events are in the new database. Put the new service in maintenance mode (step 6.2's commands with the new project), export the new database, import it into a fresh database on the old instance (drop and re-create the old database first, or import under a new name and update the old runtime database secret), route the old service back to the revision step 6.1 recorded in production's window (if a release with a migration has deployed in the new project since, that revision's code is older than the imported schema: set the GitHub values back first, and let the next merge deploy the current release to the old project instead), and set the GitHub and dashboard settings back. Then reverse step 6.7: in the new project, pause #19's check schedule and disable the new alert policies (step 6.2's commands have already paused #12's queue and recovery schedule there); in the old project, resume #12's queue and recovery schedule, resume #19's check schedule, enable the old alert policies again and run the old check job once, as in the first row. Last, release the emitter with the old `PRODUCTION_COLLECTOR_URL` (the old origin is still trusted, so only that constant changes). Builds that started on the new default keep it until they finish, and keep their events locally while the new service is in maintenance mode. |
-| The hostname | D3 B: delete the new project's mapping; in the hostname-first order, then create the mapping in the old project again (section 7's commands with `--project "$OLD_PROJECT_ID"`) and wait for its certificate. D3 C: point the `A` record back to what it named before, if anything. |
+| During a copy, before step 8.8's URL map change | Route the old service back: `gcloud run services update-traffic "$SERVICE" --project "$OLD_PROJECT_ID" --region "$REGION" --to-revisions "$rollback_revision=100"`, with the revision step 8.1 recorded in this copy. Set back, to section 3's record, only the GitHub values step 8.6 changed in this copy: in staging's copy, staging's; in production's copy, production's and `TELEMETRY_PRODUCTION_CLOUD_SQL_CONNECTION` in staging's environment. Staging's other values stay pointed at the new project, where its database now is. The hostname still reaches the old service, so builds and the dashboard recover with no other change. Builds kept their events and deliver them, except builds on a machine discarded when the build ended, such as a Modal container. |
+| A deployment into the new project fails | As in calibration-diagnostics#233: before the migration step, fix and re-run the failed jobs. The URL map hasn't changed, so the first row also applies. |
+| After step 8.8's URL map change | New events are in the new database, so prefer fixing forward. To go back: put the new service in maintenance mode (step 8.2's commands with `--project "$NEW_PROJECT_ID"`); export the new database; on the old instance, delete and re-create the old database, repeat step 7.2's "Before any import" steps there, import, and repeat step 8.4 there (deleting a database drops its default privileges); route the old service back to the revision step 8.1 recorded; set the GitHub values back as in the first row; then point the URL map back to `$OLD_BACKEND_PATH` (step 8.8's undo command). If a release with a migration has deployed in the new project since, the recorded revision's code is older than the imported schema: set the GitHub values back first, and let the next merge deploy the current release to the current project instead. If section 9 has moved the dashboard's read secret setting, it can stay: both projects' read tokens have the same value. |
 
-## 11. Retire the old resources
+Whatever the situation, never use calibration-diagnostics'
+`telemetry-service.yml` (step 8.9).
 
-Only when no build uses the old address (Microcosm has left the 0.2.1 pin, and
-the old service's request count in Cloud Monitoring has stayed at zero), and
-after an agreed holding period:
+## 12. After the move
+
+Once production's copy is verified, in this order. Each creates its cloud
+resources once, in the new project, and needs nothing in the current project.
+
+1. **The collector's own Hugging Face token and its daily check (S1, S2;
+   #13, #18, #19).** Before merging each PR, create in the new project what
+   its README section names. For S1: the secret, readable only by the
+   account the worker jobs run as, which they read as
+   `COLLECTOR_HF_READ_TOKEN`. For
+   S2: production's check job, its Cloud Scheduler job and the account it
+   starts the job as, a notification channel and two Cloud Monitoring alert
+   policies, and its production variables (`TELEMETRY_WORKER_SERVICE_ACCOUNT`,
+   `TELEMETRY_HF_CHECK_JOB`, `TELEMETRY_HF_READ_SECRET_NAME`). Enable
+   `cloudscheduler.googleapis.com` and `monitoring.googleapis.com`.
+2. **Switching intake on.** Everything in the README's "Artifact intake"
+   section: the bucket, the Cloud Tasks queue, the worker and recovery jobs,
+   the recovery job's schedule, the accounts and permissions, and the
+   deployment wiring that sets `COLLECTOR_INTAKE_ENABLED`. Enable
+   `cloudtasks.googleapis.com`. The runtime user's access to the intake
+   tables comes from the default privileges (step 8.4).
+3. **Read API v2 (C6).**
+4. **ES256 session-token signing (C7, #16).** Before merging it, create each
+   environment's signing-key secret, named by
+   `TELEMETRY_JWT_SIGNING_KEY_SECRET_NAME`, readable by the runtime account
+   and visible to the deployment account (`roles/secretmanager.viewer`). The
+   deployment checks that it exists and mounts it as
+   `TELEMETRY_JWT_SIGNING_KEY`; without it, that environment's deployment
+   stops at "Check required Secret Manager entries exist".
+
+## 13. Retire the old resources
+
+When no build uses emitter 0.2.1 (Microcosm's `main` no longer pins it) and
+the old production service's request count in Cloud Monitoring
+(`run.googleapis.com/request_count`) has been zero for seven days, the
+emitter's local retention period (choice 7). Then, in the current project
+unless stated:
 
 - The old Cloud SQL instances: export a last copy into the bucket if wanted,
   then `gcloud sql instances patch "$OLD_INSTANCE" --project "$OLD_PROJECT_ID" --no-deletion-protection`
   and `gcloud sql instances delete`.
-- The old Cloud Run services and migration jobs, every secret step 3.2
-  recorded (the four per environment, the unused ones such as production's
-  older database URL secret, and #16's signing key and S1's token if merged),
-  and the old runtime, migration and worker service accounts.
-- If #12 merged: the queue (with any tasks still in it), the worker and
-  recovery jobs, the recovery schedule and the account it used, the invoker
-  account, and the old accounts' roles on the intake bucket, or on the
-  project if step 3.2 found them there. Keep the bucket: it holds every
-  submission's files and is still in use (step 5.3). So `policyengine-api`
-  has to stay active, and billed, for as long as the collector reads them.
-- If #19 merged: the old check job, its schedule and the account the
-  schedule used, both alert policies and the notification channel. Step 6.7
-  already disabled the policies and paused the schedule.
+- The old Cloud Run services and migration jobs, and the old runtime and
+  migration service accounts.
+- Every collector secret section 3 recorded: the four per environment, and
+  production's older, unused database URL secret. Delete the old read secrets
+  only once section 9 has moved the dashboard to the new ones.
+- Each environment's backend service and serverless network endpoint group
+  from step 5.1, and the operator's `roles/compute.loadBalancerServiceUser`
+  grant on them. After this, the URL map can no longer be pointed back.
 - The collector's images in the old Artifact Registry store (only the
   collector's image name, unless the store holds nothing else).
 - The two `roles/artifactregistry.reader` bindings on the new project from
-  step 4.1 (the old deployment account and the old project's Cloud Run service
-  agent).
-- This repo's Workload Identity provider in `policyengine-api`
+  step 4.1 (the old deployment account and the current project's Cloud Run
+  service agent).
+- This repo's Workload Identity provider in the current project
   (`github/microcosm-collector`) and the old deployment account's
   `roles/iam.workloadIdentityUser` binding for this repo's principal set.
   Keep calibration-diagnostics' provider and the shared deployment account:
-  the dashboard's deployment still uses them.
-- In the hostname-first order with D3 C, the load balancer's resources that
-  step 3.4 created in `policyengine-api`, once the hostname points at the new
-  project. (With D3 B, section 7 already deleted the old project's mapping.)
-- The export bucket and every dump in it.
+  the dashboard's deployment still uses them. Keep the dashboard's Vercel
+  identity provider until C8.
+- The export bucket and every dump in it (in the new project).
 - calibration-diagnostics' leftover collector settings, as listed in
   calibration-diagnostics#233's "Manual steps".
-- S1's old Hugging Face token, if it was rotated. If #19 merged, revoke it
-  only after step 6.7 has paused the old check, which uses it.
+- In a later emitter release, the old default address from
+  `TRUSTED_COLLECTOR_ORIGINS`.
 
-## 12. Settings this runbook changes
+## 14. Settings this runbook changes
 
-| Setting | Provider | Read by | After the move |
+| Setting | Provider | Read by | Changes |
 |---|---|---|---|
-| `TELEMETRY_GCP_PROJECT_ID` | this repo's GitHub environments `staging` and `production` (variable) | `push.yaml` job `env:` as `PROJECT_ID`, then every `scripts/deploy.sh` command | the new project ID |
-| `TELEMETRY_CLOUD_SQL_CONNECTION` | same (variable) | `CLOUD_SQL_CONNECTION`: `--add-cloudsql-instances`, `--set-cloudsql-instances`, `create-database-backup` | `NEW_PROJECT_ID:REGION:INSTANCE` |
-| `TELEMETRY_PRODUCTION_CLOUD_SQL_CONNECTION` | same, in both environments (variable) | `validate-environment-target` | production's new connection |
-| `TELEMETRY_RUNTIME_SERVICE_ACCOUNT`, `TELEMETRY_MIGRATION_SERVICE_ACCOUNT` | same (variables) | `--service-account` for the service and the migration job | the new accounts |
-| `TELEMETRY_GCP_REGION`, `TELEMETRY_ARTIFACT_REGISTRY_NAME`, `TELEMETRY_IMAGE_NAME`, `TELEMETRY_SERVICE`, `TELEMETRY_PRODUCTION_SERVICE`, `TELEMETRY_MIGRATION_JOB`, and the four `TELEMETRY_*_SECRET_NAME` variables | same (variables) | image path, Cloud Run names, `--set-secrets`, `check-secrets-exist` | unchanged when the new resources reuse the names |
-| `TELEMETRY_GCP_WIF_PROVIDER` | same (secret) | `google-github-actions/auth`, `workload_identity_provider` | the new provider's resource |
-| `TELEMETRY_GCP_DEPLOY_SERVICE_ACCOUNT` | same (secret) | `google-github-actions/auth`, `service_account` | the new deployment account |
+| `TELEMETRY_GCP_PROJECT_ID` | this repo's GitHub environments `staging` and `production` (variable) | `push.yaml` job `env:` as `PROJECT_ID`, then every `scripts/deploy.sh` command | the new project ID, in step 8.6 |
+| `TELEMETRY_CLOUD_SQL_CONNECTION` | same (variable) | `CLOUD_SQL_CONNECTION`: `--add-cloudsql-instances`, `--set-cloudsql-instances`, `create-database-backup` | the new connection, `<new project ID>:<region>:<instance>`, in step 8.6 |
+| `TELEMETRY_PRODUCTION_CLOUD_SQL_CONNECTION` | same, in both environments (variable) | `validate-environment-target` | production's new connection, in production's copy |
+| `TELEMETRY_RUNTIME_SERVICE_ACCOUNT`, `TELEMETRY_MIGRATION_SERVICE_ACCOUNT` | same (variables) | `--service-account` for the service and the migration job | the new accounts, in step 8.6 |
+| `TELEMETRY_GCP_REGION`, `TELEMETRY_ARTIFACT_REGISTRY_NAME`, `TELEMETRY_IMAGE_NAME`, `TELEMETRY_SERVICE`, `TELEMETRY_PRODUCTION_SERVICE`, `TELEMETRY_MIGRATION_JOB`, and the four `TELEMETRY_*_SECRET_NAME` variables | same (variables) | image path, Cloud Run names, `--set-secrets`, `check-secrets-exist` | unchanged, because the new resources reuse the names |
+| `TELEMETRY_GCP_WIF_PROVIDER` | same (secret) | `google-github-actions/auth`, `workload_identity_provider` | the new provider's resource, in step 8.6 |
+| `TELEMETRY_GCP_DEPLOY_SERVICE_ACCOUNT` | same (secret) | `google-github-actions/auth`, `service_account` | the new deployment account, in step 8.6 |
+| `TELEMETRY_PUBLIC_ORIGIN` (only once section 16's check exists) | same (variable) | the proposed deployment check | `https://<hostname>` after step 5.4; unset in step 8.6 and set again in step 8.8 |
 | `COLLECTOR_DEPLOY_ENABLED` | this repo's variable | the deployment jobs' `if:` | unchanged (`true`) |
-| `roles/artifactregistry.reader` on the new project for the old deployment account and the old project's Cloud Run service agent | Google Cloud IAM (step 4.1) | Cloud Run, when `deploy-production` deploys staging's image into the old project | removed in section 11 |
-| `TELEMETRY_JWT_SIGNING_KEY_SECRET_NAME` (if #16 merged) | same, in both environments (variable) | `check-secrets-exist`, `--set-secrets` | unchanged when the new secret reuses the name |
-| `TELEMETRY_WORKER_SERVICE_ACCOUNT` (if #19 merged) | `production` (variable) | `configure-huggingface-check-job`, `--service-account` | the new worker account |
-| `TELEMETRY_HF_CHECK_JOB`, `TELEMETRY_HF_READ_SECRET_NAME` (if #19 merged) | `production` (variables) | `configure-huggingface-check-job` | unchanged when the new resources reuse the names |
-| `COLLECTOR_WORKER_QUEUE`, `COLLECTOR_WORKER_JOB` (if #12's intake is switched on) | the environment variables #12's deployment wiring will read (not yet written); set by hand on the recovery job | the service and the recovery job | the new project's queue and worker job |
-| `COLLECTOR_INTAKE_SIGNING_SERVICE_ACCOUNT`, `COLLECTOR_WORKER_INVOKER_SERVICE_ACCOUNT` (same) | same | the service signs upload URLs as the first; the service and the recovery job dispatch as the second | the new runtime account and the new invoker account |
-| `COLLECTOR_INTAKE_BUCKET` (same) | same | the service and the worker job | unchanged: the bucket stays in the old project (step 5.3) |
+| `roles/artifactregistry.reader` on the new project for the old deployment account and the current project's Cloud Run service agent | Google Cloud IAM (step 4.1) | Cloud Run, when `deploy-production` deploys staging's image into the current project | removed in section 13 |
 | `DATABASE_URL`, `TELEMETRY_JWT_SECRET`, `TELEMETRY_READ_TOKEN` | Google Secret Manager in the new project | the service, through `--set-secrets` | new database URL; copied signing secret and read token |
-| `TELEMETRY_JWT_SIGNING_KEY` (if #16 merged) | Secret Manager in the new project | the service, through `--set-secrets` | copied key |
 | `DATABASE_URL` (migration job) | Secret Manager in the new project | the migration job, through `--set-secrets` | new migration database URL |
-| `COLLECTOR_HF_READ_TOKEN` (if S1 merged) | Secret Manager in the new project | the worker jobs, through a secret mount | copied or rotated |
-| `TELEMETRY_MAINTENANCE_MODE` | `scripts/deploy.sh` (`--set-env-vars`), and step 6.2 on the old service | the service | unchanged |
-| Dashboard settings | calibration-diagnostics GitHub `Production` environment and the Vercel project | see section 8.1 | see section 8.1 |
-| `PRODUCTION_COLLECTOR_URL`, `TRUSTED_COLLECTOR_ORIGINS` | emitter source (`core/constants.py`) | every emitter service module | the hostname, by an emitter release |
+| `TELEMETRY_MAINTENANCE_MODE` | `scripts/deploy.sh` (`--set-env-vars`), and step 8.2 on the old service | the service | unchanged by deployments; `1` on the old service from step 8.2 |
+| `MICROCOSM_TELEMETRY_COLLECTOR_URL` | calibration-diagnostics GitHub `Production` environment (variable), and the Vercel project's Production and Preview settings | `deploy.yml` and `deploy-dashboard.sh` (production); Vercel (Preview); `telemetry-collector-client.ts` | the hostnames, in step 5.5 |
+| `MICROCOSM_TELEMETRY_READ_SECRET_VERSION` | Vercel project, Production and Preview | `telemetry-collector-client.ts` | the new project's read secrets, in section 9 |
+| `TELEMETRY_GCP_PROJECT_ID`, `TELEMETRY_READ_SECRET_NAME` (dashboard) | calibration-diagnostics GitHub `Production` environment (variables) | `deploy.yml` "Check collector read secret exists" | the new project, in section 9; the name is unchanged |
+| `PRODUCTION_COLLECTOR_URL`, `TRUSTED_COLLECTOR_ORIGINS` | emitter source (`core/constants.py`) | every emitter service module | the production hostname, by the C3 release |
 
-**Unverified before the staging window.** Apart from some read-only
-commands against `policyengine-api`, nothing in this runbook has been run.
-Still open:
+Settings that section 12's work adds (S1, S2, intake, C7) are set up then, in
+the new project only.
 
-- **Whether `postgres` may change a user Cloud SQL made** with `ALTER ROLE`,
-  which PostgreSQL 16 allows only with `ADMIN OPTION` on that user. Step
-  5.2's check on staging's new instance settles it, and gives the fallback.
+## 15. Unverified before staging's work
+
+Apart from some read-only commands against the current project, nothing in
+this runbook has been run. Still open:
+
+- **The cross-project backend service with a Cloud Run backend.** Google's
+  overview says cross-project service referencing works with serverless
+  network endpoint groups and needs no Shared VPC for global external
+  Application Load Balancers, but its step-by-step cross-project example uses
+  an instance group. Staging's load balancer (section 5) tests it first. If
+  it fails, staging's and production's hostname phase would need the whole
+  load balancer in the current project, and each move a change of the `A`
+  record: a change to these decisions, to agree before going further.
+- **Organization policies:** the new project inherits the organization's
+  policies. In the current project, which sits directly under the
+  organization, both collector services grant `roles/run.invoker` to
+  `allUsers`, as `--allow-unauthenticated` needs, so the organization
+  probably doesn't enforce domain-restricted sharing. Whether it restricts
+  cross-project backend services wasn't checked: the Organization Policy API
+  isn't enabled in the current project. If the new project refuses
+  `allUsers`, step 8.7's deployment can't reach its maintenance revision.
+- **VPC Service Controls:** whether either project is inside a service
+  perimeter, which could block the URL map's use of the current project's
+  backend service (step 5.2), and the current project's image reads from the
+  new Artifact Registry store (step 4.1). Checking needs organization-level
+  access.
+- **Whether the admin user may change a user Cloud SQL made** with
+  `ALTER ROLE`, which PostgreSQL 16 allows only with `ADMIN OPTION` on that
+  user. Step 7.2's check settles it, if a recorded user needs it.
 - **Database owners:** who owns a database that `gcloud sql databases create`
   makes, and the old databases' owners, `public` privileges, roles, grants and
-  memberships (including whether production's `telemetry_app` owns or holds
-  anything). These need a database connection; step 3.2 records the old ones,
-  and step 5.2 compares the new database before any import.
-- **VPC Service Controls:** whether either project is inside a service
-  perimeter, which could block access between them: the new accounts' access
-  to the old intake bucket (step 5.3), and the old project's image reads from
-  the new Artifact Registry store (step 4.1). Checking needs
-  organization-level access.
-- **Organization policies:** the new project inherits the policies of the
-  parent chosen in choice 2. In `policyengine-api`, which sits directly under
-  an organization, both collector services grant `roles/run.invoker` to
-  `allUsers`, as `--allow-unauthenticated` needs. Whether the chosen parent
-  sets a different policy, such as domain-restricted sharing, wasn't checked:
-  the Organization Policy API isn't enabled in `policyengine-api`. If the new
-  project refuses `allUsers`, step 6.6's deployment can't reach its
-  maintenance revision.
-- **Project liens:** whether `policyengine-api` has a lien that stops it being
-  deleted, which matters if the intake bucket stays there. Listing liens needs
-  `gcloud alpha resource-manager liens list`.
-- **#12's deployment wiring,** not yet written: its GitHub variable names
-  (step 6.5, this table), and whether it grants storage roles on the bucket or
-  on the project (step 3.2).
+  memberships. These need a database connection; section 3 records the old
+  ones, and step 7.2 compares the new database before any import.
+- **Whether the export carries the default privileges.** Step 8.4 sets them
+  either way.
+- **How long a URL map change takes** to reach every Google front end (step
+  8.8); staging's copy measures it.
 - The current deployment account's roles and the dashboard identity's bindings
-  (recorded in step 3.2), and whether a workflow re-run reads changed
-  environment values (step 6.6).
+  (recorded in section 3), and whether a workflow re-run reads changed
+  environment values (step 8.7).
 
-Every setting above needs checking end to end in the staging pass.
+Every setting above needs checking end to end in staging's pass.
 
-## 13. Code changes that go with this runbook (not yet written)
+## 16. Code changes that go with this runbook (not yet written)
 
-- **This repo:** a step after "Verify the stable service address" that checks
-  `https://$PUBLIC_ORIGIN/ready`, from a new environment variable
+- **This repo, optional:** a step after "Verify the stable service address"
+  that checks `https://$PUBLIC_ORIGIN/ready`, from a new environment variable
   `TELEMETRY_PUBLIC_ORIGIN`, so every deployment proves the hostname reaches
-  the new revision. The step skips when the variable is unset: in the "both
-  together" order the hostname reaches the new service only after section 7,
-  so set the variable once section 7's checks pass. Its merge is the release
-  that deploys staging into the new project (step 6.6).
-- **This repo, for production's window:** the README's "Cloud Run deployment"
+  the deployed service. The step skips when the variable is unset. It can be
+  set once step 5.4 passes, because the hostname then reaches the service
+  this repo deploys; steps 8.6 and 8.8 unset and set it around each copy.
+  Its merge can be the one staging's copy needs (step 8.7).
+- **This repo, for production's copy:** the README's "Cloud Run deployment"
   and "Google Cloud access" sections updated to describe the new project and
-  the hostname. Its merge is the release that deploys production into the new
-  project (step 6.6).
-- **The emitter:** the release in section 8.2.
-- **microcosm-runs:** section 8.3, if chosen.
+  the load balancer, without naming the hostname. Its merge is the one
+  production's copy needs (step 8.7).
+- **The emitter:** C3 (section 6), and later the removal of the old default
+  address from `TRUSTED_COLLECTOR_ORIGINS` (section 13).
+- **calibration-diagnostics#234:** removes `telemetry-service.yml` (step
+  8.9).
+- **microcosm-runs:** nothing until O7 and O8 remove the code that uses the
+  old address (choice 11).
