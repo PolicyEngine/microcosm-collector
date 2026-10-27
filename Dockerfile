@@ -5,6 +5,19 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy
 
+# The base image's ca-certificates 20230311+deb12u1 trusts "emSign ECC Root CA -
+# G3" and "AAA Certificate Services", the roots that the compromised eMudhra
+# intermediates chain to, and its pip 25.3 vendors certifi 2025.10.5, which holds
+# the first. Debian's ca-certificates 20250419~deb12u2 (bookworm-security) removes
+# both roots, and pip 26.2.2 vendors certifi 2026.10.19, which lacks it. CI fails
+# if the built image holds either root (tools/check-image-certificates.py).
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -m pip install --no-cache-dir --root-user-action=ignore \
+        --disable-pip-version-check --upgrade "pip>=26.2.2"
+
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
