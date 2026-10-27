@@ -103,13 +103,41 @@ accounts must be user-managed ones.
 
 The migration job's database user owns the tables it creates; the service,
 the worker and the operator commands connect as the runtime database user.
-Migration `0002_artifact_intake` copies every grant on `telemetry_runs`
-(`SELECT`, `INSERT`, `UPDATE` and `DELETE`, to any role except its owner and
-`PUBLIC`) to `artifact_submissions` and `artifact_jobs`, so the runtime user
-gets the same access to the intake tables as to the telemetry tables, whether
-it was granted explicitly or through default privileges. The intake code needs
-`SELECT`, `INSERT` and `UPDATE`; row locks (`SELECT ... FOR UPDATE`) need
-`UPDATE`.
+The migrations grant nothing. The runtime user's access to the telemetry
+tables was granted by hand when each database was set up, outside this
+repo. Its access to every table created since then comes from the
+migration user's default privileges, which each environment sets once by
+hand, before `0002_artifact_intake` is applied:
+
+```sql
+ALTER DEFAULT PRIVILEGES FOR ROLE <migration_role> IN SCHEMA public
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO <runtime_role>;
+```
+
+`<migration_role>` is the user in the migration database secret, the secret
+named by `TELEMETRY_MIGRATION_DATABASE_SECRET_NAME`, and `<runtime_role>` is
+the user in the runtime database secret, named by
+`TELEMETRY_DATABASE_SECRET_NAME`. Default privileges apply only to tables that
+role creates in `public` after they are set.
+
+- **Who can run it:** the migration user itself, or a role that is a member
+  of it with the `INHERIT` option. PostgreSQL 16 refuses the statement for a
+  member with only `ADMIN` or `SET`. A role that Cloud SQL's `postgres`
+  created in SQL is held by `postgres` with only `ADMIN`, so either connect as
+  the migration user, or have `postgres` first grant itself the role
+  `WITH INHERIT TRUE`.
+- **How to check it:** `\ddp` lists an entry owned by `<migration_role>` for
+  schema `public` and type `table`, with `<runtime_role>=arwd/<migration_role>`.
+  After a migration that creates tables,
+  `SELECT has_table_privilege('<runtime_role>', '<table>', '<privilege>')`
+  is true for each of them and each of the four privileges.
+
+The intake code needs `SELECT`, `INSERT` and `UPDATE`; row locks
+(`SELECT ... FOR UPDATE`) need `UPDATE`. No table uses a sequence. A `serial`
+column would need `USAGE` on its sequence, which these default privileges
+don't give, so a migration that adds one needs
+`GRANT USAGE, SELECT ON SEQUENCES` added to the default privileges first; an
+identity column needs no sequence privilege to insert rows.
 
 ### Worker jobs and recovery
 
@@ -152,7 +180,8 @@ in that environment's project and region:
   runs it every 10 minutes.
 - **Database access:** after the migration, the runtime database user has
   `SELECT`, `INSERT` and `UPDATE` on `artifact_submissions` and
-  `artifact_jobs` (see "Database access").
+  `artifact_jobs`, through the migration user's default privileges (see
+  "Database access").
 - **Permissions:** the runtime service account may create and read objects in
   the bucket, sign as itself (`roles/iam.serviceAccountTokenCreator` on
   itself), enqueue on the queue, and act as the invoker account; the invoker
@@ -431,8 +460,10 @@ connection pooling. Psycopg is installed only as SQLAlchemy's PostgreSQL DBAPI
 driver; application modules do not call it directly.
 
 Alembic owns the complete database schema. The service never creates or alters
-tables during application startup, and production deployment never requires a
-person to run database commands. Add a reviewed Alembic revision for every
+tables during application startup. Apart from setting the migration user's
+default privileges once per environment (see "Database access"), production
+deployment never requires a person to run database commands. Add a reviewed
+Alembic revision for every
 schema change. The deployment job recognizes an empty database, an
 Alembic-managed database, or the exact schema installed before Alembic was
 introduced; it refuses to modify any other schema. Production deployment
