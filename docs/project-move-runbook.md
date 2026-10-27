@@ -75,8 +75,8 @@ OLD_PROJECT_ID='<current project ID>'    # TELEMETRY_GCP_PROJECT_ID in both envi
 OLD_PROJECT_NUMBER=$(gcloud projects describe "$OLD_PROJECT_ID" --format='value(projectNumber)')
 OLD_DEPLOY_SERVICE_ACCOUNT='<current deployment account email>'   # the TELEMETRY_GCP_DEPLOY_SERVICE_ACCOUNT secret; found in step 3
 NEW_PROJECT_ID='<new project ID>'        # chosen in section 4; recorded by the operator
-NEW_PROJECT_NUMBER=$(gcloud projects describe "$NEW_PROJECT_ID" --format='value(projectNumber)')   # after section 4 creates it
-OPERATOR_ACCOUNT='<operator Google account email>'   # the account that runs these steps
+NEW_PROJECT_NUMBER=$(gcloud projects describe "$NEW_PROJECT_ID" --format='value(projectNumber)')   # empty until section 4 creates the project, which sets it again
+OPERATOR_ACCOUNT=$(gcloud config get-value account)   # the Google account gcloud runs these steps as
 ENVIRONMENT_NAME=staging                 # then production
 COLLECTOR_HOSTNAME='<staging hostname>'  # '<production hostname>' for production; recorded by the operator, and in the dashboard's MICROCOSM_TELEMETRY_COLLECTOR_URL after step 5.5
 
@@ -98,7 +98,7 @@ READ_SECRET_NAME=$(collector_variable TELEMETRY_READ_SECRET_NAME)
 DATABASE_NAME='<database name>'
 MIGRATION_DATABASE_USER='<migration user>'
 RUNTIME_DATABASE_USER='<runtime user>'
-ADMIN_DATABASE_USER='<admin user>'       # Cloud SQL's built-in admin user
+ADMIN_DATABASE_USER='<admin user>'       # the admin user Cloud SQL makes on every instance; `gcloud sql users list` lists it
 
 # Names are scoped to a project, so the new resources can reuse the old ones.
 NEW_INSTANCE=$OLD_INSTANCE
@@ -215,8 +215,9 @@ both from the current project, so neither value is typed:
 gcloud projects describe "$OLD_PROJECT_ID" --format='value(parent.type)'   # must print organization
 ORGANIZATION_ID=$(gcloud projects describe "$OLD_PROJECT_ID" --format='value(parent.id)')
 BILLING_ACCOUNT=$(gcloud billing projects describe "$OLD_PROJECT_ID" --format='value(billingAccountName)')
-gcloud projects create "$NEW_PROJECT_ID" --name '<display name>' --organization "$ORGANIZATION_ID"
+gcloud projects create "$NEW_PROJECT_ID" --name '<display name>' --organization "$ORGANIZATION_ID"   # the console's name for it, chosen by the operator
 gcloud billing projects link "$NEW_PROJECT_ID" --billing-account "${BILLING_ACCOUNT#billingAccounts/}"
+NEW_PROJECT_NUMBER=$(gcloud projects describe "$NEW_PROJECT_ID" --format='value(projectNumber)')   # step 4.2 needs it
 gcloud services enable run.googleapis.com sqladmin.googleapis.com \
   secretmanager.googleapis.com artifactregistry.googleapis.com iam.googleapis.com \
   iamcredentials.googleapis.com sts.googleapis.com storage.googleapis.com \
@@ -401,7 +402,8 @@ Google Cloud. Four in all, two per environment:
   them. A proxy would end TLS for requests that carry Hugging Face tokens,
   and would hide the `CNAME` from Google.
 - **Names:** if the provider's form adds the domain itself, enter only the
-  part of each name before `.<PolicyEngine domain>`. A trailing dot at the
+  part of each name before `.<PolicyEngine domain>`, the domain both
+  hostnames end with. A trailing dot at the
   end of a printed name marks it as complete; leave it out if the form
   doesn't accept it.
 - **Both records at once:** nothing uses the hostname until step 5.5, so the
@@ -873,17 +875,23 @@ redeployed production, possibly with migrations, so an earlier revision may
 not match the database schema.
 
 ```bash
-rollback_revision=$(gcloud run services describe "$SERVICE" --project "$OLD_PROJECT_ID" \
-  --region "$REGION" --format=json \
-  | jq -r '.status.traffic[] | select((.percent // 0) > 0) | .revisionName')
+old_service_json=$(gcloud run services describe "$SERVICE" --project "$OLD_PROJECT_ID" \
+  --region "$REGION" --format=json)
+rollback_revision=$(jq -r '.status.traffic[] | select((.percent // 0) > 0) | .revisionName' \
+  <<< "$old_service_json")
 echo "$rollback_revision"
+jq -r '.status.latestCreatedRevisionName' <<< "$old_service_json"
 ```
 
-It must print one revision name. Write it in the copy's notes too.
+Both must print the same one revision name. If they differ, the last
+deployment didn't finish (its maintenance or candidate revision is newer
+than the serving one): resolve that before going on. Write the revision in
+the copy's notes too.
 
 ### 8.2 Put the old service in maintenance mode
 
-`services update` makes a new revision from the serving one with only
+`services update` makes a new revision from the latest created revision's
+settings, which step 8.1 checked are the serving revision's, with only
 `TELEMETRY_MAINTENANCE_MODE` changed, so it keeps the same image, secrets and
 database:
 
@@ -1070,7 +1078,7 @@ same value. Step 7.3 has already granted the access this needs.
 
 | Setting | Where | New value | When |
 |---|---|---|---|
-| `MICROCOSM_TELEMETRY_READ_SECRET_VERSION` | Vercel, Preview | staging's new read secret version, `projects/<new project>/secrets/<staging read secret name>/versions/<version>`, naming the project as section 3's recorded value does | after staging's copy |
+| `MICROCOSM_TELEMETRY_READ_SECRET_VERSION` | Vercel, Preview | staging's new read secret version, `projects/<new project>/secrets/<staging read secret name>/versions/<version>`, naming the project as section 3's recorded value does (by ID or number), with the version step 7.3 added (`gcloud secrets versions list` shows it) | after staging's copy |
 | `MICROCOSM_TELEMETRY_READ_SECRET_VERSION` | Vercel, Production | the same, for production's read secret | after production's copy |
 | `TELEMETRY_GCP_PROJECT_ID` | calibration-diagnostics GitHub environment `Production` (variable) | `<new project ID>` | with Vercel Production |
 | `TELEMETRY_READ_SECRET_NAME` | calibration-diagnostics GitHub environment `Production` (variable) | unchanged, because the name was reused | — |
@@ -1200,7 +1208,7 @@ unless stated:
 | `TELEMETRY_GCP_REGION`, `TELEMETRY_ARTIFACT_REGISTRY_NAME`, `TELEMETRY_IMAGE_NAME`, `TELEMETRY_SERVICE`, `TELEMETRY_PRODUCTION_SERVICE`, `TELEMETRY_MIGRATION_JOB`, and the four `TELEMETRY_*_SECRET_NAME` variables | same (variables) | image path, Cloud Run names, `--set-secrets`, `check-secrets-exist` | unchanged, because the new resources reuse the names |
 | `TELEMETRY_GCP_WIF_PROVIDER` | same (secret) | `google-github-actions/auth`, `workload_identity_provider` | the new provider's resource, in step 8.6 |
 | `TELEMETRY_GCP_DEPLOY_SERVICE_ACCOUNT` | same (secret) | `google-github-actions/auth`, `service_account` | the new deployment account, in step 8.6 |
-| `TELEMETRY_PUBLIC_ORIGIN` (only once section 16's check exists) | same (variable) | the proposed deployment check | `https://<hostname>` after step 5.4; unset in step 8.6 and set again in step 8.8 |
+| `TELEMETRY_PUBLIC_ORIGIN` (only once section 16's check exists) | same (variable) | the proposed deployment check | `https://<that environment's hostname>` after step 5.4; unset in step 8.6 and set again in step 8.8 |
 | `COLLECTOR_DEPLOY_ENABLED` | this repo's variable | the deployment jobs' `if:` | unchanged (`true`) |
 | `roles/artifactregistry.reader` on the new project for the old deployment account and the current project's Cloud Run service agent | Google Cloud IAM (step 4.1) | Cloud Run, when `deploy-production` deploys staging's image into the current project | removed in section 13 |
 | `DATABASE_URL`, `TELEMETRY_JWT_SECRET`, `TELEMETRY_READ_TOKEN` | Google Secret Manager in the new project | the service, through `--set-secrets` | new database URL; copied signing secret and read token |

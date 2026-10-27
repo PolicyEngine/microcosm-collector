@@ -28,7 +28,7 @@ version of this memo).
 | 1. D2, the project | **B: a dedicated project,** holding both environments, each moved in one database copy. |
 | 2. The project's details | It uses the **same organization and billing account as the current project.** It has **one owner.** Its ID (`<new project ID>`) is chosen when it is created and recorded by the operator; after each environment's copy it is also the value of that environment's `TELEMETRY_GCP_PROJECT_ID` variable. |
 | 3. D3, the address | **C: a global external Application Load Balancer,** with a Google-managed certificate from Certificate Manager. |
-| 4. Hostnames | **One load balancer and one hostname per environment,** `<production hostname>` and `<staging hostname>`, both under a PolicyEngine-owned domain (`<PolicyEngine domain>`). |
+| 4. Hostnames | **One load balancer and one hostname per environment,** `<production hostname>` and `<staging hostname>`, both under a PolicyEngine-owned domain (`<PolicyEngine domain>`, the domain both hostnames end with). The operator records the hostnames; from C2 they are also the values of the dashboard's `MICROCOSM_TELEMETRY_COLLECTOR_URL` settings, and from C3 the production hostname is in the emitter's `PRODUCTION_COLLECTOR_URL`. |
 | 5. DNS | The domain's DNS is **managed outside Google Cloud and edited by hand by Anthony.** Each environment needs two records: an `A` record for its load balancer's static IP, and the `CNAME` for its Certificate Manager DNS authorization. The runbook lists them (step 5.3). |
 | 6. Order | **Hostname first.** Each environment's load balancer is built in the new project from the start. Until that environment moves, it sends requests across projects to today's service, through a backend service and a serverless network endpoint group left in the current project. Clients switch to the hostname; each environment's move is then one change to its load balancer's URL map. |
 | 7. The old address | **Maintenance mode after production's copy.** The old production service is deleted once no build uses emitter 0.2.1 and it has had no requests for seven days. |
@@ -280,9 +280,11 @@ The plan's constraints:
   project after the move.
 - The migration user's default privileges give the runtime user access to
   every table a migration creates; the migrations grant nothing (#12). Both
-  environments have them today. The copy recreates the database users, so the
-  runbook sets them again on each new instance before any migration runs
-  there.
+  environments have them today. The copy recreates only two database users,
+  the migration user and the runtime user (production's unused third user was
+  dropped, and Cloud SQL makes its admin user on every new instance), so the
+  runbook sets the default privileges again on each new instance before any
+  migration runs there.
 
 In order:
 
