@@ -293,7 +293,8 @@ and then runs the deployment described below, if it is enabled.
 
 This service was developed in `telemetry-service/` inside
 PolicyEngine/calibration-diagnostics, and its history was extracted here.
-calibration-diagnostics deploys production until this repo takes over (see
+This repo has deployed staging and production since release 0.3.2 on
+2026-10-21; calibration-diagnostics no longer deploys the service (see
 "Enabling deployment" below). The Docker build context is the root of this repo.
 Cloud Run assigns the production service address. Microcosm fixes that origin
 in its delivery service; the address is intentionally not repeated in
@@ -364,9 +365,11 @@ instead of reaching authentication.
 ### Enabling deployment
 
 Both deployment jobs run only when the repo variable `COLLECTOR_DEPLOY_ENABLED`
-is `true`. It is unset, so releases from `main` are tagged but not deployed.
+is `true`. It has been `true` since 2026-10-20, so every release from `main`
+deploys to staging and, if that succeeds, to production. With any other value,
+or unset, releases from `main` are tagged but not deployed.
 
-The deployment's access and configuration are already provisioned:
+The deployment's access and configuration are provisioned:
 
 - The `microcosm-collector` Workload Identity provider and the deployment
   service account's binding for this repo exist, as described above.
@@ -376,19 +379,25 @@ The deployment's access and configuration are already provisioned:
   that `.github/workflows/push.yaml` reads, copied by name and value from the
   calibration-diagnostics `staging` and `Production` environments.
 
-What remains is the cutover from calibration-diagnostics, in this order:
+The move from calibration-diagnostics is complete:
 
-1. Carry over every `telemetry-service/` change merged in calibration-diagnostics
-   (see below).
-2. Stop calibration-diagnostics from deploying this service through its
-   `telemetry-service.yml` workflow.
-3. Set `COLLECTOR_DEPLOY_ENABLED` to `true`. The next release from `main` then
-   deploys to staging and, if that succeeds, to production.
+- Its `telemetry-service/` changes up to commit `3dfbe05`
+  (PolicyEngine/calibration-diagnostics#219) were carried over, as
+  `tools/extraction-source.env` records (see below).
+- PolicyEngine/calibration-diagnostics#233 stopped its `telemetry-service.yml`
+  workflow from deploying on push. That workflow keeps a manual redeploy of
+  calibration-diagnostics' `main`, for moving deployment back there; whoever
+  dispatches it must first unset `COLLECTOR_DEPLOY_ENABLED` here, and confirms
+  that in the dispatch form.
+- `COLLECTOR_DEPLOY_ENABLED` was set to `true` on 2026-10-20. Release 0.3.2,
+  on 2026-10-21, was the first that this repo deployed to staging and
+  production.
 
 ### Carrying over changes from calibration-diagnostics
 
-Until cutover, changes to `telemetry-service/` can still merge in
-calibration-diagnostics. `tools/extraction-source.env` records the
+While calibration-diagnostics keeps `telemetry-service/`, changes to it can
+still merge there, but they deploy nothing until they are carried over here.
+`tools/extraction-source.env` records the
 calibration-diagnostics commit that this history was extracted from, and the
 commit it was rewritten to here. To carry later changes over, from the root of
 a clean, up-to-date checkout of `main`:

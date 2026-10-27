@@ -13,9 +13,10 @@ permissions:
 # run, and the app may bypass the main ruleset. On that release commit, the
 # remaining jobs verify, tag, then deploy, each only after the one before.
 #
-# Deployment stays off until this repo takes over from calibration-diagnostics:
-# both deployment jobs run only when the repo variable COLLECTOR_DEPLOY_ENABLED
-# is 'true'. They then deploy one image to staging and, only after staging
+# Both deployment jobs run only when the repo variable COLLECTOR_DEPLOY_ENABLED
+# is 'true'. It has been 'true' since 2026-10-20, when this repo took over
+# deployment from calibration-diagnostics; unset, releases are tagged but not
+# deployed. The jobs deploy one image to staging and, only after staging
 # succeeds, the same image to production. The staging and production
 # environments accept only main, and Google Cloud's Workload Identity provider
 # accepts this repo's tokens only for refs/heads/main. Both jobs also check for
