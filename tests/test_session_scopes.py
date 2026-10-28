@@ -62,14 +62,27 @@ def collector_client(*, intake: IntakeSettings | None) -> TestClient:
     )
 
 
-def token_scope(access_token: str) -> str:
-    claims = jwt.decode(
+# The claims of every session token. A token issued with lifetime_seconds adds
+# "delegated".
+SESSION_TOKEN_CLAIMS = {
+    "iss",
+    "aud",
+    "sub",
+    "username",
+    "organizations",
+    "scope",
+    "iat",
+    "exp",
+}
+
+
+def token_claims(access_token: str) -> dict:
+    return jwt.decode(
         access_token,
         JWT_SECRET,
         algorithms=["HS256"],
         audience="microcosm-telemetry-collector",
     )
-    return claims["scope"]
 
 
 def exchange(client: TestClient, **request: object):
@@ -80,20 +93,73 @@ def exchange(client: TestClient, **request: object):
     )
 
 
-def test_exchange_without_a_body_still_issues_a_telemetry_token() -> None:
-    response = exchange(collector_client(intake=None))
+@pytest.mark.parametrize(
+    ("intake", "request_body", "scope", "granted_seconds", "delegated"),
+    [
+        pytest.param(None, None, "telemetry:write", 3600, False, id="no body"),
+        pytest.param(
+            intake_settings(), {}, "telemetry:write", 3600, False, id="empty object"
+        ),
+        pytest.param(
+            intake_settings(),
+            {"scope": "artifacts:submit"},
+            "artifacts:submit",
+            3600,
+            False,
+            id="artifact submission",
+        ),
+        pytest.param(
+            None,
+            {"lifetime_seconds": 600},
+            "telemetry:write",
+            600,
+            True,
+            id="lifetime below the default",
+        ),
+        pytest.param(
+            None,
+            {"scope": "telemetry:write", "lifetime_seconds": 64_800},
+            "telemetry:write",
+            64_800,
+            True,
+            id="lifetime of 18 hours",
+        ),
+        pytest.param(
+            None,
+            {"lifetime_seconds": 86_401},
+            "telemetry:write",
+            86_400,
+            True,
+            id="lifetime above the 24-hour cap",
+        ),
+    ],
+)
+def test_exchange_issues_a_token_of_the_scope_and_lifetime_granted(
+    intake: IntakeSettings | None,
+    request_body: dict | None,
+    scope: str,
+    granted_seconds: int,
+    delegated: bool,
+) -> None:
+    response = exchange(collector_client(intake=intake), json=request_body)
 
     assert response.status_code == 200
-    assert token_scope(response.json()["access_token"]) == "telemetry:write"
-    assert response.json()["scope"] == "telemetry:write"
-
-
-def test_exchange_with_an_empty_object_still_issues_a_telemetry_token() -> None:
-    response = exchange(collector_client(intake=intake_settings()), json={})
-
-    assert response.status_code == 200
-    assert token_scope(response.json()["access_token"]) == "telemetry:write"
-    assert response.json()["scope"] == "telemetry:write"
+    access_token = response.json()["access_token"]
+    assert response.json() == {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "expires_in": granted_seconds,
+        "scope": scope,
+    }
+    claims = token_claims(access_token)
+    assert claims["scope"] == scope
+    assert claims["exp"] - claims["iat"] == granted_seconds
+    added_claims = {
+        name: value
+        for name, value in claims.items()
+        if name not in SESSION_TOKEN_CLAIMS
+    }
+    assert added_claims == ({"delegated": True} if delegated else {})
 
 
 def test_exchange_for_artifact_submission_is_not_found_while_intake_is_off() -> None:
@@ -108,31 +174,49 @@ def test_exchange_for_artifact_submission_is_not_found_while_intake_is_off() -> 
     }
 
 
-def test_exchange_for_artifact_submission_issues_a_submit_token() -> None:
-    response = exchange(
-        collector_client(intake=intake_settings()),
-        json={"scope": "artifacts:submit"},
-    )
-
-    assert response.status_code == 200
-    assert token_scope(response.json()["access_token"]) == "artifacts:submit"
-    assert set(response.json()) == {
-        "access_token",
-        "token_type",
-        "expires_in",
-        "scope",
-    }
-    assert response.json()["scope"] == "artifacts:submit"
-
-
 @pytest.mark.parametrize(
-    "request_body",
-    [{"scope": "telemetry:read"}, {"scope": "artifacts:submit", "extra": 1}],
+    ("request_body", "refusal"),
+    [
+        pytest.param(
+            {"scope": "telemetry:read"},
+            "Input should be 'telemetry:write' or 'artifacts:submit'",
+            id="unknown scope",
+        ),
+        pytest.param(
+            {"scope": "artifacts:submit", "extra": 1},
+            "Extra inputs are not permitted",
+            id="unknown field",
+        ),
+        pytest.param(
+            {"lifetime_seconds": 0},
+            "Input should be greater than 0",
+            id="lifetime of zero",
+        ),
+        pytest.param(
+            {"lifetime_seconds": -3600},
+            "Input should be greater than 0",
+            id="negative lifetime",
+        ),
+        pytest.param(
+            {"lifetime_seconds": "3600"},
+            "Input should be a valid integer",
+            id="lifetime as a string",
+        ),
+        pytest.param(
+            {"scope": "artifacts:submit", "lifetime_seconds": 3600},
+            "Value error, lifetime_seconds is accepted only with scope "
+            "telemetry:write.",
+            id="lifetime for artifact submission",
+        ),
+    ],
 )
-def test_exchange_refuses_unknown_scopes_and_fields(request_body: dict) -> None:
+def test_exchange_refuses_an_invalid_request_body(
+    request_body: dict, refusal: str
+) -> None:
     response = exchange(collector_client(intake=intake_settings()), json=request_body)
 
     assert response.status_code == 422
+    assert [error["msg"] for error in response.json()["detail"]] == [refusal]
 
 
 def test_a_submit_token_cannot_register_telemetry_runs() -> None:

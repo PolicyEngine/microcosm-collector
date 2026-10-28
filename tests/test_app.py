@@ -54,10 +54,11 @@ def registration() -> dict[str, object]:
     }
 
 
-def exchange(client: TestClient) -> str:
+def exchange(client: TestClient, request_body: dict | None = None) -> str:
     response = client.post(
         "/v1/auth/huggingface/exchange",
         headers={"Authorization": "Bearer hf_example"},
+        json=request_body,
     )
     assert response.status_code == 200
     return response.json()["access_token"]
@@ -73,7 +74,14 @@ def register(client: TestClient, session_token: str) -> None:
     assert response.json() == {"registered": True}
 
 
-def test_exchange_ingest_and_read_run() -> None:
+# A token issued with lifetime_seconds, for a build on another machine, works
+# wherever a telemetry:write token does.
+@pytest.mark.parametrize(
+    "exchange_body",
+    [None, {"lifetime_seconds": 64_800}],
+    ids=["default lifetime", "requested lifetime"],
+)
+def test_exchange_ingest_and_read_run(exchange_body: dict | None) -> None:
     store = FakeTelemetryStore()
     authenticator = StubHuggingFaceAuthenticator()
     client = TestClient(
@@ -83,7 +91,7 @@ def test_exchange_ingest_and_read_run() -> None:
             huggingface_authenticator=authenticator,
         )
     )
-    session_token = exchange(client)
+    session_token = exchange(client, exchange_body)
     register(client, session_token)
     timestamp = datetime.now(UTC).isoformat()
     event = {
