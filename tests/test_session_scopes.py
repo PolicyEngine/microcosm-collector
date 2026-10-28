@@ -62,8 +62,8 @@ def collector_client(*, intake: IntakeSettings | None) -> TestClient:
     )
 
 
-# The claims of every session token. A token issued with lifetime_seconds adds
-# "delegated".
+# The claims of a session token exchanged without lifetime_seconds. A token
+# issued with lifetime_seconds has exactly these and "delegated".
 SESSION_TOKEN_CLAIMS = {
     "iss",
     "aud",
@@ -132,6 +132,22 @@ def exchange(client: TestClient, **request: object):
             True,
             id="lifetime above the 24-hour cap",
         ),
+        pytest.param(
+            None,
+            {"lifetime_seconds": None},
+            "telemetry:write",
+            3600,
+            False,
+            id="null lifetime",
+        ),
+        pytest.param(
+            intake_settings(),
+            {"scope": "artifacts:submit", "lifetime_seconds": None},
+            "artifacts:submit",
+            3600,
+            False,
+            id="null lifetime for artifact submission",
+        ),
     ],
 )
 def test_exchange_issues_a_token_of_the_scope_and_lifetime_granted(
@@ -154,12 +170,10 @@ def test_exchange_issues_a_token_of_the_scope_and_lifetime_granted(
     claims = token_claims(access_token)
     assert claims["scope"] == scope
     assert claims["exp"] - claims["iat"] == granted_seconds
-    added_claims = {
-        name: value
-        for name, value in claims.items()
-        if name not in SESSION_TOKEN_CLAIMS
-    }
-    assert added_claims == ({"delegated": True} if delegated else {})
+    expected_added_claims = {"delegated": True} if delegated else {}
+    assert set(claims) == SESSION_TOKEN_CLAIMS | set(expected_added_claims)
+    added_claim_values = {name: claims[name] for name in expected_added_claims}
+    assert added_claim_values == expected_added_claims
 
 
 def test_exchange_for_artifact_submission_is_not_found_while_intake_is_off() -> None:
@@ -174,6 +188,14 @@ def test_exchange_for_artifact_submission_is_not_found_while_intake_is_off() -> 
     }
 
 
+# The body is checked before intake, so each refusal is the same with intake off.
+@pytest.mark.parametrize(
+    "intake",
+    [
+        pytest.param(intake_settings(), id="intake on"),
+        pytest.param(None, id="intake off"),
+    ],
+)
 @pytest.mark.parametrize(
     ("request_body", "refusal"),
     [
@@ -203,6 +225,16 @@ def test_exchange_for_artifact_submission_is_not_found_while_intake_is_off() -> 
             id="lifetime as a string",
         ),
         pytest.param(
+            {"lifetime_seconds": True},
+            "Input should be a valid integer",
+            id="lifetime of true",
+        ),
+        pytest.param(
+            {"lifetime_seconds": False},
+            "Input should be a valid integer",
+            id="lifetime of false",
+        ),
+        pytest.param(
             {"scope": "artifacts:submit", "lifetime_seconds": 3600},
             "Value error, lifetime_seconds is accepted only with scope "
             "telemetry:write.",
@@ -211,9 +243,9 @@ def test_exchange_for_artifact_submission_is_not_found_while_intake_is_off() -> 
     ],
 )
 def test_exchange_refuses_an_invalid_request_body(
-    request_body: dict, refusal: str
+    request_body: dict, refusal: str, intake: IntakeSettings | None
 ) -> None:
-    response = exchange(collector_client(intake=intake_settings()), json=request_body)
+    response = exchange(collector_client(intake=intake), json=request_body)
 
     assert response.status_code == 422
     assert [error["msg"] for error in response.json()["detail"]] == [refusal]
