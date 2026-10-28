@@ -122,6 +122,20 @@ class EventBatch(BaseModel):
 SessionScope = Literal["telemetry:write", "artifacts:submit"]
 
 
+def require_telemetry_scope_for_lifetime(
+    scope: SessionScope, lifetime_seconds: int | None
+) -> None:
+    """Refuse a requested token lifetime with any scope but telemetry:write.
+
+    The exchange's request model and the function that issues tokens both call
+    this, so the rule holds for every caller.
+    """
+    if lifetime_seconds is not None and scope != "telemetry:write":
+        raise ValueError(
+            "lifetime_seconds is accepted only with scope telemetry:write."
+        )
+
+
 class TokenExchangeRequest(BaseModel):
     """Optional body of the token exchange; omitting it asks for telemetry."""
 
@@ -135,10 +149,7 @@ class TokenExchangeRequest(BaseModel):
 
     @model_validator(mode="after")
     def _lifetime_only_for_telemetry(self) -> TokenExchangeRequest:
-        if self.lifetime_seconds is not None and self.scope != "telemetry:write":
-            raise ValueError(
-                "lifetime_seconds is accepted only with scope telemetry:write."
-            )
+        require_telemetry_scope_for_lifetime(self.scope, self.lifetime_seconds)
         return self
 
 

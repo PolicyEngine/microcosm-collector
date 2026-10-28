@@ -41,6 +41,7 @@ from telemetry_collector.models import (
     RunRegistration,
     SessionScope,
     TokenExchangeRequest,
+    require_telemetry_scope_for_lifetime,
 )
 from telemetry_collector.storage import (
     PostgresTelemetryStore,
@@ -254,6 +255,9 @@ def _issue_session_token(
     scope: SessionScope = "telemetry:write",
     lifetime_seconds: int | None = None,
 ) -> CollectorToken:
+    # The request model checks this at the exchange; checking it here as well
+    # covers every other caller.
+    require_telemetry_scope_for_lifetime(scope, lifetime_seconds)
     # A requested lifetime means the token is for a build on another machine,
     # which cannot exchange again. Such a token carries "delegated", so a log
     # of its claims can tell it apart and an endpoint can refuse it.
