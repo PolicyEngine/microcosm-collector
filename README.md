@@ -10,7 +10,9 @@ switched on (see "Artifact intake").
 Microcosm sends its ambient Hugging Face token only to
 `POST /v1/auth/huggingface/exchange`. The collector validates that opaque token
 against Hugging Face's `whoami-v2` endpoint and confirms current membership in
-the `policyengine` organization. It then returns a short-lived collector JWT.
+the `policyengine` organization. It then returns a collector JWT that expires
+after one hour by default, or after at most 24 hours when issued for a build on
+another machine (see "Tokens for builds on other machines").
 That credential registers runs and uploads events; the collector verifies that
 the authenticated Hugging Face user owns the referenced run and that each
 producer was registered first. The raw Hugging Face token is neither logged nor
@@ -26,10 +28,13 @@ Hugging Face token at launch with a body such as
 `{"scope": "telemetry:write", "lifetime_seconds": 64800}`, and passes the
 returned JWT to the build.
 
-- `lifetime_seconds` must be a positive JSON integer, and is accepted only with
-  scope `telemetry:write`, the default. Otherwise the exchange answers 422; with
-  `artifacts:submit` the message is "lifetime_seconds is accepted only with
-  scope telemetry:write."
+- `lifetime_seconds` must be a positive JSON integer; `null` is the same as
+  leaving the field out. A lifetime is accepted only with scope
+  `telemetry:write`, the default. Otherwise the exchange answers 422. With
+  `artifacts:submit`, whether intake is on or off, the refusal's
+  `detail[0].msg` is exactly
+  `Value error, lifetime_seconds is accepted only with scope telemetry:write.`
+  (pydantic adds the prefix "Value error, ").
 - The collector grants the requested lifetime, at most 86,400 seconds (24
   hours). The maximum is a constant in the code, not a deployment setting.
   `expires_in` reports the lifetime granted, so a client that needs longer can
@@ -365,7 +370,7 @@ database credential with schema-modification access; the collector runtime
 credential has only the data access required by the application. The dashboard receives its collector
 address and Secret Manager resource references through non-secret configuration.
 Public ingress lets developer machines reach the service;
-ingestion still requires a short-lived collector credential issued after
+ingestion still requires an expiring collector credential issued after
 Hugging Face authentication.
 
 ### Google Cloud access

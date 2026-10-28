@@ -96,7 +96,7 @@ class CollectorSettings:
 
 @dataclass(frozen=True)
 class SessionTokenClaims:
-    """PolicyEngine identity carried by a short-lived collector token."""
+    """PolicyEngine identity carried by an expiring collector token."""
 
     subject: str
     username: str

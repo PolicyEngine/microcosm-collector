@@ -48,9 +48,10 @@ so the byte-level SHA-256 check belongs to the worker.
 
 The request body is absent, `{}`, `{"scope": "telemetry:write"}` or
 `{"scope": "artifacts:submit"}`. A `telemetry:write` request may also carry
-`lifetime_seconds`, for a build on another machine (see the README's "Tokens
-for builds on other machines"). Any other field or scope, and
-`lifetime_seconds` with `artifacts:submit`, is refused with 422.
+`lifetime_seconds`, a positive integer, for a build on another machine (see the
+README's "Tokens for builds on other machines"); `"lifetime_seconds": null` is
+the same as leaving the field out. Any other field or scope, and a lifetime
+with `artifacts:submit`, is refused with 422.
 A successful exchange answers 200 with:
 
 ```json

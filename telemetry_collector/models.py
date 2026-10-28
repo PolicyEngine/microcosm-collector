@@ -55,7 +55,7 @@ class PageCursor(RootModel[tuple[datetime, str]]):
 
 
 class RunRegistration(BaseModel):
-    """Run identity bound to a short-lived collector credential."""
+    """Run identity bound to an expiring collector credential."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -144,7 +144,8 @@ class TokenExchangeRequest(BaseModel):
     scope: SessionScope = "telemetry:write"
     # Asks for a token that a build on another machine, with no Hugging Face
     # credential of its own, uses for its whole run. The collector grants at
-    # most 24 hours and marks the token "delegated".
+    # most 24 hours and marks the token "delegated". An explicit null is the
+    # same as leaving the field out.
     lifetime_seconds: int | None = Field(default=None, gt=0, strict=True)
 
     @model_validator(mode="after")
@@ -154,7 +155,7 @@ class TokenExchangeRequest(BaseModel):
 
 
 class CollectorToken(BaseModel):
-    """Short-lived token returned after Hugging Face verification.
+    """Expiring token returned after Hugging Face verification.
 
     ``scope`` repeats the token's scope, so a client can tell that a collector
     without intake answered an ``artifacts:submit`` request with a
