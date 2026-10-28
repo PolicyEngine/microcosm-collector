@@ -178,10 +178,10 @@ def test_exchange_issues_a_token_of_the_scope_and_lifetime_granted(
     claims = token_claims(access_token)
     assert claims["scope"] == scope
     assert claims["exp"] - claims["iat"] == granted_seconds
-    expected_added_claims = {"delegated": True} if delegated else {}
-    assert set(claims) == SESSION_TOKEN_CLAIMS | set(expected_added_claims)
-    added_claim_values = {name: claims[name] for name in expected_added_claims}
-    assert added_claim_values == expected_added_claims
+    expected_claims = SESSION_TOKEN_CLAIMS | ({"delegated"} if delegated else set())
+    assert set(claims) == expected_claims
+    if delegated:
+        assert claims["delegated"] is True
 
 
 def test_exchange_for_artifact_submission_is_not_found_while_intake_is_off() -> None:
@@ -196,62 +196,80 @@ def test_exchange_for_artifact_submission_is_not_found_while_intake_is_off() -> 
     }
 
 
-# The body is checked before intake, so each refusal is the same with intake off.
-@pytest.mark.parametrize(
-    "intake",
-    [
-        pytest.param(intake_settings(), id="intake on"),
-        pytest.param(None, id="intake off"),
-    ],
+LIFETIME_FOR_SUBMISSION_REFUSAL = (
+    "Value error, lifetime_seconds is accepted only with scope telemetry:write."
 )
+
+
+# The body is checked before intake, so a refused artifact submission body is
+# refused the same way with intake off rather than reported as not found.
 @pytest.mark.parametrize(
-    ("request_body", "refusal"),
+    ("intake", "request_body", "refusal"),
     [
         pytest.param(
+            intake_settings(),
             {"scope": "telemetry:read"},
             "Input should be 'telemetry:write' or 'artifacts:submit'",
             id="unknown scope",
         ),
         pytest.param(
-            {"scope": "artifacts:submit", "extra": 1},
-            "Extra inputs are not permitted",
-            id="unknown field",
-        ),
-        pytest.param(
+            intake_settings(),
             {"lifetime_seconds": 0},
             "Input should be greater than 0",
             id="lifetime of zero",
         ),
         pytest.param(
+            intake_settings(),
             {"lifetime_seconds": -3600},
             "Input should be greater than 0",
             id="negative lifetime",
         ),
         pytest.param(
+            intake_settings(),
             {"lifetime_seconds": "3600"},
             "Input should be a valid integer",
             id="lifetime as a string",
         ),
         pytest.param(
+            intake_settings(),
             {"lifetime_seconds": True},
             "Input should be a valid integer",
             id="lifetime of true",
         ),
         pytest.param(
+            intake_settings(),
             {"lifetime_seconds": False},
             "Input should be a valid integer",
             id="lifetime of false",
         ),
         pytest.param(
+            intake_settings(),
+            {"scope": "artifacts:submit", "extra": 1},
+            "Extra inputs are not permitted",
+            id="unknown field, intake on",
+        ),
+        pytest.param(
+            None,
+            {"scope": "artifacts:submit", "extra": 1},
+            "Extra inputs are not permitted",
+            id="unknown field, intake off",
+        ),
+        pytest.param(
+            intake_settings(),
             {"scope": "artifacts:submit", "lifetime_seconds": 3600},
-            "Value error, lifetime_seconds is accepted only with scope "
-            "telemetry:write.",
-            id="lifetime for artifact submission",
+            LIFETIME_FOR_SUBMISSION_REFUSAL,
+            id="lifetime for artifact submission, intake on",
+        ),
+        pytest.param(
+            None,
+            {"scope": "artifacts:submit", "lifetime_seconds": 3600},
+            LIFETIME_FOR_SUBMISSION_REFUSAL,
+            id="lifetime for artifact submission, intake off",
         ),
     ],
 )
 def test_exchange_refuses_an_invalid_request_body(
-    request_body: dict, refusal: str, intake: IntakeSettings | None
+    intake: IntakeSettings | None, request_body: dict, refusal: str
 ) -> None:
     response = exchange(collector_client(intake=intake), json=request_body)
 
