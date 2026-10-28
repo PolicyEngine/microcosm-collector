@@ -4,7 +4,11 @@ import jwt
 import pytest
 from fastapi.testclient import TestClient
 
-from telemetry_collector.app import CollectorSettings, create_app
+from telemetry_collector.app import (
+    CollectorSettings,
+    _issue_session_token,
+    create_app,
+)
 from telemetry_collector.auth import HuggingFacePrincipal
 from telemetry_collector.intake import IntakeServices, IntakeSettings
 from tests.fakes import (
@@ -36,13 +40,17 @@ def intake_settings() -> IntakeSettings:
     )
 
 
-def collector_client(*, intake: IntakeSettings | None) -> TestClient:
-    settings = CollectorSettings(
+def collector_settings(*, intake: IntakeSettings | None) -> CollectorSettings:
+    return CollectorSettings(
         jwt_secret=JWT_SECRET,
         read_token="dashboard-read-token",
         collector_issuer="test-collector",
         intake=intake,
     )
+
+
+def collector_client(*, intake: IntakeSettings | None) -> TestClient:
+    settings = collector_settings(intake=intake)
     intake_services = (
         None
         if intake is None
@@ -249,6 +257,24 @@ def test_exchange_refuses_an_invalid_request_body(
 
     assert response.status_code == 422
     assert [error["msg"] for error in response.json()["detail"]] == [refusal]
+
+
+def test_issuing_a_token_refuses_a_lifetime_for_artifact_submission() -> None:
+    # The request model refuses this combination at the exchange. The issuing
+    # function refuses it too, so no other caller can issue an artifacts:submit
+    # token that lasts up to 24 hours.
+    principal = MemberAuthenticator().authenticate("hf_example", "policyengine")
+
+    with pytest.raises(
+        ValueError,
+        match=r"^lifetime_seconds is accepted only with scope telemetry:write\.$",
+    ):
+        _issue_session_token(
+            collector_settings(intake=intake_settings()),
+            principal,
+            "artifacts:submit",
+            lifetime_seconds=3600,
+        )
 
 
 def test_a_submit_token_cannot_register_telemetry_runs() -> None:
