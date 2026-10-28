@@ -16,6 +16,37 @@ the authenticated Hugging Face user owns the referenced run and that each
 producer was registered first. The raw Hugging Face token is neither logged nor
 written to Postgres.
 
+### Tokens for builds on other machines
+
+A collector JWT lasts `TELEMETRY_SESSION_TOKEN_TTL_SECONDS` (3600 seconds unless
+set) and can only be replaced by exchanging a Hugging Face token again. A build
+on a machine without a Hugging Face credential, such as a Microcosm stage on
+Modal, cannot do that. Instead, the operator's workstation exchanges its own
+Hugging Face token at launch with a body such as
+`{"scope": "telemetry:write", "lifetime_seconds": 64800}`, and passes the
+returned JWT to the build.
+
+- `lifetime_seconds` must be a positive JSON integer, and is accepted only with
+  scope `telemetry:write`, the default. Otherwise the exchange answers 422; with
+  `artifacts:submit` the message is "lifetime_seconds is accepted only with
+  scope telemetry:write."
+- The collector grants the requested lifetime, at most 86,400 seconds (24
+  hours). The maximum is a constant in the code, not a deployment setting.
+  `expires_in` reports the lifetime granted, so a client that needs longer can
+  refuse to start the build. A request below the default lifetime is granted as
+  requested.
+- The token carries the claim `"delegated": true`, which tokens exchanged
+  without `lifetime_seconds` never carry. It marks a token issued for use on
+  another machine. Every endpoint that accepts `telemetry:write` accepts it; a
+  future endpoint that must not accept such tokens refuses tokens with this
+  claim.
+- Until it expires, whoever holds the token can register runs and upload events
+  as the operator, and nothing else. Changing the signing secret is the only way
+  to revoke it early.
+
+Without `lifetime_seconds`, the exchange is unchanged: the same lifetime, claims
+and response.
+
 The dashboard query endpoints require `X-Telemetry-Read-Token`. The dashboard
 server retrieves this credential from Google Secret Manager at runtime. Vercel
 authenticates using its OIDC identity; the credential is never returned to the

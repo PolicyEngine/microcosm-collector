@@ -128,6 +128,18 @@ class TokenExchangeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     scope: SessionScope = "telemetry:write"
+    # Asks for a token that a build on another machine, with no Hugging Face
+    # credential of its own, uses for its whole run. The collector grants at
+    # most 24 hours and marks the token "delegated".
+    lifetime_seconds: int | None = Field(default=None, gt=0, strict=True)
+
+    @model_validator(mode="after")
+    def _lifetime_only_for_telemetry(self) -> TokenExchangeRequest:
+        if self.lifetime_seconds is not None and self.scope != "telemetry:write":
+            raise ValueError(
+                "lifetime_seconds is accepted only with scope telemetry:write."
+            )
+        return self
 
 
 class CollectorToken(BaseModel):
