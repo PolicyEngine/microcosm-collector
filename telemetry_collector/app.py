@@ -41,6 +41,7 @@ from telemetry_collector.models import (
     RunRegistration,
     SessionScope,
     TokenExchangeRequest,
+    require_telemetry_scope_for_lifetime,
 )
 from telemetry_collector.storage import (
     PostgresTelemetryStore,
@@ -95,7 +96,7 @@ class CollectorSettings:
 
 @dataclass(frozen=True)
 class SessionTokenClaims:
-    """PolicyEngine identity carried by a short-lived collector token."""
+    """PolicyEngine identity carried by an expiring collector token."""
 
     subject: str
     username: str
@@ -243,13 +244,31 @@ SCOPE_REFUSALS: dict[str, str] = {
 }
 
 
+# The longest lifetime granted to a token issued with lifetime_seconds. It is a
+# code constant, so no deployment setting can lengthen these tokens.
+MAXIMUM_DELEGATED_LIFETIME_SECONDS = 24 * 60 * 60
+
+
 def _issue_session_token(
     settings: CollectorSettings,
     principal: HuggingFacePrincipal,
     scope: SessionScope = "telemetry:write",
+    lifetime_seconds: int | None = None,
 ) -> CollectorToken:
+    # The request model checks this at the exchange; checking it here as well
+    # covers every other caller.
+    require_telemetry_scope_for_lifetime(scope, lifetime_seconds)
+    # A requested lifetime means the token is for a build on another machine,
+    # which cannot exchange again. Such a token carries "delegated", so a log
+    # of its claims can tell it apart and an endpoint can refuse it.
+    granted_seconds = (
+        settings.session_token_ttl_seconds
+        if lifetime_seconds is None
+        else min(lifetime_seconds, MAXIMUM_DELEGATED_LIFETIME_SECONDS)
+    )
+    delegation = {} if lifetime_seconds is None else {"delegated": True}
     now = datetime.now(UTC)
-    expires = now + timedelta(seconds=settings.session_token_ttl_seconds)
+    expires = now + timedelta(seconds=granted_seconds)
     encoded = jwt.encode(
         {
             "iss": settings.collector_issuer,
@@ -260,13 +279,14 @@ def _issue_session_token(
             "scope": scope,
             "iat": now,
             "exp": expires,
+            **delegation,
         },
         settings.jwt_secret,
         algorithm="HS256",
     )
     return CollectorToken(
         access_token=encoded,
-        expires_in=settings.session_token_ttl_seconds,
+        expires_in=granted_seconds,
         scope=scope,
     )
 
@@ -408,7 +428,8 @@ def create_app(
         authorization: Annotated[str | None, Header()] = None,
     ) -> CollectorToken:
         opaque_token = _bearer_token(authorization)
-        scope = (exchange_request or TokenExchangeRequest()).scope
+        token_request = exchange_request or TokenExchangeRequest()
+        scope = token_request.scope
         if scope == "artifacts:submit" and settings.intake is None:
             raise intake_not_enabled()
         try:
@@ -425,7 +446,9 @@ def create_app(
                 status_code=403,
                 detail="The Hugging Face user is not a PolicyEngine organization member.",
             )
-        return _issue_session_token(settings, principal, scope)
+        return _issue_session_token(
+            settings, principal, scope, token_request.lifetime_seconds
+        )
 
     @application.post("/v1/runs", status_code=status.HTTP_201_CREATED)
     def register_run(

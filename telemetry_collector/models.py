@@ -55,7 +55,7 @@ class PageCursor(RootModel[tuple[datetime, str]]):
 
 
 class RunRegistration(BaseModel):
-    """Run identity bound to a short-lived collector credential."""
+    """Run identity bound to an expiring collector credential."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -122,16 +122,40 @@ class EventBatch(BaseModel):
 SessionScope = Literal["telemetry:write", "artifacts:submit"]
 
 
+def require_telemetry_scope_for_lifetime(
+    scope: SessionScope, lifetime_seconds: int | None
+) -> None:
+    """Refuse a requested token lifetime with any scope but telemetry:write.
+
+    The exchange's request model and the function that issues tokens both call
+    this, so the rule holds for every caller.
+    """
+    if lifetime_seconds is not None and scope != "telemetry:write":
+        raise ValueError(
+            "lifetime_seconds is accepted only with scope telemetry:write."
+        )
+
+
 class TokenExchangeRequest(BaseModel):
     """Optional body of the token exchange; omitting it asks for telemetry."""
 
     model_config = ConfigDict(extra="forbid")
 
     scope: SessionScope = "telemetry:write"
+    # Asks for a token that a build on another machine, with no Hugging Face
+    # credential of its own, uses for its whole run. The collector grants at
+    # most 24 hours and marks the token "delegated". An explicit null is the
+    # same as leaving the field out.
+    lifetime_seconds: int | None = Field(default=None, gt=0, strict=True)
+
+    @model_validator(mode="after")
+    def _lifetime_only_for_telemetry(self) -> TokenExchangeRequest:
+        require_telemetry_scope_for_lifetime(self.scope, self.lifetime_seconds)
+        return self
 
 
 class CollectorToken(BaseModel):
-    """Short-lived token returned after Hugging Face verification.
+    """Expiring token returned after Hugging Face verification.
 
     ``scope`` repeats the token's scope, so a client can tell that a collector
     without intake answered an ``artifacts:submit`` request with a
