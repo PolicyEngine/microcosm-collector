@@ -2,6 +2,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOY_SCRIPT = ROOT / "scripts" / "deploy.sh"
 
@@ -241,6 +243,79 @@ def test_database_backup_uses_instance_from_connection_name(tmp_path: Path) -> N
         "<--instance> <telemetry-production> "
         "<--description> <telemetry-release-123-2> <--quiet>\n"
     )
+
+
+def service_deploy_environment(
+    stub_directory: Path, command_log: Path, deployment_environment: str
+) -> dict[str, str]:
+    return {
+        "PATH": f"{stub_directory}:{os.environ['PATH']}",
+        "COMMAND_LOG": str(command_log),
+        "SERVICE": "telemetry-service",
+        "PROJECT_ID": "project",
+        "REGION": "region",
+        "IMAGE_URI": "registry/image:sha",
+        "RUNTIME_SERVICE_ACCOUNT": "runtime@example.invalid",
+        "CLOUD_SQL_CONNECTION": "project:region:database",
+        "DATABASE_SECRET_NAME": "database-url",
+        "JWT_SECRET_NAME": "jwt-secret",
+        "READ_SECRET_NAME": "read-token",
+        "DEPLOYMENT_ENVIRONMENT": deployment_environment,
+    }
+
+
+@pytest.mark.parametrize("deploy_command", ["deploy-maintenance", "deploy-candidate"])
+@pytest.mark.parametrize(
+    ("deployment_environment", "expected_minimum"),
+    [("staging", "0"), ("production", "1")],
+)
+def test_service_minimum_instances_depend_on_environment(
+    tmp_path: Path,
+    deploy_command: str,
+    deployment_environment: str,
+    expected_minimum: str,
+) -> None:
+    command_log = tmp_path / "commands.log"
+    install_command_stub(
+        tmp_path,
+        "gcloud",
+        "printf 'gcloud' >> \"$COMMAND_LOG\"\n"
+        'printf \' <%s>\' "$@" >> "$COMMAND_LOG"\n'
+        "printf '\\n' >> \"$COMMAND_LOG\"",
+    )
+
+    result = run_deploy(
+        deploy_command,
+        environment=service_deploy_environment(
+            tmp_path, command_log, deployment_environment
+        ),
+    )
+
+    assert result.returncode == 0, result.stderr
+    command = command_log.read_text()
+    assert command.startswith("gcloud <run> <deploy> <telemetry-service> ")
+    assert f"<--min> <{expected_minimum}> <--max> <4>" in command
+
+
+@pytest.mark.parametrize("deploy_command", ["deploy-maintenance", "deploy-candidate"])
+def test_service_deploy_refuses_unknown_environment(
+    tmp_path: Path, deploy_command: str
+) -> None:
+    command_log = tmp_path / "commands.log"
+    install_command_stub(
+        tmp_path,
+        "gcloud",
+        "printf 'gcloud' >> \"$COMMAND_LOG\"",
+    )
+
+    result = run_deploy(
+        deploy_command,
+        environment=service_deploy_environment(tmp_path, command_log, "preview"),
+    )
+
+    assert result.returncode == 1
+    assert "Unsupported deployment environment: preview" in result.stderr
+    assert not command_log.exists()
 
 
 def test_unknown_command_fails_with_usage() -> None:

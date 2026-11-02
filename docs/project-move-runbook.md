@@ -1061,8 +1061,9 @@ It stays in maintenance mode (choice 7), so it answers 503 at its default
 address. After production's copy, builds still on that address, on emitter
 0.2.1 or on stale machines, keep their events locally and send them through
 a later emitter on the same machine; events on discarded machines, such as
-Modal containers, are lost. The old service keeps one instance running
-(`--min 1`) until section 13 deletes it.
+Modal containers, are lost. The old production service keeps one instance
+running (`--min 1`) until section 13 deletes it; the old staging service
+runs no instance while idle (`--min 0`).
 
 **From the move on, never run calibration-diagnostics'
 `telemetry-service.yml`,** for rollback or anything else. Its settings name
