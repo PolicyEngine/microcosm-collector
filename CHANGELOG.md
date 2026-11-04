@@ -1,3 +1,10 @@
+## [0.7.1] - 2026-11-04
+
+### Changed
+
+- Staging's Cloud Run service now scales to zero between releases: `scripts/deploy.sh` deploys it with `--min 0`, chosen from `DEPLOYMENT_ENVIRONMENT`. Production still keeps one instance running (`--min 1`), and a service deployment for any other environment name fails before calling `gcloud`.
+
+
 ## [0.7.0] - 2026-10-29
 
 ### Added
