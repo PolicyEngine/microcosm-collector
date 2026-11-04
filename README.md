@@ -1,19 +1,56 @@
 # Microcosm telemetry collector
 
 This service accepts live build telemetry from Microcosm and exposes a
-read-only API to the calibration dashboard. It does not store dataset artifacts
-or Hugging Face credentials.
+read-only API to the calibration dashboard. It never stores Hugging Face
+credentials, and it stores build artifacts only when artifact intake is
+switched on (see "Artifact intake").
 
 ## Authentication
 
 Microcosm sends its ambient Hugging Face token only to
 `POST /v1/auth/huggingface/exchange`. The collector validates that opaque token
 against Hugging Face's `whoami-v2` endpoint and confirms current membership in
-the `policyengine` organization. It then returns a short-lived collector JWT.
+the `policyengine` organization. It then returns a collector JWT that expires
+after one hour by default, or after at most 24 hours when issued for a build on
+another machine (see "Tokens for builds on other machines").
 That credential registers runs and uploads events; the collector verifies that
 the authenticated Hugging Face user owns the referenced run and that each
 producer was registered first. The raw Hugging Face token is neither logged nor
 written to Postgres.
+
+### Tokens for builds on other machines
+
+A collector JWT lasts `TELEMETRY_SESSION_TOKEN_TTL_SECONDS` (3600 seconds unless
+set) and can only be replaced by exchanging a Hugging Face token again. A build
+on a machine without a Hugging Face credential, such as a Microcosm stage on
+Modal, cannot do that. Instead, the operator's workstation exchanges its own
+Hugging Face token at launch with a body such as
+`{"scope": "telemetry:write", "lifetime_seconds": 64800}`, and passes the
+returned JWT to the build.
+
+- `lifetime_seconds` must be a positive JSON integer; `null` is the same as
+  leaving the field out. A lifetime is accepted only with scope
+  `telemetry:write`, the default. Otherwise the exchange answers 422. With
+  `artifacts:submit`, whether intake is on or off, the refusal's
+  `detail[0].msg` is exactly
+  `Value error, lifetime_seconds is accepted only with scope telemetry:write.`
+  (pydantic adds the prefix "Value error, ").
+- The collector grants the requested lifetime, at most 86,400 seconds (24
+  hours). The maximum is a constant in the code, not a deployment setting.
+  `expires_in` reports the lifetime granted, so a client that needs longer can
+  refuse to start the build. A request below the default lifetime is granted as
+  requested.
+- The token carries the claim `"delegated": true`, which tokens exchanged
+  without `lifetime_seconds` never carry. It marks a token issued for use on
+  another machine. Every endpoint that accepts `telemetry:write` accepts it; a
+  future endpoint that must not accept such tokens refuses tokens with this
+  claim.
+- Until it expires, whoever holds the token can register runs and upload events
+  as the operator, and nothing else. Changing the signing secret is the only way
+  to revoke it early.
+
+Without `lifetime_seconds`, the exchange is unchanged: the same lifetime, claims
+and response.
 
 The dashboard query endpoints require `X-Telemetry-Read-Token`. The dashboard
 server retrieves this credential from Google Secret Manager at runtime. Vercel
@@ -43,6 +80,165 @@ sending the same request again cannot succeed:
 - `422`: the request does not match the event schema, including a `blocked`
   event without a valid block (a safe-identifier `phase`, a
   `blocking_failure_count` of at least 1, and `blocking_gate_ids`).
+
+## Artifact intake
+
+Builds hand calibration diagnostics and Orrery inputs to the collector as
+submissions. [`docs/artifact-submissions.md`](docs/artifact-submissions.md) is
+the contract: kinds, file roles, provenance, identifiers, statuses, answers,
+receipts and limits. File bytes go straight to a private bucket through signed
+upload URLs; `POST /v1/submissions/{id}/complete` checks the stored objects'
+sizes and recorded digests and dispatches a worker job through Cloud Tasks; the
+worker, a Cloud Run Job running
+`uv run --no-sync python -m telemetry_collector.worker`, recomputes every
+file's SHA-256 and runs the handler registered for the kind. Until the
+calibration-tree and Orrery workers register theirs, both kinds are only
+checked and kept.
+
+Intake is off unless `COLLECTOR_INTAKE_ENABLED` is exactly `1`. While it is
+off, the collector reads no other intake setting, and the token exchange for
+`{"scope": "artifacts:submit"}` and every `/v1/submissions` path answer 404 with
+the code `intake_not_enabled`. `scripts/deploy.sh` sets none of these
+variables, so a deployment leaves intake off. It still changes three things:
+the migration job applies `0002_artifact_intake`, which adds the two intake
+tables; token responses gain `scope`; and the token exchange, which used to
+ignore its request body, now answers 422 for unknown fields and 404
+`intake_not_enabled` for `{"scope": "artifacts:submit"}`.
+
+Once `0002_artifact_intake` is applied, an image without it cannot run against
+the database. That includes every earlier collector release and the old copy in
+calibration-diagnostics' `telemetry-service/`. Its migration job fails with
+"Can't locate revision identified by '0002_artifact_intake'", and its `/ready`
+check fails. To roll back to such an image, first run
+`alembic downgrade 0001_initial_schema`, which drops both intake tables and
+every submission and job in them. Run it with this release's code, for
+example as its migration job with overridden arguments, and as the migration
+database user, before deploying the older image: the older code can't find
+the revision either, and the runtime user doesn't own the tables. That is an
+exception to the rule below that downgrades are for disposable test databases;
+while intake is off, both tables stay empty.
+
+| Setting | Read by | Value |
+|---|---|---|
+| `COLLECTOR_INTAKE_ENABLED` | service | `1` switches intake on |
+| `COLLECTOR_INTAKE_BUCKET` | service, worker | the private intake bucket's name |
+| `COLLECTOR_INTAKE_SIGNING_SERVICE_ACCOUNT` | service | the runtime service account, which signs upload URLs through IAM `signBlob` |
+| `COLLECTOR_WORKER_QUEUE` | service, operations | `projects/<project>/locations/<region>/queues/<queue>` |
+| `COLLECTOR_WORKER_JOB` | service, operations | `projects/<project>/locations/<region>/jobs/<job>` |
+| `COLLECTOR_WORKER_INVOKER_SERVICE_ACCOUNT` | service, operations | the account whose OAuth token each Cloud Task uses to run the worker job |
+| `COLLECTOR_WORKER_JOB_ID` | worker | set on each execution by its Cloud Task |
+| `DATABASE_URL` | worker, operations | the runtime database secret, as for the service |
+
+The two service-account settings accept only user-managed accounts,
+`<name>@<project>.iam.gserviceaccount.com`. The collector refuses to start
+with the default Compute Engine account
+(`<number>-compute@developer.gserviceaccount.com`), so the runtime and invoker
+accounts must be user-managed ones.
+
+### Database access
+
+The migration job's database user owns the tables it creates; the service,
+the worker and the operator commands connect as the runtime database user.
+The migrations grant nothing. The runtime user's access to the telemetry
+tables was granted by hand when each database was set up, outside this
+repo. Its access to every table created since then comes from the
+migration user's default privileges, set once by hand in each environment:
+
+```sql
+ALTER DEFAULT PRIVILEGES FOR ROLE <migration_role> IN SCHEMA public
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO <runtime_role>;
+```
+
+`<migration_role>` is the user in the migration database secret, the secret
+named by `TELEMETRY_MIGRATION_DATABASE_SECRET_NAME`, and `<runtime_role>` is
+the user in the runtime database secret, named by
+`TELEMETRY_DATABASE_SECRET_NAME`. Default privileges apply only to tables that
+role creates in `public` after they are set.
+
+- **Where it is set:** staging and production both have these default
+  privileges already (checked read-only through each environment's
+  migration job on 2026-10-27). Before merging a change that adds tables,
+  check with `\ddp` that the entry is still there; there is nothing to run.
+- **When to run it again:** when the database users are recreated, as the
+  project move in PolicyEngine/microcosm-collector#21 does. An entry belongs
+  to the role itself, not its name, so a recreated migration user has one
+  only if the import or the statement creates it: check `\ddp` in the new
+  database before a migration job runs there, and run the statement if the
+  entry is missing.
+- **Who can run it:** the migration user itself, or a role that is a member
+  of it with the `INHERIT` option. PostgreSQL 16 refuses the statement for a
+  member with only `ADMIN` or `SET`. A role that Cloud SQL's `postgres`
+  created in SQL is held by `postgres` with only `ADMIN`, so either connect as
+  the migration user, or have `postgres` first grant itself the role
+  `WITH INHERIT TRUE`.
+- **How to check it:** `\ddp` lists an entry owned by `<migration_role>` for
+  schema `public` and type `table`, with `<runtime_role>=arwd/<migration_role>`.
+  After a migration that creates tables,
+  `SELECT has_table_privilege('<runtime_role>', '<table>', '<privilege>')`
+  is true for each of them and each of the four privileges.
+
+The intake code needs `SELECT`, `INSERT` and `UPDATE`; row locks
+(`SELECT ... FOR UPDATE`) need `UPDATE`. No table uses a sequence. A `serial`
+column would need `USAGE` on its sequence, which these default privileges
+don't give, so a migration that adds one needs
+`GRANT USAGE, SELECT ON SEQUENCES` added to the default privileges first; an
+identity column needs no sequence privilege to insert rows.
+
+### Worker jobs and recovery
+
+- **The worker Cloud Run Job** runs one task, with two task retries
+  (`--max-retries 2`, so three attempts, matching `MAX_JOB_ATTEMPTS`) and a
+  one-hour task timeout (`--task-timeout 1h`, matching
+  `WORKER_TASK_TIMEOUT_SECONDS`). Each claim leases the job for 65 minutes
+  (`JOB_LEASE_SECONDS`), so a lease expires only after its attempt has ended.
+  A task retry is a new attempt under the same lease holder
+  (`CLOUD_RUN_EXECUTION`).
+- **Recovery** (`uv run --no-sync python -m telemetry_collector.operations
+  recover`) runs every 10 minutes, as an execution of a second Cloud Run Job
+  on the same image that Cloud Scheduler starts. It fails a job whose lease
+  expired after its third attempt (`attempts_exhausted`) or that would need a
+  fourth dispatch (`worker_unavailable`), and dispatches again a job whose
+  attempt ended early or that stayed queued for 30 minutes without being
+  claimed. Each dispatch is a Cloud Task named `<job_id>-<dispatch number>`.
+  Without recovery, a job whose last attempt was killed stays `processing`.
+- **Reprocessing** (`uv run --no-sync python -m telemetry_collector.operations
+  reprocess SUBMISSION_ID...`, or `reprocess --kind <kind> --intake-only`, with
+  `--dry-run` to list first) processes final submissions again in a new
+  processing round, for example after a handler is registered. An operator
+  runs it as an execution of the recovery job with its arguments overridden,
+  or locally through the Cloud SQL Auth Proxy with Application Default
+  Credentials that may enqueue on the queue and act as the invoker account.
+
+None of these values is secret. Switching intake on for an environment needs,
+in that environment's project and region:
+
+- **A bucket** with uniform bucket-level access, public access prevention
+  enforced, and no lifecycle deletion, so intake files stay available for
+  back-building.
+- **A Cloud Tasks queue** for worker jobs.
+- **The worker Cloud Run Job** described above, running the released image
+  with the worker command, with the runtime database secret as `DATABASE_URL`,
+  the Cloud SQL connection and `COLLECTOR_INTAKE_BUCKET`.
+- **The recovery Cloud Run Job** on the same image with the recovery command,
+  the runtime database secret as `DATABASE_URL`, the Cloud SQL connection and
+  the three `COLLECTOR_WORKER_*` queue settings, and a Cloud Scheduler job that
+  runs it every 10 minutes.
+- **Database access:** after the migration, the runtime database user has
+  `SELECT`, `INSERT`, `UPDATE` and `DELETE` on `artifact_submissions` and
+  `artifact_jobs`, through the migration user's default privileges, which
+  both environments already have (see "Database access").
+- **Permissions:** the runtime service account may create and read objects in
+  the bucket, sign as itself (`roles/iam.serviceAccountTokenCreator` on
+  itself), enqueue on the queue, and act as the invoker account; the invoker
+  account may run the worker job with overrides; the worker's service account
+  may read the bucket, connect to Cloud SQL and read the runtime database
+  secret; the recovery job's service account may connect to Cloud SQL, read the
+  runtime database secret, enqueue on the queue and act as the invoker
+  account; Cloud Scheduler's account may run the recovery job.
+- **Deployment wiring:** `scripts/deploy.sh` passing the settings to the
+  service and updating both jobs' images on every release, from new `staging`
+  and `production` environment variables. That change is the one that
+  switches intake on.
 
 ## Local development
 
@@ -181,7 +377,8 @@ and then runs the deployment described below, if it is enabled.
 
 This service was developed in `telemetry-service/` inside
 PolicyEngine/calibration-diagnostics, and its history was extracted here.
-calibration-diagnostics deploys production until this repo takes over (see
+This repo has deployed staging and production since release 0.3.2 on
+2026-10-21; calibration-diagnostics no longer deploys the service (see
 "Enabling deployment" below). The Docker build context is the root of this repo.
 Cloud Run assigns the production service address. Microcosm fixes that origin
 in its delivery service; the address is intentionally not repeated in
@@ -221,7 +418,7 @@ database credential with schema-modification access; the collector runtime
 credential has only the data access required by the application. The dashboard receives its collector
 address and Secret Manager resource references through non-secret configuration.
 Public ingress lets developer machines reach the service;
-ingestion still requires a short-lived collector credential issued after
+ingestion still requires an expiring collector credential issued after
 Hugging Face authentication.
 
 ### Google Cloud access
@@ -252,9 +449,11 @@ instead of reaching authentication.
 ### Enabling deployment
 
 Both deployment jobs run only when the repo variable `COLLECTOR_DEPLOY_ENABLED`
-is `true`. It is unset, so releases from `main` are tagged but not deployed.
+is `true`. It has been `true` since 2026-10-20, so every release from `main`
+deploys to staging and, if that succeeds, to production. With any other value,
+or unset, releases from `main` are tagged but not deployed.
 
-The deployment's access and configuration are already provisioned:
+The deployment's access and configuration are provisioned:
 
 - The `microcosm-collector` Workload Identity provider and the deployment
   service account's binding for this repo exist, as described above.
@@ -264,19 +463,25 @@ The deployment's access and configuration are already provisioned:
   that `.github/workflows/push.yaml` reads, copied by name and value from the
   calibration-diagnostics `staging` and `Production` environments.
 
-What remains is the cutover from calibration-diagnostics, in this order:
+The move from calibration-diagnostics is complete:
 
-1. Carry over every `telemetry-service/` change merged in calibration-diagnostics
-   (see below).
-2. Stop calibration-diagnostics from deploying this service through its
-   `telemetry-service.yml` workflow.
-3. Set `COLLECTOR_DEPLOY_ENABLED` to `true`. The next release from `main` then
-   deploys to staging and, if that succeeds, to production.
+- Its `telemetry-service/` changes up to commit `3dfbe05`
+  (PolicyEngine/calibration-diagnostics#219) were carried over, as
+  `tools/extraction-source.env` records (see below).
+- PolicyEngine/calibration-diagnostics#233 stopped its `telemetry-service.yml`
+  workflow from deploying on push. That workflow keeps a manual redeploy of
+  calibration-diagnostics' `main`, for moving deployment back there; whoever
+  dispatches it must first unset `COLLECTOR_DEPLOY_ENABLED` here, and confirms
+  that in the dispatch form.
+- `COLLECTOR_DEPLOY_ENABLED` was set to `true` on 2026-10-20. Release 0.3.2,
+  on 2026-10-21, was the first that this repo deployed to staging and
+  production.
 
 ### Carrying over changes from calibration-diagnostics
 
-Until cutover, changes to `telemetry-service/` can still merge in
-calibration-diagnostics. `tools/extraction-source.env` records the
+While calibration-diagnostics keeps `telemetry-service/`, changes to it can
+still merge there, but they deploy nothing until they are carried over here.
+`tools/extraction-source.env` records the
 calibration-diagnostics commit that this history was extracted from, and the
 commit it was rewritten to here. To carry later changes over, from the root of
 a clean, up-to-date checkout of `main`:
@@ -357,8 +562,10 @@ connection pooling. Psycopg is installed only as SQLAlchemy's PostgreSQL DBAPI
 driver; application modules do not call it directly.
 
 Alembic owns the complete database schema. The service never creates or alters
-tables during application startup, and production deployment never requires a
-person to run database commands. Add a reviewed Alembic revision for every
+tables during application startup. Apart from setting the migration user's
+default privileges once per environment (see "Database access"), production
+deployment never requires a person to run database commands. Add a reviewed
+Alembic revision for every
 schema change. The deployment job recognizes an empty database, an
 Alembic-managed database, or the exact schema installed before Alembic was
 introduced; it refuses to modify any other schema. Production deployment

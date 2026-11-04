@@ -9,6 +9,8 @@ from sqlalchemy.pool import QueuePool
 from telemetry_collector.database import (
     DB_MAX_OVERFLOW,
     DB_POOL_SIZE,
+    ArtifactJob,
+    ArtifactSubmission,
     Base,
     TelemetryEvent,
     TelemetryProducer,
@@ -18,12 +20,16 @@ from telemetry_collector.database import (
 )
 
 
-def test_orm_metadata_defines_runs_producers_and_events() -> None:
+def test_orm_metadata_defines_telemetry_and_artifact_intake_tables() -> None:
     assert set(Base.metadata.tables) == {
         "telemetry_runs",
         "telemetry_producers",
         "telemetry_events",
+        "artifact_submissions",
+        "artifact_jobs",
     }
+    assert set(inspect(ArtifactSubmission).relationships.keys()) == {"jobs"}
+    assert set(inspect(ArtifactJob).relationships.keys()) == {"submission"}
     assert set(inspect(TelemetryRun).relationships.keys()) == {"producers"}
     assert set(inspect(TelemetryProducer).relationships.keys()) == {"run", "events"}
     assert set(inspect(TelemetryEvent).relationships.keys()) == {"producer"}
@@ -81,3 +87,39 @@ def test_application_modules_do_not_import_psycopg_directly() -> None:
         module == "psycopg" or module.startswith("psycopg.")
         for module in imported_modules
     )
+
+
+def _artifact_intake_migration():
+    import importlib.util
+
+    migration_path = (
+        Path(__file__).resolve().parents[1]
+        / "migrations"
+        / "versions"
+        / "0002_artifact_intake.py"
+    )
+    specification = importlib.util.spec_from_file_location(
+        "artifact_intake_migration", migration_path
+    )
+    assert specification is not None and specification.loader is not None
+    migration = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(migration)
+    return migration
+
+
+def _status_constraint(table) -> str:
+    [constraint] = [
+        constraint
+        for constraint in table.constraints
+        if constraint.__class__.__name__ == "CheckConstraint"
+    ]
+    return str(constraint.sqltext)
+
+
+def test_the_migration_keeps_the_models_status_sets() -> None:
+    migration = _artifact_intake_migration()
+
+    assert migration.SUBMISSION_STATUSES == _status_constraint(
+        ArtifactSubmission.__table__
+    )
+    assert migration.JOB_STATUSES == _status_constraint(ArtifactJob.__table__)

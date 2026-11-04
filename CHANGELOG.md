@@ -1,3 +1,59 @@
+## [0.7.1] - 2026-11-04
+
+### Changed
+
+- Staging's Cloud Run service now scales to zero between releases: `scripts/deploy.sh` deploys it with `--min 0`, chosen from `DEPLOYMENT_ENVIRONMENT`. Production still keeps one instance running (`--min 1`), and a service deployment for any other environment name fails before calling `gcloud`.
+
+
+## [0.7.0] - 2026-10-29
+
+### Added
+
+- Issue telemetry tokens for builds on other machines. The token exchange accepts an optional `lifetime_seconds`, a positive integer, only with scope `telemetry:write` (with `artifacts:submit` it answers 422); `null` is the same as leaving it out. It grants the requested lifetime up to 86,400 seconds, a constant in the code rather than a deployment setting, reports the granted lifetime in `expires_in`, and marks the token with the claim `"delegated": true`. Every endpoint that accepts `telemetry:write` accepts such a token. An operator's workstation can then exchange its Hugging Face token at launch for a token that a build without a Hugging Face credential, such as a Microcosm stage on Modal, uses for up to 24 hours. Exchanges without `lifetime_seconds` are unchanged.
+
+
+## [0.6.1] - 2026-10-27
+
+### Fixed
+
+- Remove "emSign ECC Root CA - G3" and "AAA Certificate Services", the roots that the compromised eMudhra intermediate CA certificates chain to, from the image's own certificate stores. The image now builds from `ghcr.io/astral-sh/uv:python3.13-trixie-slim`, a floating tag that Astral rebuilds with each uv release, as PolicyEngine's other images use floating tags. Its current build has Debian's `ca-certificates` 20250419+deb13u1, which drops both roots, and pip 26.2.2, whose vendored certifi 2026.10.19 lacks the first; the previous base, `python3.13-bookworm-slim`, has not been rebuilt since February and held both. This also moves the image from Debian 12 to Debian 13, Python 3.13.11 to 3.13.18 and uv 0.9.30 to 0.13.6. The collector's Hugging Face check already verifies against the locked certifi and is unchanged.
+
+
+## [0.6.0] - 2026-10-27
+
+### Added
+
+- Record the decisions on the collector's Google Cloud project and hostname (plan decisions D2 and D3: a dedicated project, behind a load balancer with one hostname per environment) in `docs/project-and-domain-decision.md`, and the steps for the hostname and then the move, including the Postgres dump and restore and rollback, in `docs/project-move-runbook.md`.
+
+
+## [0.5.0] - 2026-10-27
+
+### Added
+
+- Accept artifact submissions, switched off unless `COLLECTOR_INTAKE_ENABLED` is `1`: `POST /v1/submissions` returns signed upload instructions for a private bucket, `POST /v1/submissions/{id}/complete` checks the stored objects and dispatches a worker job through Cloud Tasks, and status and receipt endpoints report the result. The token exchange issues `artifacts:submit` credentials on request and states each token's scope; while intake is off, the exchange and every submission path answer 404 with the code `intake_not_enabled`. A worker framework, run as a Cloud Run Job, re-hashes each file, calls the handler registered for its kind, and gives handlers the disclosure rule (only Orrery outputs of licensed builds stay private). `python -m telemetry_collector.operations` recovers jobs whose attempt ended without a result and reprocesses final submissions in a new round. Alembic revision `0002_artifact_intake` adds the submission and job tables and grants nothing: the runtime database user's access to them comes from the migration user's default privileges, which each environment sets once by hand before this release is deployed (see the README's "Database access").
+
+
+## [0.4.1] - 2026-10-27
+
+### Changed
+
+- Test the trusted roots of the connection `HuggingFaceAuthenticator` opens to `huggingface.co`, compared by SHA-256 certificate fingerprint, instead of the roots in httpx's default SSL context compared by subject name. The test now also fails if the authenticator builds its own client whose SSL context trusts "emSign ECC Root CA - G3" or "AAA Certificate Services". Its comments now name certifi 2026.10.19 as the first fixed version in advisory GHSA-6q48-6c7w-9gw2, instead of calling it the first release without "emSign ECC Root CA - G3" (2026.10.18 already lacked it). The service's code and locked dependencies are unchanged.
+
+
+## [0.4.0] - 2026-10-27
+
+### Added
+
+- Document the artifact submission contract (`docs/artifact-submissions.md`): the `calibration-diagnostics` and `orrery-inputs` kinds, their file roles and how the emitter's roles map to them, provenance syntax, collector-derived identifiers, statuses, every collector and storage answer and what a client does with it, how a client recognises a collector without intake, job recovery and reprocessing, receipts, size limits, and the disclosure rules: intake storage is private, Orrery outputs of licensed builds stay private until cleared, calibration data may be public, and native evidence is never published.
+
+
+## [0.3.3] - 2026-10-22
+
+### Fixed
+
+- - Lock certifi 2026.10.19, which removes the "emSign ECC Root CA - G3" root. The previously locked certifi 2026.7.22 trusted eMudhra intermediate CA certificates whose private keys can be recovered from their public certificates (https://emudhra.we-have-a-problem.com), so the deployed image could accept a forged certificate for `huggingface.co` when it verifies a Hugging Face token. A test now fails if the locked certifi is older than 2026.10.19, or if the trust store httpx uses by default contains "emSign ECC Root CA - G3" or "AAA Certificate Services".
+
+
 ## [0.3.2] - 2026-10-21
 
 ### Fixed
