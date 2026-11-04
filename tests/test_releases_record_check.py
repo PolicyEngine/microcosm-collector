@@ -52,19 +52,39 @@ def folder(build: str) -> str:
     return f"releases/{NATIONAL}/{build}"
 
 
+#: The files Microcosm's publisher writes into a build folder beside the
+#: release manifest without listing them in its ``artifacts`` map.
+BUILD_MANIFEST_FILE = "build_manifest.json"
+CHECKSUMS_FILE = "sha256sums.txt"
+
+
 def build_files(build: str, *, dataset_bytes: bytes) -> dict[str, bytes]:
     contents = {DATASET_FILE: dataset_bytes, DIAGNOSTICS_FILE: b'{"targets": []}'}
-    roles = {DATASET_FILE: "dataset", DIAGNOSTICS_FILE: "calibration_diagnostics"}
-    manifest = {
-        "release": NATIONAL,
-        "build": build,
-        "files": [
-            {"name": name, "role": roles[name], "sha256": digest(content)}
-            for name, content in contents.items()
-        ],
+    artifacts = {
+        "microcosm_uk_2024_25": {
+            "kind": "microdata",
+            "role": "dataset",
+            "path": DATASET_FILE,
+            "repo_id": UK_RELEASES,
+            "sha256": digest(dataset_bytes),
+        },
+        "calibration_diagnostics": {
+            "kind": "diagnostics",
+            "role": "calibration_diagnostics",
+            "path": DIAGNOSTICS_FILE,
+            "repo_id": UK_RELEASES,
+            "sha256": digest(contents[DIAGNOSTICS_FILE]),
+        },
     }
+    manifest = {"release": NATIONAL, "build": build, "artifacts": artifacts}
     files = {f"{folder(build)}/{name}": content for name, content in contents.items()}
     files[f"{folder(build)}/release_manifest.json"] = json.dumps(manifest).encode()
+    files[f"{folder(build)}/{BUILD_MANIFEST_FILE}"] = json.dumps(
+        {"release": NATIONAL, "build": build}
+    ).encode()
+    files[f"{folder(build)}/{CHECKSUMS_FILE}"] = "".join(
+        f"{digest(content)}  {name}\n" for name, content in contents.items()
+    ).encode()
     return files
 
 
@@ -271,6 +291,23 @@ def test_a_file_in_a_build_folder_its_manifest_does_not_list_is_reported(
     (finding,) = findings_for(hub)
     assert finding.code == "FILE_NOT_IN_MANIFEST"
     assert "added_later.json" in finding.message
+
+
+def test_a_build_folders_build_manifest_and_checksum_list_need_no_artifacts_entry(
+    hub: FakeHuggingFace,
+) -> None:
+    for name in (BUILD_MANIFEST_FILE, CHECKSUMS_FILE):
+        assert f"{folder(FIRST_BUILD)}/{name}" in uk_files(hub)
+
+    assert findings_for(hub) == []
+
+
+def test_a_build_folder_without_a_checksum_list_has_no_findings(
+    hub: FakeHuggingFace,
+) -> None:
+    del uk_files(hub)[f"{folder(SECOND_BUILD)}/{CHECKSUMS_FILE}"]
+
+    assert findings_for(hub) == []
 
 
 def test_a_manifest_without_a_usable_file_list_is_reported(

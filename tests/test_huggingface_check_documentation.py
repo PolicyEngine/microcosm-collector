@@ -58,6 +58,19 @@ def test_the_readme_says_what_switching_on_the_releases_json_check_needs() -> No
     assert "tests/test_releases_record_check.py" in section
 
 
+def test_the_readme_says_which_manifest_fields_the_file_check_reads() -> None:
+    # Decided 2026-10-29: a build's release manifest keeps its `artifacts` map,
+    # each entry giving the file's bare `path` in the build folder and its
+    # `sha256`; the check no longer assumes a `files` list.
+    section = " ".join(readme_section().split())
+
+    assert "`artifacts` map" in section
+    assert "`path`" in section
+    assert "`build_manifest.json`" in section
+    assert "`sha256sums.txt`" in section
+    assert "`files` list" not in section
+
+
 def test_the_readme_gives_the_schedule_the_absence_alert_relies_on() -> None:
     section = readme_section()
 

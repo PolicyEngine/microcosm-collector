@@ -353,22 +353,36 @@ def digest(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
-def test_a_manifest_lists_each_file_with_its_sha256() -> None:
+def artifact(path: str, sha256: str, **fields: str) -> dict[str, str]:
+    """One entry of a release manifest's ``artifacts`` map."""
+
+    return {
+        "kind": "microdata",
+        "role": "dataset",
+        "path": path,
+        "repo_id": "policyengine/populace-uk-private",
+        "sha256": sha256,
+        **fields,
+    }
+
+
+def test_a_manifest_lists_each_file_in_its_artifacts_map_with_its_sha256() -> None:
+    # The keys name the artifacts; each entry's path is the file's bare name in
+    # the build folder (decided 2026-10-29: today's map, without revisions).
     manifest = {
         "release": "microcosm-uk-2024-25-national",
         "build": "build-1",
-        "files": [
-            {
-                "name": "microcosm_uk_2024_25.h5",
-                "role": "dataset",
-                "sha256": digest(b"rows"),
-            },
-            {
-                "name": "calibration_diagnostics.json",
-                "role": "calibration_diagnostics",
-                "sha256": digest(b"{}"),
-            },
-        ],
+        "artifacts": {
+            "microcosm_uk_2024_25": artifact(
+                "microcosm_uk_2024_25.h5", digest(b"rows")
+            ),
+            "calibration_diagnostics": artifact(
+                "calibration_diagnostics.json",
+                digest(b"{}"),
+                kind="diagnostics",
+                role="calibration_diagnostics",
+            ),
+        },
     }
 
     assert manifest_file_digests(manifest) == {
@@ -382,31 +396,45 @@ def test_a_manifest_lists_each_file_with_its_sha256() -> None:
     [
         [],
         {"release": "r", "build": "b"},
-        {"files": {"name": "a.h5"}},
-        {"files": ["a.h5"]},
-        {"files": [{"name": "a.h5"}]},
-        {"files": [{"name": "a.h5", "sha256": "ABC"}]},
-        {"files": [{"name": "nested/a.h5", "sha256": "0" * 64}]},
-        {"files": [{"name": "", "sha256": "0" * 64}]},
+        {"files": [{"name": "a.h5", "sha256": "0" * 64}]},
+        {"artifacts": [artifact("a.h5", "0" * 64)]},
+        {"artifacts": {}},
+        {"artifacts": {"a": "a.h5"}},
+        {"artifacts": {"a": {"path": "a.h5"}}},
+        {"artifacts": {"a": artifact("a.h5", "ABC")}},
+        {"artifacts": {"a": {"sha256": "0" * 64}}},
+        {"artifacts": {"a": artifact("nested/a.h5", "0" * 64)}},
+        {"artifacts": {"a": artifact("releases/r/b/a.h5", "0" * 64)}},
+        {"artifacts": {"a": artifact("a\\b.h5", "0" * 64)}},
+        {"artifacts": {"a": artifact("", "0" * 64)}},
+        {"artifacts": {"a": artifact("..", "0" * 64)}},
         {
-            "files": [
-                {"name": "a.h5", "sha256": "0" * 64},
-                {"name": "a.h5", "sha256": "1" * 64},
-            ]
+            "artifacts": {
+                "a": artifact("a.h5", "0" * 64),
+                "b": artifact("a.h5", "1" * 64),
+            }
         },
     ],
     ids=[
         "not an object",
-        "no file list",
-        "file list not a list",
+        "no artifacts map",
+        "only the files list assumed before the decision",
+        "artifacts not a map",
+        "artifacts map empty",
         "entry not an object",
         "no sha256",
         "sha256 not lowercase hexadecimal",
-        "name in a subfolder",
-        "empty name",
-        "name listed twice",
+        "no path",
+        "path in a subfolder",
+        "path including the build folder",
+        "path with a backslash",
+        "empty path",
+        "path leaving the folder",
+        "path listed twice",
     ],
 )
-def test_a_manifest_without_a_usable_file_list_is_refused(manifest: object) -> None:
+def test_a_manifest_without_a_usable_artifacts_map_is_refused(
+    manifest: object,
+) -> None:
     with pytest.raises(ValueError):
         manifest_file_digests(manifest)
