@@ -14,16 +14,17 @@ Cloud Scheduler starts the job twice a day. It runs two checks:
      ``microcosm_emitter_interface.releases`` module, the same code the
      emitter's release writer runs before every write: the record's own rules,
      and every listed build has its folder and a manifest naming it;
-   - every file in each listed build's folder is in that build's manifest and
-     still has the SHA-256 the manifest records. Files stored with LFS are
-     compared by the SHA-256 Hugging Face records for their content, without
-     a download; other files are downloaded and hashed.
+   - every file in each listed build's folder, other than its manifests and
+     its checksum list, is in that build's ``artifacts`` map and still has the
+     SHA-256 the map records. Files stored with LFS are compared by the
+     SHA-256 Hugging Face records for their content, without a download;
+     other files are downloaded and hashed.
 
    The rules that compare one write with the state before it (existing build
    entries change only ``withdrawn``; no file inside an existing build folder
    is added, changed or removed) need the earlier state, so only the release
    writer can apply them. Checking every file against its manifest finds a
-   later change to any file except the manifest itself.
+   later change to any file except the two manifests and the checksum list.
 
    The interface package is imported only when a dataset sets
    ``checks_releases_record``, and no dataset does yet: see the README's
@@ -69,6 +70,12 @@ RELEASE_RULES_DISTRIBUTION: Final = "microcosm-emitter-interface"
 PROBLEMS_FOUND_EXIT_CODE: Final = 1
 CONFIGURATION_EXIT_CODE: Final = 2
 _SHA256: Final = re.compile(r"^[0-9a-f]{64}$")
+#: Files Microcosm's publisher writes into every build folder beside the
+#: release manifest without listing them in its ``artifacts`` map: the build
+#: manifest, and for some releases the checksum list. They need no entry.
+BUILD_FOLDER_FILES_OUTSIDE_ARTIFACTS: Final = frozenset(
+    {"build_manifest.json", "sha256sums.txt"}
+)
 
 
 @dataclass(frozen=True)
@@ -141,24 +148,30 @@ def load_release_rules() -> ModuleType:
 def manifest_file_digests(manifest: object) -> dict[str, str]:
     """Each file a build's ``release_manifest.json`` lists, with its SHA-256.
 
-    The manifest lists its build's files as ``files``, each entry with the
-    file's bare ``name`` and its ``sha256``: the fields of the interface
-    package's ``ReleaseFile``. Microcosm's new manifest is not written yet
-    and the interface package does not define this list; when it does, this
-    function reads that definition instead.
+    The manifest lists its build's files in its ``artifacts`` map, one entry
+    per artifact with its ``kind``, ``role``, ``repo_id``, ``sha256`` and
+    ``path``, the file's bare name in the build folder (decided on
+    2026-10-29). The map's keys name the artifacts, not the files, so the
+    result is keyed by each entry's ``path``.
     """
 
-    files = manifest.get("files") if isinstance(manifest, dict) else None
-    if not isinstance(files, list):
-        raise ValueError("The manifest has no file list.")
+    artifacts = manifest.get("artifacts") if isinstance(manifest, dict) else None
+    if not isinstance(artifacts, dict) or not artifacts:
+        raise ValueError("The manifest has no artifacts map.")
     digests: dict[str, str] = {}
-    for entry in files:
+    for key, entry in artifacts.items():
         if not isinstance(entry, dict):
-            raise ValueError("A file entry is not an object.")
-        name = entry.get("name")
+            raise ValueError(f"Artifact {key} is not an object.")
+        name = entry.get("path")
         sha256 = entry.get("sha256")
-        if not isinstance(name, str) or not name or "/" in name or name in {".", ".."}:
-            raise ValueError("A file entry has no bare file name.")
+        if (
+            not isinstance(name, str)
+            or not name
+            or "/" in name
+            or "\\" in name
+            or name in {".", ".."}
+        ):
+            raise ValueError(f"Artifact {key} has no bare file name as its path.")
         if not isinstance(sha256, str) or not _SHA256.fullmatch(sha256):
             raise ValueError(f"{name} has no lowercase hexadecimal SHA-256.")
         if name in digests:
@@ -267,7 +280,7 @@ def _check_build_files(
         report(
             "MANIFEST_FILES_UNREADABLE",
             f"{manifest_path} does not list its build's files with their "
-            f"SHA-256: {error}",
+            f"SHA-256 in its artifacts map: {error}",
         )
         return
     for name, expected_sha256 in sorted(digests.items()):
@@ -293,6 +306,7 @@ def _check_build_files(
         if (
             path.startswith(f"{folder}/")
             and name != manifest_name
+            and name not in BUILD_FOLDER_FILES_OUTSIDE_ARTIFACTS
             and name not in digests
         ):
             report("FILE_NOT_IN_MANIFEST", f"{path} is not listed in {manifest_path}.")

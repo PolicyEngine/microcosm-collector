@@ -377,16 +377,21 @@ runs two checks:
      names a listed build that is not withdrawn, `default` names a listed
      release, and every listed build has its folder and a
      `release_manifest.json` naming the same release and build;
-   - every file in a listed build's folder is in that build's manifest and
-     has the SHA-256 the manifest records. Files stored with LFS are compared
-     by the SHA-256 Hugging Face records for their content, without a
-     download; other files are downloaded and hashed.
+   - every file in a listed build's folder is in the `artifacts` map of that
+     build's `release_manifest.json` and has the SHA-256 the map records.
+     `manifest_file_digests` reads each entry's `path`, the file's bare name
+     in the build folder, and its `sha256`. Files stored with LFS are
+     compared by the SHA-256 Hugging Face records for their content, without
+     a download; other files are downloaded and hashed. Three files of a
+     build folder need no entry: the release manifest itself, and the
+     `build_manifest.json` and `sha256sums.txt` that Microcosm's publisher
+     writes beside it.
 
    The rules that compare one write with the state before it (existing build
    entries change only `withdrawn`; nothing inside an existing build folder
    is added, changed or removed) need that earlier state, so only the release
    writer applies them. The file check above finds any later change to a
-   build's files except a change to its manifest.
+   build's files except a change to those three.
 
 **Problems and alerts.** Each problem is one JSON log entry with severity
 `ERROR`, naming the check, the dataset and a code such as `HTTP_404`,
@@ -438,10 +443,10 @@ a dataset, it can be switched on once:
 1. the microcosm-emitter-interface package, with
    `microcosm_emitter_interface.releases` (PolicyEngine/microcosm-emitter#24),
    is published and added to this collector's dependencies;
-2. Microcosm's new release manifest is defined, and `manifest_file_digests`
-   reads its file list as defined there. Until then it reads a `files` list
-   of entries with `name` and `sha256`, the fields of the interface package's
-   `ReleaseFile`;
+2. Microcosm publishes the dataset's builds into their folders with the
+   release manifest decided on 2026-10-29 (H2c): today's `artifacts` map,
+   each entry with `kind`, `role`, `repo_id`, `sha256` and a bare `path`,
+   and no `revision`;
 3. the dataset publishes builds side by side with `releases.json`, and its
    `latest*.json` files are deleted. Before that, the check would report them
    every day.
