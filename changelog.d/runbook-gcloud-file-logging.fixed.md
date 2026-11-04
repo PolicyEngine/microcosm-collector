@@ -1,0 +1,1 @@
+The project-move runbook keeps database passwords out of gcloud's log files: gcloud writes every flag's value to `~/.config/gcloud/logs`, so the commands that pass a password in `--password` now run with `CLOUDSDK_CORE_DISABLE_FILE_LOGGING=1`.

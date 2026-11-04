@@ -573,11 +573,22 @@ port 5432 on this machine). First set the admin user's password on the new
 instance, typed rather than printed:
 `gcloud sql users set-password "$ADMIN_DATABASE_USER" --instance "$NEW_INSTANCE" --project "$NEW_PROJECT_ID" --prompt-for-password`.
 
+**Keep passwords out of gcloud's log files.** gcloud writes every flag of every
+command it runs, with its value, to its log files under
+`~/.config/gcloud/logs` ("Running [gcloud.sql.users.create] with arguments:
+[... --password: "..." ...]"), at debug level, whatever `--verbosity` says. So
+each `gcloud` command below that carries a password in a flag runs with
+`CLOUDSDK_CORE_DISABLE_FILE_LOGGING=1`, which switches the log file off for
+that command only. Commands that read a value from standard input
+(`--data-file=-`) or prompt for it (`--prompt-for-password`) log only the
+flag, never the value.
+
 ```bash
 migration_password="$(openssl rand -hex 32)"
 runtime_password="$(openssl rand -hex 32)"
 create_user_with_cloud_sql() {   # USER PASSWORD
-  gcloud sql users create "$1" --instance "$NEW_INSTANCE" --project "$NEW_PROJECT_ID" --password "$2"
+  CLOUDSDK_CORE_DISABLE_FILE_LOGGING=1 gcloud sql users create "$1" \
+    --instance "$NEW_INSTANCE" --project "$NEW_PROJECT_ID" --password "$2"
 }
 create_user_in_sql() {           # CREATOR USER PASSWORD 'ATTRIBUTES'
   psql "host=localhost port=5432 dbname=$DATABASE_NAME user=$1" --set ON_ERROR_STOP=1 \
@@ -615,8 +626,8 @@ it:
 
 ```bash
 throwaway_user='<throwaway user name>'   # any name the record doesn't use
-gcloud sql users create "$throwaway_user" --instance "$NEW_INSTANCE" --project "$NEW_PROJECT_ID" \
-  --password "$(openssl rand -hex 32)"
+CLOUDSDK_CORE_DISABLE_FILE_LOGGING=1 gcloud sql users create "$throwaway_user" \
+  --instance "$NEW_INSTANCE" --project "$NEW_PROJECT_ID" --password "$(openssl rand -hex 32)"
 psql "host=localhost port=5432 dbname=$DATABASE_NAME user=$ADMIN_DATABASE_USER" \
   --set user_name="$throwaway_user" <<'SQL'
 SELECT g.rolname AS holder, m.admin_option, m.inherit_option, m.set_option
