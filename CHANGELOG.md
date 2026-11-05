@@ -1,3 +1,10 @@
+## [0.7.3] - 2026-11-05
+
+### Changed
+
+- The README describes the collector's own Google Cloud project: each environment behind its own hostname on a global external Application Load Balancer, deployments authenticating through a provider and deployment account in that project, and calibration-diagnostics' old `telemetry-service.yml` redeploy never to be run.
+
+
 ## [0.7.2] - 2026-11-04
 
 ### Fixed
