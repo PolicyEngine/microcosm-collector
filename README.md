@@ -66,7 +66,8 @@ token for `expires_in` seconds and exchanges again after a 401.
 
 - **Signing.** Once `TELEMETRY_JWT_SIGNING_KEY` holds an EC P-256 private key
   (unencrypted PEM, PKCS #8 or SEC 1), new tokens are signed with ES256. Until
-  then they are signed with HS256 and `TELEMETRY_JWT_SECRET`.
+  then they are signed with HS256 and `TELEMETRY_JWT_SECRET`. Either variable
+  set but blank stops startup.
 - **Key ID.** An ES256 token's header names its key in `kid`, the RFC 7638
   SHA-256 thumbprint of the public key. The ID is derived from the key rather
   than configured, so it cannot disagree with the key, and a new key always
@@ -132,7 +133,10 @@ To retire HS256:
    `.github/workflows/push.yaml`. Without the secret, the collector refuses to
    start unless the signing key is set, and it refuses HS256 tokens.
 2. Once that release has deployed to both environments, delete the
-   `TELEMETRY_JWT_SECRET_NAME` variables and the HS256 secrets.
+   `TELEMETRY_JWT_SECRET_NAME` variables and the HS256 secrets. Every revision
+   from the switch window mounts `TELEMETRY_JWT_SECRET`, so after this none of
+   them can start: delete the secrets only once rolling back to one is no
+   longer wanted.
 
 To rotate the signing key, put the new key in a new secret. Don't add a
 version to the secret the service already mounts. Cloud Run reads a secret
@@ -146,7 +150,10 @@ token signed by one instance would get 401 from another, and
    roles as the first key.
 2. Set `TELEMETRY_JWT_SIGNING_KEY_SECRET_NAME` in that environment to the new
    secret's name. The serving revision keeps reading the old secret.
-3. Deploy. The new revision signs with, and publishes, only the new key.
+3. Deploy. Deployments run only from the release commit of a merge to
+   `main`, so the rotation takes effect with the next merged change; every
+   merge releases and deploys. The new revision signs with, and publishes,
+   only the new key.
    Tokens signed with the previous key get 401 and are exchanged again. A
    build holding a delegated token signed with the previous key cannot
    exchange again, so the collector refuses its telemetry for the rest of its
