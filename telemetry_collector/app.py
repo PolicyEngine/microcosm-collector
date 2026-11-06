@@ -25,12 +25,22 @@ from telemetry_collector.auth import (
     HuggingFaceAuthenticator,
     HuggingFacePrincipal,
 )
+from telemetry_collector.intake import IntakeServices, IntakeSettings
+from telemetry_collector.intake_api import (
+    IntakeProblemError,
+    intake_not_enabled,
+    intake_not_enabled_router,
+    intake_problem_response,
+    submission_router,
+)
 from telemetry_collector.models import (
     CollectorToken,
     EventBatch,
     PageCursor,
     RunRegistration,
     SessionScope,
+    TokenExchangeRequest,
+    require_telemetry_scope_for_lifetime,
 )
 from telemetry_collector.session_tokens import (
     SIGNING_KEY_VARIABLE,
@@ -61,6 +71,8 @@ class CollectorSettings:
     collector_audience: str = "microcosm-telemetry-collector"
     session_token_ttl_seconds: int = 60 * 60
     maintenance_mode: bool = False
+    # None while artifact intake is switched off (the default).
+    intake: IntakeSettings | None = None
 
     @classmethod
     def from_environment(cls) -> CollectorSettings:
@@ -102,6 +114,7 @@ class CollectorSettings:
                 os.environ.get("TELEMETRY_SESSION_TOKEN_TTL_SECONDS", "3600")
             ),
             maintenance_mode=os.environ.get("TELEMETRY_MAINTENANCE_MODE") == "1",
+            intake=IntakeSettings.from_environment(),
         )
 
     def __post_init__(self) -> None:
@@ -111,7 +124,7 @@ class CollectorSettings:
 
 @dataclass(frozen=True)
 class SessionTokenClaims:
-    """PolicyEngine identity carried by a short-lived collector token."""
+    """PolicyEngine identity carried by an expiring collector token."""
 
     subject: str
     username: str
@@ -263,13 +276,31 @@ SCOPE_REFUSALS: dict[str, str] = {
 }
 
 
+# The longest lifetime granted to a token issued with lifetime_seconds. It is a
+# code constant, so no deployment setting can lengthen these tokens.
+MAXIMUM_DELEGATED_LIFETIME_SECONDS = 24 * 60 * 60
+
+
 def _issue_session_token(
     settings: CollectorSettings,
     principal: HuggingFacePrincipal,
     scope: SessionScope = "telemetry:write",
+    lifetime_seconds: int | None = None,
 ) -> CollectorToken:
+    # The request model checks this at the exchange; checking it here as well
+    # covers every other caller.
+    require_telemetry_scope_for_lifetime(scope, lifetime_seconds)
+    # A requested lifetime means the token is for a build on another machine,
+    # which cannot exchange again. Such a token carries "delegated", so a log
+    # of its claims can tell it apart and an endpoint can refuse it.
+    granted_seconds = (
+        settings.session_token_ttl_seconds
+        if lifetime_seconds is None
+        else min(lifetime_seconds, MAXIMUM_DELEGATED_LIFETIME_SECONDS)
+    )
+    delegation = {} if lifetime_seconds is None else {"delegated": True}
     now = datetime.now(UTC)
-    expires = now + timedelta(seconds=settings.session_token_ttl_seconds)
+    expires = now + timedelta(seconds=granted_seconds)
     encoded = sign_session_token(
         {
             "iss": settings.collector_issuer,
@@ -280,13 +311,15 @@ def _issue_session_token(
             "scope": scope,
             "iat": now,
             "exp": expires,
+            **delegation,
         },
         signing_key=settings.signing_key,
         hs256_secret=settings.jwt_secret,
     )
     return CollectorToken(
         access_token=encoded,
-        expires_in=settings.session_token_ttl_seconds,
+        expires_in=granted_seconds,
+        scope=scope,
     )
 
 
@@ -346,8 +379,15 @@ def create_app(
     settings: CollectorSettings,
     store: TelemetryStore,
     huggingface_authenticator: HuggingFaceAuthenticator,
+    intake_services: IntakeServices | None = None,
 ) -> FastAPI:
-    """Create the collector with explicit dependencies for tests and deployment."""
+    """Create the collector with explicit dependencies for tests and deployment.
+
+    The submission endpoints exist only when ``settings.intake`` is set.
+    """
+
+    if settings.intake is not None and intake_services is None:
+        raise ValueError("Intake is switched on but its services were not provided.")
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> Iterator[None]:
@@ -382,6 +422,21 @@ def create_app(
     ) -> SessionTokenClaims:
         return _decode_session_token(settings, authorization)
 
+    def submitter_claims(
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> SessionTokenClaims:
+        return _decode_session_token(settings, authorization, "artifacts:submit")
+
+    application.add_exception_handler(IntakeProblemError, intake_problem_response)
+    if settings.intake is not None and intake_services is not None:
+        application.include_router(
+            submission_router(
+                services=intake_services, submitter_claims=submitter_claims
+            )
+        )
+    else:
+        application.include_router(intake_not_enabled_router())
+
     @application.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
@@ -407,9 +462,14 @@ def create_app(
         response_model=CollectorToken,
     )
     def exchange_huggingface_token(
+        exchange_request: TokenExchangeRequest | None = None,
         authorization: Annotated[str | None, Header()] = None,
     ) -> CollectorToken:
         opaque_token = _bearer_token(authorization)
+        token_request = exchange_request or TokenExchangeRequest()
+        scope = token_request.scope
+        if scope == "artifacts:submit" and settings.intake is None:
+            raise intake_not_enabled()
         try:
             principal = huggingface_authenticator.authenticate(
                 opaque_token,
@@ -424,7 +484,9 @@ def create_app(
                 status_code=403,
                 detail="The Hugging Face user is not a PolicyEngine organization member.",
             )
-        return _issue_session_token(settings, principal)
+        return _issue_session_token(
+            settings, principal, scope, token_request.lifetime_seconds
+        )
 
     @application.post("/v1/runs", status_code=status.HTTP_201_CREATED)
     def register_run(
@@ -504,8 +566,33 @@ def create_app_from_environment() -> FastAPI:
 
     settings = CollectorSettings.from_environment()
     store = PostgresTelemetryStore(_required_environment("DATABASE_URL"))
+    intake_services = None
+    if settings.intake is not None:
+        # Imported only when intake is on, so a collector with intake off
+        # never loads the Google Cloud clients or looks for credentials.
+        from telemetry_collector.google_cloud import (
+            CloudTasksWorkerQueue,
+            GoogleCloudStorageIntake,
+        )
+        from telemetry_collector.submission_store import PostgresSubmissionStore
+
+        intake_services = IntakeServices(
+            submissions=PostgresSubmissionStore(store.engine),
+            objects=GoogleCloudStorageIntake(
+                bucket_name=settings.intake.bucket,
+                signing_service_account=settings.intake.signing_service_account,
+            ),
+            worker_queue=CloudTasksWorkerQueue(
+                queue=settings.intake.worker_queue,
+                worker_job=settings.intake.worker_job,
+                invoker_service_account=(
+                    settings.intake.worker_invoker_service_account
+                ),
+            ),
+        )
     return create_app(
         settings=settings,
         store=store,
         huggingface_authenticator=HuggingFaceAuthenticator(),
+        intake_services=intake_services,
     )

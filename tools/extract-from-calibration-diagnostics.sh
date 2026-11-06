@@ -7,11 +7,17 @@
 #
 # OUTPUT_DIR must not exist. It receives a `main` branch holding every source
 # commit that touched telemetry-service/, rewritten so that directory is the
-# root. RECORD_FILE records the source commit and the extracted commit. When it
-# already exists, its extracted commit must be an ancestor of the new `main`:
+# root. RECORD_FILE records the source commit and the extracted commit.
+#
+# When RECORD_FILE already exists, run this from the collector checkout that
+# will merge the output. The recorded extracted commit must then be in the
+# history of that checkout's HEAD and an ancestor of the new `main`.
 # git-filter-repo rewrites the same source commits to the same commits, so a
-# re-run only adds the telemetry-service commits merged since, and they can be
-# merged into this repo without duplicating its history.
+# re-run only adds the telemetry-service commits merged since, and merging them
+# into HEAD does not duplicate its history. A carry-over pull request that was
+# squash-merged or rebase-merged breaks the first condition: main then holds the
+# carried-over changes under new commits, but not the extracted commits, so the
+# next merge would add those commits a second time.
 #
 # Environment:
 #   EXTRACTION_SOURCE_URL  git URL or path of calibration-diagnostics
@@ -26,6 +32,28 @@ readonly FILTER_REPO_VERSION="2.47.0"
 
 usage() {
   echo "Usage: extract-from-calibration-diagnostics.sh OUTPUT_DIR RECORD_FILE" >&2
+}
+
+require_recorded_commit_in_head() {
+  local recorded_commit="$1"
+  local checkout_root
+  if ! checkout_root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+    echo "Run this from the collector checkout that will merge the extraction:" \
+      "${PWD} is not in a git work tree." >&2
+    return 1
+  fi
+  if ! git merge-base --is-ancestor "$recorded_commit" HEAD 2>/dev/null; then
+    {
+      echo "The recorded extraction ${recorded_commit} is not in the history of HEAD in ${checkout_root}."
+      echo "Run this from the collector's main or a branch created from it. If you did,"
+      echo "the pull request that carried that extraction over was squash-merged or"
+      echo "rebase-merged: main has its changes under new commits, and merging a new"
+      echo "extraction would add the extracted commits a second time. Carry-over pull"
+      echo "requests must be merged with a merge commit. To recover, see \"Carrying"
+      echo "over changes from calibration-diagnostics\" in README.md."
+    } >&2
+    return 1
+  fi
 }
 
 record_value() {
@@ -55,6 +83,9 @@ main() {
     previous_extracted_commit="$(record_value "$record_file" extracted_commit)"
     if [[ -z "$previous_extracted_commit" ]]; then
       echo "The record ${record_file} has no extracted_commit." >&2
+      return 1
+    fi
+    if ! require_recorded_commit_in_head "$previous_extracted_commit"; then
       return 1
     fi
   fi

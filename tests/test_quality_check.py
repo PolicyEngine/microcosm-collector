@@ -43,17 +43,35 @@ def run_quality_check(tree_root: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
-def test_validation_checks_quality_through_one_script() -> None:
+def validation_commands() -> list[str]:
     validation = yaml.load(
         (ROOT / ".github" / "workflows" / "ci.yml").read_text(),
         Loader=yaml.BaseLoader,
     )
-    commands = [
+    return [
         step["run"] for step in validation["jobs"]["validate"]["steps"] if "run" in step
     ]
 
+
+def readme_section_commands(heading: str) -> list[str]:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    section = readme.split(f"\n## {heading}\n", 1)[1].split("\n## ", 1)[0]
+    code_block = section.split("```bash\n", 1)[1].split("```", 1)[0]
+    return [line for line in code_block.splitlines() if line]
+
+
+def test_validation_checks_quality_through_one_script() -> None:
+    commands = validation_commands()
+
     assert "bash tools/check-quality.sh" in commands
     assert not [command for command in commands if "ruff" in command]
+
+
+def test_readme_test_commands_are_ones_ci_runs() -> None:
+    readme_commands = readme_section_commands("Tests")
+
+    assert "bash tools/check-quality.sh" in readme_commands
+    assert set(readme_commands) <= set(validation_commands())
 
 
 def test_quality_check_runs_ruff_and_accepts_valid_scripts(tmp_path: Path) -> None:

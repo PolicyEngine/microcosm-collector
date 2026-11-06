@@ -75,6 +75,21 @@ validate_environment_target() {
   esac
 }
 
+# Staging is called only by release checks and occasional manual requests, so
+# it scales to zero between releases. Production keeps one instance running.
+minimum_instances() {
+  require_variables DEPLOYMENT_ENVIRONMENT
+
+  case "$DEPLOYMENT_ENVIRONMENT" in
+    staging) echo 0 ;;
+    production) echo 1 ;;
+    *)
+      echo "Unsupported deployment environment: ${DEPLOYMENT_ENVIRONMENT}" >&2
+      return 1
+      ;;
+  esac
+}
+
 check_secrets_exist() {
   require_variables \
     PROJECT_ID DATABASE_SECRET_NAME MIGRATION_DATABASE_SECRET_NAME \
@@ -179,7 +194,11 @@ deploy_maintenance() {
     DATABASE_SECRET_NAME \
     JWT_SECRET_NAME \
     JWT_SIGNING_KEY_SECRET_NAME \
-    READ_SECRET_NAME
+    READ_SECRET_NAME \
+    DEPLOYMENT_ENVIRONMENT
+
+  local minimum_instance_count
+  minimum_instance_count="$(minimum_instances)"
 
   # The signing key signs new session tokens with ES256. The HS256 secret stays
   # mounted so tokens issued before the switch are accepted until it is retired.
@@ -192,7 +211,7 @@ deploy_maintenance() {
     --add-cloudsql-instances "$CLOUD_SQL_CONNECTION" \
     --set-secrets "DATABASE_URL=${DATABASE_SECRET_NAME}:latest,TELEMETRY_JWT_SECRET=${JWT_SECRET_NAME}:latest,TELEMETRY_JWT_SIGNING_KEY=${JWT_SIGNING_KEY_SECRET_NAME}:latest,TELEMETRY_READ_TOKEN=${READ_SECRET_NAME}:latest" \
     --set-env-vars "TELEMETRY_MAINTENANCE_MODE=1" \
-    --min 1 \
+    --min "$minimum_instance_count" \
     --max 4 \
     --cpu 1 \
     --memory 512Mi \
@@ -259,7 +278,11 @@ deploy_candidate() {
     DATABASE_SECRET_NAME \
     JWT_SECRET_NAME \
     JWT_SIGNING_KEY_SECRET_NAME \
-    READ_SECRET_NAME
+    READ_SECRET_NAME \
+    DEPLOYMENT_ENVIRONMENT
+
+  local minimum_instance_count
+  minimum_instance_count="$(minimum_instances)"
 
   # The signing key signs new session tokens with ES256. The HS256 secret stays
   # mounted so tokens issued before the switch are accepted until it is retired.
@@ -272,7 +295,7 @@ deploy_candidate() {
     --add-cloudsql-instances "$CLOUD_SQL_CONNECTION" \
     --set-secrets "DATABASE_URL=${DATABASE_SECRET_NAME}:latest,TELEMETRY_JWT_SECRET=${JWT_SECRET_NAME}:latest,TELEMETRY_JWT_SIGNING_KEY=${JWT_SIGNING_KEY_SECRET_NAME}:latest,TELEMETRY_READ_TOKEN=${READ_SECRET_NAME}:latest" \
     --set-env-vars "TELEMETRY_MAINTENANCE_MODE=0" \
-    --min 1 \
+    --min "$minimum_instance_count" \
     --max 4 \
     --cpu 1 \
     --memory 512Mi \
