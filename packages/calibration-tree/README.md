@@ -40,8 +40,10 @@ The module's opening comment describes the request. The worker writes the
 same bytes as the publisher (`src/publish-calibration-tree.ts`) for the same
 files, commit and publication time; the golden tests hold both to the trees
 recorded in `src/fixtures/calibration-tree-golden.json`. It exits 0 after
-printing a JSON description of the written parts, 2 when the files cannot be
-built into a tree, and 1 when the request cannot be followed.
+printing a JSON description of the written parts, 1 when the request cannot be
+followed, 2 when the builder refuses the files, so another run on the same
+files cannot help, and 3 for anything else: a size limit that is not a
+positive integer, or an unexpected error such as a defect in the builder.
 
 ## Development
 

@@ -386,18 +386,20 @@ copy is the only one, and the package is changed here.
 `.github/workflows/publish-calibration-tree.yaml` publishes the package when a
 push to `main` changes `packages/calibration-tree` and npm does not have its
 `package.json` version yet. To release a change, raise `version` in the same
-pull request; a change without a new version publishes nothing. The workflow
-tests and typechecks the package first, checks that Node and npm are the
-pinned versions (`tools/check-npm-toolchain.sh`), then runs
-`tools/publish-calibration-tree.sh`, which asks npm for the version and
-publishes only if npm does not have it. It can be run again by hand from
-`main` (`workflow_dispatch`) to retry a failed publication.
+pull request; a change without a new version publishes nothing. The
+workflow's first job tests and typechecks the package. Its second job, the
+only one that can request a GitHub OIDC token, installs nothing: it checks
+that Node and npm are the pinned versions (`tools/check-npm-toolchain.sh`),
+then runs `tools/publish-calibration-tree.sh`, which asks npm for the version
+and publishes only if npm does not have it. The workflow can be run again by
+hand from `main` (`workflow_dispatch`) to retry a failed publication.
 
-The workflow uses npm's trusted publishing: npm accepts the job's GitHub OIDC
-token in place of a stored npm token, and adds provenance because this repo is
-public. Nothing is published until the repo variable
-`CALIBRATION_TREE_NPM_PUBLISH_ENABLED` is `true`, which needs this one-time
-setup first:
+The workflow uses npm's trusted publishing: npm accepts the publish job's
+GitHub OIDC token in place of a stored npm token, and adds provenance because
+this repo is public. npm does not check the branch, so the `npm` environment's
+rule is what keeps other branches out. Nothing is published until the repo
+variable `CALIBRATION_TREE_NPM_PUBLISH_ENABLED` is `true`, which needs this
+one-time setup first, in this order:
 
 1. **The first version, by hand.** npm can only trust a workflow for a package
    that exists, so a member of the `policyengine` npm organization publishes
@@ -405,16 +407,18 @@ setup first:
    package: `bun install --frozen-lockfile`, then `npm pack --dry-run` to check
    the file list, then `npm publish --access public` in
    `packages/calibration-tree`.
-2. **The trusted publisher.** In the package's settings on npmjs.com, add a
+2. **The environment.** In this repo's settings, create the `npm` environment
+   and allow deployments from `main` only, so a run from any other branch
+   cannot obtain npm's trust. Create it before the trusted publisher: GitHub
+   creates a missing environment, without that rule, when a job first names
+   it.
+3. **The trusted publisher.** In the package's settings on npmjs.com, add a
    GitHub Actions trusted publisher: organization `PolicyEngine`, repo
    `microcosm-collector`, workflow `publish-calibration-tree.yaml`,
    environment `npm`. A new trusted publisher expires unless a publication
    through it succeeds within two days, so add it when a pull request that
    raises the version is ready to merge, and merge that pull request after
-   steps 3 and 4. An expired one is deleted and added again.
-3. **The environment.** In this repo's settings, create the `npm`
-   environment and allow deployments from `main` only, so a run from any other
-   branch cannot obtain npm's trust.
+   step 4. An expired one is deleted and added again.
 4. **The switch.** Set the repo variable
    `CALIBRATION_TREE_NPM_PUBLISH_ENABLED` to `true`.
 

@@ -5,10 +5,10 @@ name: Publish calibration tree package
 # release a change, raise "version" in its package.json in the same pull
 # request; a change without a new version publishes nothing.
 #
-# npm's trusted publishing authenticates the job with its GitHub OIDC token,
-# so no npm token is stored anywhere. npm accepts the token only from this
-# file in PolicyEngine/microcosm-collector, in the main-only "npm"
-# environment, and adds provenance because the repo is public. The job runs
+# npm's trusted publishing authenticates the publish job with its GitHub OIDC
+# token, so no npm token is stored anywhere. npm accepts the token only from
+# this file in PolicyEngine/microcosm-collector, in the main-only "npm"
+# environment, and adds provenance because the repo is public. Both jobs run
 # only when the repo variable CALIBRATION_TREE_NPM_PUBLISH_ENABLED is 'true';
 # the README's "Calibration tree package" section lists the one-time setup
 # that must come first.
@@ -24,8 +24,33 @@ permissions:
   contents: read
 
 jobs:
+  # Tests without an OIDC token, so nothing installed or run here can obtain
+  # npm's trust.
+  test:
+    name: Test the package
+    if: github.ref == 'refs/heads/main' && vars.CALIBRATION_TREE_NPM_PUBLISH_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: packages/calibration-tree
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - run: bun test
+      - run: bun run typecheck
+
+  # Publishes the same commit. npm packs the checked-out files as they are,
+  # so this job installs no dependencies and runs no package code.
   publish:
     name: Publish to npm
+    needs: test
     if: github.ref == 'refs/heads/main' && vars.CALIBRATION_TREE_NPM_PUBLISH_ENABLED == 'true'
     runs-on: ubuntu-latest
     environment: npm
@@ -43,12 +68,6 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version: 1.4.2
-      - run: bun install --frozen-lockfile
-      - run: bun test
-      - run: bun run typecheck
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "24.21.0"

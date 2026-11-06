@@ -6,6 +6,7 @@
     "package.json": "Publishable from this repository: not private, with a license, the repository, public access, the published files, the worker's export and its script."
   },
   "collectorFiles": [
+    "LICENSE",
     "README.md",
     "bun.lock",
     "provenance.json",

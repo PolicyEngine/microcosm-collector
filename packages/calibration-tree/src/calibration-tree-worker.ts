@@ -15,7 +15,7 @@
 //     "releaseDirectory": "<folder under releases/ the files were read from>",
 //     "hfRepo": "<owner>/<dataset>",
 //     "hfCommitSha": "<full commit SHA>",
-//     "createdAt": "<ISO 8601 publication time>" or null,
+//     "createdAt": "<ISO 8601 publication time with Z or an offset>" or null,
 //     "artifacts": {
 //       "calibrationDiagnostics": {"path": "<path in the dataset>", "file": "<local file>"},
 //       "buildManifest": {...} or null,
@@ -26,12 +26,18 @@
 //
 // It builds the bundle exactly as the publisher's `publishRelease` does from
 // the same files, commit and publication time, so both write the same bytes:
-// the golden tests hold each to the recorded trees. On success it prints one
-// JSON line describing the written parts and exits 0. It writes nothing
-// unless the whole bundle builds. Exit code 2 means the files cannot be
-// built into a tree (the content is refused); 1 means the request could not
-// be followed (a malformed request, a missing file, an output directory that
-// is not empty).
+// the golden tests hold each to the recorded trees. Like the publisher, it
+// records the publication time as Date.prototype.toISOString() writes it. On
+// success it prints one JSON line describing the written parts and exits 0.
+// It writes nothing unless the whole bundle builds. The other exit codes:
+//
+//   1  the request could not be followed: a malformed request, a missing
+//      file, an output directory that is not empty;
+//   2  the files cannot be built into a tree: the builder refused them, so
+//      running again on the same files cannot help;
+//   3  anything else: a size limit configured as something other than a
+//      positive integer, or an unexpected error, such as a defect in the
+//      builder, which may succeed once fixed.
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createHash } from "node:crypto";
@@ -39,14 +45,17 @@ import { createHash } from "node:crypto";
 import type { CalibrationTreeSourceArtifact } from "./calibration-tree-artifact";
 import { buildCalibrationTreeBundle, type CalibrationTreeBundle } from "./calibration-tree-bundle";
 import { isCountry, type MicrocosmCountry } from "./countries";
-import { buildCalibration } from "./latest-artifact";
-import { enforceConfiguredSizeLimits } from "./publish-calibration-tree";
+import { buildCalibration, InvalidReleaseIdError } from "./latest-artifact";
+import { CalibrationTreeArtifactSizeError, enforceConfiguredSizeLimits } from "./publish-calibration-tree";
 import { isBuildFolderId, isReleaseDirectory } from "./release-record";
+import { IncompatibleStagingDataError } from "./staging-contract";
+import { UnsupportedCalibrationDiagnosticsSchemaError } from "./target-representation";
 
 type JsonObject = Record<string, unknown>;
 
 export const CALIBRATION_TREE_WORKER_EXIT_REQUEST_ERROR = 1;
 export const CALIBRATION_TREE_WORKER_EXIT_UNBUILDABLE_INPUT = 2;
+export const CALIBRATION_TREE_WORKER_EXIT_WORKER_ERROR = 3;
 
 const ARTIFACT_NAMES = ["calibrationDiagnostics", "buildManifest", "releaseManifest", "demographics"] as const;
 type ArtifactName = (typeof ARTIFACT_NAMES)[number];
@@ -61,6 +70,11 @@ const REQUEST_FIELDS = [
   "artifacts",
 ] as const;
 const HF_COMMIT_RE = /^[0-9a-f]{40,64}$/;
+// A date and time with seconds and an explicit offset, so the instant never
+// depends on the machine's time zone.
+const PUBLICATION_TIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
+// The size limits enforceConfiguredSizeLimits reads.
+const SIZE_LIMIT_VARIABLES = ["CALIBRATION_TREE_MAX_RAW_BYTES", "CALIBRATION_TREE_MAX_GZIP_BYTES"] as const;
 const HF_REPO_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}\/[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/;
 
 export interface CalibrationTreeWorkerArtifact {
@@ -110,6 +124,57 @@ export class CalibrationTreeWorkerRequestError extends Error {}
 
 /** The files were read but cannot be built into a tree. */
 export class CalibrationTreeUnbuildableInputError extends Error {}
+
+/** The worker is configured in a way the publisher would also refuse. */
+export class CalibrationTreeWorkerConfigurationError extends Error {}
+
+/**
+ * Whether an error from building the tree is the builder refusing the files.
+ * The builder refuses content with plain Errors and its own error classes;
+ * any other error, such as a TypeError, is treated as a defect, not as a
+ * judgement about the files.
+ */
+export function isCalibrationTreeContentRefusal(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return error.constructor === Error ||
+    error instanceof CalibrationTreeArtifactSizeError ||
+    error instanceof IncompatibleStagingDataError ||
+    error instanceof UnsupportedCalibrationDiagnosticsSchemaError ||
+    error instanceof InvalidReleaseIdError;
+}
+
+/** The exit code for an error that stopped the worker. */
+export function calibrationTreeWorkerExitCode(error: unknown): number {
+  if (error instanceof CalibrationTreeWorkerRequestError) return CALIBRATION_TREE_WORKER_EXIT_REQUEST_ERROR;
+  if (error instanceof CalibrationTreeUnbuildableInputError) return CALIBRATION_TREE_WORKER_EXIT_UNBUILDABLE_INPUT;
+  return CALIBRATION_TREE_WORKER_EXIT_WORKER_ERROR;
+}
+
+// enforceConfiguredSizeLimits refuses a limit that is not a positive integer
+// with a plain Error, which would read as a refusal of the files, so the
+// worker checks the same rule before it builds anything.
+function checkConfiguredSizeLimits(): void {
+  for (const name of SIZE_LIMIT_VARIABLES) {
+    const configured = process.env[name]?.trim();
+    if (!configured) continue;
+    const limit = Number(configured);
+    if (!Number.isSafeInteger(limit) || limit <= 0) {
+      throw new CalibrationTreeWorkerConfigurationError(`${name} must be a positive integer.`);
+    }
+  }
+}
+
+// The publisher stores each publication time as toISOString() writes it.
+function publicationTime(value: unknown): string | null {
+  if (value === null) return null;
+  const instant = typeof value === "string" && PUBLICATION_TIME_RE.test(value) ? Date.parse(value) : Number.NaN;
+  if (!Number.isFinite(instant)) {
+    throw new CalibrationTreeWorkerRequestError(
+      "createdAt must be an ISO 8601 date and time with Z or a UTC offset, or null.",
+    );
+  }
+  return new Date(instant).toISOString();
+}
 
 function requestObject(value: unknown, label: string): JsonObject {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -171,10 +236,7 @@ export function parseCalibrationTreeWorkerRequest(value: unknown): CalibrationTr
   if (!HF_COMMIT_RE.test(hfCommitSha)) {
     throw new CalibrationTreeWorkerRequestError("hfCommitSha must be a full lowercase commit SHA.");
   }
-  const createdAt = request.createdAt;
-  if (createdAt !== null && (typeof createdAt !== "string" || Number.isNaN(Date.parse(createdAt)))) {
-    throw new CalibrationTreeWorkerRequestError("createdAt must be an ISO 8601 time or null.");
-  }
+  const createdAt = publicationTime(request.createdAt);
   const artifacts = requestObject(request.artifacts, "artifacts");
   onlyFields(artifacts, ARTIFACT_NAMES, "artifacts");
   for (const name of ARTIFACT_NAMES) {
@@ -283,8 +345,8 @@ export function buildCalibrationTreeWorkerBundle(request: CalibrationTreeWorkerR
     for (const file of bundle.files) enforceConfiguredSizeLimits(file);
     return bundle;
   } catch (error) {
-    if (error instanceof CalibrationTreeWorkerRequestError) throw error;
-    throw new CalibrationTreeUnbuildableInputError(error instanceof Error ? error.message : String(error));
+    if (!isCalibrationTreeContentRefusal(error)) throw error;
+    throw new CalibrationTreeUnbuildableInputError((error as Error).message);
   }
 }
 
@@ -307,6 +369,7 @@ export function runCalibrationTreeWorker(
   request: CalibrationTreeWorkerRequest,
   outputDirectory: string,
 ): CalibrationTreeWorkerResult {
+  checkConfiguredSizeLimits();
   emptyOutputDirectory(outputDirectory);
   const bundle = buildCalibrationTreeWorkerBundle(request);
   for (const file of bundle.files) {
@@ -366,9 +429,7 @@ export function calibrationTreeWorkerMain(argv: string[]): number {
     return 0;
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
-    return error instanceof CalibrationTreeUnbuildableInputError
-      ? CALIBRATION_TREE_WORKER_EXIT_UNBUILDABLE_INPUT
-      : CALIBRATION_TREE_WORKER_EXIT_REQUEST_ERROR;
+    return calibrationTreeWorkerExitCode(error);
   }
 }
 
