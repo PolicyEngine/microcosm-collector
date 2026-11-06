@@ -6,6 +6,8 @@ Version 1, which the dashboard reads today, keeps its recorded answers too.
 from __future__ import annotations
 
 import re
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -19,11 +21,13 @@ from referencing.jsonschema import DRAFT202012
 
 from telemetry_collector.app import create_app
 from telemetry_collector.migrate import upgrade_database
+from telemetry_collector.read_api_v2 import run_detail
 from telemetry_collector.storage import PostgresTelemetryStore
 from tests.fakes import FakeTelemetryStore
 from tests.read_api_contract import (
     INTERACTIONS_DIR,
     OPENAPI_PATH,
+    READ_HEADERS,
     V1_INTERACTIONS_DIR,
     ContractAuthenticator,
     answer,
@@ -187,3 +191,84 @@ def test_a_run_answers_with_the_state_folded_from_its_events() -> None:
         assert all(
             event["run_id"] == body["run"]["run_id"] for event in body["events"]
         ), name
+
+
+def _utc_offsets(value: Any) -> list[timedelta]:
+    """Every offset of the timestamps in a JSON document's string values."""
+
+    if isinstance(value, dict):
+        return [offset for item in value.values() for offset in _utc_offsets(item)]
+    if isinstance(value, list):
+        return [offset for item in value for offset in _utc_offsets(item)]
+    if isinstance(value, str) and re.fullmatch(r"\d{4}-\d\d-\d\dT\S+", value):
+        parsed = datetime.fromisoformat(value)
+        assert parsed.utcoffset() is not None, value
+        return [parsed.utcoffset()]
+    return []
+
+
+def test_a_run_gives_every_timestamp_in_utc_whatever_offset_it_was_read_with() -> None:
+    east = timezone(timedelta(hours=5))
+    registered_at = datetime(2026, 10, 20, 14, 0, tzinfo=east)
+    registered_run = {
+        "run_id": "run-1",
+        "country_code": "US",
+        "pipeline": "us-fiscal-refresh",
+        "candidate_id": None,
+        "release_id": None,
+        "run_kind": "build",
+        "owner_hf_id": "hf-user-1",
+        "owner_hf_username": "builder",
+        "registered_at": registered_at,
+    }
+    events = [
+        {
+            "event_id": f"run-1-{sequence}",
+            "run_id": "run-1",
+            "producer_id": "producer-1",
+            "producer_registered_at": registered_at,
+            "sequence": sequence,
+            "timestamp": registered_at + timedelta(minutes=sequence),
+            "event_type": event_type,
+            "stage_id": "calibrate",
+            "status": event_status,
+            "message": None,
+            "details": details,
+            "resources": None,
+        }
+        for sequence, event_type, event_status, details in (
+            (1, "run", "started", {}),
+            (2, "progress", "progress", {"done": 1, "total": 10}),
+            (3, "heartbeat", "progress", {}),
+            (4, "run", "completed", {}),
+        )
+    ]
+
+    body = run_detail(registered_run, events).model_dump(mode="json")
+
+    offsets = _utc_offsets(body)
+    # registered_at, started_at, updated_at, ended_at, heartbeat_at,
+    # work.updated_at and each event's timestamp.
+    assert len(offsets) == 6 + len(events)
+    assert set(offsets) == {timedelta(0)}
+    assert body["run"]["registered_at"] == "2026-10-20T09:00:00Z"
+    assert body["run"]["work"]["updated_at"] == "2026-10-20T09:02:00Z"
+
+
+def test_v2_answers_503_while_a_deployment_is_in_progress() -> None:
+    client = TestClient(
+        create_app(
+            settings=replace(contract_settings(), maintenance_mode=True),
+            store=FakeTelemetryStore(),
+            huggingface_authenticator=ContractAuthenticator(),
+        )
+    )
+
+    for request_path in ("/v2/runs", "/v2/runs/run-1", "/v2/openapi.json"):
+        response = client.get(request_path, headers=READ_HEADERS)
+
+        assert response.status_code == 503, request_path
+        assert response.headers["Retry-After"] == "60"
+        assert response.json() == {
+            "detail": "Telemetry service is temporarily unavailable."
+        }

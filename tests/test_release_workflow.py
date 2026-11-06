@@ -1,9 +1,11 @@
 """Each merge to main is released in two passes: version, then verify, tag, deploy."""
 
+import io
 import json
 import os
 import re
 import subprocess
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -14,6 +16,11 @@ PUSH_WORKFLOW = ROOT / ".github" / "workflows" / "push.yaml"
 TAG_SCRIPT = ROOT / "tools" / "publish-git-tag.sh"
 PUBLISH_CLIENT_SCRIPT = ROOT / "tools" / "publish-client.sh"
 CLIENT_PACKAGE_NAME = "@policyengine/microcosm-collector-client"
+CLIENT_ARTIFACT = "collector-client"
+PUBLISH_CONDITION = (
+    "github.event_name == 'push' && github.ref == 'refs/heads/main'"
+    " && vars.COLLECTOR_CLIENT_PUBLISH_ENABLED == 'true'"
+)
 RELEASE_COMMIT = "Update microcosm-collector"
 APP_TOKEN = "${{ steps.app-token.outputs.token }}"
 
@@ -36,6 +43,7 @@ def test_release_commit_is_verified_then_tagged_then_deployed() -> None:
         "tag",
         "deploy-staging",
         "deploy-production",
+        "pack-client",
         "publish-client",
     }
     collector_only = "github.repository == 'PolicyEngine/microcosm-collector'"
@@ -50,7 +58,8 @@ def test_release_commit_is_verified_then_tagged_then_deployed() -> None:
     assert jobs["tag"]["steps"][-1]["run"] == "bash tools/publish-git-tag.sh"
     assert jobs["deploy-staging"]["needs"] == "tag"
     assert jobs["deploy-production"]["needs"] == "deploy-staging"
-    assert jobs["publish-client"]["needs"] == "deploy-production"
+    assert jobs["pack-client"]["needs"] == "deploy-production"
+    assert jobs["publish-client"]["needs"] == "pack-client"
 
 
 def test_versioning_commits_the_release_with_the_app_token() -> None:
@@ -85,38 +94,75 @@ def test_only_versioning_and_deployment_read_secrets() -> None:
             "TELEMETRY_GCP_WIF_PROVIDER",
             "TELEMETRY_GCP_DEPLOY_SERVICE_ACCOUNT",
         },
+        "pack-client": set(),
         "publish-client": set(),
     }
 
 
-def test_client_is_published_after_production_only_when_enabled() -> None:
+def test_client_is_packed_after_production_without_an_oidc_token() -> None:
     jobs = push_jobs()
-    assert "publish-client" in jobs
-    job = jobs["publish-client"]
+    assert "pack-client" in jobs
+    job = jobs["pack-client"]
     steps = job["steps"]
 
-    # Published only once production runs the release the client describes,
-    # and only once publishing is switched on.
-    assert job["if"] == (
-        "github.event_name == 'push' && github.ref == 'refs/heads/main'"
-        " && vars.COLLECTOR_CLIENT_PUBLISH_ENABLED == 'true'"
-    )
-    # npm's trusted publisher names this workflow file and this environment.
-    assert job["environment"] == "npm"
-    assert job["permissions"] == {"contents": "read", "id-token": "write"}
-    assert job["concurrency"]["cancel-in-progress"] == "false"
+    # Packed only once production runs the release the client describes, and
+    # only once publishing is switched on. Installing the client's development
+    # dependencies and building it run here, where no OIDC token can be
+    # requested, not in the job that publishes.
+    assert job["if"] == PUBLISH_CONDITION
+    assert "permissions" not in job
+    assert "environment" not in job
     assert job["defaults"]["run"]["working-directory"] == "packages/collector-client"
     assert steps[0]["uses"].startswith("actions/checkout@")
     assert steps[0]["with"] == {"persist-credentials": "false"}
     assert steps[1]["uses"].startswith("actions/setup-node@")
     assert steps[1]["with"] == {
         "node-version": "24.22.1",
+        "package-manager-cache": "false",
+    }
+    assert [step["run"] for step in steps[2:4]] == [
+        "npm ci",
+        'npm pack --pack-destination "$RUNNER_TEMP/collector-client"',
+    ]
+    assert steps[4]["uses"].startswith("actions/upload-artifact@")
+    assert steps[4]["with"] == {
+        "name": CLIENT_ARTIFACT,
+        "path": "${{ runner.temp }}/collector-client/*.tgz",
+        "if-no-files-found": "error",
+        "retention-days": "7",
+    }
+    assert len(steps) == 5
+
+
+def test_client_is_published_from_the_packed_tarball_only() -> None:
+    jobs = push_jobs()
+    assert "publish-client" in jobs
+    job = jobs["publish-client"]
+    steps = job["steps"]
+
+    assert job["if"] == PUBLISH_CONDITION
+    # npm's trusted publisher names this workflow file and this environment.
+    assert job["environment"] == "npm"
+    assert job["permissions"] == {"contents": "read", "id-token": "write"}
+    assert job["concurrency"]["cancel-in-progress"] == "false"
+    assert "defaults" not in job
+    assert steps[0]["uses"].startswith("actions/checkout@")
+    assert steps[0]["with"] == {"persist-credentials": "false"}
+    assert steps[1]["uses"].startswith("actions/download-artifact@")
+    assert steps[1]["with"] == {
+        "name": CLIENT_ARTIFACT,
+        "path": "${{ runner.temp }}/collector-client",
+    }
+    assert steps[2]["uses"].startswith("actions/setup-node@")
+    assert steps[2]["with"] == {
+        "node-version": "24.22.1",
         "registry-url": "https://registry.npmjs.org",
         "package-manager-cache": "false",
     }
-    assert [step["run"] for step in steps[2:]] == [
-        "npm ci",
-        "bash ../../tools/publish-client.sh",
+    # With the OIDC token available, only the npm CLI that ships with Node runs:
+    # no package is installed and no package script runs.
+    assert [step["run"] for step in steps[3:]] == [
+        'bash tools/publish-client.sh "$RUNNER_TEMP/collector-client"',
     ]
 
 
@@ -214,7 +260,8 @@ def test_tag_script_refuses_a_version_tagged_on_another_commit(
 
 
 # Stands in for npm: records each call and answers `npm view` from
-# STUB_PUBLISHED, the versions on npm. With none, the package does not exist.
+# STUB_PUBLISHED, the versions on npm. As npm 11 does, `npm view` exits 1 for a
+# package that does not exist and, with no output, for a version it lacks.
 STUB_NPM = """#!/usr/bin/env bash
 echo "$*" >> "$NPM_CALLS"
 case "$1" in
@@ -222,22 +269,36 @@ case "$1" in
   view)
     if [ -z "$STUB_PUBLISHED" ]; then echo "npm error code E404" >&2; exit 1; fi
     for published in $STUB_PUBLISHED; do
-      if [ "$published" = "${2##*@}" ]; then echo "$published"; fi
-    done ;;
+      if [ "$published" = "${2##*@}" ]; then echo "$published"; exit 0; fi
+    done
+    exit 1 ;;
   publish) ;;
   *) exit 64 ;;
 esac
 """
 
 
+def write_client_tarball(directory: Path, name: str, version: str) -> Path:
+    """Write a tarball laid out as `npm pack` writes one, holding only its manifest."""
+
+    directory.mkdir(parents=True, exist_ok=True)
+    tarball_path = directory / f"client-{name.replace('/', '-')}-{version}.tgz"
+    manifest = json.dumps({"name": name, "version": version}).encode()
+    with tarfile.open(tarball_path, "w:gz") as tarball:
+        entry = tarfile.TarInfo("package/package.json")
+        entry.size = len(manifest)
+        tarball.addfile(entry, io.BytesIO(manifest))
+    return tarball_path
+
+
 def run_publish_script(
     tmp_path: Path,
     *,
-    client_version: str = "0.9.0",
+    tarballs: tuple[tuple[str, str], ...] = ((CLIENT_PACKAGE_NAME, "0.9.0"),),
     release_version: str = "0.9.0",
     npm_version: str = "11.19.1",
     published_versions: tuple[str, ...] = (),
-) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+) -> tuple[subprocess.CompletedProcess[str], list[str], list[Path]]:
     collector_root = tmp_path / "collector"
     client_dir = collector_root / "packages" / "collector-client"
     client_dir.mkdir(parents=True)
@@ -245,8 +306,14 @@ def run_publish_script(
         f'[project]\nname = "microcosm-collector"\nversion = "{release_version}"\n'
     )
     (client_dir / "package.json").write_text(
-        json.dumps({"name": CLIENT_PACKAGE_NAME, "version": client_version})
+        json.dumps({"name": CLIENT_PACKAGE_NAME, "version": release_version})
     )
+    tarball_directory = tmp_path / "packed"
+    tarball_directory.mkdir()
+    tarball_paths = [
+        write_client_tarball(tarball_directory, name, version)
+        for name, version in tarballs
+    ]
     stub_directory = tmp_path / "stub-bin"
     stub_directory.mkdir()
     (stub_directory / "npm").write_text(STUB_NPM)
@@ -254,7 +321,12 @@ def run_publish_script(
     calls_path = tmp_path / "npm-calls.txt"
     calls_path.touch()
     result = subprocess.run(
-        ["bash", str(PUBLISH_CLIENT_SCRIPT), str(collector_root)],
+        [
+            "bash",
+            str(PUBLISH_CLIENT_SCRIPT),
+            str(tarball_directory),
+            str(collector_root),
+        ],
         env={
             "PATH": f"{stub_directory}{os.pathsep}{os.environ['PATH']}",
             "HOME": os.environ.get("HOME", ""),
@@ -266,7 +338,7 @@ def run_publish_script(
         check=False,
         text=True,
     )
-    return result, calls_path.read_text().splitlines()
+    return result, calls_path.read_text().splitlines(), tarball_paths
 
 
 @pytest.mark.parametrize(
@@ -275,7 +347,7 @@ def run_publish_script(
 def test_publish_script_publishes_a_version_npm_lacks(
     tmp_path: Path, published_versions: tuple[str, ...]
 ) -> None:
-    result, npm_calls = run_publish_script(
+    result, npm_calls, [tarball_path] = run_publish_script(
         tmp_path, published_versions=published_versions
     )
 
@@ -283,25 +355,25 @@ def test_publish_script_publishes_a_version_npm_lacks(
     assert npm_calls == [
         "--version",
         f"view {CLIENT_PACKAGE_NAME}@0.9.0 version",
-        "publish --access public",
+        f"publish {tarball_path} --access public --ignore-scripts",
     ]
 
 
 def test_publish_script_accepts_a_rerun_after_publishing(tmp_path: Path) -> None:
-    result, npm_calls = run_publish_script(
+    result, npm_calls, _ = run_publish_script(
         tmp_path, published_versions=("0.8.0", "0.9.0")
     )
 
     assert result.returncode == 0, result.stderr
     assert f"{CLIENT_PACKAGE_NAME}@0.9.0 is already on npm." in result.stdout
-    assert "publish --access public" not in npm_calls
+    assert not any(call.startswith("publish") for call in npm_calls)
 
 
 def test_publish_script_refuses_a_client_version_other_than_the_release(
     tmp_path: Path,
 ) -> None:
-    result, npm_calls = run_publish_script(
-        tmp_path, client_version="0.8.0", release_version="0.9.0"
+    result, npm_calls, _ = run_publish_script(
+        tmp_path, tarballs=((CLIENT_PACKAGE_NAME, "0.8.0"),), release_version="0.9.0"
     )
 
     assert result.returncode == 1
@@ -309,10 +381,35 @@ def test_publish_script_refuses_a_client_version_other_than_the_release(
     assert npm_calls == []
 
 
+def test_publish_script_refuses_a_tarball_of_another_package(tmp_path: Path) -> None:
+    result, npm_calls, _ = run_publish_script(
+        tmp_path, tarballs=(("@policyengine/another-package", "0.9.0"),)
+    )
+
+    assert result.returncode == 1
+    assert f"not {CLIENT_PACKAGE_NAME}" in result.stderr
+    assert npm_calls == []
+
+
+@pytest.mark.parametrize(
+    "tarballs",
+    [(), ((CLIENT_PACKAGE_NAME, "0.9.0"), (CLIENT_PACKAGE_NAME, "0.9.1"))],
+    ids=["no tarball", "two tarballs"],
+)
+def test_publish_script_needs_exactly_one_tarball(
+    tmp_path: Path, tarballs: tuple[tuple[str, str], ...]
+) -> None:
+    result, npm_calls, _ = run_publish_script(tmp_path, tarballs=tarballs)
+
+    assert result.returncode == 1
+    assert "exactly one packed client" in result.stderr
+    assert npm_calls == []
+
+
 def test_publish_script_refuses_npm_without_trusted_publishing(
     tmp_path: Path,
 ) -> None:
-    result, npm_calls = run_publish_script(tmp_path, npm_version="11.5.0")
+    result, npm_calls, _ = run_publish_script(tmp_path, npm_version="11.5.0")
 
     assert result.returncode == 1
     assert "needs 11.5.1 or later" in result.stderr

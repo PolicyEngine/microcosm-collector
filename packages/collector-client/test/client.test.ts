@@ -323,6 +323,27 @@ describe("errors", () => {
     );
   });
 
+  test("a timeout while the answer is read is a timeout", async () => {
+    // The answer's headers arrive, but its body never finishes.
+    const fetchStub = async (_input: unknown, init?: RequestInit) =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            init?.signal?.addEventListener("abort", () =>
+              controller.error(init.signal?.reason),
+            );
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    await assert.rejects(
+      clientFor(fetchStub as typeof fetch, { timeoutMs: 10 }).getRun(
+        "us-run-completed",
+      ),
+      { name: "TimeoutError" },
+    );
+  });
+
   test("a request that takes too long is abandoned", async () => {
     const fetchStub = (_input: unknown, init?: RequestInit) =>
       new Promise<Response>((_resolve, reject) => {
@@ -351,9 +372,47 @@ describe("configuration", () => {
       "https://user:secret@collector.example",
       "https://collector.example/?token=x",
       "https://collector.example/#x",
+      "https://collector.example/prefix?",
+      "https://collector.example/prefix#",
     ]) {
       assert.throws(() => createCollectorClient({ baseUrl, readToken: "x" }));
     }
+  });
+
+  test("refuses a timeout that is not a positive number of milliseconds", () => {
+    for (const timeoutMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 1.5]) {
+      assert.throws(
+        () =>
+          createCollectorClient({ baseUrl: BASE_URL, readToken: "x", timeoutMs }),
+        RangeError,
+        String(timeoutMs),
+      );
+    }
+  });
+
+  test("accepts optional fields given as undefined", async () => {
+    // Callers often hold an optional value in a variable; with
+    // `exactOptionalPropertyTypes`, the types must still accept it.
+    const maybeCountry = undefined as string | undefined;
+    const maybeLimit = undefined as number | undefined;
+    const collector = pagingCollector(3);
+    const client = createCollectorClient({
+      baseUrl: BASE_URL,
+      readToken: READ_TOKEN,
+      fetch: collector.fetch,
+      timeoutMs: undefined,
+    });
+
+    const page = await client.listRuns({
+      country: maybeCountry,
+      limit: maybeLimit,
+      before: undefined,
+    });
+    const runs = await client.listRecentRuns({ country: maybeCountry, count: 2 });
+
+    assert.equal(page.runs.length, 3);
+    assert.equal(runs.length, 2);
+    assert.deepEqual(collector.limits, [60, 2]);
   });
 
   test("keeps a path prefix and drops a trailing slash", async () => {

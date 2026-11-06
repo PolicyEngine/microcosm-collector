@@ -21,6 +21,16 @@ DEPLOY_JOBS = {"deploy-staging", "deploy-production"}
 # The job that publishes the read API client holds an OIDC token for npm's
 # trusted publishing, in the npm environment, and never authenticates to Google.
 PUBLISH_CLIENT_JOB = "publish-client"
+DEPLOYMENT_ENVIRONMENTS = {"staging", "production"}
+# The Workload Identity provider's condition once it also requires a deployment
+# environment, so that a token from a job in any other environment, such as
+# publish-client's npm, cannot obtain Google credentials.
+PROVIDER_CONDITION = (
+    "assertion.repository=='PolicyEngine/microcosm-collector'"
+    " && assertion.ref=='refs/heads/main'"
+    " && assertion.environment in ['staging', 'production']"
+)
+README = ROOT / "README.md"
 CLIENT_DIRECTORY = "packages/collector-client"
 WORKLOAD_IDENTITY_SECRETS = {
     "TELEMETRY_GCP_WIF_PROVIDER",
@@ -127,7 +137,7 @@ def test_deployment_uses_main_only_staging_then_production_environments() -> Non
         assert jobs[job_name]["concurrency"]["cancel-in-progress"] == "false"
 
 
-def test_only_deployment_jobs_hold_oidc_tokens_and_workload_identity_secrets() -> None:
+def test_oidc_tokens_and_workload_identity_secrets_stay_with_their_jobs() -> None:
     for workflow_path in workflow_paths():
         workflow = load_workflow(workflow_path)
         assert "id-token" not in workflow.get("permissions", {}), workflow_path.name
@@ -152,6 +162,33 @@ def test_only_deployment_jobs_hold_oidc_tokens_and_workload_identity_secrets() -
     publish_text = yaml.safe_dump(jobs[PUBLISH_CLIENT_JOB])
     assert re.findall(r"secrets\.(\w+)", publish_text) == []
     assert "NODE_AUTH_TOKEN" not in publish_text
+
+
+def readme_section(heading: str) -> str:
+    readme = README.read_text(encoding="utf-8")
+    assert f"\n{heading}\n" in readme, heading
+    section = readme.split(f"\n{heading}\n", 1)[1]
+    return re.split(r"\n#{2,3} ", section, maxsplit=1)[0]
+
+
+def test_publishing_waits_for_the_provider_to_check_the_environment() -> None:
+    jobs = load_workflow(PUSH_WORKFLOW)["jobs"]
+    google_access = readme_section("### Google Cloud access")
+    client_section = readme_section("### The TypeScript client")
+
+    assert {jobs[job_name]["environment"] for job_name in DEPLOY_JOBS} == (
+        DEPLOYMENT_ENVIRONMENTS
+    )
+    assert jobs[PUBLISH_CLIENT_JOB]["environment"] not in DEPLOYMENT_ENVIRONMENTS
+    assert PROVIDER_CONDITION in google_access
+    assert "No other job requests an OIDC token" not in google_access
+    # The manual steps change the provider's condition before publishing is
+    # switched on.
+    assert "**Switch.**" in client_section
+    assert PROVIDER_CONDITION in client_section
+    assert client_section.index(PROVIDER_CONDITION) < client_section.index(
+        "**Switch.**"
+    )
 
 
 def test_pull_requests_report_one_required_check() -> None:
