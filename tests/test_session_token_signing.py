@@ -259,6 +259,42 @@ def test_settings_still_refuse_a_short_hs256_secret(
         CollectorSettings.from_environment()
 
 
+# Every deployed revision mounts both variables from Secret Manager, so a blank
+# value means a mistaken secret version. Treating it as absent would let the
+# collector start and keep issuing HS256 tokens without anyone noticing.
+@pytest.mark.parametrize(
+    "blank_value", ["", " ", "\n", "\r\n"], ids=["empty", "space", "lf", "crlf"]
+)
+def test_settings_refuse_a_signing_key_that_is_set_but_blank(
+    collector_environment: pytest.MonkeyPatch, blank_value: str
+) -> None:
+    collector_environment.setenv("TELEMETRY_JWT_SIGNING_KEY", blank_value)
+    collector_environment.setenv("TELEMETRY_JWT_SECRET", HS256_SECRET)
+
+    with pytest.raises(RuntimeError) as refusal:
+        CollectorSettings.from_environment()
+
+    assert str(refusal.value) == "TELEMETRY_JWT_SIGNING_KEY is set but empty."
+
+
+@pytest.mark.parametrize(
+    "blank_value", ["", " ", "\n", "\r\n"], ids=["empty", "space", "lf", "crlf"]
+)
+def test_settings_refuse_an_hs256_secret_that_is_set_but_blank(
+    collector_environment: pytest.MonkeyPatch, blank_value: str
+) -> None:
+    private_key, _ = generated_signing_key()
+    collector_environment.setenv(
+        "TELEMETRY_JWT_SIGNING_KEY", private_key_pem(private_key)
+    )
+    collector_environment.setenv("TELEMETRY_JWT_SECRET", blank_value)
+
+    with pytest.raises(RuntimeError) as refusal:
+        CollectorSettings.from_environment()
+
+    assert str(refusal.value) == "TELEMETRY_JWT_SECRET is set but empty."
+
+
 def exchange(client: TestClient) -> str:
     response = client.post(
         "/v1/auth/huggingface/exchange",
