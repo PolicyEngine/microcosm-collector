@@ -3,19 +3,25 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient
 
+import telemetry_collector.app as collector_app
 from telemetry_collector.app import CollectorSettings, create_app
 from telemetry_collector.auth import HuggingFacePrincipal
 from telemetry_collector.session_tokens import SessionSigningKey
 from tests.fakes import FakeTelemetryStore
 from tests.signing_keys import p256_private_key, private_key_pem
 
+ROOT = Path(__file__).resolve().parents[1]
 HS256_SECRET = "test-secret-that-is-long-enough-32"
+# The longest a token lasts: a delegated token, which a build on another
+# machine, such as a Microcosm stage on Modal, holds for its whole run.
+LONGEST_TOKEN_SECONDS = 24 * 60 * 60
 ISSUER = "test-collector"
 AUDIENCE = "microcosm-telemetry-collector"
 READ_TOKEN = "dashboard-read-token"
@@ -378,3 +384,69 @@ def test_a_verifier_holding_only_the_jwks_accepts_issued_tokens() -> None:
     )
 
     assert claims["sub"] == "hf-user-1"
+
+
+def test_a_delegated_token_is_signed_with_es256_and_lasts_24_hours() -> None:
+    private_key, signing_key = generated_signing_key()
+    client = collector_client(signing_key=signing_key, hs256_secret=HS256_SECRET)
+
+    response = client.post(
+        "/v1/auth/huggingface/exchange",
+        headers={"Authorization": "Bearer hf_example"},
+        json={"scope": "telemetry:write", "lifetime_seconds": 200_000},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["expires_in"] == LONGEST_TOKEN_SECONDS
+    session_token = response.json()["access_token"]
+    assert jwt.get_unverified_header(session_token)["alg"] == "ES256"
+    claims = jwt.decode(
+        session_token,
+        private_key.public_key(),
+        algorithms=["ES256"],
+        issuer=ISSUER,
+        audience=AUDIENCE,
+    )
+    assert claims["delegated"] is True
+    assert claims["exp"] - claims["iat"] == LONGEST_TOKEN_SECONDS
+    assert register_run(client, session_token).status_code == 201
+
+
+def test_an_hs256_token_issued_23_hours_before_the_switch_is_still_accepted() -> None:
+    _, signing_key = generated_signing_key()
+    client = collector_client(signing_key=signing_key, hs256_secret=HS256_SECRET)
+    issued_at = datetime.now(UTC) - timedelta(hours=23)
+    session_token = jwt.encode(
+        {
+            **session_claims(),
+            "iat": issued_at,
+            "exp": issued_at + timedelta(seconds=LONGEST_TOKEN_SECONDS),
+            "delegated": True,
+        },
+        HS256_SECRET,
+        algorithm="HS256",
+    )
+
+    assert register_run(client, session_token).status_code == 201
+
+
+def switching_section() -> str:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    heading = "\n### Switching from HS256 to ES256\n"
+    assert heading in readme
+    return readme.split(heading, 1)[1].split("\n## ", 1)[0].split("\n### ", 1)[0]
+
+
+def test_the_switch_accepts_hs256_tokens_for_the_longest_token_lifetime() -> None:
+    section = switching_section()
+
+    assert (
+        getattr(collector_app, "MAXIMUM_DELEGATED_LIFETIME_SECONDS", None)
+        == LONGEST_TOKEN_SECONDS
+    )
+    # Agreed on 2026-10-27: HS256 tokens stay accepted for 24 hours after the
+    # last revision that issued them, the longest a Modal build's token lasts.
+    assert "at least 24 hours" in section
+    assert "one token lifetime" not in section
+    # A build holding a delegated token cannot exchange again after a 401.
+    assert "cannot exchange again" in section
