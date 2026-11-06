@@ -79,10 +79,13 @@ def test_publishing_runs_only_on_main_and_only_once_switched_on() -> None:
     job = workflow["jobs"]["publish"]
     assert job["needs"] == "test"
     assert job["environment"] == "npm"
-    assert job["concurrency"] == {
+    # Whole runs, tests included, wait for each other, so versions merged one
+    # after another are published in that order.
+    assert workflow.get("concurrency") == {
         "group": "calibration-tree-npm-publication",
         "cancel-in-progress": "false",
     }
+    assert all("concurrency" not in job for job in workflow["jobs"].values())
 
 
 def test_publishing_uses_npm_trusted_publishing_and_no_stored_credential() -> None:
@@ -245,6 +248,26 @@ def run_publish_script(
 
 
 def test_publish_script_publishes_a_version_npm_does_not_have(tmp_path: Path) -> None:
+    assert PUBLISH_SCRIPT.is_file()
+
+    # npm 11's answer for a package that exists without this version.
+    result, calls = run_publish_script(
+        tmp_path,
+        view_exit=1,
+        view_output="",
+        view_error="npm error code E404\nnpm error 404 No match found for version 0.2.0\n",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert calls == [
+        "view @policyengine/calibration-tree@0.2.0 version",
+        "publish --access public",
+    ]
+
+
+def test_publish_script_publishes_a_version_older_npm_lists_as_empty(
+    tmp_path: Path,
+) -> None:
     assert PUBLISH_SCRIPT.is_file()
 
     result, calls = run_publish_script(tmp_path, view_exit=0, view_output="")
