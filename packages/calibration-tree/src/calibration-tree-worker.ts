@@ -1,7 +1,7 @@
-// The calibration tree worker: builds one release's tree bundle from local
-// copies of the files the publisher reads from Hugging Face, and writes each
-// part's gzip bytes under an output directory, at the path the publisher
-// uploads it to. The collector runs it as its own Bun process:
+// The calibration tree worker: builds one release's or staged run's tree
+// bundle from local copies of a build's files, and writes each part's gzip
+// bytes under an output directory, at the path the publisher uploads it to.
+// The collector runs it as its own Bun process:
 //
 //   bun run src/calibration-tree-worker.ts REQUEST.json OUTPUT_DIRECTORY
 //
@@ -24,12 +24,25 @@
 //     }
 //   }
 //
-// It builds the bundle exactly as the publisher's `publishRelease` does from
-// the same files, commit and publication time, so both write the same bytes:
-// the golden tests hold each to the recorded trees. Like the publisher, it
-// records the publication time as Date.prototype.toISOString() writes it. On
-// success it prints one JSON line describing the written parts and exits 0.
-// It writes nothing unless the whole bundle builds. The other exit codes:
+// or a staged run's, built from a staged bundle's submitted files:
+//
+//   {
+//     "kind": "staging",
+//     "country": "uk",
+//     "runId": "<the staged run>",
+//     "label": "<the candidate release, or the run id when it names none>",
+//     "hfRepo": ..., "hfCommitSha": ..., "createdAt": ..., "artifacts": {...}
+//   }
+//
+// A release bundle is built exactly as the publisher's `publishRelease` builds
+// it from the same files, commit and publication time, so both write the same
+// bytes: the golden tests hold each to the recorded trees. A staged run's is
+// built as the publisher's `publishStagingSource` builds a staging tree, but
+// from the files given here rather than the staging repo's run files. Like the
+// publisher, it records the publication time as Date.prototype.toISOString()
+// writes it. On success it prints one JSON line describing the written parts,
+// with the manifest entry the publisher would record for the build, and exits
+// 0. It writes nothing unless the whole bundle builds. The other exit codes:
 //
 //   1  the request could not be followed: a malformed request, a missing
 //      file, an output directory that is not empty;
@@ -49,10 +62,11 @@ import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createHash } from "node:crypto";
 
-import type { CalibrationTreeSourceArtifact } from "./calibration-tree-artifact";
+import { CALIBRATION_TREE_SCHEMA_VERSION, type CalibrationTreeSourceArtifact } from "./calibration-tree-artifact";
 import { buildCalibrationTreeBundle, type CalibrationTreeBundle } from "./calibration-tree-bundle";
+import type { CalibrationTreeManifestEntry } from "./calibration-tree-manifest";
 import { isCountry, type MicrocosmCountry } from "./countries";
-import { buildCalibration, InvalidReleaseIdError } from "./latest-artifact";
+import { assertSafeReleaseId, buildCalibration, InvalidReleaseIdError } from "./latest-artifact";
 import { CalibrationTreeArtifactSizeError, enforceConfiguredSizeLimits } from "./publish-calibration-tree";
 import { isBuildFolderId, isReleaseDirectory } from "./release-record";
 import { IncompatibleStagingDataError } from "./staging-contract";
@@ -76,6 +90,16 @@ const REQUEST_FIELDS = [
   "createdAt",
   "artifacts",
 ] as const;
+const STAGING_REQUEST_FIELDS = [
+  "kind",
+  "country",
+  "runId",
+  "label",
+  "hfRepo",
+  "hfCommitSha",
+  "createdAt",
+  "artifacts",
+] as const;
 const HF_COMMIT_RE = /^[0-9a-f]{40,64}$/;
 // A date and time with seconds and an explicit offset, so the instant never
 // depends on the machine's time zone.
@@ -91,7 +115,14 @@ export interface CalibrationTreeWorkerArtifact {
   file: string;
 }
 
-export interface CalibrationTreeWorkerRequest {
+export interface CalibrationTreeWorkerArtifacts {
+  calibrationDiagnostics: CalibrationTreeWorkerArtifact;
+  buildManifest: CalibrationTreeWorkerArtifact | null;
+  releaseManifest: CalibrationTreeWorkerArtifact | null;
+  demographics: CalibrationTreeWorkerArtifact | null;
+}
+
+export interface CalibrationTreeWorkerReleaseRequest {
   kind: "release";
   country: MicrocosmCountry;
   releaseId: string;
@@ -99,13 +130,25 @@ export interface CalibrationTreeWorkerRequest {
   hfRepo: string;
   hfCommitSha: string;
   createdAt: string | null;
-  artifacts: {
-    calibrationDiagnostics: CalibrationTreeWorkerArtifact;
-    buildManifest: CalibrationTreeWorkerArtifact | null;
-    releaseManifest: CalibrationTreeWorkerArtifact | null;
-    demographics: CalibrationTreeWorkerArtifact | null;
-  };
+  artifacts: CalibrationTreeWorkerArtifacts;
 }
+
+/** A staged run, built from its staged bundle's files. */
+export interface CalibrationTreeWorkerStagingRequest {
+  kind: "staging";
+  country: MicrocosmCountry;
+  runId: string;
+  /** The candidate release the run was staged for, or the run id. */
+  label: string;
+  hfRepo: string;
+  hfCommitSha: string;
+  createdAt: string | null;
+  artifacts: CalibrationTreeWorkerArtifacts;
+}
+
+export type CalibrationTreeWorkerRequest =
+  | CalibrationTreeWorkerReleaseRequest
+  | CalibrationTreeWorkerStagingRequest;
 
 export interface CalibrationTreeWorkerPart {
   part: string;
@@ -117,6 +160,7 @@ export interface CalibrationTreeWorkerPart {
 
 export interface CalibrationTreeWorkerResult {
   country: MicrocosmCountry;
+  /** The release id for a release; the label for a staged run. */
   releaseId: string;
   hfRepo: string;
   hfCommitSha: string;
@@ -124,6 +168,8 @@ export interface CalibrationTreeWorkerResult {
   buildArtifactId: string;
   index: Omit<CalibrationTreeWorkerPart, "part">;
   files: CalibrationTreeWorkerPart[];
+  /** The entry the publisher would add to the manifest for this build. */
+  manifestEntry: CalibrationTreeManifestEntry;
 }
 
 /** The request could not be followed; nothing about the files is known. */
@@ -224,13 +270,23 @@ function workerArtifact(value: unknown, name: ArtifactName): CalibrationTreeWork
   };
 }
 
+function stagedRunId(value: JsonObject): string {
+  const runId = requestString(value, "runId");
+  try {
+    if (runId === "latest") throw new InvalidReleaseIdError("Invalid run id");
+    return assertSafeReleaseId(runId, "run");
+  } catch {
+    throw new CalibrationTreeWorkerRequestError("runId must be a run id: letters, digits, dots, underscores and hyphens.");
+  }
+}
+
 /** Checks a request read from JSON, refusing anything the worker would guess at. */
 export function parseCalibrationTreeWorkerRequest(value: unknown): CalibrationTreeWorkerRequest {
   const request = requestObject(value, "The request");
-  onlyFields(request, REQUEST_FIELDS, "The request");
-  if (request.kind !== "release") {
-    throw new CalibrationTreeWorkerRequestError('kind must be "release".');
+  if (request.kind !== "release" && request.kind !== "staging") {
+    throw new CalibrationTreeWorkerRequestError('kind must be "release" or "staging".');
   }
+  onlyFields(request, request.kind === "release" ? REQUEST_FIELDS : STAGING_REQUEST_FIELDS, "The request");
   const country = requestString(request, "country");
   if (!isCountry(country)) {
     throw new CalibrationTreeWorkerRequestError(`country ${country} is not a registered country.`);
@@ -244,12 +300,30 @@ export function parseCalibrationTreeWorkerRequest(value: unknown): CalibrationTr
     throw new CalibrationTreeWorkerRequestError("hfCommitSha must be a full lowercase commit SHA.");
   }
   const createdAt = publicationTime(request.createdAt);
-  const artifacts = requestObject(request.artifacts, "artifacts");
-  onlyFields(artifacts, ARTIFACT_NAMES, "artifacts");
+  const artifactFields = requestObject(request.artifacts, "artifacts");
+  onlyFields(artifactFields, ARTIFACT_NAMES, "artifacts");
   for (const name of ARTIFACT_NAMES) {
-    if (!(name in artifacts)) {
+    if (!(name in artifactFields)) {
       throw new CalibrationTreeWorkerRequestError(`artifacts.${name} is required (null when absent).`);
     }
+  }
+  const artifacts = {
+    calibrationDiagnostics: workerArtifact(artifactFields.calibrationDiagnostics, "calibrationDiagnostics")!,
+    buildManifest: workerArtifact(artifactFields.buildManifest, "buildManifest"),
+    releaseManifest: workerArtifact(artifactFields.releaseManifest, "releaseManifest"),
+    demographics: workerArtifact(artifactFields.demographics, "demographics"),
+  };
+  if (request.kind === "staging") {
+    return {
+      kind: "staging",
+      country,
+      runId: stagedRunId(request),
+      label: requestString(request, "label"),
+      hfRepo,
+      hfCommitSha,
+      createdAt,
+      artifacts,
+    };
   }
   return {
     kind: "release",
@@ -259,12 +333,7 @@ export function parseCalibrationTreeWorkerRequest(value: unknown): CalibrationTr
     hfRepo,
     hfCommitSha,
     createdAt,
-    artifacts: {
-      calibrationDiagnostics: workerArtifact(artifacts.calibrationDiagnostics, "calibrationDiagnostics")!,
-      buildManifest: workerArtifact(artifacts.buildManifest, "buildManifest"),
-      releaseManifest: workerArtifact(artifacts.releaseManifest, "releaseManifest"),
-      demographics: workerArtifact(artifacts.demographics, "demographics"),
-    },
+    artifacts,
   };
 }
 
@@ -302,59 +371,181 @@ function readArtifact(artifact: CalibrationTreeWorkerArtifact | null): ReadArtif
   };
 }
 
-/** Builds the release's bundle in memory, as the publisher's publishRelease does. */
+/**
+ * Builds the requested bundle in memory: a release as the publisher's
+ * publishRelease does, a staged run as its publishStagingSource does.
+ */
 export function buildCalibrationTreeWorkerBundle(request: CalibrationTreeWorkerRequest): CalibrationTreeBundle {
   const [diagnostics, buildManifest, releaseManifest, demographics] = ARTIFACT_NAMES.map((name) =>
     readArtifact(request.artifacts[name])
   );
   if (!diagnostics) throw new CalibrationTreeWorkerRequestError("Calibration diagnostics are missing.");
-  const { country, releaseId: id, releaseDirectory, hfCommitSha } = request;
   try {
-    const calibration = buildCalibration(
-      diagnostics.json,
-      id,
-      null,
-      buildManifest?.json ?? {},
-      releaseManifest?.json ?? {},
-      demographics?.json ?? {},
-      country,
-      "huggingface_immutable",
-      diagnostics.source.sha256,
-      hfCommitSha,
-    );
-    const bundle = buildCalibrationTreeBundle({
-      country,
-      createdAt: request.createdAt,
-      releaseId: id,
-      hfRepo: request.hfRepo,
-      hfCommitSha,
-      sourceArtifacts: {
-        calibrationDiagnostics: diagnostics.source,
-        buildManifest: buildManifest?.source ?? null,
-        releaseManifest: releaseManifest?.source ?? null,
-        demographics: demographics?.source ?? null,
-      },
-      rows: calibration.rows,
-      calibrationProvenance: calibration.calibration_provenance,
-      lossAttributionAvailable: calibration.target_loss_attribution.status !== "unavailable",
-      comparison: {
-        // As in publishRelease: a tag or a build folder compares under its
-        // own id, a release folder under the release its diagnostics name.
-        releaseId: releaseDirectory === id && !isBuildFolderId(id) ? calibration.release_id : id,
-        calibrationProvenance: calibration.calibration_provenance,
-        status: calibration.target_loss_attribution.status,
-        aggregate: calibration.target_loss_attribution.aggregate,
-        cap: calibration.target_loss_attribution.cap,
-        basisIdentifier: calibration.target_loss_attribution.basis_identifier,
-        targetRepresentation: calibration.target_schema.target_representation,
-      },
+    const sourceArtifacts = {
+      calibrationDiagnostics: diagnostics.source,
+      buildManifest: buildManifest?.source ?? null,
+      releaseManifest: releaseManifest?.source ?? null,
+      demographics: demographics?.source ?? null,
+    };
+    if (request.kind === "staging") {
+      return buildStagingBundle(request, sourceArtifacts, {
+        diagnostics: diagnostics.json,
+        buildManifest: buildManifest?.json ?? {},
+        releaseManifest: releaseManifest?.json ?? {},
+        demographics: demographics?.json ?? {},
+      });
+    }
+    return buildReleaseBundle(request, sourceArtifacts, {
+      diagnostics: diagnostics.json,
+      buildManifest: buildManifest?.json ?? {},
+      releaseManifest: releaseManifest?.json ?? {},
+      demographics: demographics?.json ?? {},
     });
-    for (const file of bundle.files) enforceConfiguredSizeLimits(file);
-    return bundle;
   } catch (error) {
     if (!isCalibrationTreeContentRefusal(error)) throw error;
     throw new CalibrationTreeUnbuildableInputError((error as Error).message);
   }
+}
+
+interface WorkerDocuments {
+  diagnostics: JsonObject;
+  buildManifest: JsonObject;
+  releaseManifest: JsonObject;
+  demographics: JsonObject;
+}
+
+type WorkerSourceArtifacts = Parameters<typeof buildCalibrationTreeBundle>[0]["sourceArtifacts"];
+
+// As publishStagingSource builds a new staged run's tree: a staging build of
+// the run, labelled and released under its candidate release, comparing
+// under the release its diagnostics name.
+function buildStagingBundle(
+  request: CalibrationTreeWorkerStagingRequest,
+  sourceArtifacts: WorkerSourceArtifacts,
+  documents: WorkerDocuments,
+): CalibrationTreeBundle {
+  const { country, runId, label, hfRepo, hfCommitSha, createdAt } = request;
+  const calibration = buildCalibration(
+    documents.diagnostics,
+    label,
+    createdAt,
+    documents.buildManifest,
+    documents.releaseManifest,
+    documents.demographics,
+    country,
+    "huggingface_staged_bundle",
+    sourceArtifacts.calibrationDiagnostics?.sha256 ?? null,
+    hfCommitSha,
+  );
+  const bundle = buildCalibrationTreeBundle({
+    country,
+    buildKind: "staging",
+    sourceId: runId,
+    label,
+    createdAt,
+    releaseId: label,
+    hfRepo,
+    hfCommitSha,
+    sourceArtifacts,
+    rows: calibration.rows,
+    calibrationProvenance: calibration.calibration_provenance,
+    lossAttributionAvailable: calibration.target_loss_attribution.status !== "unavailable",
+    comparison: {
+      releaseId: calibration.release_id,
+      calibrationProvenance: calibration.calibration_provenance,
+      status: calibration.target_loss_attribution.status,
+      aggregate: calibration.target_loss_attribution.aggregate,
+      cap: calibration.target_loss_attribution.cap,
+      basisIdentifier: calibration.target_loss_attribution.basis_identifier,
+      targetRepresentation: calibration.target_schema.target_representation,
+    },
+  });
+  for (const file of bundle.files) enforceConfiguredSizeLimits(file);
+  return bundle;
+}
+
+function buildReleaseBundle(
+  request: CalibrationTreeWorkerReleaseRequest,
+  sourceArtifacts: WorkerSourceArtifacts,
+  documents: WorkerDocuments,
+): CalibrationTreeBundle {
+  const { country, releaseId: id, releaseDirectory, hfCommitSha } = request;
+  const calibration = buildCalibration(
+    documents.diagnostics,
+    id,
+    null,
+    documents.buildManifest,
+    documents.releaseManifest,
+    documents.demographics,
+    country,
+    "huggingface_immutable",
+    sourceArtifacts.calibrationDiagnostics?.sha256 ?? null,
+    hfCommitSha,
+  );
+  const bundle = buildCalibrationTreeBundle({
+    country,
+    createdAt: request.createdAt,
+    releaseId: id,
+    hfRepo: request.hfRepo,
+    hfCommitSha,
+    sourceArtifacts,
+    rows: calibration.rows,
+    calibrationProvenance: calibration.calibration_provenance,
+    lossAttributionAvailable: calibration.target_loss_attribution.status !== "unavailable",
+    comparison: {
+      // As in publishRelease: a tag or a build folder compares under its
+      // own id, a release folder under the release its diagnostics name.
+      releaseId: releaseDirectory === id && !isBuildFolderId(id) ? calibration.release_id : id,
+      calibrationProvenance: calibration.calibration_provenance,
+      status: calibration.target_loss_attribution.status,
+      aggregate: calibration.target_loss_attribution.aggregate,
+      cap: calibration.target_loss_attribution.cap,
+      basisIdentifier: calibration.target_loss_attribution.basis_identifier,
+      targetRepresentation: calibration.target_schema.target_representation,
+    },
+  });
+  for (const file of bundle.files) enforceConfiguredSizeLimits(file);
+  return bundle;
+}
+
+// The entry the publisher adds to the manifest for the build: releaseManifestEntry
+// for a release, publishStagingSource's new entry for a staged run.
+function manifestEntry(
+  request: CalibrationTreeWorkerRequest,
+  bundle: CalibrationTreeBundle,
+  index: Omit<CalibrationTreeWorkerPart, "part">,
+): CalibrationTreeManifestEntry {
+  const build = bundle.index.build;
+  const shared = {
+    buildArtifactId: build.buildArtifactId,
+    hfRepo: request.hfRepo,
+    hfCommitSha: request.hfCommitSha,
+    treeSchemaVersion: CALIBRATION_TREE_SCHEMA_VERSION,
+    indexSha256: index.sha256,
+    indexBytes: index.rawBytes,
+    createdAt: build.createdAt,
+    updatedAt: build.createdAt,
+  };
+  if (request.kind === "staging") {
+    return {
+      ...shared,
+      kind: "staging",
+      sourceId: request.runId,
+      label: request.label,
+      releaseId: null,
+      stagingRunId: request.runId,
+    };
+  }
+  return {
+    ...shared,
+    kind: "release",
+    sourceId: build.sourceId,
+    label: build.label,
+    releaseId: request.releaseId,
+    // Recorded only for a tag read from its release's folder.
+    ...(request.releaseDirectory !== request.releaseId ? { releaseDirectory: request.releaseDirectory } : {}),
+    stagingRunId: null,
+  };
 }
 
 function emptyOutputDirectory(outputDirectory: string): void {
@@ -394,13 +585,14 @@ export function runCalibrationTreeWorker(
   const { part: _index, ...index } = files.find((file) => file.part === "index")!;
   return {
     country: request.country,
-    releaseId: request.releaseId,
+    releaseId: request.kind === "staging" ? request.label : request.releaseId,
     hfRepo: request.hfRepo,
     hfCommitSha: request.hfCommitSha,
     createdAt: request.createdAt,
     buildArtifactId: bundle.index.buildArtifactId,
     index,
     files,
+    manifestEntry: manifestEntry(request, bundle, index),
   };
 }
 

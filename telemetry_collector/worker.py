@@ -3,8 +3,11 @@
 Cloud Tasks starts an execution of the worker job with ``COLLECTOR_WORKER_JOB_ID``
 set. The worker leases that job, recomputes the SHA-256 of every file at the
 generation recorded at completion, then calls the handler registered for the
-submission's kind. Calibration-tree and Orrery workers register their own
-handlers; until then both kinds only have their bytes checked.
+submission's kind. Where the worker job has a calibration tree Blob token,
+``calibration-diagnostics`` submissions build calibration trees
+(``telemetry_collector.calibration_trees``); otherwise, and for Orrery inputs
+until the Orrery worker registers its handler, they only have their bytes
+checked.
 
 Run it with ``python -m telemetry_collector.worker``.
 """
@@ -228,11 +231,15 @@ def main() -> int:
     # retry continues its own lease while a duplicate execution cannot.
     holder = os.environ.get("CLOUD_RUN_EXECUTION") or f"local-{uuid.uuid4().hex}"
     engine = create_database_engine(database_url)
+    # Imported here: the calibration tree handler builds on this module.
+    from telemetry_collector.calibration_trees import handlers_from_environment
+
     try:
         outcome = run_job(
             job_id,
             submissions=PostgresSubmissionStore(engine),
             objects=GoogleCloudStorageIntake(bucket_name=bucket_name),
+            handlers=handlers_from_environment(engine=engine),
             holder=holder,
         )
     finally:

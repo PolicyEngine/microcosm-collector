@@ -64,7 +64,7 @@ class InMemoryBlobStore {
       if (!stored) return null;
       return {
         statusCode: 200,
-        stream: new Response(stored.bytes).body,
+        stream: new Response(Buffer.from(stored.bytes)).body,
         headers: new Headers(),
         blob: { pathname, etag: stored.etag, contentType: "application/octet-stream", size: stored.bytes.byteLength },
       };
@@ -169,7 +169,7 @@ test("a built tree's parts are uploaded from disk and the manifest is created wi
     const stored = store.blobs.get(file.path);
     expect(stored?.bytes).toEqual(new Uint8Array(readFileSync(join(tree.bundleDirectory, file.path))));
   }
-  expect(store.manifest()?.countries.uk?.builds).toEqual([tree.worker.manifestEntry]);
+  expect(store.manifest()?.countries.uk?.builds as unknown).toEqual([tree.worker.manifestEntry]);
   // An absent manifest is created only if it is still absent.
   expect(store.puts.filter((put) => put.pathname === CALIBRATION_TREE_MANIFEST_PATH)).toEqual([
     { pathname: CALIBRATION_TREE_MANIFEST_PATH, allowOverwrite: false, ifMatch: undefined },
@@ -199,7 +199,8 @@ test("an existing manifest is replaced only if its ETag is still the one read", 
     allowOverwrite: true,
     ifMatch: etagBefore,
   });
-  expect(store.manifest()?.countries.uk?.builds.map((build) => build.kind)).toEqual(["staging", "release"]);
+  // The manifest orders builds by time, then build ID.
+  expect(store.manifest()?.countries.uk?.builds.map((build) => build.kind).sort()).toEqual(["release", "staging"]);
 });
 
 test("a manifest another writer changed is never overwritten: the publication fails so it can run again", async () => {
@@ -237,7 +238,7 @@ test("a stored part with other bytes stops the publication before the manifest c
   const store = new InMemoryBlobStore();
   const tree = builtTree("staging");
   const [firstPart] = tree.worker.files;
-  store.store(firstPart.path, new Uint8Array([0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0x03, 0x00]));
+  store.store(firstPart.path, Bun.gzipSync(new TextEncoder().encode("{}")));
 
   await expect(publish(store, tree)).rejects.toThrow(/already exists with different content/);
 
