@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Mapping
 from datetime import datetime
@@ -11,9 +12,11 @@ from typing import Annotated, Any, Final, Literal
 from pydantic import (
     AwareDatetime,
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
     RootModel,
+    Strict,
     StrictBool,
     StrictFloat,
     StrictInt,
@@ -90,9 +93,21 @@ class ResourceSnapshot(BaseModel):
 # reading of the build and its machine and any sleep on heartbeats, the
 # machine description on the run's start, stage spans, and outer progress.
 
+_LOGGER = logging.getLogger(__name__)
+
+
+def _require_text(value: object) -> object:
+    """Refuse a time given as a number; the emitter sends ISO 8601 text."""
+    if not isinstance(value, str):
+        raise ValueError("a time must be ISO 8601 text")
+    return value
+
+
+# Numbers are strict: an int or a float, never a boolean or numeric text.
 _Count = Annotated[StrictInt, Field(ge=0)]
-_Amount = Annotated[float, Field(ge=0, allow_inf_nan=False)]
-_Share = Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
+_Amount = Annotated[float, Strict(), Field(ge=0, allow_inf_nan=False)]
+_Share = Annotated[float, Strict(), Field(ge=0, le=1, allow_inf_nan=False)]
+_Time = Annotated[AwareDatetime, BeforeValidator(_require_text)]
 _Text = Annotated[str, Field(max_length=200)]
 _Identifier = Annotated[str, Field(pattern=SAFE_IDENTIFIER)]
 
@@ -120,7 +135,7 @@ class ReadingProgress(_EmitterDetail):
     total: StrictInt | StrictFloat | None
     unit: _Text | None
     outer: OuterProgress | None
-    reported_at: AwareDatetime
+    reported_at: _Time
 
 
 class ProcessTreeReading(_EmitterDetail):
@@ -175,8 +190,8 @@ class Reading(_EmitterDetail):
 class SleepRecord(_EmitterDetail):
     """One system sleep, on the heartbeat sent on waking (``details.sleep``)."""
 
-    started_at: AwareDatetime
-    ended_at: AwareDatetime
+    started_at: _Time
+    ended_at: _Time
     seconds: _Amount
 
     @model_validator(mode="after")
@@ -308,6 +323,14 @@ class TelemetryEvent(BaseModel):
                 dropped.append(key)
         if dropped:
             details[DROPPED_EMITTER_DETAILS_KEY] = dropped
+            _LOGGER.warning(
+                "Dropped emitter details %s from %s event %s of run %s: they "
+                "do not match their models.",
+                ", ".join(dropped),
+                self.event_type,
+                self.event_id,
+                self.run_id,
+            )
         self.details = details
         return self
 

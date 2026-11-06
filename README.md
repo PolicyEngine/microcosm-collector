@@ -88,15 +88,18 @@ the collector checks each against a model in `telemetry_collector.models`:
 
 | Event | Key | Model |
 | --- | --- | --- |
-| `heartbeat` | `reading`: the build's process tree and the machine, every 30 s | `Reading` |
+| `heartbeat` | `reading`: the build's process tree and the machine, on every heartbeat (every 30 s by default) | `Reading` |
 | `heartbeat` | `sleep`: a system sleep, on the heartbeat sent on waking | `SleepRecord` |
 | `run` | `environment`: a local machine or a Modal container | `MachineEnvironment` |
-| `stage` | `stage_span`: the parent stage, occurrence, awake and asleep seconds | `StageSpan` |
+| `stage` | `stage_span`: the parent stage, occurrence, awake and asleep seconds, and why the emitter closed it (`closed_by`) | `StageSpan` |
 | `progress` | `outer`: the counter one level above the stage's own | `OuterProgress` |
 
 A key that doesn't match its model is removed from the stored event and named
-in `details.dropped_emitter_details`; the rest of the event is accepted, since a
-`422` would stop the emitter delivering the whole run. The same keys on other
+in `details.dropped_emitter_details`, with a warning in the collector's log
+naming the event and run. The rest of the event is accepted, since a `422`
+would stop the emitter delivering the whole run. The models' numbers are
+strict (an integer or a float, never a boolean or numeric text) and their times
+are ISO 8601 text. The same keys on other
 event types are stored as sent, and only the collector writes
 `dropped_emitter_details`.
 
