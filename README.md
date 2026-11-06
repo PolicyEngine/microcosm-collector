@@ -46,8 +46,9 @@ returned JWT to the build.
   future endpoint that must not accept such tokens refuses tokens with this
   claim.
 - Until it expires, whoever holds the token can register runs and upload events
-  as the operator, and nothing else. Changing the signing secret is the only way
-  to revoke it early.
+  as the operator, and nothing else. Replacing the key that signed it is the
+  only way to revoke it early: the signing key for an ES256 token ("Switching
+  from HS256 to ES256"), or `TELEMETRY_JWT_SECRET` for an HS256 token.
 
 Without `lifetime_seconds`, the exchange is unchanged: the same lifetime, claims
 and response.
@@ -82,8 +83,11 @@ token for `expires_in` seconds and exchanges again after a 401.
   `none`, an unknown `kid` and an HS256 token keyed with the public key, gets
   401.
 - **Claims.** `iss`, `aud`, `sub` (the Hugging Face user ID), `username`,
-  `organizations`, `scope`, `iat` and `exp`. A token lasts
-  `TELEMETRY_SESSION_TOKEN_TTL_SECONDS`, one hour by default.
+  `organizations`, `scope`, `iat` and `exp`, and `"delegated": true` on a token
+  issued with `lifetime_seconds`. A token lasts
+  `TELEMETRY_SESSION_TOKEN_TTL_SECONDS`, one hour by default, or the lifetime
+  granted, at most 24 hours, when it is delegated ("Tokens for builds on other
+  machines").
 - **Scopes.** `scope` is exactly one of `telemetry:write`, which registers runs
   and sends their events, and `artifacts:submit`, which only the artifact
   submission endpoints accept. Each endpoint requires its own scope and answers
@@ -106,13 +110,19 @@ The switch window starts with the first deployment that mounts the signing key
 and ends with the change that stops mounting `TELEMETRY_JWT_SECRET`. During
 the window the collector issues ES256 tokens and accepts both kinds, so HS256
 tokens issued before the deployment keep working until they expire. The window
-must last at least one token lifetime after the last revision that issued
-HS256 tokens stopped serving. Keep it open until rolling back to such a
+must last at least 24 hours after the last revision that issued HS256 tokens
+stopped serving: a delegated token that revision issued to a build on another
+machine, such as a Microcosm stage on Modal, stays valid that long
+(`MAXIMUM_DELEGATED_LIFETIME_SECONDS`), and that build cannot exchange again
+for an ES256 token. Keep the window open longer, until rolling back to such a
 revision is no longer wanted.
 
 A revision from before the signing key answers 401 to ES256 tokens. After a
-rollback to one, the emitter exchanges again, receives an HS256 token and
-carries on after one retry.
+rollback to one, an emitter that holds a Hugging Face token exchanges again,
+receives an HS256 token and carries on after one retry. A build holding a
+delegated ES256 token cannot exchange again, so the collector refuses its
+telemetry until that build ends; builds launched after the rollback get HS256
+tokens.
 
 To retire HS256:
 
@@ -137,7 +147,11 @@ token signed by one instance would get 401 from another, and
 2. Set `TELEMETRY_JWT_SIGNING_KEY_SECRET_NAME` in that environment to the new
    secret's name. The serving revision keeps reading the old secret.
 3. Deploy. The new revision signs with, and publishes, only the new key.
-   Tokens signed with the previous key get 401 and are exchanged again.
+   Tokens signed with the previous key get 401 and are exchanged again. A
+   build holding a delegated token signed with the previous key cannot
+   exchange again, so the collector refuses its telemetry for the rest of its
+   run. Unless the previous key must stop working at once, rotate when no such
+   build has been launched in the previous 24 hours.
 4. Delete the old secret once rolling back to a revision that mounts it is no
    longer wanted, since such a revision can't start without it.
 
