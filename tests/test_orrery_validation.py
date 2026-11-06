@@ -341,7 +341,37 @@ def test_an_unpaired_surrogate_in_a_document_is_replaced_in_its_issues(
         encodes_as_utf8(issue["path"]) and encodes_as_utf8(issue["message"])
         for issue in issues
     )
-    assert "Duplicate identity a�b" in [issue["message"] for issue in issues]
+    assert "Duplicate identity a\ufffdb" in [issue["message"] for issue in issues]
+
+
+def test_a_nul_in_a_document_is_replaced_in_its_issues(tmp_path: Path) -> None:
+    # JSON can escape a NUL ("\u0000") too, and PostgreSQL cannot store one in
+    # jsonb, where a rejection is recorded.
+    issues = duplicate_identity_issues(tmp_path, "a\x00b")
+
+    assert all(
+        "\x00" not in issue["path"] and "\x00" not in issue["message"]
+        for issue in issues
+    )
+    assert "Duplicate identity a\ufffdb" in [issue["message"] for issue in issues]
+
+
+def test_a_nul_in_a_key_above_a_link_is_replaced_in_its_path(tmp_path: Path) -> None:
+    validation_module = validation()
+    document = projected_document("toy-declarations-only")
+    unpublished_link = "http://example.org/source"
+    document["nodes"][0].setdefault("data", {})["k\x00"] = {"url": unpublished_link}
+
+    with pytest.raises(validation_module.OrreryDocumentRefusedError) as refusal:
+        validation_module.validate_orrery_document(
+            write_document(tmp_path, document),
+            linked_names(document) - {unpublished_link},
+        )
+
+    assert refusal.value.code == "invalid_source"
+    assert [issue["path"] for issue in refusal.value.issues] == [
+        "$.nodes[0].data.k\ufffd.url"
+    ]
 
 
 def test_a_document_with_a_byte_order_mark_is_accepted(tmp_path: Path) -> None:
@@ -387,6 +417,23 @@ def test_a_missing_node_is_a_validator_error(tmp_path: Path) -> None:
             linked_names(document),
             node=str(tmp_path / "no-such-node"),
         )
+
+
+def test_output_that_is_not_utf8_is_a_validator_error_that_says_so(
+    tmp_path: Path,
+) -> None:
+    validation_module = validation()
+    garbled_validator = tmp_path / "garbled.mjs"
+    garbled_validator.write_text(
+        "process.stdout.write(Buffer.from([0xff, 0xfe, 0x7b])); process.exitCode = 2;\n"
+    )
+
+    with pytest.raises(validation_module.OrreryValidatorError) as error:
+        validation_module.validate_orrery_document(
+            write_document(tmp_path, {}), set(), validator=garbled_validator
+        )
+
+    assert str(error.value) == "The Orrery validator's output is not UTF-8."
 
 
 def test_a_validator_that_runs_too_long_is_stopped(tmp_path: Path) -> None:
