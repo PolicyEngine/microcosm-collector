@@ -1,0 +1,64 @@
+name: Publish calibration tree package
+
+# Publishes packages/calibration-tree to npm as @policyengine/calibration-tree
+# when a push to main changes it and its version is not on npm yet. To
+# release a change, raise "version" in its package.json in the same pull
+# request; a change without a new version publishes nothing.
+#
+# npm's trusted publishing authenticates the job with its GitHub OIDC token,
+# so no npm token is stored anywhere. npm accepts the token only from this
+# file in PolicyEngine/microcosm-collector, in the main-only "npm"
+# environment, and adds provenance because the repository is public. The job
+# runs only when the repository variable CALIBRATION_TREE_NPM_PUBLISH_ENABLED
+# is 'true'; the README's "Calibration tree package" section lists the
+# one-time setup that must come first.
+on:
+  push:
+    branches: [main]
+    paths:
+      - packages/calibration-tree/**
+  # Retries a publication that failed, without a new commit.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish to npm
+    if: github.ref == 'refs/heads/main' && vars.CALIBRATION_TREE_NPM_PUBLISH_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    # One publication at a time, so two runs never publish the same version.
+    concurrency:
+      group: calibration-tree-npm-publication
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: packages/calibration-tree
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - run: bun test
+      - run: bun run typecheck
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24.21.0"
+          registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm 11.5.1 or later.
+      - name: Verify the npm publishing toolchain
+        run: |
+          node --version
+          npm --version
+          test "$(node --version)" = "v24.21.0"
+          test "$(npm --version)" = "11.19.0"
+      - name: Publish unless this version is already on npm
+        run: bash ../../tools/publish-calibration-tree.sh

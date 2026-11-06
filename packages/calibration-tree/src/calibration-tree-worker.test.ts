@@ -175,7 +175,8 @@ for (const name of RELEASE_CASES) {
 }
 
 function writtenIndex(outputDirectory: string, summary: WorkerSummary): {
-  build: { releaseId: string; comparison: { releaseId: string } | null };
+  build: { releaseId: string };
+  targetComparison: { releaseId: string };
 } {
   return JSON.parse(gunzipSync(readFileSync(join(outputDirectory, summary.index.path))).toString("utf8"));
 }
@@ -191,7 +192,7 @@ test("a build folder's tree compares under the build folder, as the publisher re
   expect({ exitCode: run.exitCode, stderr: run.stderr }).toEqual({ exitCode: 0, stderr: "" });
   const index = writtenIndex(outputDirectory, JSON.parse(run.stdout) as WorkerSummary);
   expect(index.build.releaseId).toBe(buildFolder);
-  expect(index.build.comparison?.releaseId).toBe(buildFolder);
+  expect(index.targetComparison.releaseId).toBe(buildFolder);
 });
 
 test("a tag read from its release's folder compares under the tag", () => {
@@ -205,7 +206,7 @@ test("a tag read from its release's folder compares under the tag", () => {
   expect({ exitCode: run.exitCode, stderr: run.stderr }).toEqual({ exitCode: 0, stderr: "" });
   const index = writtenIndex(outputDirectory, JSON.parse(run.stdout) as WorkerSummary);
   expect(index.build.releaseId).toBe(tag);
-  expect(index.build.comparison?.releaseId).toBe(tag);
+  expect(index.targetComparison.releaseId).toBe(tag);
 });
 
 test("a release folder compares under the release its diagnostics name", () => {
@@ -219,7 +220,7 @@ test("a release folder compares under the release its diagnostics name", () => {
   expect({ exitCode: run.exitCode, stderr: run.stderr }).toEqual({ exitCode: 0, stderr: "" });
   const index = writtenIndex(outputDirectory, JSON.parse(run.stdout) as WorkerSummary);
   expect(index.build.releaseId).toBe(folder);
-  expect(index.build.comparison?.releaseId).toBe(release.releaseId);
+  expect(index.targetComparison.releaseId).toBe(release.releaseId);
 });
 
 test("diagnostics that are not a JSON object are refused as unbuildable and nothing is written", () => {
@@ -250,7 +251,7 @@ test("a request the worker cannot follow is a request error, not unbuildable inp
   const release = goldenReleaseInputs()["be-release"];
   const cases: Array<[string, Record<string, unknown>, string]> = [
     ["an unknown kind", { kind: "staging" }, "kind must be \"release\""],
-    ["an unregistered country", { country: "zz" }, "country"],
+    ["an unregistered country", { country: "xx" }, "country xx"],
     ["a commit that is not a full SHA", { hfCommitSha: "main" }, "hfCommitSha"],
     ["an unknown field", { buildArtifactId: "a".repeat(64) }, "buildArtifactId"],
   ];

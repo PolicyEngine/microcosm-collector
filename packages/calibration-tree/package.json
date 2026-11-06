@@ -2,8 +2,23 @@
   "name": "@policyengine/calibration-tree",
   "version": "0.1.0",
   "description": "Builds, validates, reads and publishes Microcosm calibration tree artifacts (tree schema 6), with the release and staging readers they are built from.",
-  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PolicyEngine/microcosm-collector.git",
+    "directory": "packages/calibration-tree"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
+  "files": [
+    "src/**/*.ts",
+    "!src/**/*.test.ts",
+    "!src/test-support/**",
+    "!src/fixtures/**",
+    "types/**/*.d.ts"
+  ],
   "exports": {
     "./calibration-build-comparison": "./src/calibration-build-comparison.ts",
     "./calibration-comparison-blob": "./src/calibration-comparison-blob.ts",
@@ -15,6 +30,7 @@
     "./calibration-tree-blob": "./src/calibration-tree-blob.ts",
     "./calibration-tree-bundle": "./src/calibration-tree-bundle.ts",
     "./calibration-tree-manifest": "./src/calibration-tree-manifest.ts",
+    "./calibration-tree-worker": "./src/calibration-tree-worker.ts",
     "./chronicle-metadata": "./src/chronicle-metadata.ts",
     "./countries": "./src/countries.ts",
     "./geography-labels": "./src/geography-labels.ts",
@@ -43,7 +59,8 @@
   "scripts": {
     "publish:calibration-tree": "bun run src/publish-calibration-tree.ts",
     "test": "bun test",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "worker": "bun run src/calibration-tree-worker.ts"
   },
   "dependencies": {
     "@vercel/blob": "^2.6.1"
