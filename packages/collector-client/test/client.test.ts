@@ -433,7 +433,18 @@ describe("configuration", () => {
   });
 
   test("refuses a timeout that is not a positive number of milliseconds", () => {
-    for (const timeoutMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 1.5]) {
+    // Node's timers take at most 2^31 - 1 milliseconds: a longer delay fires
+    // after 1 millisecond, and from 2^32 `AbortSignal.timeout` throws.
+    for (const timeoutMs of [
+      0,
+      -1,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      1.5,
+      2 ** 31,
+      2 ** 32,
+      Number.MAX_SAFE_INTEGER,
+    ]) {
       assert.throws(
         () =>
           createCollectorClient({ baseUrl: BASE_URL, readToken: "x", timeoutMs }),
@@ -466,6 +477,37 @@ describe("configuration", () => {
     assert.equal(page.runs.length, 3);
     assert.equal(runs.length, 2);
     assert.deepEqual(collector.limits, [60, 2]);
+  });
+
+  test("accepts the longest timeout Node's timers allow", () => {
+    createCollectorClient({
+      baseUrl: BASE_URL,
+      readToken: "x",
+      timeoutMs: 2 ** 31 - 1,
+    });
+  });
+
+  test("uses the global fetch in place when each request is sent", async () => {
+    // A client created when its module loads still uses a fetch that a test,
+    // or the framework, installs later.
+    const client = createCollectorClient({
+      baseUrl: BASE_URL,
+      readToken: READ_TOKEN,
+    });
+    const collector = recordedCollector();
+    const originalFetch = globalThis.fetch;
+    let requestError: unknown = null;
+    globalThis.fetch = collector.fetch;
+    try {
+      await client.listRuns();
+    } catch (error) {
+      requestError = error;
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    assert.equal(requestError, null);
+    assert.equal(collector.sent.length, 1);
   });
 
   test("keeps a path prefix and drops a trailing slash", async () => {

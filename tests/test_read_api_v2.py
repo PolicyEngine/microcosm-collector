@@ -272,3 +272,30 @@ def test_v2_answers_503_while_a_deployment_is_in_progress() -> None:
         assert response.json() == {
             "detail": "Telemetry service is temporarily unavailable."
         }
+
+
+@pytest.mark.parametrize("request_path", ["/v1/runs", "/v2/runs", "/v2/runs/run-1"])
+def test_a_credential_with_bytes_above_ascii_is_refused_as_wrong(
+    request_path: str,
+) -> None:
+    # Starlette decodes header bytes as Latin-1, so such a credential reaches
+    # the check as a string with characters above ASCII. The client returns a
+    # server error as the answer it is, rather than raising it.
+    client = TestClient(
+        create_app(
+            settings=contract_settings(),
+            store=FakeTelemetryStore(),
+            huggingface_authenticator=ContractAuthenticator(),
+        ),
+        raise_server_exceptions=False,
+    )
+
+    response = client.get(
+        request_path,
+        headers={"X-Telemetry-Read-Token": "caf\xe9-read-token".encode("latin-1")},
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {
+        "detail": "A valid dashboard read credential is required."
+    }
