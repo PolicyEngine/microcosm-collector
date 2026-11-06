@@ -216,6 +216,92 @@ def test_bytes_that_are_not_utf8_json_are_refused(
     assert refusal.value.code == "invalid_json"
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://user:s3cret@example.org/source",
+        "http://user:s3cret@example.org/source",
+        "https://user:s3cret@exa mple.org/source",
+        "HTTPS://user:s3cret@example.org/source",
+    ],
+)
+def test_a_refusal_never_repeats_a_link_s_value(url: str, tmp_path: Path) -> None:
+    validation_module = validation()
+    document = projected_document("toy-declarations-only")
+    assert replace_first_url(document, url)
+
+    with pytest.raises(validation_module.OrreryDocumentRefusedError) as refusal:
+        validation_module.validate_orrery_document(
+            write_document(tmp_path, document), linked_names(document) - {url}
+        )
+
+    assert refusal.value.code == "invalid_source"
+    assert "s3cret" not in str(refusal.value)
+    assert "s3cret" not in json.dumps(refusal.value.issues)
+    # The refusal says where the link is, not what it holds.
+    assert refusal.value.issues
+    assert refusal.value.issues[0]["path"].endswith(".url")
+
+
+def test_a_refusal_reports_the_orrery_version(tmp_path: Path) -> None:
+    validation_module = validation()
+    document = projected_document("toy-declarations-only")
+    document.pop("nodes")
+
+    with pytest.raises(validation_module.OrreryDocumentRefusedError) as refusal:
+        validation_module.validate_orrery_document(
+            write_document(tmp_path, document), linked_names(document)
+        )
+
+    assert getattr(refusal.value, "orrery_version", None) == ORRERY_VERSION
+
+
+def test_a_refusal_keeps_at_most_100_short_issues(tmp_path: Path) -> None:
+    validation_module = validation()
+    document = projected_document("toy-declarations-only")
+    # Orrery reports each repeated node identity, with the identity in the
+    # message.
+    repeated = {**document["nodes"][0], "id": "n" * 5000}
+    document["nodes"] = [repeated] * 150
+    document["edges"] = []
+
+    with pytest.raises(validation_module.OrreryDocumentRefusedError) as refusal:
+        validation_module.validate_orrery_document(
+            write_document(tmp_path, document), linked_names(document)
+        )
+
+    assert refusal.value.code == "invalid_graph"
+    assert len(refusal.value.issues) == 100
+    assert all(
+        len(issue["path"]) <= 500 and len(issue["message"]) <= 500
+        for issue in refusal.value.issues
+    )
+
+
+def test_a_document_with_a_byte_order_mark_is_accepted(tmp_path: Path) -> None:
+    validation_module = validation()
+    document = projected_document("toy-declarations-only")
+    document_path = tmp_path / "graph.orrery.json"
+    # microcosm-runs' decoder drops a leading byte-order mark too.
+    document_path.write_bytes(b"\xef\xbb\xbf" + json.dumps(document).encode())
+
+    result = validation_module.validate_orrery_document(
+        document_path, linked_names(document)
+    )
+
+    assert result.orrery_version == ORRERY_VERSION
+
+
+def test_published_names_are_a_collection_of_names(tmp_path: Path) -> None:
+    validation_module = validation()
+    document_path = write_document(tmp_path, projected_document("toy-failed-check"))
+
+    with pytest.raises(TypeError):
+        validation_module.validate_orrery_document(document_path, "graph.schema.json")
+    with pytest.raises(validation_module.OrreryValidatorError):
+        validation_module.validate_orrery_document(document_path, {"graph\x00.json"})
+
+
 def test_a_missing_document_is_a_validator_error_not_a_refusal(
     tmp_path: Path,
 ) -> None:
@@ -281,7 +367,9 @@ def test_the_command_line_prints_the_result_and_exits_with_its_code(
         "orrery_version": ORRERY_VERSION,
     }
     assert refused.returncode == 2, refused.stderr
-    assert json.loads(refused.stdout)["code"] == "invalid_graph"
+    refusal = json.loads(refused.stdout)
+    assert refusal["code"] == "invalid_graph"
+    assert refusal.get("orrery_version") == ORRERY_VERSION
 
 
 def test_the_image_holds_pinned_node_and_the_installed_validator() -> None:
