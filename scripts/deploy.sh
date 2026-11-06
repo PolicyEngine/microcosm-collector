@@ -260,14 +260,16 @@ check_intake_job() {
     echo "Cannot confirm the existence of Cloud Run job: ${job}" >&2
     return 1
   fi
-  account="$(
+  if ! account="$(
     jq -r '.spec.template.spec.template.spec.serviceAccountName // ""' \
-      <<< "$job_json"
-  )" || return 1
-  connection="$(
+      <<< "$job_json" 2> /dev/null
+  )" || ! connection="$(
     jq -r '.spec.template.metadata.annotations["run.googleapis.com/cloudsql-instances"] // ""' \
-      <<< "$job_json"
-  )" || return 1
+      <<< "$job_json" 2> /dev/null
+  )"; then
+    echo "Cannot read the description of Cloud Run job: ${job}" >&2
+    return 1
+  fi
   if [[ "$account" != "$expected_account" ]]; then
     echo "Cloud Run job ${job} runs as another service account than this deployment gives it." >&2
     return 1
