@@ -19,6 +19,20 @@ DEPLOY_GATE = "vars.COLLECTOR_DEPLOY_ENABLED == 'true'"
 MAIN_PUSH_GUARD = "github.event_name == 'push' && github.ref == 'refs/heads/main'"
 DEPLOY_CONDITION = f"{MAIN_PUSH_GUARD} && {DEPLOY_GATE}"
 DEPLOY_JOBS = {"deploy-staging", "deploy-production"}
+# The job that publishes the read API client holds an OIDC token for npm's
+# trusted publishing, in the npm environment, and never authenticates to Google.
+PUBLISH_CLIENT_JOB = "publish-client"
+DEPLOYMENT_ENVIRONMENTS = {"staging", "production"}
+# The Workload Identity provider's condition once it also requires a deployment
+# environment, so that a token from a job in any other environment, such as
+# publish-client's npm, cannot obtain Google credentials.
+PROVIDER_CONDITION = (
+    "assertion.repository=='PolicyEngine/microcosm-collector'"
+    " && assertion.ref=='refs/heads/main'"
+    " && assertion.environment in ['staging', 'production']"
+)
+README = ROOT / "README.md"
+CLIENT_DIRECTORY = "packages/collector-client"
 WORKLOAD_IDENTITY_SECRETS = {
     "TELEMETRY_GCP_WIF_PROVIDER",
     "TELEMETRY_GCP_DEPLOY_SERVICE_ACCOUNT",
@@ -35,14 +49,21 @@ def workflow_paths() -> list[Path]:
 
 
 def authenticates_to_google_cloud(job: dict) -> bool:
-    return job.get("permissions", {}).get("id-token") == "write" or any(
+    return any(
         step.get("uses", "").startswith("google-github-actions/auth@")
         for step in job.get("steps", [])
     )
 
 
+def holds_oidc_token(job: dict) -> bool:
+    return job.get("permissions", {}).get("id-token") == "write"
+
+
 def push_job_text(job_name: str, next_job_name: str | None) -> str:
     workflow = PUSH_WORKFLOW.read_text(encoding="utf-8")
+    assert f"  {job_name}:" in workflow, job_name
+    if next_job_name:
+        assert f"  {next_job_name}:" in workflow, next_job_name
     start = workflow.index(f"  {job_name}:")
     end = workflow.index(f"  {next_job_name}:") if next_job_name else len(workflow)
     return workflow[start:end]
@@ -63,20 +84,31 @@ def test_deployment_runs_only_when_collector_deploy_is_enabled() -> None:
 
     for job_name in DEPLOY_JOBS:
         assert jobs[job_name]["if"] == DEPLOY_CONDITION, job_name
-    for workflow_path in workflow_paths():
-        for job_name, job in load_workflow(workflow_path)["jobs"].items():
-            if "environment" in job:
-                assert job_name in DEPLOY_JOBS, (workflow_path.name, job_name)
+    environment_jobs = {
+        (workflow_path.name, job_name): job["environment"]
+        for workflow_path in workflow_paths()
+        for job_name, job in load_workflow(workflow_path)["jobs"].items()
+        if "environment" in job
+    }
+    assert environment_jobs == {
+        ("push.yaml", "deploy-staging"): "staging",
+        ("push.yaml", "deploy-production"): "production",
+        ("push.yaml", PUBLISH_CLIENT_JOB): "npm",
+    }
 
 
 def test_google_cloud_authentication_runs_only_on_pushes_to_main() -> None:
-    authenticating_jobs = {
-        (workflow_path.name, job_name): (workflow, job)
-        for workflow_path in workflow_paths()
-        for workflow in [load_workflow(workflow_path)]
-        for job_name, job in workflow["jobs"].items()
-        if authenticates_to_google_cloud(job)
-    }
+    def jobs_where(condition) -> dict:
+        return {
+            (workflow_path.name, job_name): (workflow, job)
+            for workflow_path in workflow_paths()
+            for workflow in [load_workflow(workflow_path)]
+            for job_name, job in workflow["jobs"].items()
+            if condition(job)
+        }
+
+    authenticating_jobs = jobs_where(authenticates_to_google_cloud)
+    oidc_jobs = jobs_where(holds_oidc_token)
 
     # Only the release pass of push.yaml reaches these jobs, and pull requests,
     # tags and reusable calls can never run them.
@@ -84,7 +116,10 @@ def test_google_cloud_authentication_runs_only_on_pushes_to_main() -> None:
         ("push.yaml", "deploy-staging"),
         ("push.yaml", "deploy-production"),
     }
-    for (workflow_name, job_name), (workflow, job) in authenticating_jobs.items():
+    assert set(oidc_jobs) == set(authenticating_jobs) | {
+        ("push.yaml", PUBLISH_CLIENT_JOB)
+    }
+    for (workflow_name, job_name), (workflow, job) in oidc_jobs.items():
         assert workflow["on"] == {"push": {"branches": ["main"]}}, workflow_name
         assert job["if"].startswith(f"{MAIN_PUSH_GUARD} && "), job_name
 
@@ -103,7 +138,7 @@ def test_deployment_uses_main_only_staging_then_production_environments() -> Non
         assert jobs[job_name]["concurrency"]["cancel-in-progress"] == "false"
 
 
-def test_only_deployment_jobs_hold_oidc_tokens_and_workload_identity_secrets() -> None:
+def test_oidc_tokens_and_workload_identity_secrets_stay_with_their_jobs() -> None:
     for workflow_path in workflow_paths():
         workflow = load_workflow(workflow_path)
         assert "id-token" not in workflow.get("permissions", {}), workflow_path.name
@@ -112,7 +147,11 @@ def test_only_deployment_jobs_hold_oidc_tokens_and_workload_identity_secrets() -
             for job_name, job in workflow["jobs"].items()
             if job.get("permissions", {}).get("id-token") == "write"
         }
-        expected_jobs = DEPLOY_JOBS if workflow_path == PUSH_WORKFLOW else set()
+        expected_jobs = (
+            DEPLOY_JOBS | {PUBLISH_CLIENT_JOB}
+            if workflow_path == PUSH_WORKFLOW
+            else set()
+        )
         assert oidc_jobs == expected_jobs, workflow_path.name
 
     jobs = load_workflow(PUSH_WORKFLOW)["jobs"]
@@ -121,6 +160,36 @@ def test_only_deployment_jobs_hold_oidc_tokens_and_workload_identity_secrets() -
         assert set(re.findall(r"secrets\.(\w+)", job_text)) == (
             WORKLOAD_IDENTITY_SECRETS
         )
+    publish_text = yaml.safe_dump(jobs[PUBLISH_CLIENT_JOB])
+    assert re.findall(r"secrets\.(\w+)", publish_text) == []
+    assert "NODE_AUTH_TOKEN" not in publish_text
+
+
+def readme_section(heading: str) -> str:
+    readme = README.read_text(encoding="utf-8")
+    assert f"\n{heading}\n" in readme, heading
+    section = readme.split(f"\n{heading}\n", 1)[1]
+    return re.split(r"\n#{2,3} ", section, maxsplit=1)[0]
+
+
+def test_publishing_waits_for_the_provider_to_check_the_environment() -> None:
+    jobs = load_workflow(PUSH_WORKFLOW)["jobs"]
+    google_access = readme_section("### Google Cloud access")
+    client_section = readme_section("### The TypeScript client")
+
+    assert {jobs[job_name]["environment"] for job_name in DEPLOY_JOBS} == (
+        DEPLOYMENT_ENVIRONMENTS
+    )
+    assert jobs[PUBLISH_CLIENT_JOB]["environment"] not in DEPLOYMENT_ENVIRONMENTS
+    assert PROVIDER_CONDITION in google_access
+    assert "No other job requests an OIDC token" not in google_access
+    # The manual steps change the provider's condition before publishing is
+    # switched on.
+    assert "**Switch.**" in client_section
+    assert PROVIDER_CONDITION in client_section
+    assert client_section.index(PROVIDER_CONDITION) < client_section.index(
+        "**Switch.**"
+    )
 
 
 def test_pull_requests_report_one_required_check() -> None:
@@ -153,6 +222,40 @@ def test_validation_is_reusable_and_runs_against_postgres() -> None:
     assert "defaults" not in validate
 
 
+def test_validation_tests_and_packs_the_read_api_client() -> None:
+    validation_jobs = load_workflow(VALIDATION_WORKFLOW)["jobs"]
+    assert "client" in validation_jobs
+    client = validation_jobs["client"]
+    commands = [step["run"] for step in client["steps"] if "run" in step]
+    push_jobs = load_workflow(PUSH_WORKFLOW)["jobs"]
+    assert "pack-client" in push_jobs
+    release_pack_commands = [
+        step["run"]
+        for step in push_jobs["pack-client"]["steps"]
+        if step.get("run", "").startswith("npm pack")
+    ]
+    setup_node = next(
+        step
+        for step in client["steps"]
+        if step.get("uses", "").startswith("actions/setup-node@")
+    )
+
+    assert client["defaults"]["run"]["working-directory"] == CLIENT_DIRECTORY
+    assert setup_node["with"]["node-version"] == "24.22.1"
+    assert setup_node["with"]["package-manager-cache"] == "false"
+    assert commands == [
+        "npm ci",
+        "npm run generate",
+        "git diff --exit-code -- src/schema.ts",
+        "npm run typecheck",
+        "npm test",
+        'npm pack --pack-destination "$RUNNER_TEMP"',
+    ]
+    # Every pull request packs the client exactly as a release does, writing
+    # the tarball, so a pack command that cannot work fails CI.
+    assert release_pack_commands == [commands[-1]]
+
+
 def test_service_deployment_uses_oidc_and_verifies_before_promotion() -> None:
     workflow = PUSH_WORKFLOW.read_text(encoding="utf-8")
     deploy_script = DEPLOY_SCRIPT.read_text(encoding="utf-8")
@@ -176,7 +279,7 @@ def test_service_deployment_uses_oidc_and_verifies_before_promotion() -> None:
 
 def test_service_deployment_checks_secret_existence_before_changing_traffic() -> None:
     staging_job = push_job_text("deploy-staging", "deploy-production")
-    production_job = push_job_text("deploy-production", None)
+    production_job = push_job_text("deploy-production", "pack-client")
 
     assert "environment: staging" in staging_job
     assert "image_uri: ${{ steps.image.outputs.uri }}" in staging_job
@@ -310,7 +413,14 @@ def test_collector_uses_store_vocabulary() -> None:
         ".yaml",
         ".yml",
     }
-    ignored_parts = {".git", ".pytest_cache", ".ruff_cache", ".venv", "__pycache__"}
+    ignored_parts = {
+        ".git",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".venv",
+        "__pycache__",
+        "node_modules",
+    }
     source_files = [
         source_path
         for source_path in ROOT.rglob("*")

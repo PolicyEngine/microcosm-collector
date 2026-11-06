@@ -1,0 +1,37 @@
+{
+  "name": "@policyengine/microcosm-collector-client",
+  "version": "0.9.0",
+  "description": "Typed client for version 2 of the Microcosm collector's read API",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PolicyEngine/microcosm-collector.git",
+    "directory": "packages/collector-client"
+  },
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "generate": "openapi-typescript ../../contracts/read-api-v2/openapi.json --output src/schema.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --test test/client.test.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "openapi-typescript": "7.13.0",
+    "typescript": "5.9.3"
+  }
+}
