@@ -370,8 +370,8 @@ own, or when a file listed as changed is identical to the dashboard's.
 
 While calibration-diagnostics keeps its copy, a change merged there is carried
 over by copying the changed files from a calibration-diagnostics commit,
-keeping this repository's changes to `package.json`, and recording that commit
-and the new blob IDs, which git lists with:
+keeping this repo's changes to `package.json`, and recording that commit and
+the new blob IDs, which git lists with:
 
 ```bash
 git -C ../calibration-diagnostics ls-tree -r \
@@ -387,14 +387,15 @@ copy is the only one, and the package is changed here.
 push to `main` changes `packages/calibration-tree` and npm does not have its
 `package.json` version yet. To release a change, raise `version` in the same
 pull request; a change without a new version publishes nothing. The workflow
-tests and typechecks the package first, then runs
+tests and typechecks the package first, checks that Node and npm are the
+pinned versions (`tools/check-npm-toolchain.sh`), then runs
 `tools/publish-calibration-tree.sh`, which asks npm for the version and
 publishes only if npm does not have it. It can be run again by hand from
 `main` (`workflow_dispatch`) to retry a failed publication.
 
 The workflow uses npm's trusted publishing: npm accepts the job's GitHub OIDC
-token in place of a stored npm token, and adds provenance because this
-repository is public. Nothing is published until the repository variable
+token in place of a stored npm token, and adds provenance because this repo is
+public. Nothing is published until the repo variable
 `CALIBRATION_TREE_NPM_PUBLISH_ENABLED` is `true`, which needs this one-time
 setup first:
 
@@ -405,16 +406,16 @@ setup first:
    the file list, then `npm publish --access public` in
    `packages/calibration-tree`.
 2. **The trusted publisher.** In the package's settings on npmjs.com, add a
-   GitHub Actions trusted publisher: organization `PolicyEngine`, repository
+   GitHub Actions trusted publisher: organization `PolicyEngine`, repo
    `microcosm-collector`, workflow `publish-calibration-tree.yaml`,
    environment `npm`. A new trusted publisher expires unless a publication
    through it succeeds within two days, so add it when a pull request that
    raises the version is ready to merge, and merge that pull request after
    steps 3 and 4. An expired one is deleted and added again.
-3. **The environment.** In this repository's settings, create the `npm`
+3. **The environment.** In this repo's settings, create the `npm`
    environment and allow deployments from `main` only, so a run from any other
    branch cannot obtain npm's trust.
-4. **The switch.** Set the repository variable
+4. **The switch.** Set the repo variable
    `CALIBRATION_TREE_NPM_PUBLISH_ENABLED` to `true`.
 
 ## Hugging Face read access

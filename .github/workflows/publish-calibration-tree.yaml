@@ -8,10 +8,10 @@ name: Publish calibration tree package
 # npm's trusted publishing authenticates the job with its GitHub OIDC token,
 # so no npm token is stored anywhere. npm accepts the token only from this
 # file in PolicyEngine/microcosm-collector, in the main-only "npm"
-# environment, and adds provenance because the repository is public. The job
-# runs only when the repository variable CALIBRATION_TREE_NPM_PUBLISH_ENABLED
-# is 'true'; the README's "Calibration tree package" section lists the
-# one-time setup that must come first.
+# environment, and adds provenance because the repo is public. The job runs
+# only when the repo variable CALIBRATION_TREE_NPM_PUBLISH_ENABLED is 'true';
+# the README's "Calibration tree package" section lists the one-time setup
+# that must come first.
 on:
   push:
     branches: [main]
@@ -53,12 +53,9 @@ jobs:
         with:
           node-version: "24.21.0"
           registry-url: https://registry.npmjs.org
-      # Trusted publishing needs npm 11.5.1 or later.
+      # Trusted publishing needs npm 11.5.1 or later; Node 24.21.0 bundles
+      # npm 11.19.0.
       - name: Verify the npm publishing toolchain
-        run: |
-          node --version
-          npm --version
-          test "$(node --version)" = "v24.21.0"
-          test "$(npm --version)" = "11.19.0"
+        run: bash ../../tools/check-npm-toolchain.sh 24.21.0 11.19.0
       - name: Publish unless this version is already on npm
         run: bash ../../tools/publish-calibration-tree.sh
