@@ -542,3 +542,33 @@ def test_the_manifest_lock_lets_one_writer_in_at_a_time(postgres_url: str) -> No
 
     assert taken_while_held is False
     assert taken_after is True
+
+
+def test_the_worker_job_builds_trees_where_its_blob_token_is_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from telemetry_collector import worker
+
+    given: dict[str, Any] = {}
+
+    class StandInReader:
+        def __init__(self, **settings: Any) -> None:
+            pass
+
+    def recorded_run_job(job_id: str, **arguments: Any) -> JobOutcome:
+        # run_job uses DEFAULT_HANDLERS when it is given none.
+        given["handlers"] = arguments.get("handlers", DEFAULT_HANDLERS)
+        return JobOutcome.FINISHED
+
+    monkeypatch.setattr(worker, "GoogleCloudStorageIntake", StandInReader)
+    monkeypatch.setattr(worker, "run_job", recorded_run_job)
+    monkeypatch.setenv("COLLECTOR_WORKER_JOB_ID", "job-0123")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://user:password@127.0.0.1:1/none")
+    monkeypatch.setenv("COLLECTOR_INTAKE_BUCKET", "collector-intake")
+    monkeypatch.setenv("COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN", BLOB_TOKEN)
+
+    assert worker.main() == 0
+    assert (
+        given["handlers"]["calibration-diagnostics"]
+        is not DEFAULT_HANDLERS["calibration-diagnostics"]
+    )
