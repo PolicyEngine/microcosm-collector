@@ -15,7 +15,8 @@
 // It prints one JSON line. Exit 0: {"valid": true, "orrery_version": ...}.
 // Exit 2, the document is refused: {"valid": false, "orrery_version": ...,
 // "code": ..., "message": ..., "issues": [{"path", "message"}, ...]}, with at
-// most 100 issues of at most 500 characters each. A refusal says where a
+// most 100 issues of at most 500 characters each, all encodable as UTF-8. A
+// refusal says where a
 // link is, never what it holds, since a link may carry a credential. Exit 1:
 // the validator could not run (a wrong argument, an unreadable file, an
 // unexpected error), with the reason on standard error.
@@ -33,8 +34,15 @@ const ORRERY_VERSION = JSON.parse(
 const MAX_ISSUES = 100;
 const MAX_ISSUE_CHARACTERS = 500;
 
+// Counts and keeps whole characters (code points, as Python counts them), and
+// replaces any unpaired surrogate with U+FFFD: a document's JSON can escape
+// one ("\ud83d"), Orrery repeats identities in its issues, and UTF-8 cannot
+// encode it.
 function shortened(text) {
-  return text.length > MAX_ISSUE_CHARACTERS ? `${text.slice(0, MAX_ISSUE_CHARACTERS - 1)}…` : text;
+  const characters = Array.from(text.toWellFormed());
+  return characters.length > MAX_ISSUE_CHARACTERS
+    ? `${characters.slice(0, MAX_ISSUE_CHARACTERS - 1).join("")}…`
+    : characters.join("");
 }
 
 class DocumentRefusal extends Error {

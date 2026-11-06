@@ -18,6 +18,7 @@ could not run.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from collections.abc import Collection
@@ -77,6 +78,13 @@ def _answer(stdout: str) -> dict[str, Any]:
     return answer
 
 
+def _node_environment() -> dict[str, str]:
+    """Only what Node needs to start: none of the worker's settings or
+    credentials, such as ``DATABASE_URL``, reach the validator."""
+
+    return {"PATH": os.environ.get("PATH", os.defpath), "LANG": "C.UTF-8"}
+
+
 def validate_orrery_document(
     document: Path,
     published_file_names: Collection[str],
@@ -96,11 +104,14 @@ def validate_orrery_document(
         raise TypeError("published_file_names must be a collection of names.")
     command = [node, str(validator), str(document), *sorted(published_file_names)]
     try:
+        # Node writes UTF-8 whatever the locale, so its answer is read as UTF-8
+        # whatever the worker's locale is.
         completed = subprocess.run(
             command,
             capture_output=True,
             check=False,
-            text=True,
+            encoding="utf-8",
+            env=_node_environment(),
             timeout=timeout_seconds,
         )
     except subprocess.TimeoutExpired as error:
