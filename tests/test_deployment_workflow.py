@@ -310,7 +310,15 @@ def test_collector_uses_store_vocabulary() -> None:
         ".yaml",
         ".yml",
     }
-    ignored_parts = {".git", ".pytest_cache", ".ruff_cache", ".venv", "__pycache__"}
+    # node_modules holds installed npm packages, such as the Orrery validator's.
+    ignored_parts = {
+        ".git",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".venv",
+        "__pycache__",
+        "node_modules",
+    }
     source_files = [
         source_path
         for source_path in ROOT.rglob("*")
