@@ -25,6 +25,7 @@ from typing import Any
 
 import pytest
 import sqlalchemy as sa
+import yaml
 
 from telemetry_collector.auth import HuggingFacePrincipal
 from telemetry_collector.database import create_database_engine
@@ -572,3 +573,141 @@ def test_the_worker_job_builds_trees_where_its_blob_token_is_set(
         given["handlers"]["calibration-diagnostics"]
         is not DEFAULT_HANDLERS["calibration-diagnostics"]
     )
+
+
+ROOT = Path(__file__).resolve().parents[1]
+BUN_VERSION = "1.4.2"
+TREE_IMAGE_CHECK = ROOT / "tools" / "check-calibration-tree-image.sh"
+IMAGE = "microcosm-collector:validation"
+
+
+def test_the_image_holds_pinned_bun_and_the_tree_package_s_production_install() -> None:
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    trees_module = trees()
+
+    # The Bun release the package's CI job uses, from the official image by
+    # digest, on the same Debian release as the image.
+    assert f"FROM oven/bun:{BUN_VERSION}-slim@sha256:" in dockerfile
+    assert (
+        "RUN bun install --frozen-lockfile --production --ignore-scripts" in dockerfile
+    )
+    assert "COPY --from=calibration-tree /usr/local/bin/bun /usr/local/bin/bun" in (
+        dockerfile
+    )
+    assert (
+        "COPY --from=calibration-tree /calibration-tree ./packages/calibration-tree"
+        in dockerfile
+    )
+    # The image's package is where the handler runs it from.
+    assert trees_module.WORKER_SCRIPT.relative_to(ROOT) == Path(
+        "packages/calibration-tree/src/calibration-tree-worker.ts"
+    )
+    assert trees_module.PUBLICATION_SCRIPT.relative_to(ROOT) == Path(
+        "packages/calibration-tree/src/calibration-tree-publication.ts"
+    )
+    # Its tests, fixtures and test support stay out of the image.
+    dockerignore = (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+    assert {
+        "packages/calibration-tree/src/**/*.test.ts",
+        "packages/calibration-tree/src/fixtures",
+        "packages/calibration-tree/src/test-support",
+    } <= set(dockerignore)
+
+
+def test_ci_checks_the_tree_package_in_the_built_image() -> None:
+    workflow = yaml.load(
+        (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"),
+        Loader=yaml.BaseLoader,
+    )
+    runs = [step.get("run") for step in workflow["jobs"]["validate"]["steps"]]
+    tree_check = f"bash tools/check-calibration-tree-image.sh {IMAGE}"
+
+    assert tree_check in runs
+    assert runs.index(f"docker build --tag {IMAGE} .") < runs.index(tree_check)
+
+
+def run_tree_image_check(
+    tmp_path: Path, *, build_exit: int, build_answer: str, publication_exit: int
+) -> subprocess.CompletedProcess[str]:
+    bin_directory = tmp_path / "bin"
+    bin_directory.mkdir()
+    calls = tmp_path / "docker-calls"
+    fake_docker = bin_directory / "docker"
+    fake_docker.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$*" >> {calls}\n'
+        'if [[ "$*" == *calibration-tree-worker.ts* ]]; then\n'
+        f"  printf '%s\\n' '{build_answer}'\n"
+        f"  exit {build_exit}\n"
+        "fi\n"
+        f"exit {publication_exit}\n"
+    )
+    fake_docker.chmod(0o755)
+    return subprocess.run(
+        ["bash", str(TREE_IMAGE_CHECK), IMAGE],
+        cwd=ROOT,
+        env={"PATH": f"{bin_directory}:/usr/bin:/bin"},
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+
+BUILT_STAGING_TREE = json.dumps(
+    {
+        "buildArtifactId": "a" * 64,
+        "files": [{"part": "filter-index"}, {"part": "index"}],
+        "manifestEntry": {"kind": "staging"},
+    }
+)
+
+
+def test_the_tree_image_check_passes_when_the_image_builds_a_tree(
+    tmp_path: Path,
+) -> None:
+    assert TREE_IMAGE_CHECK.is_file()
+
+    result = run_tree_image_check(
+        tmp_path, build_exit=0, build_answer=BUILT_STAGING_TREE, publication_exit=1
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = (tmp_path / "docker-calls").read_text().splitlines()
+    assert len(calls) == 2
+    assert all(call.startswith("run --rm ") and IMAGE in call for call in calls)
+    assert (
+        "bun run /app/packages/calibration-tree/src/calibration-tree-worker.ts"
+        in calls[0]
+    )
+    assert (
+        "bun run /app/packages/calibration-tree/src/calibration-tree-publication.ts"
+        in calls[1]
+    )
+    # The publication command runs without a token, so it can write nothing.
+    assert "BLOB" not in calls[1]
+
+
+@pytest.mark.parametrize(
+    ("build_exit", "build_answer", "publication_exit"),
+    [
+        (3, "", 1),
+        (0, "not json", 1),
+        (0, json.dumps({"files": [], "manifestEntry": {"kind": "release"}}), 1),
+        (0, BUILT_STAGING_TREE, 127),
+        (0, BUILT_STAGING_TREE, 0),
+    ],
+    ids=["build-fails", "no-answer", "wrong-tree", "no-bun", "publication-ran"],
+)
+def test_the_tree_image_check_fails_otherwise(
+    build_exit: int, build_answer: str, publication_exit: int, tmp_path: Path
+) -> None:
+    assert TREE_IMAGE_CHECK.is_file()
+
+    result = run_tree_image_check(
+        tmp_path,
+        build_exit=build_exit,
+        build_answer=build_answer,
+        publication_exit=publication_exit,
+    )
+
+    assert result.returncode != 0
