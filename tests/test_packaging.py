@@ -11,7 +11,16 @@ IMPORT_PACKAGE = "telemetry_collector"
 EMITTER_LICENSE_SHA256 = (
     "919d42904bc9c6bb0621ab4eb7e4c9828d1467ea5ee64da7ca88eed53af1530b"
 )
-IGNORED_PARTS = {".git", ".pytest_cache", ".ruff_cache", ".venv", "__pycache__", "dist"}
+# node_modules holds the Orrery validator's installed packages (orrery-validator).
+IGNORED_PARTS = {
+    ".git",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "__pycache__",
+    "dist",
+    "node_modules",
+}
 TEXT_SUFFIXES = {".env", ".ini", ".lock", ".md", ".py", ".sh", ".toml", ".yaml", ".yml"}
 
 
