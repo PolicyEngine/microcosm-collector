@@ -81,6 +81,34 @@ sending the same request again cannot succeed:
   event without a valid block (a safe-identifier `phase`, a
   `blocking_failure_count` of at least 1, and `blocking_gate_ids`).
 
+### Details the emitter writes
+
+microcosm-emitter 0.14.0 and later write five `details` keys themselves, and
+the collector checks each against a model in `telemetry_collector.models`:
+
+| Event | Key | Model |
+| --- | --- | --- |
+| `heartbeat` | `reading`: the build's process tree and the machine, on every heartbeat (every 30 s by default) | `Reading` |
+| `heartbeat` | `sleep`: a system sleep, on the heartbeat sent on waking | `SleepRecord` |
+| `run` | `environment`: a local machine or a Modal container | `MachineEnvironment` |
+| `stage` | `stage_span`: the parent stage, occurrence, awake and asleep seconds, and why the emitter closed it (`closed_by`) | `StageSpan` |
+| `progress` | `outer`: the counter one level above the stage's own | `OuterProgress` |
+
+A key that doesn't match its model is removed from the stored event and named
+in `details.dropped_emitter_details`, with a warning in the collector's log
+naming the event and run. The rest of the event is accepted, since a `422`
+would stop the emitter delivering the whole run. The models' numbers are
+strict (an integer or a float, never a boolean or numeric text) and their times
+are ISO 8601 text. The same keys on other
+event types are stored as sent, and only the collector writes
+`dropped_emitter_details`.
+
+`GET /v1/runs/{run_id}` serves them beside the events:
+
+- `run_manifest.environment`: the latest run start's machine description;
+- `progress.reading`: the latest reading of the run's current attempt, with its `timestamp`, or `null` until that attempt sends one;
+- `sleeps`: every attempt's sleeps, in event order, each with its `producer_id`.
+
 ## Artifact intake
 
 Builds hand calibration diagnostics and Orrery inputs to the collector as

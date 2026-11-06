@@ -2,15 +2,25 @@
 
 from __future__ import annotations
 
+import logging
 import re
+from collections.abc import Mapping
 from datetime import datetime
-from typing import Any, Literal
+from types import MappingProxyType
+from typing import Annotated, Any, Final, Literal
 
 from pydantic import (
+    AwareDatetime,
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
     RootModel,
+    Strict,
+    StrictBool,
+    StrictFloat,
+    StrictInt,
+    ValidationError,
     field_validator,
     model_validator,
 )
@@ -79,6 +89,186 @@ class ResourceSnapshot(BaseModel):
     peak_rss_bytes: int | None = Field(default=None, ge=0)
 
 
+# The details keys microcosm-emitter writes itself (microcosm-emitter#90): a
+# reading of the build and its machine and any sleep on heartbeats, the
+# machine description on the run's start, stage spans, and outer progress.
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _require_text(value: object) -> object:
+    """Refuse a time given as a number; the emitter sends ISO 8601 text."""
+    if not isinstance(value, str):
+        raise ValueError("a time must be ISO 8601 text")
+    return value
+
+
+# Numbers are strict: an int or a float, never a boolean or numeric text.
+_Count = Annotated[StrictInt, Field(ge=0)]
+_Amount = Annotated[float, Strict(), Field(ge=0, allow_inf_nan=False)]
+_Share = Annotated[float, Strict(), Field(ge=0, le=1, allow_inf_nan=False)]
+_Time = Annotated[AwareDatetime, BeforeValidator(_require_text)]
+_Text = Annotated[str, Field(max_length=200)]
+_Identifier = Annotated[str, Field(pattern=SAFE_IDENTIFIER)]
+
+
+class _EmitterDetail(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class OuterProgress(_EmitterDetail):
+    """The counter one level above a stage's own, such as the pass of a batch."""
+
+    done: StrictInt
+    total: StrictInt
+    unit: _Text | None = None
+
+
+class ReadingProgress(_EmitterDetail):
+    """The latest progress the build reported, as a reading repeats it.
+
+    ``done`` and ``total`` are null unless the build sent numbers.
+    """
+
+    stage_id: _Identifier
+    done: StrictInt | StrictFloat | None
+    total: StrictInt | StrictFloat | None
+    unit: _Text | None
+    outer: OuterProgress | None
+    reported_at: _Time
+
+
+class ProcessTreeReading(_EmitterDetail):
+    """The build and every descendant process at one reading.
+
+    Memory is the physical footprint on macOS and RSS elsewhere; the CPU
+    shares are cores in use and the disk bytes those moved during the
+    reading's interval.
+    """
+
+    processes: _Count
+    memory_bytes: _Count
+    memory_peak_bytes: _Count
+    interval_memory_peak_bytes: _Count
+    cpu_user_cores: _Amount | None
+    cpu_system_cores: _Amount | None
+    disk_read_bytes: _Count | None
+    disk_written_bytes: _Count | None
+
+
+class MachineReading(_EmitterDetail):
+    """The machine at one reading; each value the emitter can't read is null."""
+
+    memory_available_bytes: _Count | None
+    memory_compressed_bytes: _Count | None
+    memory_pressure_level: Literal["normal", "warning", "critical"] | None
+    memory_stall_some_share: _Share | None
+    memory_stall_full_share: _Share | None
+    swap_used_bytes: _Count | None
+    swap_total_bytes: _Count | None
+    swap_in_bytes: _Count | None
+    swap_out_bytes: _Count | None
+    cpu_busy_share: _Share | None
+    load_average_1m: _Amount | None
+    on_battery: StrictBool | None
+    disk_free_bytes: _Count | None
+    cgroup_memory_bytes: _Count | None
+    cgroup_memory_limit_bytes: _Count | None
+
+
+class Reading(_EmitterDetail):
+    """A heartbeat's reading of the build and its machine (``details.reading``)."""
+
+    interval_seconds: _Amount
+    late_seconds: _Amount
+    stages: list[_Identifier] = Field(max_length=32)
+    progress: ReadingProgress | None
+    process_tree: ProcessTreeReading
+    machine: MachineReading
+
+
+class SleepRecord(_EmitterDetail):
+    """One system sleep, on the heartbeat sent on waking (``details.sleep``)."""
+
+    started_at: _Time
+    ended_at: _Time
+    seconds: _Amount
+
+    @model_validator(mode="after")
+    def _ends_after_it_starts(self) -> SleepRecord:
+        if self.ended_at < self.started_at:
+            raise ValueError("a sleep must end after it starts")
+        return self
+
+
+class StageSpan(_EmitterDetail):
+    """A stage start's parent and occurrence, and an end's durations and cause.
+
+    ``closed_by`` is null when the build ended the stage itself.
+    """
+
+    parent_stage_id: _Identifier | None
+    occurrence: Annotated[StrictInt, Field(ge=1)]
+    awake_seconds: _Amount | None = None
+    asleep_seconds: _Amount | None = None
+    closed_by: (
+        Literal[
+            "enclosing_stage_ended",
+            "next_stage_started",
+            "other_stage_updated",
+            "run_completed",
+            "run_blocked",
+            "run_failed",
+        ]
+        | None
+    ) = None
+
+
+class ModalContainer(_EmitterDetail):
+    """The Modal container a build runs in."""
+
+    task_id: _Text
+    region: _Text | None
+    cloud_provider: _Text | None
+
+
+class MachineEnvironment(_EmitterDetail):
+    """Where a build runs, on its run's start (``details.environment``)."""
+
+    kind: Literal["local", "modal_container"]
+    os: _Text | None
+    os_version: _Text | None
+    architecture: _Text | None
+    cpu_model: _Text | None
+    logical_cpus: Annotated[StrictInt, Field(ge=1)] | None
+    memory_total_bytes: _Count | None
+    cgroup_cpu_limit_cores: _Amount | None
+    cgroup_memory_limit_bytes: _Count | None
+    modal: ModalContainer | None
+    emitter_version: _Text | None
+    python_version: _Text | None
+
+    @model_validator(mode="after")
+    def _modal_matches_kind(self) -> MachineEnvironment:
+        if (self.kind == "modal_container") != (self.modal is not None):
+            raise ValueError("only a Modal container has a Modal description")
+        return self
+
+
+#: Each event type's emitter-written details keys and the model of each.
+EMITTER_DETAILS: Final[Mapping[str, Mapping[str, type[BaseModel]]]] = MappingProxyType(
+    {
+        "heartbeat": {"reading": Reading, "sleep": SleepRecord},
+        "run": {"environment": MachineEnvironment},
+        "stage": {"stage_span": StageSpan},
+        "progress": {"outer": OuterProgress},
+    }
+)
+#: Names the emitter-written keys the collector removed because they didn't
+#: match their model. Only the collector writes it.
+DROPPED_EMITTER_DETAILS_KEY: Final = "dropped_emitter_details"
+
+
 class TelemetryEvent(BaseModel):
     """One idempotent event emitted by a Microcosm build process."""
 
@@ -108,6 +298,40 @@ class TelemetryEvent(BaseModel):
     def require_block_details(self) -> TelemetryEvent:
         if self.status == "blocked":
             _require_block(self.details)
+        return self
+
+    @model_validator(mode="after")
+    def check_emitter_details(self) -> TelemetryEvent:
+        """Remove each emitter-written key that doesn't match its model.
+
+        The removed keys are named in ``DROPPED_EMITTER_DETAILS_KEY``, and the
+        rest of the event is kept: refusing the batch would make the emitter
+        stop sending the run's events. Keys on other event types are kept as
+        they are.
+        """
+
+        details = dict(self.details)
+        details.pop(DROPPED_EMITTER_DETAILS_KEY, None)
+        dropped = []
+        for key, model in EMITTER_DETAILS.get(self.event_type, {}).items():
+            if key not in details:
+                continue
+            try:
+                model.model_validate(details[key])
+            except ValidationError:
+                del details[key]
+                dropped.append(key)
+        if dropped:
+            details[DROPPED_EMITTER_DETAILS_KEY] = dropped
+            _LOGGER.warning(
+                "Dropped emitter details %s from %s event %s of run %s: they "
+                "do not match their models.",
+                ", ".join(dropped),
+                self.event_type,
+                self.event_id,
+                self.run_id,
+            )
+        self.details = details
         return self
 
 

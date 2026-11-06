@@ -396,10 +396,29 @@ def run_documents(
     lifecycle_events: list[dict[str, Any]] = []
     calibration_events: list[dict[str, Any]] = []
     identity: dict[str, Any] | None = None
+    environment: dict[str, Any] | None = None
+    reading: dict[str, Any] | None = None
+    sleeps: list[dict[str, Any]] = []
+    active_producer_id: str | None = None
     for sequence, event in enumerate(ordered, start=1):
         details = deepcopy(event.get("details") or {})
+        if event["producer_id"] != active_producer_id:
+            # A later producer is a restarted attempt: the previous attempt's
+            # reading no longer describes the run.
+            active_producer_id = event["producer_id"]
+            reading = None
         if event["event_type"] == "run" and isinstance(details.get("identity"), dict):
             identity = details["identity"]
+        if event["event_type"] == "run" and event["status"] == "started":
+            started_environment = details.get("environment")
+            environment = (
+                started_environment if isinstance(started_environment, dict) else None
+            )
+        if event["event_type"] == "heartbeat":
+            if isinstance(details.get("reading"), dict):
+                reading = {"timestamp": event["timestamp"], **details["reading"]}
+            if isinstance(details.get("sleep"), dict):
+                sleeps.append({"producer_id": event["producer_id"], **details["sleep"]})
         event_type = "calibration" if event["event_type"] == "calibration" else "stage"
         lifecycle_events.append(
             {
@@ -442,6 +461,7 @@ def run_documents(
         **common,
         "heartbeat_at": run.get("heartbeat_at"),
         "resources": run.get("resources"),
+        "reading": reading,
         "work": run.get("work"),
         "failure": run.get("failure"),
         "block": run.get("block"),
@@ -449,6 +469,7 @@ def run_documents(
     manifest = {
         **common,
         "identity": identity,
+        "environment": environment,
         "failure": run.get("failure"),
         "block": run.get("block"),
         "delivery": {
@@ -472,6 +493,7 @@ def run_documents(
         if calibration_events
         else None,
         "events": lifecycle_events,
+        "sleeps": sleeps,
     }
 
 
