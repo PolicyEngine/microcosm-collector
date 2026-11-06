@@ -17,12 +17,14 @@ permissions:
 # is 'true'. It has been 'true' since 2026-10-20, when this repo took over
 # deployment from calibration-diagnostics; unset, releases are tagged but not
 # deployed. The jobs deploy one image to staging and, only after staging
-# succeeds, the same image to production. The staging and production
-# environments accept only main, and Google Cloud's Workload Identity provider
-# accepts this repo's tokens only for refs/heads/main. Both jobs also check for
-# a push to main. This workflow runs only for pushes to main, so that check is
-# always true; it keeps a trigger added later (tags, manual dispatch) from
-# reaching authentication.
+# succeeds, the same image to production. Each switches artifact intake on in
+# its environment and updates the environment's intake worker and recovery
+# jobs to that image. The staging and production environments accept only
+# main, and Google Cloud's Workload Identity provider accepts this repo's
+# tokens only for refs/heads/main. Both jobs also check for a push to main.
+# This workflow runs only for pushes to main, so that check is always true; it
+# keeps a trigger added later (tags, manual dispatch) from reaching
+# authentication.
 jobs:
   versioning:
     name: Update versioning
@@ -105,6 +107,17 @@ jobs:
       READ_SECRET_NAME: ${{ vars.TELEMETRY_READ_SECRET_NAME }}
       PRODUCTION_CLOUD_SQL_CONNECTION: ${{ vars.TELEMETRY_PRODUCTION_CLOUD_SQL_CONNECTION }}
       PRODUCTION_SERVICE: ${{ vars.TELEMETRY_PRODUCTION_SERVICE }}
+      # Each environment has its own intake resources.
+      INTAKE_BUCKET: ${{ vars.TELEMETRY_INTAKE_BUCKET }}
+      WORKER_QUEUE: ${{ vars.TELEMETRY_WORKER_QUEUE }}
+      WORKER_JOB: ${{ vars.TELEMETRY_WORKER_JOB }}
+      RECOVERY_JOB: ${{ vars.TELEMETRY_RECOVERY_JOB }}
+      WORKER_SERVICE_ACCOUNT: ${{ vars.TELEMETRY_WORKER_SERVICE_ACCOUNT }}
+      WORKER_INVOKER_SERVICE_ACCOUNT: ${{ vars.TELEMETRY_WORKER_INVOKER_SERVICE_ACCOUNT }}
+      RECOVERY_SERVICE_ACCOUNT: ${{ vars.TELEMETRY_RECOVERY_SERVICE_ACCOUNT }}
+      # This environment's own Hugging Face read token, which only its
+      # worker job mounts and only its worker service account may read.
+      HF_READ_SECRET_NAME: ${{ vars.TELEMETRY_HF_READ_SECRET_NAME }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -125,6 +138,9 @@ jobs:
 
       - name: Check required Secret Manager entries exist
         run: scripts/deploy.sh check-secrets-exist
+
+      - name: Check the worker and recovery jobs belong to this environment
+        run: scripts/deploy.sh check-intake-jobs
 
       - name: Configure Artifact Registry authentication
         run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
@@ -157,6 +173,16 @@ jobs:
 
       - name: Apply database migrations
         run: scripts/deploy.sh apply-migrations
+
+      - name: Update the worker job to the released image
+        run: scripts/deploy.sh configure-worker-job
+        env:
+          IMAGE_URI: ${{ steps.image.outputs.uri }}
+
+      - name: Update the recovery job to the released image
+        run: scripts/deploy.sh configure-recovery-job
+        env:
+          IMAGE_URI: ${{ steps.image.outputs.uri }}
 
       - name: Deploy an isolated candidate revision
         run: scripts/deploy.sh deploy-candidate
@@ -208,6 +234,17 @@ jobs:
       READ_SECRET_NAME: ${{ vars.TELEMETRY_READ_SECRET_NAME }}
       PRODUCTION_CLOUD_SQL_CONNECTION: ${{ vars.TELEMETRY_PRODUCTION_CLOUD_SQL_CONNECTION }}
       PRODUCTION_SERVICE: ${{ vars.TELEMETRY_PRODUCTION_SERVICE }}
+      # Each environment has its own intake resources.
+      INTAKE_BUCKET: ${{ vars.TELEMETRY_INTAKE_BUCKET }}
+      WORKER_QUEUE: ${{ vars.TELEMETRY_WORKER_QUEUE }}
+      WORKER_JOB: ${{ vars.TELEMETRY_WORKER_JOB }}
+      RECOVERY_JOB: ${{ vars.TELEMETRY_RECOVERY_JOB }}
+      WORKER_SERVICE_ACCOUNT: ${{ vars.TELEMETRY_WORKER_SERVICE_ACCOUNT }}
+      WORKER_INVOKER_SERVICE_ACCOUNT: ${{ vars.TELEMETRY_WORKER_INVOKER_SERVICE_ACCOUNT }}
+      RECOVERY_SERVICE_ACCOUNT: ${{ vars.TELEMETRY_RECOVERY_SERVICE_ACCOUNT }}
+      # This environment's own Hugging Face read token, which only its
+      # worker job mounts and only its worker service account may read.
+      HF_READ_SECRET_NAME: ${{ vars.TELEMETRY_HF_READ_SECRET_NAME }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -228,6 +265,9 @@ jobs:
 
       - name: Check required Secret Manager entries exist
         run: scripts/deploy.sh check-secrets-exist
+
+      - name: Check the worker and recovery jobs belong to this environment
+        run: scripts/deploy.sh check-intake-jobs
 
       - name: Deploy an isolated maintenance revision
         run: scripts/deploy.sh deploy-maintenance
@@ -256,6 +296,16 @@ jobs:
 
       - name: Apply database migrations
         run: scripts/deploy.sh apply-migrations
+
+      - name: Update the worker job to the released image
+        run: scripts/deploy.sh configure-worker-job
+        env:
+          IMAGE_URI: ${{ needs.deploy-staging.outputs.image_uri }}
+
+      - name: Update the recovery job to the released image
+        run: scripts/deploy.sh configure-recovery-job
+        env:
+          IMAGE_URI: ${{ needs.deploy-staging.outputs.image_uri }}
 
       - name: Deploy an isolated candidate revision
         run: scripts/deploy.sh deploy-candidate
