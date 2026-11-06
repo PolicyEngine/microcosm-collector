@@ -137,8 +137,8 @@ jobs:
       - name: Check required Secret Manager entries exist
         run: scripts/deploy.sh check-secrets-exist
 
-      - name: Check the worker and recovery jobs exist
-        run: scripts/deploy.sh check-intake-jobs-exist
+      - name: Check the worker and recovery jobs belong to this environment
+        run: scripts/deploy.sh check-intake-jobs
 
       - name: Configure Artifact Registry authentication
         run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
@@ -265,8 +265,8 @@ jobs:
       - name: Check required Secret Manager entries exist
         run: scripts/deploy.sh check-secrets-exist
 
-      - name: Check the worker and recovery jobs exist
-        run: scripts/deploy.sh check-intake-jobs-exist
+      - name: Check the worker and recovery jobs belong to this environment
+        run: scripts/deploy.sh check-intake-jobs
 
       - name: Deploy an isolated maintenance revision
         run: scripts/deploy.sh deploy-maintenance

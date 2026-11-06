@@ -51,10 +51,51 @@ require_configuration() {
 
   require_variables "${names[@]}"
   require_intake_switch
+  require_intake_resource_names
 }
 
 # The helpers below also run inside command substitutions, where bash does not
 # apply set -e, so each one returns as soon as a check fails.
+
+# The collector's patterns for the intake settings (telemetry_collector.intake),
+# applied to the names the deploy builds them from. With production's switch
+# at 0 the collector reads none of these, but the recovery job validates its
+# three settings on every scheduled run, so a malformed name must stop the
+# deploy instead. The deploy script's tests compare each verdict with the
+# collector's.
+BUCKET_NAME_PATTERN='^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$'
+QUEUE_NAME_PATTERN='^[A-Za-z0-9-]{1,100}$'
+JOB_NAME_PATTERN='^[a-z][a-z0-9-]{0,62}$'
+SERVICE_ACCOUNT_PATTERN='^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z0-9.-]+\.iam\.gserviceaccount\.com$'
+
+require_resource_name() {
+  local name="$1"
+  local pattern="$2"
+
+  if [[ ! "${!name}" =~ $pattern ]]; then
+    echo "${name} is not a valid resource name." >&2
+    return 1
+  fi
+}
+
+require_intake_resource_names() {
+  require_variables \
+    INTAKE_BUCKET \
+    WORKER_QUEUE \
+    WORKER_JOB \
+    RECOVERY_JOB \
+    RUNTIME_SERVICE_ACCOUNT \
+    WORKER_INVOKER_SERVICE_ACCOUNT || return 1
+
+  local failed=0
+  require_resource_name INTAKE_BUCKET "$BUCKET_NAME_PATTERN" || failed=1
+  require_resource_name WORKER_QUEUE "$QUEUE_NAME_PATTERN" || failed=1
+  require_resource_name WORKER_JOB "$JOB_NAME_PATTERN" || failed=1
+  require_resource_name RECOVERY_JOB "$JOB_NAME_PATTERN" || failed=1
+  require_resource_name RUNTIME_SERVICE_ACCOUNT "$SERVICE_ACCOUNT_PATTERN" || failed=1
+  require_resource_name WORKER_INVOKER_SERVICE_ACCOUNT "$SERVICE_ACCOUNT_PATTERN" || failed=1
+  return "$failed"
+}
 
 # Each environment sets its own intake switch, so production's intake can stay
 # off while staging's is checked. The collector treats anything but exactly 1
@@ -111,6 +152,7 @@ service_intake_settings() {
     WORKER_JOB \
     WORKER_INVOKER_SERVICE_ACCOUNT || return 1
   require_intake_switch || return 1
+  require_intake_resource_names || return 1
 
   local queue_resource_name
   local worker_job_resource_name
@@ -198,24 +240,62 @@ check_secrets_exist() {
 }
 
 # The worker and recovery jobs, and who may run them, are created by hand; a
-# release only updates them. Confirming both exist before anything changes
-# stops a deploy with a wrong job name before production goes into
-# maintenance mode.
-check_intake_jobs_exist() {
-  require_variables PROJECT_ID REGION WORKER_JOB RECOVERY_JOB
+# release only updates them. Before anything changes, confirm that each job
+# exists, already runs as the account this deploy gives it, and connects to
+# this environment's Cloud SQL instance, which validate-environment-target has
+# tied to the environment. A variable naming the other environment's job, or a
+# job on another account, stops the deploy before production goes into
+# maintenance mode. To move a job to another account, update the job by hand
+# first.
+check_intake_jobs() {
+  require_variables \
+    PROJECT_ID \
+    REGION \
+    CLOUD_SQL_CONNECTION \
+    WORKER_JOB \
+    RECOVERY_JOB \
+    WORKER_SERVICE_ACCOUNT \
+    RECOVERY_SERVICE_ACCOUNT
 
   local failed=0
-  local job
-  for job in "$WORKER_JOB" "$RECOVERY_JOB"; do
-    if ! gcloud run jobs describe "$job" \
+  check_intake_job "$WORKER_JOB" "$WORKER_SERVICE_ACCOUNT" || failed=1
+  check_intake_job "$RECOVERY_JOB" "$RECOVERY_SERVICE_ACCOUNT" || failed=1
+  return "$failed"
+}
+
+# Runs in an `||` list, where bash does not apply set -e, so each check returns.
+check_intake_job() {
+  local job="$1"
+  local expected_account="$2"
+  local account
+  local connection
+  local job_json
+
+  if ! job_json="$(
+    gcloud run jobs describe "$job" \
       --project "$PROJECT_ID" \
       --region "$REGION" \
-      --format=none; then
-      echo "Cannot confirm the existence of Cloud Run job: ${job}" >&2
-      failed=1
-    fi
-  done
-  return "$failed"
+      --format=json
+  )"; then
+    echo "Cannot confirm the existence of Cloud Run job: ${job}" >&2
+    return 1
+  fi
+  account="$(
+    jq -r '.spec.template.spec.template.spec.serviceAccountName // ""' \
+      <<< "$job_json"
+  )" || return 1
+  connection="$(
+    jq -r '.spec.template.metadata.annotations["run.googleapis.com/cloudsql-instances"] // ""' \
+      <<< "$job_json"
+  )" || return 1
+  if [[ "$account" != "$expected_account" ]]; then
+    echo "Cloud Run job ${job} runs as another service account than this deployment gives it." >&2
+    return 1
+  fi
+  if [[ "$connection" != "$CLOUD_SQL_CONNECTION" ]]; then
+    echo "Cloud Run job ${job} connects to another Cloud SQL instance than this environment's." >&2
+    return 1
+  fi
 }
 
 build_and_push_image() {
@@ -279,6 +359,7 @@ configure_worker_job() {
     CLOUD_SQL_CONNECTION \
     DATABASE_SECRET_NAME \
     INTAKE_BUCKET
+  require_resource_name INTAKE_BUCKET "$BUCKET_NAME_PATTERN"
 
   local huggingface_secret
   local secrets
@@ -321,6 +402,9 @@ configure_recovery_job() {
     WORKER_QUEUE \
     WORKER_JOB \
     WORKER_INVOKER_SERVICE_ACCOUNT
+  require_resource_name WORKER_QUEUE "$QUEUE_NAME_PATTERN"
+  require_resource_name WORKER_JOB "$JOB_NAME_PATTERN"
+  require_resource_name WORKER_INVOKER_SERVICE_ACCOUNT "$SERVICE_ACCOUNT_PATTERN"
 
   local queue_resource_name
   local worker_job_resource_name
@@ -573,7 +657,7 @@ Commands:
   require-configuration
   validate-environment-target
   check-secrets-exist
-  check-intake-jobs-exist
+  check-intake-jobs
   build-and-push-image
   deploy-maintenance
   resolve-and-verify-maintenance
@@ -600,7 +684,7 @@ main() {
     require-configuration) require_configuration ;;
     validate-environment-target) validate_environment_target ;;
     check-secrets-exist) check_secrets_exist ;;
-    check-intake-jobs-exist) check_intake_jobs_exist ;;
+    check-intake-jobs) check_intake_jobs ;;
     build-and-push-image) build_and_push_image ;;
     deploy-maintenance) deploy_maintenance ;;
     resolve-and-verify-maintenance) resolve_and_verify_maintenance ;;

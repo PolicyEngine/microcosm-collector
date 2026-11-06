@@ -116,8 +116,11 @@ every submission and job in them. Run it with this release's code, for
 example as its migration job with overridden arguments, and as the migration
 database user, before deploying the older image: the older code can't find
 the revision either, and the runtime user doesn't own the tables. That is an
-exception to the rule below that downgrades are for disposable test databases;
-while intake is off, both tables stay empty.
+exception to the rule below that downgrades are for disposable test databases.
+Both tables stay empty only while an environment's intake has never been
+switched on. In an environment whose intake is or was on, the downgrade
+deletes the record of every submission and job; the files stay in the
+bucket.
 
 | Setting | Read by | Value | The deploy sets it from |
 |---|---|---|---|
@@ -250,9 +253,18 @@ and region, these resources, created by hand (both environments have them):
 
 Each release, in each environment, `scripts/deploy.sh`:
 
-1. checks, before it changes anything, that both jobs exist
-   (`check-intake-jobs-exist`), and in production that the Hugging Face read
-   token's secret exists (`check-secrets-exist`);
+1. checks, before it changes anything:
+   - that every intake name has the shape the collector accepts
+     (`require-configuration`, before it authenticates). With the switch at
+     `0` the service reads none of the settings, but the recovery job reads
+     its three on every run, so a malformed name stops the deploy instead;
+   - that each job exists, already runs as the service account the deploy
+     gives it, and connects to the environment's own Cloud SQL instance
+     (`check-intake-jobs`), so a variable naming the other environment's job
+     stops the deploy. To move a job to another account, update the job by
+     hand first;
+   - in production, that the Hugging Face read token's secret exists
+     (`check-secrets-exist`);
 2. passes the intake settings in the first table to the maintenance and
    candidate revisions;
 3. after the migration and before the candidate revision, updates the worker
@@ -264,6 +276,13 @@ Each release, in each environment, `scripts/deploy.sh`:
    so the worker job's lists `DATABASE_URL` and, in production,
    `COLLECTOR_HF_READ_TOKEN` together. The deploy changes neither the
    schedule nor any job's permissions.
+
+Maintenance mode holds only the service. An execution of either job keeps the
+image it started with, so a worker attempt that is running during a migration
+(up to an hour), or one that a scheduled recovery run or a Cloud Tasks retry
+starts before the job is updated, runs the previous release's code against
+the migrated schema. A migration that changes the intake tables must
+therefore keep working with the previous release's worker and recovery code.
 
 To switch an environment's intake on, set its `TELEMETRY_INTAKE_ENABLED` to `1`;
 to switch it off again, set it to `0`. Either takes effect at that
@@ -446,8 +465,9 @@ the complete SQLAlchemy metadata, and deploys the staging collector. Production 
 succeeds. Before either environment changes, deployment checks only that its
 runtime database, migration database, JWT signing, and read-token secret
 resources exist, in production also the Hugging Face read token's secret,
-and that its worker and recovery jobs exist. It does not access the secrets'
-payloads or test their values. The
+and that its worker and recovery jobs exist and belong to that environment
+(see "Worker jobs and recovery"). It does not access the secrets' payloads or
+test their values. The
 previous HF authentication and write/read deployment qualification is removed.
 
 Each deployment first routes traffic to a verified maintenance revision that
