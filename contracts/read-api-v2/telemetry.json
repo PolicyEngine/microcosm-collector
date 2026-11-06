@@ -1,0 +1,385 @@
+{
+  "description": "The telemetry the recorded interactions were answered from. Each step registers a producer for a run, at the time given, or posts a batch of events through POST /v1/runs/{run_id}/events, in this order.",
+  "steps": [
+    {
+      "register_at": "2026-10-20T09:00:00Z",
+      "registration": {
+        "run_id": "us-run-completed",
+        "producer_id": "us-completed-producer",
+        "country_code": "US",
+        "pipeline": "us-fiscal-refresh",
+        "candidate_id": "candidate-a",
+        "release_id": null,
+        "run_kind": "build"
+      }
+    },
+    {
+      "run_id": "us-run-completed",
+      "events": [
+        {
+          "schema_version": 1,
+          "event_id": "us-run-completed-1",
+          "run_id": "us-run-completed",
+          "producer_id": "us-completed-producer",
+          "sequence": 1,
+          "timestamp": "2026-10-20T09:00:05Z",
+          "event_type": "run",
+          "stage_id": "created",
+          "status": "started",
+          "message": "Run started",
+          "details": {
+            "identity": {"microcosm_version": "0.40.0", "country": "us"}
+          }
+        },
+        {
+          "schema_version": 1,
+          "event_id": "us-run-completed-2",
+          "run_id": "us-run-completed",
+          "producer_id": "us-completed-producer",
+          "sequence": 2,
+          "timestamp": "2026-10-20T09:00:10Z",
+          "event_type": "stage",
+          "stage_id": "target_compilation",
+          "status": "started",
+          "message": "Compiling targets.",
+          "details": {},
+          "resources": {
+            "cpu_user_seconds": 2.0,
+            "cpu_system_seconds": 0.5,
+            "rss_bytes": 1024,
+            "peak_rss_bytes": 2048
+          }
+        },
+        {
+          "schema_version": 1,
+          "event_id": "us-run-completed-3",
+          "run_id": "us-run-completed",
+          "producer_id": "us-completed-producer",
+          "sequence": 3,
+          "timestamp": "2026-10-20T09:10:00Z",
+          "event_type": "progress",
+          "stage_id": "calibrate",
+          "status": "progress",
+          "message": null,
+          "details": {
+            "done": 50,
+            "total": 500,
+            "unit": "epochs",
+            "elapsed_seconds": 12.5,
+            "loss": 0.25
+          }
+        },
+        {
+          "schema_version": 1,
+          "event_id": "us-run-completed-4",
+          "run_id": "us-run-completed",
+          "producer_id": "us-completed-producer",
+          "sequence": 4,
+          "timestamp": "2026-10-20T09:10:01Z",
+          "event_type": "calibration",
+          "stage_id": "calibrate",
+          "status": "progress",
+          "message": null,
+          "details": {"epoch": 50, "loss": 0.25}
+        }
+      ]
+    },
+    {
+      "run_id": "us-run-completed",
+      "events": [
+        {
+          "schema_version": 1,
+          "event_id": "us-run-completed-6",
+          "run_id": "us-run-completed",
+          "producer_id": "us-completed-producer",
+          "sequence": 6,
+          "timestamp": "2026-10-20T09:30:00Z",
+          "event_type": "stage",
+          "stage_id": "calibrate",
+          "status": "completed",
+          "message": null,
+          "details": {}
+        },
+        {
+          "schema_version": 1,
+          "event_id": "us-run-completed-7",
+          "run_id": "us-run-completed",
+          "producer_id": "us-completed-producer",
+          "sequence": 7,
+          "timestamp": "2026-10-20T09:31:00Z",
+          "event_type": "run",
+          "stage_id": "complete",
+          "status": "completed",
+          "message": "Run completed",
+          "details": {}
+        },
+        {
+          "schema_version": 1,
+          "event_id": "us-run-completed-5",
+          "run_id": "us-run-completed",
+          "producer_id": "us-completed-producer",
+          "sequence": 5,
+          "timestamp": "2026-10-20T10:11:00+01:00",
+          "event_type": "heartbeat",
+          "stage_id": null,
+          "status": "progress",
+          "message": null,
+          "details": {},
+          "resources": {
+            "cpu_user_seconds": 600.25,
+            "rss_bytes": 4096,
+            "peak_rss_bytes": 8192
+          }
+        }
+      ]
+    },
+    {
+      "register_at": "2026-10-21T10:00:00Z",
+      "registration": {
+        "run_id": "us-run-failed",
+        "producer_id": "us-failed-producer",
+        "country_code": "US",
+        "pipeline": "us-fiscal-refresh",
+        "candidate_id": null,
+        "release_id": "us-2026.10",
+        "run_kind": "release"
+      }
+    },
+    {
+      "run_id": "us-run-failed",
+      "events": [
+        {
+          "schema_version": 1,
+          "event_id": "us-run-failed-1",
+          "run_id": "us-run-failed",
+          "producer_id": "us-failed-producer",
+          "sequence": 1,
+          "timestamp": "2026-10-21T10:00:04Z",
+          "event_type": "run",
+          "stage_id": "created",
+          "status": "started",
+          "message": "Run started",
+          "details": {}
+        },
+        {
+          "schema_version": 1,
+          "event_id": "us-run-failed-2",
+          "run_id": "us-run-failed",
+          "producer_id": "us-failed-producer",
+          "sequence": 2,
+          "timestamp": "2026-10-21T11:00:00Z",
+          "event_type": "stage",
+          "stage_id": "release_acceptance",
+          "status": "started",
+          "message": null,
+          "details": {}
+        },
+        {
+          "schema_version": 1,
+          "event_id": "us-run-failed-3",
+          "run_id": "us-run-failed",
+          "producer_id": "us-failed-producer",
+          "sequence": 3,
+          "timestamp": "2026-10-21T11:05:00Z",
+          "event_type": "run",
+          "stage_id": "release_acceptance",
+          "status": "failed",
+          "message": "Release acceptance checks failed: 1 critical target is outside its tolerance.",
+          "details": {
+            "error_type": "ReleaseAcceptanceError",
+            "error_code": "RELEASE_ACCEPTANCE",
+            "failure_class": "acceptance",
+            "failed_during": "release_acceptance"
+          }
+        }
+      ]
+    },
+    {
+      "register_at": "2026-10-22T08:00:00Z",
+      "registration": {
+        "run_id": "gb-run-blocked",
+        "producer_id": "gb-blocked-producer",
+        "country_code": "GB",
+        "pipeline": "uk-local-areas",
+        "candidate_id": "candidate-b",
+        "release_id": null,
+        "run_kind": "build"
+      }
+    },
+    {
+      "run_id": "gb-run-blocked",
+      "events": [
+        {
+          "schema_version": 1,
+          "event_id": "gb-run-blocked-1",
+          "run_id": "gb-run-blocked",
+          "producer_id": "gb-blocked-producer",
+          "sequence": 1,
+          "timestamp": "2026-10-22T08:00:03Z",
+          "event_type": "run",
+          "stage_id": "created",
+          "status": "started",
+          "message": "Run started",
+          "details": {}
+        },
+        {
+          "schema_version": 1,
+          "event_id": "gb-run-blocked-2",
+          "run_id": "gb-run-blocked",
+          "producer_id": "gb-blocked-producer",
+          "sequence": 2,
+          "timestamp": "2026-10-22T09:15:00Z",
+          "event_type": "stage",
+          "stage_id": "acceptance",
+          "status": "started",
+          "message": null,
+          "details": {}
+        },
+        {
+          "schema_version": 1,
+          "event_id": "gb-run-blocked-3",
+          "run_id": "gb-run-blocked",
+          "producer_id": "gb-blocked-producer",
+          "sequence": 3,
+          "timestamp": "2026-10-22T09:20:00Z",
+          "event_type": "run",
+          "stage_id": "blocked",
+          "status": "blocked",
+          "message": "Acceptance checks refused the candidate.",
+          "details": {
+            "phase": "candidate",
+            "blocking_failure_count": 2,
+            "blocking_gate_ids": ["local-area-totals", "household-weights"],
+            "gate_statuses": {
+              "local-area-totals": "failed",
+              "household-weights": "failed",
+              "population": "passed"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "register_at": "2026-10-23T07:00:00Z",
+      "registration": {
+        "run_id": "gb-run-restarted",
+        "producer_id": "gb-restarted-first-attempt",
+        "country_code": "GB",
+        "pipeline": "uk-national",
+        "candidate_id": null,
+        "release_id": null,
+        "run_kind": "calibration"
+      }
+    },
+    {
+      "run_id": "gb-run-restarted",
+      "events": [
+        {
+          "schema_version": 1,
+          "event_id": "gb-run-restarted-first-1",
+          "run_id": "gb-run-restarted",
+          "producer_id": "gb-restarted-first-attempt",
+          "sequence": 1,
+          "timestamp": "2026-10-23T07:00:02Z",
+          "event_type": "run",
+          "stage_id": "created",
+          "status": "started",
+          "message": "Run started",
+          "details": {}
+        },
+        {
+          "schema_version": 1,
+          "event_id": "gb-run-restarted-first-2",
+          "run_id": "gb-run-restarted",
+          "producer_id": "gb-restarted-first-attempt",
+          "sequence": 2,
+          "timestamp": "2026-10-23T07:30:00Z",
+          "event_type": "run",
+          "stage_id": "calibrate",
+          "status": "failed",
+          "message": "Worker preempted",
+          "details": {"error_type": "WorkerLost"}
+        }
+      ]
+    },
+    {
+      "register_at": "2026-10-23T08:00:00Z",
+      "registration": {
+        "run_id": "gb-run-restarted",
+        "producer_id": "gb-restarted-second-attempt",
+        "country_code": "GB",
+        "pipeline": "uk-national",
+        "candidate_id": null,
+        "release_id": null,
+        "run_kind": "calibration"
+      }
+    },
+    {
+      "run_id": "gb-run-restarted",
+      "events": [
+        {
+          "schema_version": 1,
+          "event_id": "gb-run-restarted-second-1",
+          "run_id": "gb-run-restarted",
+          "producer_id": "gb-restarted-second-attempt",
+          "sequence": 1,
+          "timestamp": "2026-10-23T08:00:05Z",
+          "event_type": "run",
+          "stage_id": "created",
+          "status": "started",
+          "message": "Run started",
+          "details": {}
+        },
+        {
+          "schema_version": 1,
+          "event_id": "gb-run-restarted-second-2",
+          "run_id": "gb-run-restarted",
+          "producer_id": "gb-restarted-second-attempt",
+          "sequence": 2,
+          "timestamp": "2026-10-23T08:20:00Z",
+          "event_type": "progress",
+          "stage_id": "calibrate",
+          "status": "progress",
+          "message": null,
+          "details": {
+            "done": 10,
+            "total": 200,
+            "unit": "epochs",
+            "elapsed_seconds": 30
+          }
+        },
+        {
+          "schema_version": 1,
+          "event_id": "gb-run-restarted-second-3",
+          "run_id": "gb-run-restarted",
+          "producer_id": "gb-restarted-second-attempt",
+          "sequence": 3,
+          "timestamp": "2026-10-23T08:21:00Z",
+          "event_type": "heartbeat",
+          "stage_id": null,
+          "status": "progress",
+          "message": null,
+          "details": {},
+          "resources": {
+            "cpu_user_seconds": 90.5,
+            "cpu_system_seconds": 3.25,
+            "rss_bytes": 65536,
+            "peak_rss_bytes": 131072
+          }
+        }
+      ]
+    },
+    {
+      "register_at": "2026-10-24T12:00:00Z",
+      "registration": {
+        "run_id": "us-run-registered",
+        "producer_id": "us-registered-producer",
+        "country_code": "US",
+        "pipeline": "us-fiscal-refresh",
+        "candidate_id": null,
+        "release_id": null,
+        "run_kind": "build"
+      }
+    }
+  ]
+}

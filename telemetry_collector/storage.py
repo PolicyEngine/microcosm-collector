@@ -31,6 +31,18 @@ class RunRegistrationConflictError(ValueError):
     """Raised when a run identifier is reused with different metadata."""
 
 
+@dataclass(frozen=True)
+class RunRecord:
+    """A registered run and every stored event, read together.
+
+    ``registered_run`` maps each run column to its stored value, and each event
+    carries its producer's registration time for ``canonical_events``.
+    """
+
+    registered_run: dict[str, Any]
+    events: list[dict[str, Any]]
+
+
 class TelemetryStore(Protocol):
     """Storage operations used by the HTTP service."""
 

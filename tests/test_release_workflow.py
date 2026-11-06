@@ -1,5 +1,6 @@
 """Each merge to main is released in two passes: version, then verify, tag, deploy."""
 
+import json
 import os
 import re
 import subprocess
@@ -11,6 +12,8 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 PUSH_WORKFLOW = ROOT / ".github" / "workflows" / "push.yaml"
 TAG_SCRIPT = ROOT / "tools" / "publish-git-tag.sh"
+PUBLISH_CLIENT_SCRIPT = ROOT / "tools" / "publish-client.sh"
+CLIENT_PACKAGE_NAME = "@policyengine/microcosm-collector-client"
 RELEASE_COMMIT = "Update microcosm-collector"
 APP_TOKEN = "${{ steps.app-token.outputs.token }}"
 
@@ -33,6 +36,7 @@ def test_release_commit_is_verified_then_tagged_then_deployed() -> None:
         "tag",
         "deploy-staging",
         "deploy-production",
+        "publish-client",
     }
     collector_only = "github.repository == 'PolicyEngine/microcosm-collector'"
     release_message = "github.event.head_commit.message"
@@ -46,6 +50,7 @@ def test_release_commit_is_verified_then_tagged_then_deployed() -> None:
     assert jobs["tag"]["steps"][-1]["run"] == "bash tools/publish-git-tag.sh"
     assert jobs["deploy-staging"]["needs"] == "tag"
     assert jobs["deploy-production"]["needs"] == "deploy-staging"
+    assert jobs["publish-client"]["needs"] == "deploy-production"
 
 
 def test_versioning_commits_the_release_with_the_app_token() -> None:
@@ -80,7 +85,39 @@ def test_only_versioning_and_deployment_read_secrets() -> None:
             "TELEMETRY_GCP_WIF_PROVIDER",
             "TELEMETRY_GCP_DEPLOY_SERVICE_ACCOUNT",
         },
+        "publish-client": set(),
     }
+
+
+def test_client_is_published_after_production_only_when_enabled() -> None:
+    jobs = push_jobs()
+    assert "publish-client" in jobs
+    job = jobs["publish-client"]
+    steps = job["steps"]
+
+    # Published only once production runs the release the client describes,
+    # and only once publishing is switched on.
+    assert job["if"] == (
+        "github.event_name == 'push' && github.ref == 'refs/heads/main'"
+        " && vars.COLLECTOR_CLIENT_PUBLISH_ENABLED == 'true'"
+    )
+    # npm's trusted publisher names this workflow file and this environment.
+    assert job["environment"] == "npm"
+    assert job["permissions"] == {"contents": "read", "id-token": "write"}
+    assert job["concurrency"]["cancel-in-progress"] == "false"
+    assert job["defaults"]["run"]["working-directory"] == "packages/collector-client"
+    assert steps[0]["uses"].startswith("actions/checkout@")
+    assert steps[0]["with"] == {"persist-credentials": "false"}
+    assert steps[1]["uses"].startswith("actions/setup-node@")
+    assert steps[1]["with"] == {
+        "node-version": "24.22.1",
+        "registry-url": "https://registry.npmjs.org",
+        "package-manager-cache": "false",
+    }
+    assert [step["run"] for step in steps[2:]] == [
+        "npm ci",
+        "bash ../../tools/publish-client.sh",
+    ]
 
 
 def isolated_git_environment() -> dict[str, str]:
@@ -174,3 +211,109 @@ def test_tag_script_refuses_a_version_tagged_on_another_commit(
 
     assert result.returncode == 1
     assert "not the release commit" in result.stderr
+
+
+# Stands in for npm: records each call and answers `npm view` from
+# STUB_PUBLISHED, the versions on npm. With none, the package does not exist.
+STUB_NPM = """#!/usr/bin/env bash
+echo "$*" >> "$NPM_CALLS"
+case "$1" in
+  --version) echo "$STUB_NPM_VERSION" ;;
+  view)
+    if [ -z "$STUB_PUBLISHED" ]; then echo "npm error code E404" >&2; exit 1; fi
+    for published in $STUB_PUBLISHED; do
+      if [ "$published" = "${2##*@}" ]; then echo "$published"; fi
+    done ;;
+  publish) ;;
+  *) exit 64 ;;
+esac
+"""
+
+
+def run_publish_script(
+    tmp_path: Path,
+    *,
+    client_version: str = "0.9.0",
+    release_version: str = "0.9.0",
+    npm_version: str = "11.19.1",
+    published_versions: tuple[str, ...] = (),
+) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    collector_root = tmp_path / "collector"
+    client_dir = collector_root / "packages" / "collector-client"
+    client_dir.mkdir(parents=True)
+    (collector_root / "pyproject.toml").write_text(
+        f'[project]\nname = "microcosm-collector"\nversion = "{release_version}"\n'
+    )
+    (client_dir / "package.json").write_text(
+        json.dumps({"name": CLIENT_PACKAGE_NAME, "version": client_version})
+    )
+    stub_directory = tmp_path / "stub-bin"
+    stub_directory.mkdir()
+    (stub_directory / "npm").write_text(STUB_NPM)
+    (stub_directory / "npm").chmod(0o755)
+    calls_path = tmp_path / "npm-calls.txt"
+    calls_path.touch()
+    result = subprocess.run(
+        ["bash", str(PUBLISH_CLIENT_SCRIPT), str(collector_root)],
+        env={
+            "PATH": f"{stub_directory}{os.pathsep}{os.environ['PATH']}",
+            "HOME": os.environ.get("HOME", ""),
+            "NPM_CALLS": str(calls_path),
+            "STUB_NPM_VERSION": npm_version,
+            "STUB_PUBLISHED": " ".join(published_versions),
+        },
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    return result, calls_path.read_text().splitlines()
+
+
+@pytest.mark.parametrize(
+    "published_versions", [(), ("0.8.0",)], ids=["new package", "new version"]
+)
+def test_publish_script_publishes_a_version_npm_lacks(
+    tmp_path: Path, published_versions: tuple[str, ...]
+) -> None:
+    result, npm_calls = run_publish_script(
+        tmp_path, published_versions=published_versions
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert npm_calls == [
+        "--version",
+        f"view {CLIENT_PACKAGE_NAME}@0.9.0 version",
+        "publish --access public",
+    ]
+
+
+def test_publish_script_accepts_a_rerun_after_publishing(tmp_path: Path) -> None:
+    result, npm_calls = run_publish_script(
+        tmp_path, published_versions=("0.8.0", "0.9.0")
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"{CLIENT_PACKAGE_NAME}@0.9.0 is already on npm." in result.stdout
+    assert "publish --access public" not in npm_calls
+
+
+def test_publish_script_refuses_a_client_version_other_than_the_release(
+    tmp_path: Path,
+) -> None:
+    result, npm_calls = run_publish_script(
+        tmp_path, client_version="0.8.0", release_version="0.9.0"
+    )
+
+    assert result.returncode == 1
+    assert "not the release's version 0.9.0" in result.stderr
+    assert npm_calls == []
+
+
+def test_publish_script_refuses_npm_without_trusted_publishing(
+    tmp_path: Path,
+) -> None:
+    result, npm_calls = run_publish_script(tmp_path, npm_version="11.5.0")
+
+    assert result.returncode == 1
+    assert "needs 11.5.1 or later" in result.stderr
+    assert npm_calls == ["--version"]
