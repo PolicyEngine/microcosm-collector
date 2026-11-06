@@ -117,6 +117,7 @@ jobs:
       # This environment's own Hugging Face read token, which only its
       # worker job mounts and only its worker service account may read.
       HF_READ_SECRET_NAME: ${{ vars.TELEMETRY_HF_READ_SECRET_NAME }}
+      CALIBRATION_TREE_BLOB_SECRET_NAME: ${{ vars.TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -243,6 +244,7 @@ jobs:
       # This environment's own Hugging Face read token, which only its
       # worker job mounts and only its worker service account may read.
       HF_READ_SECRET_NAME: ${{ vars.TELEMETRY_HF_READ_SECRET_NAME }}
+      CALIBRATION_TREE_BLOB_SECRET_NAME: ${{ vars.TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:

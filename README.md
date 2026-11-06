@@ -130,7 +130,7 @@ bucket.
 | `COLLECTOR_WORKER_INVOKER_SERVICE_ACCOUNT` | service, operations | the account whose OAuth token each Cloud Task uses to run the worker job | `TELEMETRY_WORKER_INVOKER_SERVICE_ACCOUNT` |
 | `COLLECTOR_WORKER_JOB_ID` | worker | set on each execution by its Cloud Task | not set by the deploy |
 | `DATABASE_URL` | worker, operations | the runtime database secret, as for the service | `TELEMETRY_DATABASE_SECRET_NAME` |
-| `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN` | worker | the read-write token of the environment's own calibration tree Vercel Blob store, a Secret Manager secret; without it, `calibration-diagnostics` submissions stay in intake storage (see "Building trees from submissions") | not set by the deploy yet |
+| `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN` | worker | the read-write token of the environment's own calibration tree Vercel Blob store, a Secret Manager secret; without it, `calibration-diagnostics` submissions stay in intake storage (see "Building trees from submissions") | `TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME`, the secret's name |
 
 The `TELEMETRY_*` names are GitHub `staging` and `production` environment
 variables, which `.github/workflows/push.yaml` passes to `scripts/deploy.sh`.
@@ -142,6 +142,7 @@ The deploy also reads these, to update the two jobs:
 | `TELEMETRY_WORKER_SERVICE_ACCOUNT` | the worker job's service account |
 | `TELEMETRY_RECOVERY_SERVICE_ACCOUNT` | the recovery job's service account |
 | `TELEMETRY_HF_READ_SECRET_NAME` | the environment's own Hugging Face read token's secret, mounted on the worker job (see "Hugging Face read access") |
+| `TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME` | the secret holding the read-write token of the environment's own calibration tree Blob store, mounted on the worker job only as `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN` (see "Building trees from submissions") |
 
 The two service-account settings accept only user-managed accounts,
 `<name>@<project>.iam.gserviceaccount.com`. The collector refuses to start
@@ -460,9 +461,12 @@ recorded for the same release build or staged run.
 The worker job builds a calibration tree from each `calibration-diagnostics`
 submission (`telemetry_collector/calibration_trees.py`) where it has
 `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN`, the read-write token of its
-environment's own Vercel Blob store. Each environment has its own store, which
-nothing reads until the dashboard switches to it. Without the token,
-submissions stay in intake storage and can be reprocessed later. Nothing here
+environment's own Vercel Blob store, which the deploy mounts on the worker job
+only, from the secret `TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME` names.
+Each environment has its own store, which nothing reads until the dashboard
+switches to it, and its own secret, which only its worker service account may
+read. Without the token, submissions stay in intake storage and can be
+reprocessed later. Nothing here
 reads Hugging Face: every value comes from the submission.
 
 - **Which tree.** A build folder, `releases/<release>/<build>`, gives a release
@@ -691,9 +695,10 @@ one image identified by the commit SHA. It first applies the migration to the
 persistent staging PostgreSQL database, verifies both the Alembic revision and
 the complete SQLAlchemy metadata, and deploys the staging collector. Production receives that exact image only when the staging sequence
 succeeds. Before either environment changes, deployment checks only that the
-environment's five secrets exist (the runtime database URL, the migration
-database URL, the JWT signing secret, the dashboard's read token and the
-Hugging Face read token), and that its worker and recovery jobs exist and
+environment's six secrets exist (the runtime database URL, the migration
+database URL, the JWT signing secret, the dashboard's read token, the
+Hugging Face read token and the calibration tree Blob token), and that its
+worker and recovery jobs exist and
 belong to that environment (see "Worker jobs and recovery"). It does not
 access the secrets' payloads or test their values. The
 previous HF authentication and write/read deployment qualification is removed.
@@ -766,7 +771,9 @@ The deployment's access and configuration are provisioned:
 - For intake, each environment also holds the seven `TELEMETRY_*` variables
   for its bucket, queue, jobs and the service accounts that run them, and
   `TELEMETRY_HF_READ_SECRET_NAME` for its own Hugging Face read token's
-  secret (see "Artifact intake").
+  secret (see "Artifact intake"), and
+  `TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME` for its own calibration tree
+  Blob store's token's secret (see "Building trees from submissions").
   `scripts/deploy.sh require-configuration` names any that is missing, and
   the deployment stops before it authenticates.
 
