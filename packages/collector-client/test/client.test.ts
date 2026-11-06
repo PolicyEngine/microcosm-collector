@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";
 import { describe, test } from "node:test";
 
+import * as collectorClient from "../src/index.ts";
 import {
   CollectorRequestError,
   CollectorResponseError,
@@ -30,6 +31,11 @@ interface Interaction {
   request: RecordedRequest;
   response: { status: number; body: unknown };
 }
+
+const OPENAPI_URL = new URL(
+  "../../../contracts/read-api-v2/openapi.json",
+  import.meta.url,
+);
 
 const interactions = new Map<string, Interaction>(
   readdirSync(INTERACTIONS_URL)
@@ -323,9 +329,10 @@ describe("errors", () => {
     );
   });
 
-  test("a timeout while the answer is read is a timeout", async () => {
-    // The answer's headers arrive, but its body never finishes.
-    const fetchStub = async (_input: unknown, init?: RequestInit) =>
+  // The answer's headers arrive, with this status, but its body never
+  // finishes.
+  function stalledBody(answerStatus: number): typeof fetch {
+    return (async (_input: unknown, init?: RequestInit) =>
       new Response(
         new ReadableStream({
           start(controller) {
@@ -334,15 +341,23 @@ describe("errors", () => {
             );
           },
         }),
-        { status: 200, headers: { "Content-Type": "application/json" } },
+        {
+          status: answerStatus,
+          headers: { "Content-Type": "application/json" },
+        },
+      )) as typeof fetch;
+  }
+
+  for (const answerStatus of [200, 404, 503]) {
+    test(`a timeout while a ${answerStatus} answer is read is a timeout`, async () => {
+      await assert.rejects(
+        clientFor(stalledBody(answerStatus), { timeoutMs: 10 }).getRun(
+          "us-run-completed",
+        ),
+        { name: "TimeoutError" },
       );
-    await assert.rejects(
-      clientFor(fetchStub as typeof fetch, { timeoutMs: 10 }).getRun(
-        "us-run-completed",
-      ),
-      { name: "TimeoutError" },
-    );
-  });
+    });
+  }
 
   test("a request that takes too long is abandoned", async () => {
     const fetchStub = (_input: unknown, init?: RequestInit) =>
@@ -355,6 +370,44 @@ describe("errors", () => {
       clientFor(fetchStub as typeof fetch, { timeoutMs: 10 }).listRuns(),
       { name: "TimeoutError" },
     );
+  });
+});
+
+describe("the OpenAPI document", () => {
+  interface Parameter {
+    name: string;
+    schema: {
+      pattern?: string;
+      minimum?: number;
+      maximum?: number;
+      anyOf?: { pattern?: string }[];
+    };
+  }
+  const spec = JSON.parse(readFileSync(OPENAPI_URL, "utf8")) as {
+    paths: Record<string, { get: { parameters: Parameter[] } }>;
+  };
+  function parameter(operationPath: string, name: string): Parameter {
+    const found = spec.paths[operationPath]?.get.parameters.find(
+      (candidate) => candidate.name === name,
+    );
+    assert.ok(found, `${operationPath} has no parameter ${name}.`);
+    return found;
+  }
+
+  test("gives the limits the client checks before sending", () => {
+    const country = parameter("/v2/runs", "country").schema;
+    const limit = parameter("/v2/runs", "limit").schema;
+    const runId = parameter("/v2/runs/{run_id}", "run_id").schema;
+
+    assert.ok(collectorClient.RUN_ID_PATTERN instanceof RegExp);
+    assert.ok(collectorClient.COUNTRY_PATTERN instanceof RegExp);
+    assert.equal(collectorClient.RUN_ID_PATTERN.source, runId.pattern);
+    assert.equal(
+      collectorClient.COUNTRY_PATTERN.source,
+      country.anyOf?.find((option) => option.pattern)?.pattern,
+    );
+    assert.equal(limit.minimum, 1);
+    assert.equal(collectorClient.MAX_PAGE_SIZE, limit.maximum);
   });
 });
 

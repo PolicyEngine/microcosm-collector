@@ -17,6 +17,9 @@ TAG_SCRIPT = ROOT / "tools" / "publish-git-tag.sh"
 PUBLISH_CLIENT_SCRIPT = ROOT / "tools" / "publish-client.sh"
 CLIENT_PACKAGE_NAME = "@policyengine/microcosm-collector-client"
 CLIENT_ARTIFACT = "collector-client"
+# RUNNER_TEMP exists, and is empty, at the start of every job; `npm pack` does
+# not create a missing destination directory.
+PACK_COMMAND = 'npm pack --pack-destination "$RUNNER_TEMP"'
 PUBLISH_CONDITION = (
     "github.event_name == 'push' && github.ref == 'refs/heads/main'"
     " && vars.COLLECTOR_CLIENT_PUBLISH_ENABLED == 'true'"
@@ -120,14 +123,11 @@ def test_client_is_packed_after_production_without_an_oidc_token() -> None:
         "node-version": "24.22.1",
         "package-manager-cache": "false",
     }
-    assert [step["run"] for step in steps[2:4]] == [
-        "npm ci",
-        'npm pack --pack-destination "$RUNNER_TEMP/collector-client"',
-    ]
+    assert [step["run"] for step in steps[2:4]] == ["npm ci", PACK_COMMAND]
     assert steps[4]["uses"].startswith("actions/upload-artifact@")
     assert steps[4]["with"] == {
         "name": CLIENT_ARTIFACT,
-        "path": "${{ runner.temp }}/collector-client/*.tgz",
+        "path": "${{ runner.temp }}/*.tgz",
         "if-no-files-found": "error",
         "retention-days": "7",
     }
@@ -278,12 +278,16 @@ esac
 """
 
 
-def write_client_tarball(directory: Path, name: str, version: str) -> Path:
+def write_client_tarball(
+    directory: Path, name: str, version: str, **manifest_fields: object
+) -> Path:
     """Write a tarball laid out as `npm pack` writes one, holding only its manifest."""
 
     directory.mkdir(parents=True, exist_ok=True)
     tarball_path = directory / f"client-{name.replace('/', '-')}-{version}.tgz"
-    manifest = json.dumps({"name": name, "version": version}).encode()
+    manifest = json.dumps(
+        {"name": name, "version": version, **manifest_fields}
+    ).encode()
     with tarfile.open(tarball_path, "w:gz") as tarball:
         entry = tarfile.TarInfo("package/package.json")
         entry.size = len(manifest)
@@ -295,6 +299,7 @@ def run_publish_script(
     tmp_path: Path,
     *,
     tarballs: tuple[tuple[str, str], ...] = ((CLIENT_PACKAGE_NAME, "0.9.0"),),
+    packed_manifest_fields: dict[str, object] | None = None,
     release_version: str = "0.9.0",
     npm_version: str = "11.19.1",
     published_versions: tuple[str, ...] = (),
@@ -311,7 +316,9 @@ def run_publish_script(
     tarball_directory = tmp_path / "packed"
     tarball_directory.mkdir()
     tarball_paths = [
-        write_client_tarball(tarball_directory, name, version)
+        write_client_tarball(
+            tarball_directory, name, version, **(packed_manifest_fields or {})
+        )
         for name, version in tarballs
     ]
     stub_directory = tmp_path / "stub-bin"
@@ -388,6 +395,21 @@ def test_publish_script_refuses_a_tarball_of_another_package(tmp_path: Path) -> 
 
     assert result.returncode == 1
     assert f"not {CLIENT_PACKAGE_NAME}" in result.stderr
+    assert npm_calls == []
+
+
+def test_publish_script_refuses_a_tarball_that_changes_publish_settings(
+    tmp_path: Path,
+) -> None:
+    # npm applies a packed manifest's publishConfig, such as another registry
+    # or no provenance, over its own settings. The checked-in manifest has none.
+    result, npm_calls, _ = run_publish_script(
+        tmp_path,
+        packed_manifest_fields={"publishConfig": {"registry": "https://example.test"}},
+    )
+
+    assert result.returncode == 1
+    assert "publishConfig" in result.stderr
     assert npm_calls == []
 
 

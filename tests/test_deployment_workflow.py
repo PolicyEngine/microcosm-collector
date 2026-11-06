@@ -226,6 +226,13 @@ def test_validation_tests_and_packs_the_read_api_client() -> None:
     assert "client" in validation_jobs
     client = validation_jobs["client"]
     commands = [step["run"] for step in client["steps"] if "run" in step]
+    push_jobs = load_workflow(PUSH_WORKFLOW)["jobs"]
+    assert "pack-client" in push_jobs
+    release_pack_commands = [
+        step["run"]
+        for step in push_jobs["pack-client"]["steps"]
+        if step.get("run", "").startswith("npm pack")
+    ]
     setup_node = next(
         step
         for step in client["steps"]
@@ -241,8 +248,11 @@ def test_validation_tests_and_packs_the_read_api_client() -> None:
         "git diff --exit-code -- src/schema.ts",
         "npm run typecheck",
         "npm test",
-        "npm pack --dry-run",
+        'npm pack --pack-destination "$RUNNER_TEMP"',
     ]
+    # Every pull request packs the client exactly as a release does, writing
+    # the tarball, so a pack command that cannot work fails CI.
+    assert release_pack_commands == [commands[-1]]
 
 
 def test_service_deployment_uses_oidc_and_verifies_before_promotion() -> None:
