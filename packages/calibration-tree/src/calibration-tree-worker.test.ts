@@ -404,7 +404,7 @@ test("a part over the publisher's configured size limit is refused as unbuildabl
 test("a request the worker cannot follow is a request error, not unbuildable input", () => {
   const release = goldenReleaseInputs()["be-release"];
   const cases: Array<[string, Record<string, unknown>, string]> = [
-    ["an unknown kind", { kind: "staging" }, "kind must be \"release\""],
+    ["an unknown kind", { kind: "comparison" }, "kind must be \"release\" or \"staging\""],
     ["an unregistered country", { country: "xx" }, "country xx"],
     ["a commit that is not a full SHA", { hfCommitSha: "main" }, "hfCommitSha"],
     ["an unknown field", { buildArtifactId: "a".repeat(64) }, "buildArtifactId"],
