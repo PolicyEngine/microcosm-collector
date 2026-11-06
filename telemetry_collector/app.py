@@ -76,8 +76,8 @@ class CollectorSettings:
 
     @classmethod
     def from_environment(cls) -> CollectorSettings:
-        jwt_secret = _optional_environment("TELEMETRY_JWT_SECRET")
-        signing_key_pem = _optional_environment(SIGNING_KEY_VARIABLE)
+        jwt_secret = _optional_secret_environment("TELEMETRY_JWT_SECRET")
+        signing_key_pem = _optional_secret_environment(SIGNING_KEY_VARIABLE)
         read_token = _required_environment("TELEMETRY_READ_TOKEN")
         if jwt_secret is None and signing_key_pem is None:
             raise RuntimeError(
@@ -227,6 +227,21 @@ def _required_environment(name: str) -> str:
 
 def _optional_environment(name: str) -> str | None:
     return os.environ.get(name, "").strip() or None
+
+
+def _optional_secret_environment(name: str) -> str | None:
+    """A secret that may be absent, but that stops startup when set and blank.
+
+    Deployment mounts each one from Secret Manager, so a blank value means a
+    mistaken secret version rather than a secret that isn't configured.
+    """
+
+    if name not in os.environ:
+        return None
+    value = _optional_environment(name)
+    if value is None:
+        raise RuntimeError(f"{name} is set but empty.")
+    return value
 
 
 def _bearer_token(value: str | None) -> str:
