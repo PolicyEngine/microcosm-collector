@@ -1,0 +1,436 @@
+export type HistoricalAttributionStatus =
+  | "exact_reconstructed"
+  | "derived"
+  | "unavailable";
+
+export type HistoricalAttributionRecipe =
+  | "uniform_target_scale_cap_100pct_v1"
+  | "historical_sqrt_value_50_50_v1"
+  | "newer_sqrt_value_50_50_v2"
+  | "concept_budget_sqrt_value_50_50_v3"
+  | "legacy_current_doctrine_v1";
+
+export interface AttributionVerificationTolerance {
+  kind: "floating_point" | "six_decimal_quantization" | "not_applicable";
+  absolute: number;
+  relative: number;
+}
+
+export interface HistoricalAttributionSupport {
+  releaseId: string;
+  buildId: string;
+  diagnosticsSha256?: string;
+  buildSha: string | null;
+  producerCommit: string | null;
+  releaseFamily: "national" | "local_area";
+  diagnosticsSchema: number | null;
+  targetCount: number;
+  orderedTargetNamesSha256: string;
+  producerTargetSurfaceSha256: string | null;
+  weightingIdentifier: string | null;
+  lossCap?: number;
+  recipe: HistoricalAttributionRecipe;
+  expectedStatus: HistoricalAttributionStatus;
+  tolerance: AttributionVerificationTolerance;
+}
+
+const FLOATING_POINT_TOLERANCE: AttributionVerificationTolerance = {
+  kind: "floating_point",
+  absolute: 1e-12,
+  relative: 1e-12,
+};
+
+const SIX_DECIMAL_TOLERANCE: AttributionVerificationTolerance = {
+  kind: "six_decimal_quantization",
+  absolute: 0.5e-6,
+  relative: 0,
+};
+
+const DERIVED_TOLERANCE: AttributionVerificationTolerance = {
+  kind: "not_applicable",
+  absolute: 0,
+  relative: 0,
+};
+
+const HISTORICAL_WEIGHTING =
+  "sqrt_value_weighted_mape_50_50_amount_count_target_scale_cap_100pct";
+const HISTORICAL_WEIGHTING_CAP_1000 =
+  "sqrt_value_weighted_mape_50_50_amount_count_target_scale_cap_1000pct";
+const CONCEPT_BUDGET_WEIGHTING =
+  "sqrt_value_concept_budget_weighted_mape_50_50_amount_count_target_scale_cap_100pct";
+
+// This manifest is required because older builds do not expose target-importance
+// weights in their diagnostic files. It was audited against every US release
+// eligible for the picker through 2026-09-29 and includes explicitly verified staging
+// candidates when needed. These fingerprints cover ordered diagnostic row names,
+// not downloaded files; runtime reconstruction must refuse an artifact whose
+// target surface changes.
+export const HISTORICAL_ATTRIBUTION_SUPPORT: readonly HistoricalAttributionSupport[] = [
+  {
+    releaseId: "populace-us-2024-f32c2e5-20260614",
+    buildId: "populace-us-2024-f32c2e5-20260614",
+    buildSha: "f32c2e5",
+    producerCommit: null,
+    releaseFamily: "national",
+    diagnosticsSchema: 1,
+    targetCount: 3704,
+    orderedTargetNamesSha256: "29b3911feaa3b9172792aaacb2dd4bf5cbd941b0bc1d6e289b2304f81d72c0ca",
+    producerTargetSurfaceSha256: null,
+    weightingIdentifier: null,
+    recipe: "legacy_current_doctrine_v1",
+    expectedStatus: "derived",
+    tolerance: DERIVED_TOLERANCE,
+  },
+  {
+    releaseId: "populace-us-2024-f32c2e5-2d2a2ce92f8a-20260615T185857Z",
+    buildId: "populace-us-2024-f32c2e5-2d2a2ce92f8a-20260615T185857Z",
+    buildSha: "2d2a2ce",
+    producerCommit: "2d2a2ce92f8a4caacc07f7678b00c43523fcf198",
+    releaseFamily: "national",
+    diagnosticsSchema: 2,
+    targetCount: 457,
+    orderedTargetNamesSha256: "7e6830ca2b1793e0de7a9bc78c9eed5507422efa0205e42d61568d32c5787c9d",
+    producerTargetSurfaceSha256: "876a96c6e13345fdf6d23bee2cd65b93e7ec47877ea2e42b79c2f083ce11dc99",
+    weightingIdentifier: null,
+    recipe: "legacy_current_doctrine_v1",
+    expectedStatus: "derived",
+    tolerance: DERIVED_TOLERANCE,
+  },
+  {
+    releaseId: "populace-us-2024-0cdbb27-c239dfe51c11-20260615T201302Z",
+    buildId: "populace-us-2024-0cdbb27-c239dfe51c11-20260615T201302Z",
+    buildSha: "c239dfe",
+    producerCommit: "c239dfe51c11a7715324e957406c050154f4c4cd",
+    releaseFamily: "national",
+    diagnosticsSchema: 2,
+    targetCount: 457,
+    orderedTargetNamesSha256: "7e6830ca2b1793e0de7a9bc78c9eed5507422efa0205e42d61568d32c5787c9d",
+    producerTargetSurfaceSha256: "876a96c6e13345fdf6d23bee2cd65b93e7ec47877ea2e42b79c2f083ce11dc99",
+    weightingIdentifier: null,
+    recipe: "legacy_current_doctrine_v1",
+    expectedStatus: "derived",
+    tolerance: DERIVED_TOLERANCE,
+  },
+  {
+    releaseId: "populace-us-2024-f32c2e5-0c38bc47db89-20260616T124451Z",
+    buildId: "populace-us-2024-f32c2e5-0c38bc47db89-20260616T124451Z",
+    buildSha: "0c38bc4",
+    producerCommit: "0c38bc47db89c9d054944ace41ff778af4e01769",
+    releaseFamily: "national",
+    diagnosticsSchema: 2,
+    targetCount: 5229,
+    orderedTargetNamesSha256: "43db0a4c797c954fab4cd45d56b6fe47aaa3dc3276dc284de3afa06453f0daf9",
+    producerTargetSurfaceSha256: "4a79fcd4580e6fe7895fb72334fd458228b4066c96a9e6ea1c28493b67104cef",
+    weightingIdentifier: null,
+    recipe: "legacy_current_doctrine_v1",
+    expectedStatus: "derived",
+    tolerance: DERIVED_TOLERANCE,
+  },
+  {
+    releaseId: "populace-us-2024-a912aea-76666318a202-20260616T175345Z",
+    buildId: "populace-us-2024-a912aea-76666318a202-20260616T175345Z",
+    buildSha: "7666631",
+    producerCommit: "76666318a202f5c638cc4c432b3d7bca981102ba",
+    releaseFamily: "national",
+    diagnosticsSchema: 2,
+    targetCount: 5128,
+    orderedTargetNamesSha256: "2b90b98a6240d5f3561b35216a6fd9effa076d1953e6b0f6d3f3dd976c79c062",
+    producerTargetSurfaceSha256: "fcd51ac0472dd42e9d89f6e432b5fd66a39014e5b9a302730851248d9a092a1a",
+    weightingIdentifier: null,
+    recipe: "legacy_current_doctrine_v1",
+    expectedStatus: "derived",
+    tolerance: DERIVED_TOLERANCE,
+  },
+  {
+    releaseId: "populace-us-2024-f0d2ef6-09292aa0d5db-20260617T032307Z",
+    buildId: "populace-us-2024-f0d2ef6-09292aa0d5db-20260617T032307Z",
+    buildSha: "09292aa",
+    producerCommit: "09292aa0d5dbe938cb91a776d9015bebf3b5fc6c",
+    releaseFamily: "national",
+    diagnosticsSchema: 2,
+    targetCount: 5097,
+    orderedTargetNamesSha256: "5ee947622fce9ea6ea267b17ad29211bb50e7034975bc4f8c624d41aa1fc5e96",
+    producerTargetSurfaceSha256: "8f594a608663139bf1bcbbfdea70ef5fc269bdce737fe0861688c6602025fca7",
+    weightingIdentifier: null,
+    recipe: "legacy_current_doctrine_v1",
+    expectedStatus: "derived",
+    tolerance: DERIVED_TOLERANCE,
+  },
+  {
+    releaseId: "populace-us-2024-losscap1-01d14d5-20260618",
+    buildId: "populace-us-2024-losscap1-01d14d5-20260618",
+    buildSha: "01d14d5",
+    producerCommit: "01d14d5eb38a431c2d7cc7806d7ed9d9c689dc1a",
+    releaseFamily: "national",
+    diagnosticsSchema: 2,
+    targetCount: 4408,
+    orderedTargetNamesSha256: "69be18026dde429e6a8d620b8ed14fcff2d72e5a04930a59292dcadf05cd7196",
+    producerTargetSurfaceSha256: "9e7b1a5d09f8e6c920285ec37c40a87afebaddb8e0b29f6a670f241d01c42dce",
+    weightingIdentifier: HISTORICAL_WEIGHTING,
+    recipe: "historical_sqrt_value_50_50_v1",
+    expectedStatus: "exact_reconstructed",
+    tolerance: FLOATING_POINT_TOLERANCE,
+  },
+  {
+    releaseId: "populace-us-2024-losscap1-5b54f6d-20260618",
+    buildId: "populace-us-2024-losscap1-5b54f6d-20260618",
+    buildSha: "5b54f6d",
+    producerCommit: "5b54f6d9ec192e4cda4b21b802ba1491f8b3c15a",
+    releaseFamily: "national",
+    diagnosticsSchema: 2,
+    targetCount: 4408,
+    orderedTargetNamesSha256: "69be18026dde429e6a8d620b8ed14fcff2d72e5a04930a59292dcadf05cd7196",
+    producerTargetSurfaceSha256: "9e7b1a5d09f8e6c920285ec37c40a87afebaddb8e0b29f6a670f241d01c42dce",
+    weightingIdentifier: HISTORICAL_WEIGHTING,
+    recipe: "historical_sqrt_value_50_50_v1",
+    expectedStatus: "exact_reconstructed",
+    tolerance: FLOATING_POINT_TOLERANCE,
+  },
+  {
+    releaseId: "populace-us-2024-incumbent-improved-996401a-20260618",
+    buildId: "populace-us-2024-incumbent-improved-996401a-20260618",
+    buildSha: "996401a",
+    producerCommit: "996401aadb25d3acd69ddf54d149fb8d96b28a78",
+    releaseFamily: "national",
+    diagnosticsSchema: 2,
+    targetCount: 6033,
+    orderedTargetNamesSha256: "dfb8af65980d71b2e05afb2ccf5d77d635d373b8e65aee0af6092bbb66c12fa1",
+    producerTargetSurfaceSha256: "0c6be6f5878af8ee69cb672285073fd4db1fc773ec85d450cd7a8e96bf356af5",
+    weightingIdentifier: HISTORICAL_WEIGHTING_CAP_1000,
+    recipe: "historical_sqrt_value_50_50_v1",
+    expectedStatus: "exact_reconstructed",
+    tolerance: FLOATING_POINT_TOLERANCE,
+  },
+  {
+    releaseId: "populace-us-2024-c86a631-6e1bcd0271a5-20260619T002242Z",
+    buildId: "populace-us-2024-c86a631-6e1bcd0271a5-20260619T002242Z",
+    buildSha: "6e1bcd0",
+    producerCommit: "6e1bcd0271a50fbf5c797dd3b94f2905401f8fb8",
+    releaseFamily: "national",
+    diagnosticsSchema: 2,
+    targetCount: 4408,
+    orderedTargetNamesSha256: "69be18026dde429e6a8d620b8ed14fcff2d72e5a04930a59292dcadf05cd7196",
+    producerTargetSurfaceSha256: "13e135245cd069a347a7fad14044a1cb917dd057b66832808e97c24421dcb9f1",
+    weightingIdentifier: HISTORICAL_WEIGHTING,
+    recipe: "historical_sqrt_value_50_50_v1",
+    expectedStatus: "exact_reconstructed",
+    tolerance: FLOATING_POINT_TOLERANCE,
+  },
+  {
+    releaseId: "populace-us-2024-f0af251-0ad74ed34493-20260619T181855Z",
+    buildId: "populace-us-2024-f0af251-0ad74ed34493-20260619T181855Z",
+    buildSha: "0ad74ed",
+    producerCommit: "0ad74ed344935e29d7c46703ce457ae6e8847b4d",
+    releaseFamily: "national",
+    diagnosticsSchema: 2,
+    targetCount: 4356,
+    orderedTargetNamesSha256: "0f562e9142dd33adb31339b457c6d5959575070b1a53c1dba5d0093b64664d60",
+    producerTargetSurfaceSha256: "67b491fe59f72e4622fd0d13c0f6a71e43e1c6ed74afae4032cb238515bd0269",
+    weightingIdentifier: HISTORICAL_WEIGHTING,
+    recipe: "newer_sqrt_value_50_50_v2",
+    expectedStatus: "exact_reconstructed",
+    tolerance: FLOATING_POINT_TOLERANCE,
+  },
+  {
+    releaseId: "populace-us-2024-f0af251-703bd81a565c-20260620T201958Z",
+    buildId: "populace-us-2024-f0af251-703bd81a565c-20260620T201958Z",
+    buildSha: "703bd81",
+    producerCommit: "703bd81a565ce61210e5b6c3fe7431141c728111",
+    releaseFamily: "national",
+    diagnosticsSchema: 3,
+    targetCount: 4582,
+    orderedTargetNamesSha256: "332c6c16d34e7045f7f4fbda8fcf6834dfb1a566011f3956bd8e530383d7f633",
+    producerTargetSurfaceSha256: "f3349f9d250d9e2141b7337dce95d3ddc8527f2182d22d00969bf03f5527b00c",
+    weightingIdentifier: HISTORICAL_WEIGHTING,
+    recipe: "newer_sqrt_value_50_50_v2",
+    expectedStatus: "exact_reconstructed",
+    tolerance: FLOATING_POINT_TOLERANCE,
+  },
+  {
+    releaseId: "populace-us-2024-formula-owned-fix-a56aefd-capgains-b2500-20260626T122636Z",
+    buildId: "populace-us-2024-formula-owned-fix-a56aefd-capgains-b2500-20260626T122636Z",
+    buildSha: "a56aefd",
+    producerCommit: "a56aefdb27d09c6f088d17100e42cee3d549b28d",
+    releaseFamily: "national",
+    diagnosticsSchema: 3,
+    targetCount: 5593,
+    orderedTargetNamesSha256: "73d2aca420af0c9918ec206a4284bc1f0786503dbe78453996cbb1aa45063ec3",
+    producerTargetSurfaceSha256: "5d0a2f228e48edbb8a81c97336b3032aa280ff9e504466c3494dc435395e6e1f",
+    weightingIdentifier: HISTORICAL_WEIGHTING,
+    recipe: "newer_sqrt_value_50_50_v2",
+    expectedStatus: "exact_reconstructed",
+    tolerance: FLOATING_POINT_TOLERANCE,
+  },
+  {
+    releaseId: "populace-us-2024-cd-concept-budget-dbbdcec-512e-b2500-r2-20260627T022640Z",
+    buildId: "populace-us-2024-cd-concept-budget-dbbdcec-512e-b2500-r2-20260627T022640Z",
+    buildSha: "dbbdcec",
+    producerCommit: "dbbdcecc0f291502e776d1a2f59a198aa473baf6",
+    releaseFamily: "national",
+    diagnosticsSchema: 3,
+    targetCount: 6877,
+    orderedTargetNamesSha256: "551c6afd3fa7ac20e4c622f6009097e0e82d887e3e570d4b3329e24cd1807159",
+    producerTargetSurfaceSha256: "6a0b9550961e30dc72b353cf719cf3e1748ddcebee7ff0ffd6642e204711f3f8",
+    weightingIdentifier: CONCEPT_BUDGET_WEIGHTING,
+    recipe: "concept_budget_sqrt_value_50_50_v3",
+    expectedStatus: "exact_reconstructed",
+    tolerance: FLOATING_POINT_TOLERANCE,
+  },
+  {
+    releaseId: "populace-us-2024-sparse-l0-refit-57k-71a0887-national-only-20260701",
+    buildId: "populace-us-2024-sparse-l0-refit-57k-71a0887-national-only-20260701",
+    buildSha: "71a0887",
+    producerCommit: "71a0887b7b07010621fac130d93f2dd7e2d9f789",
+    releaseFamily: "national",
+    diagnosticsSchema: 3,
+    targetCount: 32637,
+    orderedTargetNamesSha256: "8c1c79ee4fafd1014d90b02ef96269966d09a375c57fd38075a83839b1ef4a4b",
+    producerTargetSurfaceSha256: "bc3e2dc57edf7795da6cab776554806bb426ffd449377e36af7348b141f5b2f1",
+    weightingIdentifier: CONCEPT_BUDGET_WEIGHTING,
+    recipe: "concept_budget_sqrt_value_50_50_v3",
+    expectedStatus: "exact_reconstructed",
+    tolerance: FLOATING_POINT_TOLERANCE,
+  },
+  {
+    releaseId: "populace-us-2024-buildi-sparse-rmloss100-6e8e929-20260709T034135Z",
+    buildId: "populace-us-2024-buildi-sparse-rmloss100-6e8e929-20260709T034135Z",
+    buildSha: "6e8e929",
+    producerCommit: "6e8e9293e9ac8bc72c52d3c4ca1fb71fe3e8c7f2",
+    releaseFamily: "national",
+    diagnosticsSchema: 4,
+    targetCount: 5514,
+    orderedTargetNamesSha256: "11941113618d0e1f8f1ba034c23a7714fc81e7cac55ad1ee2354a3d26f1221d7",
+    producerTargetSurfaceSha256: "f83ddb07ea4fed60f835086ae2405e3787df5c24563b9c0796a52464b2a4ca0c",
+    weightingIdentifier: CONCEPT_BUDGET_WEIGHTING,
+    recipe: "concept_budget_sqrt_value_50_50_v3",
+    expectedStatus: "exact_reconstructed",
+    tolerance: FLOATING_POINT_TOLERANCE,
+  },
+  {
+    releaseId: "populace-us-2024-buildj-sparse-rmloss100-75d5add-20260710T094201Z",
+    buildId: "populace-us-2024-buildj-sparse-rmloss100-75d5add-20260710T094201Z",
+    buildSha: "564a2c7",
+    producerCommit: "564a2c7d3b3624e7042401d37c6b739f1bce76b3",
+    releaseFamily: "national",
+    diagnosticsSchema: 4,
+    targetCount: 5510,
+    orderedTargetNamesSha256: "9f727116cc9700035faf768d3cfffe5fa9c39881ad11284390a934014b3272d6",
+    producerTargetSurfaceSha256: "934c72ae7e7c01b2427ca1c31cb4607c3a31b2f6c462fc0f9ef74fd9ca7941d9",
+    weightingIdentifier: CONCEPT_BUDGET_WEIGHTING,
+    recipe: "concept_budget_sqrt_value_50_50_v3",
+    expectedStatus: "exact_reconstructed",
+    tolerance: FLOATING_POINT_TOLERANCE,
+  },
+  {
+    releaseId: "populace-us-2024-buildl-acs-local-36de5d9a-20260712T104640Z",
+    buildId: "populace-us-2024-buildl-acs-local-36de5d9a-20260712T104640Z",
+    buildSha: "32d446b",
+    producerCommit: null,
+    releaseFamily: "local_area",
+    diagnosticsSchema: 4,
+    targetCount: 742,
+    orderedTargetNamesSha256: "c37c4b679fa4f34265c0f93e4358408d52421aebd8e2678f780aca6c8c5684ad",
+    producerTargetSurfaceSha256: null,
+    weightingIdentifier: null,
+    recipe: "uniform_target_scale_cap_100pct_v1",
+    expectedStatus: "exact_reconstructed",
+    tolerance: SIX_DECIMAL_TOLERANCE,
+  },
+  {
+    releaseId: "populace-us-2024-buildm-sparse-rmloss100-98bf731-20260717T075101Z",
+    buildId: "populace-us-2024-buildm-sparse-rmloss100-98bf731-20260717T075101Z",
+    buildSha: "98bf731",
+    producerCommit: "98bf731b1d26f2b0880732f2331e503108afc90e",
+    releaseFamily: "national",
+    diagnosticsSchema: 4,
+    targetCount: 5667,
+    orderedTargetNamesSha256: "de400ebf81cdf7e64b4cb869d18e1bd8917ed6936b7878369e92195184ad540d",
+    producerTargetSurfaceSha256: "6326d60da096c1d6351b7115c8e286a721c276d237db9f6534de95ac949ddc3e",
+    weightingIdentifier: CONCEPT_BUDGET_WEIGHTING,
+    recipe: "concept_budget_sqrt_value_50_50_v3",
+    expectedStatus: "exact_reconstructed",
+    tolerance: FLOATING_POINT_TOLERANCE,
+  },
+  {
+    releaseId: "populace-us-2024-buildn-sparse-rmloss100-c3e378a-20260722T010408Z",
+    buildId: "populace-us-2024-buildn-sparse-rmloss100-c3e378a-20260722T010408Z",
+    buildSha: "c3e378a",
+    producerCommit: "c3e378a91d847ff5138e485574c601f96f8ac468",
+    releaseFamily: "national",
+    diagnosticsSchema: 4,
+    targetCount: 5672,
+    orderedTargetNamesSha256: "b6c5885ba338a0f0fde58775def34f5ebb523703e2532945c348ea598332de0c",
+    producerTargetSurfaceSha256: "94920c693c6810b1484fe23165f243636b6f59defe8a9d8a98a30830150ec9a2",
+    weightingIdentifier: CONCEPT_BUDGET_WEIGHTING,
+    recipe: "concept_budget_sqrt_value_50_50_v3",
+    expectedStatus: "exact_reconstructed",
+    tolerance: FLOATING_POINT_TOLERANCE,
+  },
+  {
+    releaseId: "populace-us-2024-buildo-sparse-rmloss100-22bd902-20260722T232627Z",
+    buildId: "populace-us-2024-buildo-sparse-rmloss100-22bd902-20260722T232627Z",
+    buildSha: "22bd902",
+    producerCommit: "22bd902f54a1a111b18b081bce2f1c4c497b5e8e",
+    releaseFamily: "national",
+    diagnosticsSchema: 5,
+    targetCount: 5672,
+    orderedTargetNamesSha256: "b6c5885ba338a0f0fde58775def34f5ebb523703e2532945c348ea598332de0c",
+    producerTargetSurfaceSha256: "94920c693c6810b1484fe23165f243636b6f59defe8a9d8a98a30830150ec9a2",
+    weightingIdentifier: CONCEPT_BUDGET_WEIGHTING,
+    recipe: "concept_budget_sqrt_value_50_50_v3",
+    expectedStatus: "exact_reconstructed",
+    tolerance: FLOATING_POINT_TOLERANCE,
+  },
+  {
+    releaseId: "populace-us-2024-buildo-acs-local-77e2061-20260724T110908Z",
+    buildId: "populace-us-2024-buildo-acs-local-77e2061-20260724T110908Z",
+    buildSha: "77e2061",
+    producerCommit: null,
+    releaseFamily: "local_area",
+    diagnosticsSchema: null,
+    targetCount: 4461,
+    orderedTargetNamesSha256: "41129e956bc91a7e5af563e4c37a6dcf7c2aecc5b247968f4e5f3eed1b713754",
+    producerTargetSurfaceSha256: null,
+    weightingIdentifier: null,
+    recipe: "uniform_target_scale_cap_100pct_v1",
+    expectedStatus: "exact_reconstructed",
+    tolerance: SIX_DECIMAL_TOLERANCE,
+  },
+  {
+    releaseId: "populace-us-2024-buildp-sparse-rmloss100-cae8640-20260728T011454Z",
+    buildId: "populace-us-2024-buildp-sparse-rmloss100-cae8640-20260728T011454Z",
+    diagnosticsSha256: "870449b44e86b13b25bcea1a57f0e7af37f4d4db18be815eea3acdf9fe6eb40e",
+    buildSha: "cae8640",
+    producerCommit: "cae8640f9e65e274aea65c7916cb37b956978e32",
+    releaseFamily: "national",
+    diagnosticsSchema: 5,
+    targetCount: 5659,
+    orderedTargetNamesSha256: "49861b0d1c7e528256c3548293e8f304b9ca726db96f92481a709e87437fffbe",
+    producerTargetSurfaceSha256: "49bb0fe3dfd4c399e7b3f900b0e5ba29d9d72413d9170dfc155a9fa5e91c6f6f",
+    weightingIdentifier: CONCEPT_BUDGET_WEIGHTING,
+    lossCap: 1,
+    recipe: "concept_budget_sqrt_value_50_50_v3",
+    expectedStatus: "exact_reconstructed",
+    tolerance: FLOATING_POINT_TOLERANCE,
+  },
+  {
+    releaseId: "populace-us-2024-buildo-acs-local-767312d60-20260923T074941Z",
+    buildId: "populace-us-2024-buildo-acs-local-767312d60-20260923T074941Z",
+    diagnosticsSha256: "f39d10a72415eb85ac0faa231f7970bffcc408bd53ef0f05985ea8dd0ac94903",
+    buildSha: "767312d60",
+    producerCommit: null,
+    releaseFamily: "local_area",
+    diagnosticsSchema: null,
+    targetCount: 4459,
+    orderedTargetNamesSha256: "3ec3156612fa78d193055eaba7a5212b2bc21b533c037670cd7e8d3af7735500",
+    producerTargetSurfaceSha256: null,
+    weightingIdentifier: null,
+    recipe: "uniform_target_scale_cap_100pct_v1",
+    expectedStatus: "exact_reconstructed",
+    tolerance: SIX_DECIMAL_TOLERANCE,
+  },
+] as const;
+
+export const HISTORICAL_ATTRIBUTION_SUPPORT_BY_RELEASE = new Map(
+  HISTORICAL_ATTRIBUTION_SUPPORT.map((entry) => [entry.releaseId, entry]),
+);

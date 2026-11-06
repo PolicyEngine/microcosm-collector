@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "description": "Microcosm-BE: synthetic Belgian population calibrated to Belgian administrative and national-accounts targets (sums of Chronicle facts; surveys validation-only). Support records: US survey donor pool, reweighted; a Belgian donor pool is the planned upgrade. Cross-engine agreement is evidence about the encodings.",
+  "build": {
+    "schema_version": 1,
+    "description": "Microcosm-BE: synthetic Belgian population calibrated to Belgian administrative and national-accounts targets (sums of Chronicle facts; surveys validation-only). Support records: US survey donor pool, reweighted; a Belgian donor pool is the planned upgrade. Cross-engine agreement is evidence about the encodings.",
+    "build_id": "microcosm-be-2026-chronicle-3cef97b-20260823T134247Z",
+    "built_at": "2026-08-23T13:42:47.070381+00:00",
+    "lineage": "microcosm_be_v04",
+    "population_year": 2026,
+    "chronicle": {
+      "repo": "PolicyEngine/chronicle",
+      "commit": "3cef97b4ece3a70601fca84fe121ffbb1a62388d",
+      "merged_as": "PR #190"
+    }
+  },
+  "data_package": {
+    "name": "microcosm-be",
+    "version": "0.4.0"
+  },
+  "default_datasets": {
+    "national": "microcosm_be_v04_2026"
+  }
+}
