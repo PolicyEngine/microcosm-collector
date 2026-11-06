@@ -25,8 +25,10 @@ export const MAX_PAGE_SIZE = 200;
 /** How long a request may take, from sending it to reading its whole answer. */
 export const DEFAULT_TIMEOUT_MS = 30_000;
 
-const RUN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/;
-const COUNTRY_PATTERN = /^[A-Z]{2}$/;
+/** A run id the collector accepts; the OpenAPI document gives the same. */
+export const RUN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/;
+/** A country code the collector accepts, such as "US" or "GB". */
+export const COUNTRY_PATTERN = /^[A-Z]{2}$/;
 // The collector's answer for a run it has no record of. Any other 404, such
 // as a collector without version 2, is an error.
 const RUN_NOT_FOUND = "Run was not found.";
@@ -176,7 +178,8 @@ async function errorDetail(response: Response): Promise<unknown> {
   try {
     const body: unknown = await response.json();
     return isObject(body) ? body.detail : undefined;
-  } catch {
+  } catch (error) {
+    if (isAbandoned(error)) throw error;
     return undefined;
   }
 }

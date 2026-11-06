@@ -61,4 +61,6 @@ jobs:
       - run: git diff --exit-code -- src/schema.ts
       - run: npm run typecheck
       - run: npm test
-      - run: npm pack --dry-run
+      # The command push.yaml's pack-client job packs a release with, so that
+      # every pull request writes the tarball a release would publish.
+      - run: npm pack --pack-destination "$RUNNER_TEMP"

@@ -37,6 +37,12 @@ if [ "$packed_version" != "$release" ]; then
   echo "The client's version $packed_version is not the release's version $release." >&2
   exit 1
 fi
+# npm applies a packed manifest's publishConfig, such as another registry or no
+# provenance, over its own settings. The checked-in manifest has none.
+if tar -xOzf "$tarball" package/package.json | python3 -c 'import json, sys; sys.exit("publishConfig" not in json.load(sys.stdin))'; then
+  echo "The packed client's manifest sets publishConfig; it must not." >&2
+  exit 1
+fi
 
 npm_version="$(npm --version)"
 if ! python3 -c 'import sys; sys.exit(tuple(map(int, sys.argv[1].split("."))) < (11, 5, 1))' "$npm_version"; then
