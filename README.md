@@ -357,6 +357,121 @@ modules named in `provenance.py`, in
 Once Microcosm hands its Orrery inputs to the collector and removes its copy,
 this copy is the only one, and changes to the projection are made here.
 
+## Calibration tree package
+
+`packages/calibration-tree` is the calibration tree package: the TypeScript
+tree builder, its schema-6 types and readers, the release and staging readers
+it builds from, and the GitHub Actions publisher that calibration-diagnostics
+runs today. It was copied from calibration-diagnostics'
+`frontend/packages/calibration-tree` and is published to npm as
+`@policyengine/calibration-tree`, so the dashboard can import it from npm
+instead of keeping its own copy. Until the dashboard does, calibration-diagnostics
+keeps its copy, and its GitHub Actions workflow still publishes the production
+trees with it.
+
+The package ships TypeScript source; Bun runs it directly and Next.js
+compiles it through `transpilePackages`. Its own
+[README](packages/calibration-tree/README.md) describes how to import it.
+
+### The tree worker
+
+`src/calibration-tree-worker.ts` builds one release's tree from local files
+and writes its gzip parts to a directory, as its own Bun process:
+
+```bash
+cd packages/calibration-tree
+bun run src/calibration-tree-worker.ts REQUEST.json OUTPUT_DIRECTORY
+```
+
+It builds exactly what the publisher builds from the same files, commit and
+publication time. Nothing in the collector runs it yet; the calibration-tree
+worker (K4) will run it for each `calibration-diagnostics` submission, so the
+worker image will need Bun then.
+
+### Tests
+
+The "Calibration tree package" job in `.github/workflows/pr.yaml` runs the
+package's Bun tests and its typecheck on every pull request, with Bun 1.4.2.
+The golden tests rebuild recorded US, UK and Belgian releases, staging runs
+and comparisons, and require every part's raw JSON and deflate stream to match
+`src/fixtures/calibration-tree-golden.json`, which calibration-diagnostics'
+builder recorded. The worker's tests run it as a separate process on the
+recorded releases and require the same bytes on disk.
+
+```bash
+cd packages/calibration-tree
+bun install --frozen-lockfile
+bun test src/calibration-tree-worker.test.ts
+bun run typecheck
+```
+
+### Carrying over changes from calibration-diagnostics
+
+`packages/calibration-tree/provenance.json` records the calibration-diagnostics
+commit the package was copied from, each copied file's git blob ID, the copied
+files changed here and why (only `package.json`), and the files that exist only
+here. `src/provenance.test.ts` fails when a copied file no longer has its
+recorded blob ID, when a file is neither copied nor listed as the collector's
+own, or when a file listed as changed is identical to the dashboard's.
+
+While calibration-diagnostics keeps its copy, a change merged there is carried
+over by copying the changed files from a calibration-diagnostics commit,
+keeping this repo's changes to `package.json`, and recording that commit and
+the new blob IDs, which git lists with:
+
+```bash
+git -C ../calibration-diagnostics ls-tree -r \
+  --format='%(objectname) %(path)' COMMIT -- frontend/packages/calibration-tree
+```
+
+Once the dashboard imports the published package and removes its copy, this
+copy is the only one, and the package is changed here.
+
+### Publishing to npm
+
+`.github/workflows/publish-calibration-tree.yaml` publishes the package when a
+push to `main` changes `packages/calibration-tree` and npm does not have its
+`package.json` version yet. To release a change, raise `version` in the same
+pull request; a change without a new version publishes nothing. The
+workflow's first job tests and typechecks the package. Its second job, the
+only one that can request a GitHub OIDC token, installs nothing: it checks
+that Node and npm are the pinned versions (`tools/check-npm-toolchain.sh`),
+then runs `tools/publish-calibration-tree.sh`, which asks npm for the version
+and publishes only if npm does not have it. It publishes under npm's default
+`latest` tag, which npm refuses for a prerelease version or one lower than the
+latest, so a release raises the version to a new highest one. One run goes at
+a time, so versions merged one after another publish in that order. The
+workflow can be run again by hand from `main` (`workflow_dispatch`) to retry a
+failed publication.
+
+The workflow uses npm's trusted publishing: npm accepts the publish job's
+GitHub OIDC token in place of a stored npm token, and adds provenance because
+this repo is public. npm does not check the branch, so the `npm` environment's
+rule is what keeps other branches out. Nothing is published until the repo
+variable `CALIBRATION_TREE_NPM_PUBLISH_ENABLED` is `true`, which needs this
+one-time setup first, in this order:
+
+1. **The first version, by hand.** npm can only trust a workflow for a package
+   that exists, so a member of the `policyengine` npm organization publishes
+   the first version from a clean checkout of the `main` commit that added the
+   package: `bun install --frozen-lockfile`, then `npm pack --dry-run` to check
+   the file list, then `npm publish --access public` in
+   `packages/calibration-tree`.
+2. **The environment.** In this repo's settings, create the `npm` environment
+   and allow deployments from `main` only, so a run from any other branch
+   cannot obtain npm's trust. Create it before the trusted publisher: GitHub
+   creates a missing environment, without that rule, when a job first names
+   it.
+3. **The trusted publisher.** In the package's settings on npmjs.com, add a
+   GitHub Actions trusted publisher: organization `PolicyEngine`, repo
+   `microcosm-collector`, workflow `publish-calibration-tree.yaml`,
+   environment `npm`. A new trusted publisher expires unless a publication
+   through it succeeds within two days, so add it when a pull request that
+   raises the version is ready to merge, and merge that pull request after
+   step 4. An expired one is deleted and added again.
+4. **The switch.** Set the repo variable
+   `CALIBRATION_TREE_NPM_PUBLISH_ENABLED` to `true`.
+
 ## Hugging Face read access
 
 Only the collector's worker jobs read Hugging Face, for backfills, old

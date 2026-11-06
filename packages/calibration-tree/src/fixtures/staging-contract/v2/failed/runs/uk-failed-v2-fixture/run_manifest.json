@@ -1,0 +1,44 @@
+{
+  "artifacts": [],
+  "candidate_id": "uk-failed-v2-fixture",
+  "country_code": "GB",
+  "current_stage": "failed",
+  "delivery": {
+    "configured_repository": null,
+    "contract_version": 2,
+    "enabled": true,
+    "last_error_code": null,
+    "mode": "local_only",
+    "opt_out_reason": null,
+    "read_back": "not_requested",
+    "run_id": "uk-failed-v2-fixture",
+    "upload_attempts": 0,
+    "upload_successes": 0
+  },
+  "failure": {
+    "error_code": "BUILD_FAILED",
+    "error_type": "RuntimeError",
+    "local_diagnostic_reference": "diagnostics/operator-error.txt",
+    "message": "The build failed during input_verification."
+  },
+  "non_release": true,
+  "operation_id": "uk_frs_spine",
+  "paths": {
+    "calibration_progress": null,
+    "events": "runs/uk-failed-v2-fixture/events.ndjson",
+    "progress": "runs/uk-failed-v2-fixture/progress.json"
+  },
+  "pipeline": {
+    "id": "uk_national_spine",
+    "version": "2026.09"
+  },
+  "release_id": null,
+  "run_id": "uk-failed-v2-fixture",
+  "run_kind": "smoke",
+  "sample": null,
+  "schema_name": "microcosm.staging.run-manifest",
+  "schema_version": 2,
+  "started_at": "2026-01-04T00:00:00+00:00",
+  "status": "failed",
+  "updated_at": "2026-01-04T00:00:02+00:00"
+}

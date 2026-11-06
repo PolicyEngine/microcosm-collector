@@ -1,0 +1,73 @@
+{
+  "name": "@policyengine/calibration-tree",
+  "version": "0.1.0",
+  "description": "Builds, validates, reads and publishes Microcosm calibration tree artifacts (tree schema 6), with the release and staging readers they are built from.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PolicyEngine/microcosm-collector.git",
+    "directory": "packages/calibration-tree"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "files": [
+    "src/**/*.ts",
+    "!src/**/*.test.ts",
+    "!src/test-support/**",
+    "!src/fixtures/**",
+    "types/**/*.d.ts"
+  ],
+  "exports": {
+    "./calibration-build-comparison": "./src/calibration-build-comparison.ts",
+    "./calibration-comparison-blob": "./src/calibration-comparison-blob.ts",
+    "./calibration-comparison-bundle": "./src/calibration-comparison-bundle.ts",
+    "./calibration-explorer": "./src/calibration-explorer.ts",
+    "./calibration-release-locator": "./src/calibration-release-locator.ts",
+    "./calibration-tree": "./src/calibration-tree.ts",
+    "./calibration-tree-artifact": "./src/calibration-tree-artifact.ts",
+    "./calibration-tree-blob": "./src/calibration-tree-blob.ts",
+    "./calibration-tree-bundle": "./src/calibration-tree-bundle.ts",
+    "./calibration-tree-manifest": "./src/calibration-tree-manifest.ts",
+    "./calibration-tree-worker": "./src/calibration-tree-worker.ts",
+    "./chronicle-metadata": "./src/chronicle-metadata.ts",
+    "./countries": "./src/countries.ts",
+    "./geography-labels": "./src/geography-labels.ts",
+    "./hierarchy-catalog-reader": "./src/hierarchy-catalog-reader.ts",
+    "./hierarchy-target-reader": "./src/hierarchy-target-reader.ts",
+    "./historical-weight-summary": "./src/historical-weight-summary.ts",
+    "./latest-artifact": "./src/latest-artifact.ts",
+    "./legacy-target-reader": "./src/legacy-target-reader.ts",
+    "./program-label": "./src/program-label.ts",
+    "./publish-calibration-tree": "./src/publish-calibration-tree.ts",
+    "./reforms": "./src/reforms.ts",
+    "./release-cut": "./src/release-cut.ts",
+    "./release-record": "./src/release-record.ts",
+    "./source-label": "./src/source-label.ts",
+    "./source-labels": "./src/source-labels.ts",
+    "./staging-artifact": "./src/staging-artifact.ts",
+    "./staging-contract": "./src/staging-contract.ts",
+    "./structured-dimension-reader": "./src/structured-dimension-reader.ts",
+    "./structured-target-reader": "./src/structured-target-reader.ts",
+    "./target-change": "./src/target-change.ts",
+    "./target-loss-attribution": "./src/target-loss-attribution.ts",
+    "./target-loss-attribution-manifest": "./src/target-loss-attribution-manifest.ts",
+    "./target-representation": "./src/target-representation.ts",
+    "./target-surface-matcher": "./src/target-surface-matcher.ts"
+  },
+  "scripts": {
+    "publish:calibration-tree": "bun run src/publish-calibration-tree.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "worker": "bun run src/calibration-tree-worker.ts"
+  },
+  "dependencies": {
+    "@vercel/blob": "^2.6.1"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "fast-check": "^4.10.2",
+    "typescript": "^5.8.0"
+  }
+}
