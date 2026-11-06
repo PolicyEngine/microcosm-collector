@@ -1,3 +1,10 @@
+## [0.8.0] - 2026-11-06
+
+### Added
+
+- Read Hugging Face from worker jobs with the collector's own fine-grained read token, `COLLECTOR_HF_READ_TOKEN`, mounted from Secret Manager. `telemetry_collector.huggingface_read` refuses a missing or malformed token and any generic `HF_TOKEN`, lists the datasets the collector reads and the token's scope, and reads dataset information, file lists and files, sending the token only to Hugging Face. Nothing in the service or the existing worker reads Hugging Face yet; the README lists the manual steps that create the token, its secret, its access and its mount.
+
+
 ## [0.7.3] - 2026-11-05
 
 ### Changed
