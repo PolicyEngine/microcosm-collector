@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import subprocess
@@ -5,11 +6,24 @@ from pathlib import Path
 
 import pytest
 
+from telemetry_collector.intake import (
+    BUCKET_PATTERN,
+    JOB_PATTERN,
+    QUEUE_PATTERN,
+    SERVICE_ACCOUNT_PATTERN,
+    IntakeSettings,
+    resource_setting,
+)
 from telemetry_collector.submissions import MAX_JOB_ATTEMPTS
 from telemetry_collector.worker import WORKER_TASK_TIMEOUT_SECONDS
 
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOY_SCRIPT = ROOT / "scripts" / "deploy.sh"
+# User-managed accounts, in the shape the collector's settings accept.
+RUNTIME_ACCOUNT = "collector-runtime@example-project.iam.gserviceaccount.com"
+WORKER_ACCOUNT = "collector-worker@example-project.iam.gserviceaccount.com"
+INVOKER_ACCOUNT = "collector-invoker@example-project.iam.gserviceaccount.com"
+RECOVERY_ACCOUNT = "collector-recovery@example-project.iam.gserviceaccount.com"
 # What the deploy reads to configure intake, in both environments.
 DEPLOY_INTAKE_SETTINGS = {
     "INTAKE_ENABLED": "1",
@@ -17,9 +31,9 @@ DEPLOY_INTAKE_SETTINGS = {
     "WORKER_QUEUE": "worker-queue",
     "WORKER_JOB": "worker-job",
     "RECOVERY_JOB": "recovery-job",
-    "WORKER_SERVICE_ACCOUNT": "worker@example.invalid",
-    "WORKER_INVOKER_SERVICE_ACCOUNT": "invoker@example.invalid",
-    "RECOVERY_SERVICE_ACCOUNT": "recovery@example.invalid",
+    "WORKER_SERVICE_ACCOUNT": WORKER_ACCOUNT,
+    "WORKER_INVOKER_SERVICE_ACCOUNT": INVOKER_ACCOUNT,
+    "RECOVERY_SERVICE_ACCOUNT": RECOVERY_ACCOUNT,
 }
 # Only production's worker job mounts the collector's Hugging Face read token.
 PRODUCTION_ONLY_SETTINGS = {"HF_READ_SECRET_NAME": "hugging-face-read-token"}
@@ -88,7 +102,7 @@ def complete_configuration(deployment_environment: str) -> dict[str, str]:
         "REGION": "region",
         "ARTIFACT_REGISTRY_NAME": "container-images",
         "CLOUD_SQL_CONNECTION": "connection",
-        "RUNTIME_SERVICE_ACCOUNT": "service-account",
+        "RUNTIME_SERVICE_ACCOUNT": RUNTIME_ACCOUNT,
         "MIGRATION_SERVICE_ACCOUNT": "migration-service-account",
         "SERVICE": "service",
         "MIGRATION_JOB": "migration-job",
@@ -194,50 +208,285 @@ def test_check_secrets_exist_includes_the_read_token_secret_only_in_production(
     ]
 
 
-def test_check_intake_jobs_exist_describes_both_jobs(tmp_path: Path) -> None:
+STAGING_CONNECTION = "example-project:region:staging-database"
+PRODUCTION_CONNECTION = "example-project:region:production-database"
+# Answers `gcloud run jobs describe JOB` with $JOB_DESCRIPTIONS/JOB.json, and
+# fails as gcloud does for a job that has no description there.
+DESCRIBING_GCLOUD = (
+    LOGGING_GCLOUD
+    + '\ndescription="$JOB_DESCRIPTIONS/$4.json"\n'
+    + '[[ -f "$description" ]] || exit 1\n'
+    + 'cat "$description"'
+)
+
+
+def write_job_description(
+    directory: Path, job: str, *, account: str, connection: str
+) -> None:
+    """Save what `gcloud run jobs describe --format=json` shows of a job."""
+
+    description = {
+        "metadata": {"name": job},
+        "spec": {
+            "template": {
+                "metadata": {
+                    "annotations": {"run.googleapis.com/cloudsql-instances": connection}
+                },
+                "spec": {"template": {"spec": {"serviceAccountName": account}}},
+            }
+        },
+    }
+    directory.mkdir(exist_ok=True)
+    (directory / f"{job}.json").write_text(json.dumps(description))
+
+
+def job_check_environment(
+    stub_directory: Path, command_log: Path, descriptions: Path
+) -> dict[str, str]:
+    return {
+        "PATH": f"{stub_directory}:{os.environ['PATH']}",
+        "COMMAND_LOG": str(command_log),
+        "JOB_DESCRIPTIONS": str(descriptions),
+        "PROJECT_ID": "project",
+        "REGION": "region",
+        "CLOUD_SQL_CONNECTION": STAGING_CONNECTION,
+        **DEPLOY_INTAKE_SETTINGS,
+    }
+
+
+def test_check_intake_jobs_accepts_this_environments_jobs(tmp_path: Path) -> None:
     command_log = tmp_path / "commands.log"
-    install_command_stub(tmp_path, "gcloud", LOGGING_GCLOUD)
+    descriptions = tmp_path / "jobs"
+    install_command_stub(tmp_path, "gcloud", DESCRIBING_GCLOUD)
+    write_job_description(
+        descriptions,
+        "worker-job",
+        account=WORKER_ACCOUNT,
+        connection=STAGING_CONNECTION,
+    )
+    write_job_description(
+        descriptions,
+        "recovery-job",
+        account=RECOVERY_ACCOUNT,
+        connection=STAGING_CONNECTION,
+    )
 
     result = run_deploy(
-        "check-intake-jobs-exist",
-        environment={
-            "PATH": f"{tmp_path}:{os.environ['PATH']}",
-            "COMMAND_LOG": str(command_log),
-            "PROJECT_ID": "project",
-            "REGION": "region",
-            **DEPLOY_INTAKE_SETTINGS,
-        },
+        "check-intake-jobs",
+        environment=job_check_environment(tmp_path, command_log, descriptions),
     )
 
     assert result.returncode == 0, result.stderr
     assert command_log.read_text().splitlines() == [
         f"gcloud <run> <jobs> <describe> <{job}> <--project> <project> "
-        "<--region> <region> <--format=none>"
+        "<--region> <region> <--format=json>"
         for job in ("worker-job", "recovery-job")
     ]
 
 
-def test_check_intake_jobs_exist_names_each_missing_job(tmp_path: Path) -> None:
-    install_command_stub(
-        tmp_path,
-        "gcloud",
-        '[[ "$4" != recovery-job ]] || exit 1',
-    )
+@pytest.mark.parametrize(
+    "missing_jobs",
+    [["worker-job"], ["recovery-job"], ["worker-job", "recovery-job"]],
+)
+def test_check_intake_jobs_names_each_missing_job(
+    tmp_path: Path, missing_jobs: list[str]
+) -> None:
+    descriptions = tmp_path / "jobs"
+    install_command_stub(tmp_path, "gcloud", DESCRIBING_GCLOUD)
+    accounts = {"worker-job": WORKER_ACCOUNT, "recovery-job": RECOVERY_ACCOUNT}
+    descriptions.mkdir()
+    for job, account in accounts.items():
+        if job not in missing_jobs:
+            write_job_description(
+                descriptions, job, account=account, connection=STAGING_CONNECTION
+            )
 
     result = run_deploy(
-        "check-intake-jobs-exist",
-        environment={
-            "PATH": f"{tmp_path}:{os.environ['PATH']}",
-            "PROJECT_ID": "project",
-            "REGION": "region",
-            **DEPLOY_INTAKE_SETTINGS,
-        },
+        "check-intake-jobs",
+        environment=job_check_environment(
+            tmp_path, tmp_path / "commands.log", descriptions
+        ),
     )
 
     assert result.returncode == 1
-    assert result.stderr == (
-        "Cannot confirm the existence of Cloud Run job: recovery-job\n"
+    assert result.stderr == "".join(
+        f"Cannot confirm the existence of Cloud Run job: {job}\n"
+        for job in missing_jobs
     )
+
+
+@pytest.mark.parametrize(
+    ("job", "account", "connection", "expected_error"),
+    [
+        # Staging's worker variable naming production's worker job.
+        (
+            "worker-job",
+            "collector-worker-production@example-project.iam.gserviceaccount.com",
+            PRODUCTION_CONNECTION,
+            "Cloud Run job worker-job runs as another service account than "
+            "this deployment gives it.\n",
+        ),
+        # A job on this environment's account but another environment's database.
+        (
+            "recovery-job",
+            RECOVERY_ACCOUNT,
+            PRODUCTION_CONNECTION,
+            "Cloud Run job recovery-job connects to another Cloud SQL instance "
+            "than this environment's.\n",
+        ),
+        # The deploy's account variable naming another account than the job's.
+        (
+            "recovery-job",
+            "collector-other@example-project.iam.gserviceaccount.com",
+            STAGING_CONNECTION,
+            "Cloud Run job recovery-job runs as another service account than "
+            "this deployment gives it.\n",
+        ),
+    ],
+)
+def test_check_intake_jobs_refuses_a_job_of_another_environment_or_account(
+    tmp_path: Path, job: str, account: str, connection: str, expected_error: str
+) -> None:
+    command_log = tmp_path / "commands.log"
+    descriptions = tmp_path / "jobs"
+    install_command_stub(tmp_path, "gcloud", DESCRIBING_GCLOUD)
+    expected_accounts = {"worker-job": WORKER_ACCOUNT, "recovery-job": RECOVERY_ACCOUNT}
+    for described_job, expected_account in expected_accounts.items():
+        if described_job == job:
+            write_job_description(
+                descriptions, described_job, account=account, connection=connection
+            )
+        else:
+            write_job_description(
+                descriptions,
+                described_job,
+                account=expected_account,
+                connection=STAGING_CONNECTION,
+            )
+
+    result = run_deploy(
+        "check-intake-jobs",
+        environment=job_check_environment(tmp_path, command_log, descriptions),
+    )
+
+    assert result.returncode == 1
+    assert result.stderr == expected_error
+
+
+PROJECT_RESOURCES = "projects/project/locations/region"
+# Each name the deploy checks, the collector's pattern for the setting it
+# becomes, and how the deploy turns the name into that setting.
+COLLECTOR_SETTING_SHAPES = {
+    "INTAKE_BUCKET": (BUCKET_PATTERN, "{}"),
+    "WORKER_QUEUE": (QUEUE_PATTERN, PROJECT_RESOURCES + "/queues/{}"),
+    "WORKER_JOB": (JOB_PATTERN, PROJECT_RESOURCES + "/jobs/{}"),
+    "RECOVERY_JOB": (JOB_PATTERN, PROJECT_RESOURCES + "/jobs/{}"),
+    "RUNTIME_SERVICE_ACCOUNT": (SERVICE_ACCOUNT_PATTERN, "{}"),
+    "WORKER_INVOKER_SERVICE_ACCOUNT": (SERVICE_ACCOUNT_PATTERN, "{}"),
+}
+
+
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [
+        ("INTAKE_BUCKET", "collector-intake.example"),
+        ("INTAKE_BUCKET", "Intake-Bucket"),
+        ("INTAKE_BUCKET", "-intake-bucket"),
+        ("INTAKE_BUCKET", "gs://intake-bucket"),
+        ("WORKER_QUEUE", "Worker-Queue-2"),
+        ("WORKER_QUEUE", "projects/project/locations/region/queues/worker-queue"),
+        ("WORKER_QUEUE", "worker_queue"),
+        ("WORKER_JOB", "collector-worker-2"),
+        ("WORKER_JOB", "Worker-Job"),
+        ("WORKER_JOB", "2-worker-job"),
+        ("WORKER_JOB", "projects/project/locations/region/jobs/worker-job"),
+        ("RECOVERY_JOB", "recovery_job"),
+        ("RUNTIME_SERVICE_ACCOUNT", RUNTIME_ACCOUNT),
+        ("RUNTIME_SERVICE_ACCOUNT", "runtime@example.invalid"),
+        ("RUNTIME_SERVICE_ACCOUNT", "abc@example-project.iam.gserviceaccount.com"),
+        (
+            "WORKER_INVOKER_SERVICE_ACCOUNT",
+            "123456789-compute@developer.gserviceaccount.com",
+        ),
+        (
+            "WORKER_INVOKER_SERVICE_ACCOUNT",
+            "Invoker-1@example-project.iam.gserviceaccount.com",
+        ),
+    ],
+)
+def test_require_configuration_refuses_exactly_the_names_the_collector_refuses(
+    variable: str, value: str
+) -> None:
+    pattern, setting_format = COLLECTOR_SETTING_SHAPES[variable]
+    collector_accepts = re.fullmatch(pattern, setting_format.format(value)) is not None
+    configuration = complete_configuration("production")
+    configuration[variable] = value
+
+    result = run_deploy("require-configuration", environment=configuration)
+
+    if collector_accepts:
+        assert result.returncode == 0, result.stderr
+    else:
+        assert result.returncode == 1
+        assert result.stderr == f"{variable} is not a valid resource name.\n"
+
+
+def logged_setting_values(command: str) -> dict[str, str]:
+    match = re.search(r"<--set-env-vars> <([^>]*)>", command)
+    assert match is not None, command
+    return dict(pair.split("=", 1) for pair in match.group(1).split(","))
+
+
+def test_service_intake_settings_are_ones_the_collector_accepts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    command_log = tmp_path / "commands.log"
+    install_command_stub(tmp_path, "gcloud", LOGGING_GCLOUD)
+
+    result = run_deploy(
+        "deploy-candidate",
+        environment=service_deploy_environment(tmp_path, command_log, "staging"),
+    )
+
+    assert result.returncode == 0, result.stderr
+    for name, value in logged_setting_values(command_log.read_text()).items():
+        monkeypatch.setenv(name, value)
+    assert IntakeSettings.from_environment() == IntakeSettings(
+        bucket="intake-bucket",
+        signing_service_account=RUNTIME_ACCOUNT,
+        worker_queue=f"{PROJECT_RESOURCES}/queues/worker-queue",
+        worker_job=f"{PROJECT_RESOURCES}/jobs/worker-job",
+        worker_invoker_service_account=INVOKER_ACCOUNT,
+    )
+
+
+def test_recovery_job_settings_are_ones_the_operations_command_accepts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    command_log = tmp_path / "commands.log"
+    install_command_stub(tmp_path, "gcloud", LOGGING_GCLOUD)
+
+    result = run_deploy(
+        "configure-recovery-job",
+        environment=job_deploy_environment(tmp_path, command_log, "production"),
+    )
+
+    assert result.returncode == 0, result.stderr
+    for name, value in logged_setting_values(command_log.read_text()).items():
+        monkeypatch.setenv(name, value)
+    accepted = [
+        resource_setting(name, pattern, required_by="recovery runs")
+        for name, pattern in (
+            ("COLLECTOR_WORKER_QUEUE", QUEUE_PATTERN),
+            ("COLLECTOR_WORKER_JOB", JOB_PATTERN),
+            ("COLLECTOR_WORKER_INVOKER_SERVICE_ACCOUNT", SERVICE_ACCOUNT_PATTERN),
+        )
+    ]
+    assert accepted == [
+        f"{PROJECT_RESOURCES}/queues/worker-queue",
+        f"{PROJECT_RESOURCES}/jobs/worker-job",
+        INVOKER_ACCOUNT,
+    ]
 
 
 def test_build_and_push_image_records_the_immutable_uri(tmp_path: Path) -> None:
@@ -412,7 +661,7 @@ def service_deploy_environment(
         "PROJECT_ID": "project",
         "REGION": "region",
         "IMAGE_URI": "registry/image:sha",
-        "RUNTIME_SERVICE_ACCOUNT": "runtime@example.invalid",
+        "RUNTIME_SERVICE_ACCOUNT": RUNTIME_ACCOUNT,
         "CLOUD_SQL_CONNECTION": "project:region:database",
         "DATABASE_SECRET_NAME": "database-url",
         "JWT_SECRET_NAME": "jwt-secret",
@@ -427,10 +676,10 @@ def expected_service_settings(maintenance_mode: str, intake_switch: str) -> str:
         f"<--set-env-vars> <TELEMETRY_MAINTENANCE_MODE={maintenance_mode},"
         f"COLLECTOR_INTAKE_ENABLED={intake_switch},"
         "COLLECTOR_INTAKE_BUCKET=intake-bucket,"
-        "COLLECTOR_INTAKE_SIGNING_SERVICE_ACCOUNT=runtime@example.invalid,"
+        f"COLLECTOR_INTAKE_SIGNING_SERVICE_ACCOUNT={RUNTIME_ACCOUNT},"
         "COLLECTOR_WORKER_QUEUE=projects/project/locations/region/queues/worker-queue,"
         "COLLECTOR_WORKER_JOB=projects/project/locations/region/jobs/worker-job,"
-        "COLLECTOR_WORKER_INVOKER_SERVICE_ACCOUNT=invoker@example.invalid>"
+        f"COLLECTOR_WORKER_INVOKER_SERVICE_ACCOUNT={INVOKER_ACCOUNT}>"
     )
 
 
@@ -528,7 +777,7 @@ def test_worker_job_update_mounts_the_read_token_only_in_production(
         "gcloud <run> <jobs> <update> <worker-job> "
         "<--project> <project> <--region> <region> "
         "<--image> <registry/image:sha> "
-        "<--service-account> <worker@example.invalid> "
+        f"<--service-account> <{WORKER_ACCOUNT}> "
         "<--set-cloudsql-instances> <project:region:database> "
         f"<--set-secrets> <{expected_secrets}> "
         "<--set-env-vars> <COLLECTOR_INTAKE_BUCKET=intake-bucket> "
@@ -617,13 +866,13 @@ def test_recovery_job_update_dispatches_through_the_worker_queue(
         "gcloud <run> <jobs> <update> <recovery-job> "
         "<--project> <project> <--region> <region> "
         "<--image> <registry/image:sha> "
-        "<--service-account> <recovery@example.invalid> "
+        f"<--service-account> <{RECOVERY_ACCOUNT}> "
         "<--set-cloudsql-instances> <project:region:database> "
         "<--set-secrets> <DATABASE_URL=database-url:latest> "
         "<--set-env-vars> <"
         "COLLECTOR_WORKER_QUEUE=projects/project/locations/region/queues/worker-queue,"
         "COLLECTOR_WORKER_JOB=projects/project/locations/region/jobs/worker-job,"
-        "COLLECTOR_WORKER_INVOKER_SERVICE_ACCOUNT=invoker@example.invalid> "
+        f"COLLECTOR_WORKER_INVOKER_SERVICE_ACCOUNT={INVOKER_ACCOUNT}> "
         "<--command> <uv> "
         "<--args> <run,--no-sync,python,-m,telemetry_collector.operations,recover> "
         "<--tasks> <1> <--max-retries> <0> <--task-timeout> <10m> "

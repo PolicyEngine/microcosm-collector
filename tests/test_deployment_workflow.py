@@ -269,10 +269,10 @@ def test_release_updates_both_intake_jobs_between_migration_and_candidate(
 ) -> None:
     job = load_workflow(PUSH_WORKFLOW)["jobs"][job_name]
 
-    # Both jobs are confirmed to exist before anything changes, and updated to
+    # Both jobs are checked before anything changes, and updated to
     # the released image once the database has its schema, before a revision
     # that can dispatch to them is deployed.
-    assert step_position(job, "check-intake-jobs-exist") < step_position(
+    assert step_position(job, "check-intake-jobs") < step_position(
         job, "deploy-maintenance"
     )
     for command in ("configure-worker-job", "configure-recovery-job"):
@@ -360,7 +360,7 @@ def test_workflow_shell_logic_lives_in_scripts() -> None:
         "require-configuration",
         "validate-environment-target",
         "check-secrets-exist",
-        "check-intake-jobs-exist",
+        "check-intake-jobs",
         "configure-worker-job",
         "configure-recovery-job",
         "build-and-push-image",
