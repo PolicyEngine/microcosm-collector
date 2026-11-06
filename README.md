@@ -98,13 +98,11 @@ checked and kept.
 Intake is off unless `COLLECTOR_INTAKE_ENABLED` is exactly `1`. While it is
 off, the collector reads no other intake setting, and the token exchange for
 `{"scope": "artifacts:submit"}` and every `/v1/submissions` path answer 404 with
-the code `intake_not_enabled`. Each environment has its own switch:
-`scripts/deploy.sh` sets `COLLECTOR_INTAKE_ENABLED` on both service revisions
-from that environment's `TELEMETRY_INTAKE_ENABLED`, which must be `0` or `1`,
-so staging's intake can be switched on and checked before production's. A
-change to the variable takes effect at that environment's next deployment.
-Whatever the switch, the deploy passes the other intake settings and updates
-both intake jobs (see "Worker jobs and recovery").
+the code `intake_not_enabled`. `scripts/deploy.sh` switches intake on in both
+environments: it sets `COLLECTOR_INTAKE_ENABLED=1` and the other intake
+settings on both service revisions, and updates both intake jobs (see "Worker
+jobs and recovery"). Switching an environment's intake off past its next
+release therefore takes a change to `scripts/deploy.sh`.
 
 Once `0002_artifact_intake` is applied, an image without it cannot run against
 the database. That includes every earlier collector release and the old copy in
@@ -124,7 +122,7 @@ bucket.
 
 | Setting | Read by | Value | The deploy sets it from |
 |---|---|---|---|
-| `COLLECTOR_INTAKE_ENABLED` | service | `1` switches intake on | `TELEMETRY_INTAKE_ENABLED` |
+| `COLLECTOR_INTAKE_ENABLED` | service | `1` switches intake on | always `1` |
 | `COLLECTOR_INTAKE_BUCKET` | service, worker | the private intake bucket's name | `TELEMETRY_INTAKE_BUCKET` |
 | `COLLECTOR_INTAKE_SIGNING_SERVICE_ACCOUNT` | service | the runtime service account, which signs upload URLs through IAM `signBlob` | `TELEMETRY_RUNTIME_SERVICE_ACCOUNT` |
 | `COLLECTOR_WORKER_QUEUE` | service, operations | `projects/<project>/locations/<region>/queues/<queue>` | `TELEMETRY_WORKER_QUEUE`, the queue's name, in the deployment's project and region |
@@ -255,9 +253,8 @@ Each release, in each environment, `scripts/deploy.sh`:
 
 1. checks, before it changes anything:
    - that every intake name has the shape the collector accepts
-     (`require-configuration`, before it authenticates). With the switch at
-     `0` the service reads none of the settings, but the recovery job reads
-     its three on every run, so a malformed name stops the deploy instead;
+     (`require-configuration`, before it authenticates), so a malformed name
+     stops the deploy before a revision or job that reads it fails to start;
    - that each job exists, already runs as the service account the deploy
      gives it, and connects to the environment's own Cloud SQL instance
      (`check-intake-jobs`), so a variable naming the other environment's job
@@ -278,15 +275,16 @@ Each release, in each environment, `scripts/deploy.sh`:
    schedule nor any job's permissions.
 
 Maintenance mode holds only the service. An execution of either job keeps the
-image it started with, so a worker attempt that is running during a migration
-(up to an hour), or one that a scheduled recovery run or a Cloud Tasks retry
-starts before the job is updated, runs the previous release's code against
-the migrated schema. A migration that changes the intake tables must
-therefore keep working with the previous release's worker and recovery code.
+image it started with, for all its attempts: a worker execution that is
+running during a migration (up to three attempts of an hour each), or one that
+a scheduled recovery run or a Cloud Tasks retry starts before the job is
+updated, runs the previous release's code against the migrated schema. A
+migration that changes the intake tables must therefore keep working with the
+previous release's worker and recovery code.
 
-To switch an environment's intake on, set its `TELEMETRY_INTAKE_ENABLED` to `1`;
-to switch it off again, set it to `0`. Either takes effect at that
-environment's next deployment.
+Each dispatch is a `jobs.run` call that returns once the execution is created,
+so the queue's limit on concurrent dispatches does not limit how many worker
+executions run at once.
 
 ## Local development
 
@@ -406,7 +404,7 @@ here:
    (`scripts/deploy.sh configure-worker-job`), naming the secret from the
    production environment variable `TELEMETRY_HF_READ_SECRET_NAME`, and first
    checks that the secret exists. Staging's worker job mounts no token. Any
-   other job that reads Hugging Face mounts it by hand, for example with
+   other job that reads Hugging Face mounts it too, for example with
    `gcloud run jobs update JOB --update-secrets COLLECTOR_HF_READ_TOKEN=SECRET:latest`.
    A command that sets a job's secrets with `--set-secrets` replaces all of
    its mounts, so any such command for these jobs must list this one too, as
@@ -535,11 +533,11 @@ The deployment's access and configuration are provisioned:
   and `Production` environments; the project move pointed each environment's
   project, Cloud SQL connections, service accounts, provider and deployment
   account at the collector's project (the runbook's section 14 lists them).
-- For intake, each environment also holds the eight `TELEMETRY_*` variables
-  for its intake switch, bucket, queue, jobs and the service accounts that run
-  them, and production holds `TELEMETRY_HF_READ_SECRET_NAME` (see "Artifact
-  intake"). `scripts/deploy.sh require-configuration` names any that is
-  missing, and the deployment stops before it authenticates.
+- For intake, each environment also holds the seven `TELEMETRY_*` variables
+  for its bucket, queue, jobs and the service accounts that run them, and
+  production holds `TELEMETRY_HF_READ_SECRET_NAME` (see "Artifact intake").
+  `scripts/deploy.sh require-configuration` names any that is missing, and
+  the deployment stops before it authenticates.
 
 The move from calibration-diagnostics is complete:
 

@@ -236,11 +236,11 @@ def test_service_deployment_reads_resource_names_from_environment_variables() ->
 def test_release_switches_intake_on_without_a_per_environment_switch() -> None:
     jobs = load_workflow(PUSH_WORKFLOW)["jobs"]
 
-    # Every release switches intake on in both environments together.
+    # Every release switches intake on in both environments together; the
+    # deploy script's tests check the setting each revision gets.
     assert "TELEMETRY_INTAKE_ENABLED" not in PUSH_WORKFLOW.read_text(encoding="utf-8")
     for job_name in DEPLOY_JOBS:
         assert "INTAKE_ENABLED" not in jobs[job_name]["env"], job_name
-    assert "COLLECTOR_INTAKE_ENABLED=1," in DEPLOY_SCRIPT.read_text(encoding="utf-8")
 
 
 def test_only_production_reads_the_hugging_face_read_token_secret_name() -> None:

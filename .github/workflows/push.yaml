@@ -17,14 +17,14 @@ permissions:
 # is 'true'. It has been 'true' since 2026-10-20, when this repo took over
 # deployment from calibration-diagnostics; unset, releases are tagged but not
 # deployed. The jobs deploy one image to staging and, only after staging
-# succeeds, the same image to production. Each also updates its environment's
-# intake worker and recovery jobs to that image, and sets the service's
-# intake switch from the environment variable TELEMETRY_INTAKE_ENABLED. The
-# staging and production environments accept only main, and Google Cloud's
-# Workload Identity provider accepts this repo's tokens only for
-# refs/heads/main. Both jobs also check for a push to main. This workflow runs
-# only for pushes to main, so that check is always true; it keeps a trigger
-# added later (tags, manual dispatch) from reaching authentication.
+# succeeds, the same image to production. Each switches artifact intake on in
+# its environment and updates the environment's intake worker and recovery
+# jobs to that image. The staging and production environments accept only
+# main, and Google Cloud's Workload Identity provider accepts this repo's
+# tokens only for refs/heads/main. Both jobs also check for a push to main.
+# This workflow runs only for pushes to main, so that check is always true; it
+# keeps a trigger added later (tags, manual dispatch) from reaching
+# authentication.
 jobs:
   versioning:
     name: Update versioning
@@ -106,9 +106,7 @@ jobs:
       READ_SECRET_NAME: ${{ vars.TELEMETRY_READ_SECRET_NAME }}
       PRODUCTION_CLOUD_SQL_CONNECTION: ${{ vars.TELEMETRY_PRODUCTION_CLOUD_SQL_CONNECTION }}
       PRODUCTION_SERVICE: ${{ vars.TELEMETRY_PRODUCTION_SERVICE }}
-      # Each environment has its own intake resources and its own switch,
-      # TELEMETRY_INTAKE_ENABLED (0 or 1).
-      INTAKE_ENABLED: ${{ vars.TELEMETRY_INTAKE_ENABLED }}
+      # Each environment has its own intake resources.
       INTAKE_BUCKET: ${{ vars.TELEMETRY_INTAKE_BUCKET }}
       WORKER_QUEUE: ${{ vars.TELEMETRY_WORKER_QUEUE }}
       WORKER_JOB: ${{ vars.TELEMETRY_WORKER_JOB }}
@@ -231,9 +229,7 @@ jobs:
       READ_SECRET_NAME: ${{ vars.TELEMETRY_READ_SECRET_NAME }}
       PRODUCTION_CLOUD_SQL_CONNECTION: ${{ vars.TELEMETRY_PRODUCTION_CLOUD_SQL_CONNECTION }}
       PRODUCTION_SERVICE: ${{ vars.TELEMETRY_PRODUCTION_SERVICE }}
-      # Each environment has its own intake resources and its own switch,
-      # TELEMETRY_INTAKE_ENABLED (0 or 1).
-      INTAKE_ENABLED: ${{ vars.TELEMETRY_INTAKE_ENABLED }}
+      # Each environment has its own intake resources.
       INTAKE_BUCKET: ${{ vars.TELEMETRY_INTAKE_BUCKET }}
       WORKER_QUEUE: ${{ vars.TELEMETRY_WORKER_QUEUE }}
       WORKER_JOB: ${{ vars.TELEMETRY_WORKER_JOB }}

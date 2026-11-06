@@ -36,7 +36,6 @@ require_configuration() {
     DEPLOYMENT_ENVIRONMENT
     PRODUCTION_CLOUD_SQL_CONNECTION
     PRODUCTION_SERVICE
-    INTAKE_ENABLED
     INTAKE_BUCKET
     WORKER_QUEUE
     WORKER_JOB
@@ -50,7 +49,6 @@ require_configuration() {
   fi
 
   require_variables "${names[@]}"
-  require_intake_switch
   require_intake_resource_names
 }
 
@@ -58,11 +56,10 @@ require_configuration() {
 # apply set -e, so each one returns as soon as a check fails.
 
 # The collector's patterns for the intake settings (telemetry_collector.intake),
-# applied to the names the deploy builds them from. With production's switch
-# at 0 the collector reads none of these, but the recovery job validates its
-# three settings on every scheduled run, so a malformed name must stop the
-# deploy instead. The deploy script's tests compare each verdict with the
-# collector's.
+# applied to the names the deploy builds them from, so a malformed name stops
+# the deploy before it authenticates rather than when a revision or a job
+# that reads it starts. The deploy script's tests compare these patterns and
+# their verdicts with the collector's.
 BUCKET_NAME_PATTERN='^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$'
 QUEUE_NAME_PATTERN='^[A-Za-z0-9-]{1,100}$'
 JOB_NAME_PATTERN='^[a-z][a-z0-9-]{0,62}$'
@@ -97,21 +94,6 @@ require_intake_resource_names() {
   return "$failed"
 }
 
-# Each environment sets its own intake switch, so production's intake can stay
-# off while staging's is checked. The collector treats anything but exactly 1
-# as off, so any other value is refused rather than quietly leaving it off.
-require_intake_switch() {
-  require_variables INTAKE_ENABLED || return 1
-
-  case "$INTAKE_ENABLED" in
-    0 | 1) ;;
-    *)
-      echo "INTAKE_ENABLED must be 0 or 1." >&2
-      return 1
-      ;;
-  esac
-}
-
 # Only production's worker job reads Hugging Face: the collector has one read
 # token, and only production's worker service account may read its secret.
 # Prints that secret's name in production and nothing in staging.
@@ -139,9 +121,8 @@ worker_job_resource() {
   printf 'projects/%s/locations/%s/jobs/%s\n' "$PROJECT_ID" "$REGION" "$WORKER_JOB"
 }
 
-# The intake settings every service revision gets. The service signs upload
-# URLs as its own runtime account. While COLLECTOR_INTAKE_ENABLED is 0 the
-# collector reads none of the others.
+# The intake settings every service revision gets: intake is on in every
+# environment. The service signs upload URLs as its own runtime account.
 service_intake_settings() {
   require_variables \
     PROJECT_ID \
@@ -151,7 +132,6 @@ service_intake_settings() {
     WORKER_QUEUE \
     WORKER_JOB \
     WORKER_INVOKER_SERVICE_ACCOUNT || return 1
-  require_intake_switch || return 1
   require_intake_resource_names || return 1
 
   local queue_resource_name
@@ -159,7 +139,7 @@ service_intake_settings() {
   queue_resource_name="$(worker_queue_resource)"
   worker_job_resource_name="$(worker_job_resource)"
   printf '%s,' \
-    "COLLECTOR_INTAKE_ENABLED=${INTAKE_ENABLED}" \
+    "COLLECTOR_INTAKE_ENABLED=1" \
     "COLLECTOR_INTAKE_BUCKET=${INTAKE_BUCKET}" \
     "COLLECTOR_INTAKE_SIGNING_SERVICE_ACCOUNT=${RUNTIME_SERVICE_ACCOUNT}" \
     "COLLECTOR_WORKER_QUEUE=${queue_resource_name}" \
