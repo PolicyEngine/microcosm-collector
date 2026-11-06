@@ -10,7 +10,12 @@ import { join, relative } from "node:path";
 import { gunzipSync } from "node:zlib";
 
 import recordedGoldens from "./fixtures/calibration-tree-golden.json";
-import { microcosmRepo } from "@policyengine/calibration-tree/latest-artifact";
+import { InvalidReleaseIdError, microcosmRepo } from "@policyengine/calibration-tree/latest-artifact";
+import * as calibrationTreeWorker from "./calibration-tree-worker";
+import { CountryNotConfiguredError } from "./countries";
+import { CalibrationTreeArtifactSizeError } from "./publish-calibration-tree";
+import { IncompatibleStagingDataError } from "./staging-contract";
+import { UnsupportedCalibrationDiagnosticsSchemaError } from "./target-representation";
 import {
   GZIP_HEADER_WITHOUT_OS,
   goldenReleaseInputs,
@@ -27,6 +32,7 @@ const GZIP_HEADER_BYTES = 10;
 const BUILD_TIMEOUT_MS = 300_000;
 const EXIT_REQUEST_ERROR = 1;
 const EXIT_UNBUILDABLE_INPUT = 2;
+const EXIT_WORKER_ERROR = 3;
 
 type ReleaseCaseName = keyof ReturnType<typeof goldenReleaseInputs>;
 const RELEASE_CASES = Object.keys(goldenReleaseInputs()) as ReleaseCaseName[];
@@ -305,4 +311,91 @@ test("a byte-order mark and the file's digest are read as the publisher reads Hu
   expect({ exitCode: run.exitCode, stderr: run.stderr }).toEqual({ exitCode: 0, stderr: "" });
   expect((JSON.parse(run.stdout) as WorkerSummary).buildArtifactId)
     .toBe(recorded.sources["be-release"].buildArtifactId);
+});
+
+test("a publication time with an offset is recorded as the publisher records it", () => {
+  const release = goldenReleaseInputs()["be-release"];
+  const expected = recorded.sources["be-release"];
+  expect(release.publishedAt).toBe("2026-09-16T12:00:00.000Z");
+  // The dataset's releases record writes times like the first; the publisher
+  // stores every publication time as Date.prototype.toISOString() writes it.
+  for (const createdAt of ["2026-09-16T12:00:00+00:00", "2026-09-16T14:00:00.000+02:00"]) {
+    const { requestPath } = releaseRequest(release, { createdAt });
+    const outputDirectory = join(temporaryDirectory(), "trees");
+
+    const run = runWorker(requestPath, outputDirectory);
+
+    expect({ createdAt, exitCode: run.exitCode, stderr: run.stderr }).toEqual({ createdAt, exitCode: 0, stderr: "" });
+    const summary = JSON.parse(run.stdout) as WorkerSummary & { createdAt: string };
+    expect(summary.createdAt).toBe(release.publishedAt);
+    expect(summary.files.map((file) => writtenFileRecord(outputDirectory, file.part, file.path)))
+      .toEqual(expected.files);
+  }
+});
+
+test("a publication time without a UTC offset is a request error", () => {
+  const release = goldenReleaseInputs()["be-release"];
+  // Each parses as a date, but the first two would be read in the machine's
+  // own time zone.
+  for (const createdAt of ["2026-09-16T12:00:00", "September 16, 2026 12:00", "2026-09-16"]) {
+    const { requestPath } = releaseRequest(release, { createdAt });
+    const outputDirectory = join(temporaryDirectory(), "trees");
+
+    const run = runWorker(requestPath, outputDirectory);
+
+    expect({ createdAt, exitCode: run.exitCode }).toEqual({ createdAt, exitCode: EXIT_REQUEST_ERROR });
+    expect(run.stderr).toContain("createdAt");
+    expect(writtenFiles(outputDirectory)).toEqual([]);
+  }
+});
+
+test("a size limit that is not a positive integer is a worker error, not unbuildable input", () => {
+  for (const [name, value] of [
+    ["CALIBRATION_TREE_MAX_RAW_BYTES", "100MB"],
+    ["CALIBRATION_TREE_MAX_GZIP_BYTES", "0"],
+  ]) {
+    const { requestPath } = releaseRequest(goldenReleaseInputs()["be-release"]);
+    const outputDirectory = join(temporaryDirectory(), "trees");
+
+    const run = runWorker(requestPath, outputDirectory, { [name]: value });
+
+    expect({ name, exitCode: run.exitCode }).toEqual({ name, exitCode: EXIT_WORKER_ERROR });
+    expect(run.stderr).toContain(`${name} must be a positive integer.`);
+    expect(writtenFiles(outputDirectory)).toEqual([]);
+  }
+});
+
+test("only the builder's refusals of the files count as unbuildable input", () => {
+  const isContentRefusal = calibrationTreeWorker.isCalibrationTreeContentRefusal;
+  expect(typeof isContentRefusal).toBe("function");
+
+  const refusals = [
+    new Error("Calibration diagnostics have no targets."),
+    new CalibrationTreeArtifactSizeError("too large"),
+    new IncompatibleStagingDataError("incompatible"),
+    new UnsupportedCalibrationDiagnosticsSchemaError("unsupported"),
+    new InvalidReleaseIdError("Invalid release id"),
+  ];
+  const failures = [
+    new TypeError("Cannot read properties of undefined"),
+    new RangeError("Invalid string length"),
+    new ReferenceError("undefinedName is not defined"),
+    new CountryNotConfiguredError("zz"),
+    "a thrown string",
+  ];
+  expect(refusals.map((error) => isContentRefusal(error))).toEqual(refusals.map(() => true));
+  expect(failures.map((error) => isContentRefusal(error))).toEqual(failures.map(() => false));
+});
+
+test("each kind of failure has its own exit code", () => {
+  const exitCodeFor = calibrationTreeWorker.calibrationTreeWorkerExitCode;
+  expect(typeof exitCodeFor).toBe("function");
+
+  expect(exitCodeFor(new calibrationTreeWorker.CalibrationTreeWorkerRequestError("request")))
+    .toBe(EXIT_REQUEST_ERROR);
+  expect(exitCodeFor(new calibrationTreeWorker.CalibrationTreeUnbuildableInputError("content")))
+    .toBe(EXIT_UNBUILDABLE_INPUT);
+  for (const error of [new Error("disk full"), new TypeError("defect"), "a thrown string"]) {
+    expect(exitCodeFor(error)).toBe(EXIT_WORKER_ERROR);
+  }
 });

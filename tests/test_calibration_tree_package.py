@@ -72,9 +72,12 @@ def test_publishing_runs_only_on_main_and_only_once_switched_on() -> None:
         "workflow_dispatch": "",
     }
     assert workflow["permissions"] == {"contents": "read"}
-    assert set(workflow["jobs"]) == {"publish"}
+    assert set(workflow["jobs"]) == {"test", "publish"}
+    for job in workflow["jobs"].values():
+        assert job["if"] == f"{MAIN_GUARD} && {PUBLISH_SWITCH}"
+    assert "environment" not in workflow["jobs"]["test"]
     job = workflow["jobs"]["publish"]
-    assert job["if"] == f"{MAIN_GUARD} && {PUBLISH_SWITCH}"
+    assert job["needs"] == "test"
     assert job["environment"] == "npm"
     assert job["concurrency"] == {
         "group": "calibration-tree-npm-publication",
@@ -85,19 +88,25 @@ def test_publishing_runs_only_on_main_and_only_once_switched_on() -> None:
 def test_publishing_uses_npm_trusted_publishing_and_no_stored_credential() -> None:
     assert PUBLISH_WORKFLOW.is_file()
     text = PUBLISH_WORKFLOW.read_text(encoding="utf-8")
-    job = load_workflow(PUBLISH_WORKFLOW)["jobs"]["publish"]
+    jobs = load_workflow(PUBLISH_WORKFLOW)["jobs"]
+    assert set(jobs) == {"test", "publish"}
+    job = jobs["publish"]
 
     # npm accepts the job's GitHub OIDC token instead of a stored npm token.
+    # Only the publish job, which installs and runs nothing from npm, can
+    # request one; the test job installs dependencies and runs the tests.
     assert job["permissions"] == {"contents": "read", "id-token": "write"}
+    assert jobs["test"]["permissions"] == {"contents": "read"}
     assert "secrets." not in text
     assert "NODE_AUTH_TOKEN" not in text
     assert "NPM_TOKEN" not in text
     assert "google-github-actions" not in text
-    for step in job["steps"]:
-        if "uses" in step:
-            assert re.match(PINNED_ACTION, step["uses"]), step["uses"]
-    checkout = step_using(job, "actions/checkout@")
-    assert checkout["with"]["persist-credentials"] == "false"
+    for workflow_job in jobs.values():
+        for step in workflow_job["steps"]:
+            if "uses" in step:
+                assert re.match(PINNED_ACTION, step["uses"]), step["uses"]
+        checkout = step_using(workflow_job, "actions/checkout@")
+        assert checkout["with"]["persist-credentials"] == "false"
     node = step_using(job, "actions/setup-node@")
     assert node["with"]["node-version"] == "24.21.0"
     assert node["with"]["registry-url"] == "https://registry.npmjs.org"
@@ -105,17 +114,26 @@ def test_publishing_uses_npm_trusted_publishing_and_no_stored_credential() -> No
 
 def test_publishing_tests_the_package_before_publishing_it() -> None:
     assert PUBLISH_WORKFLOW.is_file()
-    job = load_workflow(PUBLISH_WORKFLOW)["jobs"]["publish"]
-    commands = step_commands(job)
+    jobs = load_workflow(PUBLISH_WORKFLOW)["jobs"]
 
-    assert commands == [
+    assert set(jobs) == {"test", "publish"}
+    assert step_commands(jobs["test"]) == [
         "bun install --frozen-lockfile",
         "bun test",
         "bun run typecheck",
+    ]
+    assert jobs["publish"]["needs"] == "test"
+    assert step_commands(jobs["publish"]) == [
         "bash ../../tools/check-npm-toolchain.sh 24.21.0 11.19.0",
         "bash ../../tools/publish-calibration-tree.sh",
     ]
-    assert job["defaults"]["run"]["working-directory"] == PACKAGE_DIRECTORY
+    assert not [
+        step
+        for step in jobs["publish"]["steps"]
+        if step.get("uses", "").startswith("oven-sh/setup-bun@")
+    ]
+    for job in jobs.values():
+        assert job["defaults"]["run"]["working-directory"] == PACKAGE_DIRECTORY
 
 
 def test_publishing_checks_the_npm_toolchain_after_installing_node() -> None:

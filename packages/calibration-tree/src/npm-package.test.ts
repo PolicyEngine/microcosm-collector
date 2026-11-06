@@ -1,7 +1,8 @@
-// What npm would publish: the package's TypeScript modules and declarations,
-// never its tests, fixtures, test support, lockfile or provenance record.
+// What npm would publish: the package's TypeScript modules and declarations
+// and its license, never its tests, fixtures, test support, lockfile or
+// provenance record.
 import { expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 const PACKAGE_ROOT = resolve(import.meta.dir, "..");
@@ -56,13 +57,22 @@ test("the manifest can be published publicly from the collector's repository", (
 });
 
 test(
-  "the published files are the exported modules, the declarations, the manifest and the README",
+  "the published files are the exported modules, the declarations, the manifest, the README and the license",
   () => {
     const exportedModules = Object.values(manifest().exports).map((target) => target.replace(/^\.\//, ""));
 
     expect(packedFiles()).toEqual(
-      [...exportedModules, "types/next-fetch-cache.d.ts", "package.json", "README.md"].sort(),
+      [...exportedModules, "types/next-fetch-cache.d.ts", "package.json", "README.md", "LICENSE"].sort(),
     );
   },
   PACK_TIMEOUT_MS,
 );
+
+// The MIT license requires its notice in every copy, so the tarball carries
+// the collector's own license text.
+test("the package's license is the collector's", () => {
+  const packageLicense = join(PACKAGE_ROOT, "LICENSE");
+
+  expect(existsSync(packageLicense)).toBe(true);
+  expect(readFileSync(packageLicense, "utf8")).toBe(readFileSync(join(PACKAGE_ROOT, "..", "..", "LICENSE"), "utf8"));
+});
