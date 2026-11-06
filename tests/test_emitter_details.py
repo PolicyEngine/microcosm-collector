@@ -128,6 +128,25 @@ INVALID_CHANGES: list[tuple[str, str, Callable[[dict[str, Any]], None]]] = [
     ("progress", "outer", lambda value: value.update(done="57")),
     ("progress", "outer", lambda value: value.update(done=True)),
     ("progress", "outer", lambda value: value.update(unit="x" * 201)),
+    (
+        "heartbeat",
+        "reading",
+        lambda value: value["process_tree"].update(cpu_user_cores=True),
+    ),
+    (
+        "heartbeat",
+        "reading",
+        lambda value: value["machine"].update(load_average_1m="1.5"),
+    ),
+    ("heartbeat", "reading", lambda value: value.update(interval_seconds="30")),
+    (
+        "heartbeat",
+        "reading",
+        lambda value: value["progress"].update(reported_at=1793979283),
+    ),
+    ("heartbeat", "sleep", lambda value: value.update(seconds="3600")),
+    ("heartbeat", "sleep", lambda value: value.update(started_at=1793979283)),
+    ("stage", "stage_span", lambda value: value.update(occurrence=True)),
 ]
 
 
@@ -304,3 +323,107 @@ def test_a_readings_progress_may_hold_numbers_or_nothing(
     event = TelemetryEvent.model_validate(raw)
     assert DROPPED not in event.details
     assert event.details["reading"]["progress"] == raw["details"]["reading"]["progress"]
+
+
+def test_a_dropped_key_is_logged(caplog: pytest.LogCaptureFixture) -> None:
+    raw = first_with("heartbeat", "reading")
+    raw["details"]["reading"]["unexpected"] = 1
+    with caplog.at_level("WARNING", logger="telemetry_collector.models"):
+        TelemetryEvent.model_validate(raw)
+    assert [record.levelname for record in caplog.records] == ["WARNING"]
+    message = caplog.records[0].getMessage()
+    for expected in (raw["event_id"], raw["run_id"], "heartbeat", "reading"):
+        assert expected in message
+
+
+def test_an_accepted_event_logs_nothing(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level("WARNING", logger="telemetry_collector.models"):
+        for raw in emitter_events():
+            TelemetryEvent.model_validate(raw)
+    assert caplog.records == []
+
+
+def test_a_linux_reading_is_accepted() -> None:
+    raw = first_with("heartbeat", "reading")
+    raw["details"]["reading"]["machine"].update(
+        memory_compressed_bytes=None,
+        memory_pressure_level=None,
+        memory_stall_some_share=0.125,
+        memory_stall_full_share=0,
+        swap_in_bytes=4096,
+        swap_out_bytes=0,
+        on_battery=None,
+        cgroup_memory_bytes=1048576,
+        cgroup_memory_limit_bytes=None,
+        cpu_busy_share=None,
+    )
+    raw["details"]["reading"]["process_tree"].update(
+        cpu_user_cores=0, disk_read_bytes=None, disk_written_bytes=None
+    )
+    assert TelemetryEvent.model_validate(raw).details == raw["details"]
+
+
+@pytest.mark.parametrize(
+    "closed_by",
+    [
+        None,
+        "enclosing_stage_ended",
+        "next_stage_started",
+        "other_stage_updated",
+        "run_completed",
+        "run_blocked",
+        "run_failed",
+    ],
+)
+def test_every_reason_the_emitter_closes_a_stage_is_accepted(
+    closed_by: str | None,
+) -> None:
+    raw = next(
+        deepcopy(event)
+        for event in emitter_events()
+        if event["event_type"] == "stage" and event["status"] == "completed"
+    )
+    raw["details"]["stage_span"]["closed_by"] = closed_by
+    assert TelemetryEvent.model_validate(raw).details == raw["details"]
+
+
+def test_a_repeated_event_with_a_dropped_key_is_a_duplicate() -> None:
+    store = FakeTelemetryStore()
+    client = TestClient(
+        create_app(
+            settings=settings(),
+            store=store,
+            huggingface_authenticator=StubHuggingFaceAuthenticator(),
+        )
+    )
+    headers = {"Authorization": f"Bearer {exchange(client)}"}
+    registration = {
+        "run_id": "fixture-run",
+        "producer_id": "fixture-producer",
+        "country_code": "US",
+        "pipeline": "fixture-pipeline",
+    }
+    assert (
+        client.post("/v1/runs", headers=headers, json=registration).status_code == 201
+    )
+    heartbeat = first_with("heartbeat", "reading")
+    heartbeat["details"]["reading"]["unexpected"] = 1
+    answers = [
+        client.post(
+            "/v1/runs/fixture-run/events",
+            headers=headers,
+            json={"events": [heartbeat]},
+        ).json()
+        for _ in range(2)
+    ]
+    assert answers == [
+        {"accepted": 1, "duplicates": 0},
+        {"accepted": 0, "duplicates": 1},
+    ]
+    document = client.get(
+        "/v1/runs/fixture-run",
+        headers={"X-Telemetry-Read-Token": "dashboard-read-token"},
+    ).json()
+    assert [event["details"] for event in document["events"]] == [
+        {DROPPED: ["reading"]}
+    ]
