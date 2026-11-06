@@ -110,6 +110,9 @@ INVALID_CHANGES: list[tuple[str, str, Callable[[dict[str, Any]], None]]] = [
         "sleep",
         lambda value: value.update(ended_at="2026-11-06T11:00:00+00:00"),
     ),
+    ("heartbeat", "reading", lambda value: value["progress"].update(done="74")),
+    ("heartbeat", "reading", lambda value: value["progress"].update(total=[177])),
+    ("heartbeat", "reading", lambda value: value["progress"].update(unit="u" * 201)),
     ("heartbeat", "sleep", lambda value: value.update(seconds=-1)),
     (
         "heartbeat",
@@ -283,3 +286,21 @@ def test_a_run_without_readings_serves_none() -> None:
     assert "reading" in document["progress"]
     assert document["progress"]["reading"] is None
     assert document.get("sleeps") == []
+
+
+@pytest.mark.parametrize(
+    "progress",
+    [
+        {"done": 74.5, "total": 177},
+        {"done": None, "total": None, "unit": None},
+        {"stage_id": "node.population", "outer": None},
+    ],
+)
+def test_a_readings_progress_may_hold_numbers_or_nothing(
+    progress: dict[str, Any],
+) -> None:
+    raw = first_with("heartbeat", "reading")
+    raw["details"]["reading"]["progress"].update(progress)
+    event = TelemetryEvent.model_validate(raw)
+    assert DROPPED not in event.details
+    assert event.details["reading"]["progress"] == raw["details"]["reading"]["progress"]
