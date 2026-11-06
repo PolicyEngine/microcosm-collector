@@ -34,8 +34,16 @@ jobs:
         with:
           python-version: "3.13"
       - run: uv sync --locked --dev
+      # The Orrery validator's tests run the real validator under the Node
+      # release the image holds.
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24.21.0"
+      - run: npm ci --prefix orrery-validator --omit=dev --omit=peer --ignore-scripts
       - run: uv run pytest -q
       - run: DATABASE_URL="$TEST_DATABASE_URL" uv run python -m telemetry_collector.migrate
       - run: DATABASE_URL="$TEST_DATABASE_URL" uv run alembic check
       - run: bash tools/check-quality.sh
       - run: docker build --tag microcosm-collector:validation .
+      - run: bash tools/check-worker-image.sh microcosm-collector:validation
+      - run: bash tools/check-calibration-tree-image.sh microcosm-collector:validation

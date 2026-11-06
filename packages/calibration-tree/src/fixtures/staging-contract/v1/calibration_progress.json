@@ -1,0 +1,18 @@
+{
+ "schema_version": 1,
+ "run_id": "v1-us-fixture",
+ "candidate_release_id": "populace-us-2024-v1-fixture",
+ "updated_at": "2026-01-01T00:00:04+00:00",
+ "events": [
+  {
+   "epoch": 1,
+   "epochs": 2,
+   "loss": 1.5,
+   "budget_search": null,
+   "budget_iteration": null,
+   "budget_iters": null,
+   "l0_lambda": null,
+   "time": "2026-01-01T00:00:03+00:00"
+  }
+ ]
+}

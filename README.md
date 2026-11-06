@@ -130,6 +130,7 @@ bucket.
 | `COLLECTOR_WORKER_INVOKER_SERVICE_ACCOUNT` | service, operations | the account whose OAuth token each Cloud Task uses to run the worker job | `TELEMETRY_WORKER_INVOKER_SERVICE_ACCOUNT` |
 | `COLLECTOR_WORKER_JOB_ID` | worker | set on each execution by its Cloud Task | not set by the deploy |
 | `DATABASE_URL` | worker, operations | the runtime database secret, as for the service | `TELEMETRY_DATABASE_SECRET_NAME` |
+| `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN` | worker | the read-write token of the environment's own calibration tree Vercel Blob store, a Secret Manager secret; without it, `calibration-diagnostics` submissions stay in intake storage (see "Building trees from submissions") | `TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME`, the secret's name |
 
 The `TELEMETRY_*` names are GitHub `staging` and `production` environment
 variables, which `.github/workflows/push.yaml` passes to `scripts/deploy.sh`.
@@ -141,6 +142,7 @@ The deploy also reads these, to update the two jobs:
 | `TELEMETRY_WORKER_SERVICE_ACCOUNT` | the worker job's service account |
 | `TELEMETRY_RECOVERY_SERVICE_ACCOUNT` | the recovery job's service account |
 | `TELEMETRY_HF_READ_SECRET_NAME` | the environment's own Hugging Face read token's secret, mounted on the worker job (see "Hugging Face read access") |
+| `TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME` | the secret holding the read-write token of the environment's own calibration tree Blob store, mounted on the worker job only as `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN` (see "Building trees from submissions") |
 
 The two service-account settings accept only user-managed accounts,
 `<name>@<project>.iam.gserviceaccount.com`. The collector refuses to start
@@ -307,9 +309,14 @@ a destination environment variable.
 
 ```bash
 uv sync --locked --dev
+npm ci --prefix orrery-validator --omit=dev --omit=peer --ignore-scripts
 uv run pytest -q
 bash tools/check-quality.sh
 ```
+
+The Orrery validator's tests (`tests/test_orrery_validation.py`) run the
+real validator, so they need Node 22.14 or later and the validator's
+packages installed as above; CI uses Node 24.21.0, the release the image holds.
 
 `tools/check-quality.sh` runs Ruff's lint and format checks and syntax-checks
 every shell script in `tools/` and `scripts/` with `bash -n`, as CI does.
@@ -356,6 +363,230 @@ modules named in `provenance.py`, in
 
 Once Microcosm hands its Orrery inputs to the collector and removes its copy,
 this copy is the only one, and changes to the projection are made here.
+
+### Orrery validation
+
+`orrery-validator/validate-orrery-document.mjs` validates an Orrery graph
+document under Node with one version of `@axiom-foundation/orrery`, pinned in
+`orrery-validator/package.json` and its lockfile (0.6.2; its validation code
+is identical to 0.6.1's, which microcosm-runs uses). It accepts exactly the
+graph file contents microcosm-runs' publication accepts (`lib/service.ts`):
+
+- the bytes decode as strict UTF-8 and parse as JSON, or the answer is
+  `invalid_json`;
+- Orrery's `parseGraphDocument` accepts the document, or it is
+  `invalid_graph`, with Orrery's issues;
+- `checkSources`: every `url` is an `https://` URL without a user name or
+  password, or names, before any `#`, a file published with the document, or
+  it is `invalid_source`. An `https://` value that is not a URL is refused
+  here; microcosm-runs answers 503 for it instead.
+
+A refusal says where a link is (its JSON path), never what it holds, since a
+link may carry a credential, and keeps at most 100 issues of at most 500
+characters (code points) each. Issue text always encodes as UTF-8 and can be
+stored in PostgreSQL's `jsonb`: shortening keeps whole characters, and an
+unpaired surrogate or a NUL, which a document's JSON can escape and Orrery
+repeats in its issues, becomes U+FFFD. microcosm-runs also
+refuses a graph file over 64 MiB and file names outside its role patterns;
+those are checks on the publication, which the Orrery worker (O4) makes, not
+on the document.
+
+`telemetry_collector.orrery.validation.validate_orrery_document(document,
+published_file_names)` runs it and returns the Orrery version, raises
+`OrreryDocumentRefusedError` with the code, issues and Orrery version for a
+refused document, and raises `OrreryValidatorError` when the validator could
+not run. Node gets only `PATH` and `LANG=C.UTF-8`, so none of the worker's
+settings or credentials, such as `DATABASE_URL`, reach it, and its answer is
+read as UTF-8 whatever the worker's locale; output that is not UTF-8 is a
+validator error. By hand:
+
+```bash
+uv run python -m telemetry_collector.orrery.validation graph.orrery.json NAME...
+```
+
+The image holds Node 24.21.0, copied from the official image by digest, and the
+validator installed with `npm ci`. npm is not in the image. CI checks the built
+image with `tools/check-worker-image.sh`, which runs the validator inside it on
+a projected document and on one Orrery refuses. Nothing in the service or the
+worker validates documents yet; the collector's Orrery worker will.
+
+To move to another Orrery version, change the version in
+`orrery-validator/package.json`, run `npm install --prefix orrery-validator
+--package-lock-only --ignore-scripts`, and update `ORRERY_VERSION` in
+`tests/test_orrery_validation.py`.
+
+## Calibration tree package
+
+`packages/calibration-tree` is the calibration tree package: the TypeScript
+tree builder, its schema-6 types and readers, the release and staging readers
+it builds from, and the GitHub Actions publisher that calibration-diagnostics
+runs today. It was copied from calibration-diagnostics'
+`frontend/packages/calibration-tree` and is published to npm as
+`@policyengine/calibration-tree`, so the dashboard can import it from npm
+instead of keeping its own copy. Until the dashboard does, calibration-diagnostics
+keeps its copy, and its GitHub Actions workflow still publishes the production
+trees with it.
+
+The package ships TypeScript source; Bun runs it directly and Next.js
+compiles it through `transpilePackages`. Its own
+[README](packages/calibration-tree/README.md) describes how to import it.
+
+### The tree worker
+
+`src/calibration-tree-worker.ts` builds one release's or one staged run's
+tree from local files and writes its gzip parts to a directory, as its own Bun
+process, and `src/calibration-tree-publication.ts` uploads those parts and adds
+the build to the manifest:
+
+```bash
+cd packages/calibration-tree
+bun run src/calibration-tree-worker.ts REQUEST.json OUTPUT_DIRECTORY
+CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN=... \
+  bun run src/calibration-tree-publication.ts PUBLICATION.json
+```
+
+The worker builds a release exactly as the publisher builds it from the same
+files, commit and publication time, and a staged run as the publisher builds a
+staging tree, from the files it is given. It prints the manifest entry the
+publisher would record. The publication command uploads each part to its
+immutable path (keeping a part already stored with the same bytes), then
+writes the manifest with a compare-and-swap: it creates the manifest only if
+it is still absent and replaces it only if its ETag is still the one read, so
+a manifest another writer changed is never overwritten. Exit 2 means the
+manifest refuses the entry, for example because another build is already
+recorded for the same release build or staged run.
+
+### Building trees from submissions
+
+The worker job builds a calibration tree from each `calibration-diagnostics`
+submission (`telemetry_collector/calibration_trees.py`) where it has
+`COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN`, the read-write token of its
+environment's own Vercel Blob store, which the deploy mounts on the worker job
+only, from the secret `TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME` names.
+Each environment has its own store, which nothing reads until the dashboard
+switches to it, and its own secret, which only its worker service account may
+read. Without the token, submissions stay in intake storage and can be
+reprocessed later. Nothing here
+reads Hugging Face: every value comes from the submission.
+
+- **Which tree.** A build folder, `releases/<release>/<build>`, gives a release
+  tree whose release ID is `<release>/<build>`; its `release` and `build_id`
+  must name the same release and build. A staged bundle, `staged/<run_id>`,
+  gives a staging tree of that run, labelled with the submission's `release`
+  (the candidate release) or, when that is null, the run ID; its `run_id`
+  must be the folder's. Files must come from the country's release repo, or,
+  for a staged bundle, its staging repo. Contradicting provenance and other
+  repos reject the submission. Other folders, and countries the collector
+  does not list, stay in intake storage with the reason in the result.
+- **Time.** The tree records the submission's `accepted_at` as its
+  publication time, so reprocessing a submission builds the same tree.
+- **Latest.** A release build becomes its country's latest when its release
+  is the country's default release, listed in `DEFAULT_RELEASES`: the UK's is
+  `microcosm-uk-2024-25-national`; the US's is added once its stable releases
+  are agreed. Builds of other releases are recorded without moving the latest.
+- **How.** Each attempt downloads the files into a new temporary directory
+  and runs the tree worker with only `PATH`, `LANG` and the package's size
+  limits (`CALIBRATION_TREE_MAX_RAW_BYTES`, `CALIBRATION_TREE_MAX_GZIP_BYTES`)
+  in its environment, never the Blob token. It then runs the publication
+  command, with the token, inside a Postgres transaction lock
+  (`pg_advisory_xact_lock`), so the collector's writers change the manifest
+  one at a time.
+- **Results.** A published tree's result names its build ID, kind, how many
+  parts were uploaded or already stored, and whether it became the latest.
+  The worker refusing the files (`calibration_tree_unbuildable`) or the
+  manifest refusing the entry (`calibration_tree_refused`) rejects the
+  submission; any other failure, including a manifest another writer changed
+  meanwhile, fails the attempt so it runs again.
+
+The image holds Bun 1.4.2, copied from the official image by digest, and the
+package's production install, without its tests, fixtures and test support.
+CI checks the built image with `tools/check-calibration-tree-image.sh`, which
+builds a small staged run's tree inside it and runs the publication command
+without a token, which must refuse to run.
+
+### Tests
+
+The "Calibration tree package" job in `.github/workflows/pr.yaml` runs the
+package's Bun tests and its typecheck on every pull request, with Bun 1.4.2.
+The golden tests rebuild recorded US, UK and Belgian releases, staging runs
+and comparisons, and require every part's raw JSON and deflate stream to match
+`src/fixtures/calibration-tree-golden.json`, which calibration-diagnostics'
+builder recorded. The worker's tests run it as a separate process on the
+recorded releases and require the same bytes on disk.
+
+```bash
+cd packages/calibration-tree
+bun install --frozen-lockfile
+bun test src/calibration-tree-worker.test.ts
+bun run typecheck
+```
+
+### Carrying over changes from calibration-diagnostics
+
+`packages/calibration-tree/provenance.json` records the calibration-diagnostics
+commit the package was copied from, each copied file's git blob ID, the copied
+files changed here and why (only `package.json`), and the files that exist only
+here. `src/provenance.test.ts` fails when a copied file no longer has its
+recorded blob ID, when a file is neither copied nor listed as the collector's
+own, or when a file listed as changed is identical to the dashboard's.
+
+While calibration-diagnostics keeps its copy, a change merged there is carried
+over by copying the changed files from a calibration-diagnostics commit,
+keeping this repo's changes to `package.json`, and recording that commit and
+the new blob IDs, which git lists with:
+
+```bash
+git -C ../calibration-diagnostics ls-tree -r \
+  --format='%(objectname) %(path)' COMMIT -- frontend/packages/calibration-tree
+```
+
+Once the dashboard imports the published package and removes its copy, this
+copy is the only one, and the package is changed here.
+
+### Publishing to npm
+
+`.github/workflows/publish-calibration-tree.yaml` publishes the package when a
+push to `main` changes `packages/calibration-tree` and npm does not have its
+`package.json` version yet. To release a change, raise `version` in the same
+pull request; a change without a new version publishes nothing. The
+workflow's first job tests and typechecks the package. Its second job, the
+only one that can request a GitHub OIDC token, installs nothing: it checks
+that Node and npm are the pinned versions (`tools/check-npm-toolchain.sh`),
+then runs `tools/publish-calibration-tree.sh`, which asks npm for the version
+and publishes only if npm does not have it. It publishes under npm's default
+`latest` tag, which npm refuses for a prerelease version or one lower than the
+latest, so a release raises the version to a new highest one. One run goes at
+a time, so versions merged one after another publish in that order. The
+workflow can be run again by hand from `main` (`workflow_dispatch`) to retry a
+failed publication.
+
+The workflow uses npm's trusted publishing: npm accepts the publish job's
+GitHub OIDC token in place of a stored npm token, and adds provenance because
+this repo is public. npm does not check the branch, so the `npm` environment's
+rule is what keeps other branches out. Nothing is published until the repo
+variable `CALIBRATION_TREE_NPM_PUBLISH_ENABLED` is `true`, which needs this
+one-time setup first, in this order:
+
+1. **The first version, by hand.** npm can only trust a workflow for a package
+   that exists, so a member of the `policyengine` npm organization publishes
+   the first version from a clean checkout of the `main` commit that added the
+   package: `bun install --frozen-lockfile`, then `npm pack --dry-run` to check
+   the file list, then `npm publish --access public` in
+   `packages/calibration-tree`.
+2. **The environment.** In this repo's settings, create the `npm` environment
+   and allow deployments from `main` only, so a run from any other branch
+   cannot obtain npm's trust. Create it before the trusted publisher: GitHub
+   creates a missing environment, without that rule, when a job first names
+   it.
+3. **The trusted publisher.** In the package's settings on npmjs.com, add a
+   GitHub Actions trusted publisher: organization `PolicyEngine`, repo
+   `microcosm-collector`, workflow `publish-calibration-tree.yaml`,
+   environment `npm`. A new trusted publisher expires unless a publication
+   through it succeeds within two days, so add it when a pull request that
+   raises the version is ready to merge, and merge that pull request after
+   step 4. An expired one is deleted and added again.
+4. **The switch.** Set the repo variable
+   `CALIBRATION_TREE_NPM_PUBLISH_ENABLED` to `true`.
 
 ## Hugging Face read access
 
@@ -464,9 +695,10 @@ one image identified by the commit SHA. It first applies the migration to the
 persistent staging PostgreSQL database, verifies both the Alembic revision and
 the complete SQLAlchemy metadata, and deploys the staging collector. Production receives that exact image only when the staging sequence
 succeeds. Before either environment changes, deployment checks only that the
-environment's five secrets exist (the runtime database URL, the migration
-database URL, the JWT signing secret, the dashboard's read token and the
-Hugging Face read token), and that its worker and recovery jobs exist and
+environment's six secrets exist (the runtime database URL, the migration
+database URL, the JWT signing secret, the dashboard's read token, the
+Hugging Face read token and the calibration tree Blob token), and that its
+worker and recovery jobs exist and
 belong to that environment (see "Worker jobs and recovery"). It does not
 access the secrets' payloads or test their values. The
 previous HF authentication and write/read deployment qualification is removed.
@@ -539,7 +771,9 @@ The deployment's access and configuration are provisioned:
 - For intake, each environment also holds the seven `TELEMETRY_*` variables
   for its bucket, queue, jobs and the service accounts that run them, and
   `TELEMETRY_HF_READ_SECRET_NAME` for its own Hugging Face read token's
-  secret (see "Artifact intake").
+  secret (see "Artifact intake"), and
+  `TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME` for its own calibration tree
+  Blob store's token's secret (see "Building trees from submissions").
   `scripts/deploy.sh require-configuration` names any that is missing, and
   the deployment stops before it authenticates.
 

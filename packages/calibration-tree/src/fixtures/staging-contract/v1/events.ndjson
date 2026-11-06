@@ -1,0 +1,3 @@
+{"time": "2026-01-01T00:00:01+00:00", "type": "stage", "status": "running", "stage": "created", "message": "Staging run created.", "details": {}}
+{"time": "2026-01-01T00:00:02+00:00", "type": "stage", "status": "running", "stage": "calibrating", "message": "Calibration started.", "details": {"n_targets": 2}}
+{"time": "2026-01-01T00:00:05+00:00", "type": "stage", "status": "passed", "stage": "complete", "message": "Staging run completed.", "details": {}}

@@ -1,5 +1,6 @@
 """The collector validates every change and deploys only once deployment is enabled."""
 
+import json
 import re
 from pathlib import Path
 
@@ -23,6 +24,10 @@ WORKLOAD_IDENTITY_SECRETS = {
     "TELEMETRY_GCP_WIF_PROVIDER",
     "TELEMETRY_GCP_DEPLOY_SERVICE_ACCOUNT",
 }
+# npm's trusted publishing takes this job's GitHub OIDC token; it never
+# authenticates to Google Cloud (tests/test_calibration_tree_package.py).
+NPM_PUBLISH_JOB = ("publish-calibration-tree.yaml", "publish")
+CALIBRATION_TREE_PACKAGE = Path("packages") / "calibration-tree"
 
 
 def load_workflow(workflow_path: Path) -> dict:
@@ -32,6 +37,19 @@ def load_workflow(workflow_path: Path) -> dict:
 
 def workflow_paths() -> list[Path]:
     return sorted(WORKFLOWS.glob("*.y*ml"))
+
+
+def copied_unchanged_package_files() -> set[Path]:
+    provenance = json.loads(
+        (ROOT / CALIBRATION_TREE_PACKAGE / "provenance.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    return {
+        ROOT / CALIBRATION_TREE_PACKAGE / copied_file
+        for copied_file in provenance["files"]
+        if copied_file not in provenance["changed"]
+    }
 
 
 def authenticates_to_google_cloud(job: dict) -> bool:
@@ -65,7 +83,9 @@ def test_deployment_runs_only_when_collector_deploy_is_enabled() -> None:
         assert jobs[job_name]["if"] == DEPLOY_CONDITION, job_name
     for workflow_path in workflow_paths():
         for job_name, job in load_workflow(workflow_path)["jobs"].items():
-            if "environment" in job:
+            if "environment" in job and (workflow_path.name, job_name) != (
+                NPM_PUBLISH_JOB
+            ):
                 assert job_name in DEPLOY_JOBS, (workflow_path.name, job_name)
 
 
@@ -76,6 +96,7 @@ def test_google_cloud_authentication_runs_only_on_pushes_to_main() -> None:
         for workflow in [load_workflow(workflow_path)]
         for job_name, job in workflow["jobs"].items()
         if authenticates_to_google_cloud(job)
+        and (workflow_path.name, job_name) != NPM_PUBLISH_JOB
     }
 
     # Only the release pass of push.yaml reaches these jobs, and pull requests,
@@ -113,7 +134,10 @@ def test_only_deployment_jobs_hold_oidc_tokens_and_workload_identity_secrets() -
             if job.get("permissions", {}).get("id-token") == "write"
         }
         expected_jobs = DEPLOY_JOBS if workflow_path == PUSH_WORKFLOW else set()
+        if workflow_path.name == NPM_PUBLISH_JOB[0]:
+            expected_jobs = {NPM_PUBLISH_JOB[1]}
         assert oidc_jobs == expected_jobs, workflow_path.name
+    assert NPM_PUBLISH_JOB[0] in {path.name for path in workflow_paths()}
 
     jobs = load_workflow(PUSH_WORKFLOW)["jobs"]
     for job_name in DEPLOY_JOBS:
@@ -133,9 +157,14 @@ def test_pull_requests_report_one_required_check() -> None:
     required = jobs["required"]
     assert required["name"] == "Required checks"
     assert required["if"] == "always()"
-    assert set(required["needs"]) == {"lint-workflows", "changelog", "verify"}
+    assert set(required["needs"]) == {
+        "lint-workflows",
+        "changelog",
+        "verify",
+        "calibration-tree",
+    }
     assert required["steps"][-1]["run"] == (
-        'test "$RESULTS" = "success success success"'
+        'test "$RESULTS" = "success success success success"'
     )
 
 
@@ -253,6 +282,18 @@ def test_both_deploy_jobs_read_their_hugging_face_read_token_secret_name() -> No
     assert PUSH_WORKFLOW.read_text(encoding="utf-8").count(mapping) == 2
 
 
+def test_both_deploy_jobs_read_their_calibration_tree_blob_secret_name() -> None:
+    jobs = load_workflow(PUSH_WORKFLOW)["jobs"]
+    mapping = "${{ vars.TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME }}"
+
+    # Each environment names its own store's token, which only its worker reads.
+    for job_name in DEPLOY_JOBS:
+        assert (
+            jobs[job_name]["env"].get("CALIBRATION_TREE_BLOB_SECRET_NAME") == mapping
+        ), job_name
+    assert PUSH_WORKFLOW.read_text(encoding="utf-8").count(mapping) == 2
+
+
 def deploy_step(job: dict, command: str) -> dict:
     matching_steps = [
         step
@@ -310,13 +351,27 @@ def test_collector_uses_store_vocabulary() -> None:
         ".yaml",
         ".yml",
     }
-    ignored_parts = {".git", ".pytest_cache", ".ruff_cache", ".venv", "__pycache__"}
+    # node_modules holds installed npm packages, such as the Orrery validator's.
+    ignored_parts = {
+        ".git",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".venv",
+        "__pycache__",
+        "node_modules",
+    }
+    # Files of the calibration tree package that provenance.json records as
+    # copied unchanged from calibration-diagnostics keep that repo's words:
+    # src/provenance.test.ts requires their recorded blob IDs, and a fixture
+    # generator writes the word as a key of the fixture it reproduces.
+    copied_unchanged = copied_unchanged_package_files()
     source_files = [
         source_path
         for source_path in ROOT.rglob("*")
         if source_path.is_file()
         and source_path.suffix in source_suffixes
         and not ignored_parts.intersection(source_path.relative_to(ROOT).parts)
+        and source_path not in copied_unchanged
     ]
 
     def own_words(source_path: Path) -> str:
@@ -333,6 +388,7 @@ def test_collector_uses_store_vocabulary() -> None:
     ]
 
     assert WORKFLOWS / "push.yaml" in source_files
+    assert ROOT / CALIBRATION_TREE_PACKAGE / "README.md" in source_files
     assert matches == []
 
 

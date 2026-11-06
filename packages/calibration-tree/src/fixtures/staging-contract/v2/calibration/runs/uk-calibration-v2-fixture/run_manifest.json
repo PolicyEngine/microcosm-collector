@@ -1,0 +1,41 @@
+{
+  "artifacts": [],
+  "candidate_id": "uk-calibration-candidate",
+  "country_code": "GB",
+  "current_stage": "complete",
+  "delivery": {
+    "configured_repository": null,
+    "contract_version": 2,
+    "enabled": true,
+    "last_error_code": null,
+    "mode": "local_only",
+    "opt_out_reason": null,
+    "read_back": "not_requested",
+    "run_id": "uk-calibration-v2-fixture",
+    "upload_attempts": 0,
+    "upload_successes": 0
+  },
+  "failure": null,
+  "non_release": false,
+  "operation_id": "uk_national_calibration",
+  "paths": {
+    "calibration_progress": "runs/uk-calibration-v2-fixture/calibration_progress.json",
+    "events": "runs/uk-calibration-v2-fixture/events.ndjson",
+    "progress": "runs/uk-calibration-v2-fixture/progress.json"
+  },
+  "pipeline": {
+    "id": "uk_national_calibration",
+    "version": "2026.09"
+  },
+  "release_id": "populace-uk-2023-v2-fixture",
+  "run_id": "uk-calibration-v2-fixture",
+  "run_kind": "calibration",
+  "sample": {
+    "mode": "full"
+  },
+  "schema_name": "microcosm.staging.run-manifest",
+  "schema_version": 2,
+  "started_at": "2026-01-03T00:00:00+00:00",
+  "status": "completed",
+  "updated_at": "2026-01-03T00:00:04+00:00"
+}

@@ -34,6 +34,9 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 88
 target-version = "py313"
+# The calibration tree package's fixture generators are copied unchanged from
+# calibration-diagnostics, so they keep its formatting.
+extend-exclude = ["packages/calibration-tree/src/fixtures"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP", "B"]

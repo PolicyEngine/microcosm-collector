@@ -44,6 +44,7 @@ require_configuration() {
     WORKER_INVOKER_SERVICE_ACCOUNT
     RECOVERY_SERVICE_ACCOUNT
     HF_READ_SECRET_NAME
+    CALIBRATION_TREE_BLOB_SECRET_NAME
   )
 
   require_variables "${names[@]}"
@@ -199,7 +200,7 @@ minimum_instances() {
 check_secrets_exist() {
   require_variables \
     PROJECT_ID DATABASE_SECRET_NAME MIGRATION_DATABASE_SECRET_NAME \
-    JWT_SECRET_NAME READ_SECRET_NAME
+    JWT_SECRET_NAME READ_SECRET_NAME CALIBRATION_TREE_BLOB_SECRET_NAME
 
   local huggingface_secret
   huggingface_secret="$(worker_huggingface_secret)" || return 1
@@ -209,7 +210,8 @@ check_secrets_exist() {
     "$MIGRATION_DATABASE_SECRET_NAME" \
     "$JWT_SECRET_NAME" \
     "$READ_SECRET_NAME" \
-    "$huggingface_secret"
+    "$huggingface_secret" \
+    "$CALIBRATION_TREE_BLOB_SECRET_NAME"
 }
 
 # The worker and recovery jobs, and who may run them, are created by hand; a
@@ -321,8 +323,9 @@ configure_migration_job() {
 # Task that sets COLLECTOR_WORKER_JOB_ID. Two task retries give the three
 # attempts the worker counts (MAX_JOB_ATTEMPTS), each within the worker's
 # one-hour task timeout (WORKER_TASK_TIMEOUT_SECONDS). --set-secrets replaces
-# every mount, so it lists the database and the environment's Hugging Face
-# read token together. `update` never creates a job: the job and the
+# every mount, so it lists the database, the environment's Hugging Face read
+# token and its calibration tree Blob store's read-write token together. Only
+# the worker job mounts the Blob token. `update` never creates a job: the job and the
 # invoker's permission to run it are created by hand.
 configure_worker_job() {
   require_variables \
@@ -338,8 +341,10 @@ configure_worker_job() {
 
   local huggingface_secret
   huggingface_secret="$(worker_huggingface_secret)" || return 1
+  require_variables CALIBRATION_TREE_BLOB_SECRET_NAME || return 1
   local secrets="DATABASE_URL=${DATABASE_SECRET_NAME}:latest"
   secrets+=",COLLECTOR_HF_READ_TOKEN=${huggingface_secret}:latest"
+  secrets+=",COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN=${CALIBRATION_TREE_BLOB_SECRET_NAME}:latest"
 
   gcloud run jobs update "$WORKER_JOB" \
     --project "$PROJECT_ID" \
