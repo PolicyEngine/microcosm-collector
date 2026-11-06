@@ -98,12 +98,11 @@ checked and kept.
 Intake is off unless `COLLECTOR_INTAKE_ENABLED` is exactly `1`. While it is
 off, the collector reads no other intake setting, and the token exchange for
 `{"scope": "artifacts:submit"}` and every `/v1/submissions` path answer 404 with
-the code `intake_not_enabled`. `scripts/deploy.sh` sets none of these
-variables, so a deployment leaves intake off. It still changes three things:
-the migration job applies `0002_artifact_intake`, which adds the two intake
-tables; token responses gain `scope`; and the token exchange, which used to
-ignore its request body, now answers 422 for unknown fields and 404
-`intake_not_enabled` for `{"scope": "artifacts:submit"}`.
+the code `intake_not_enabled`. `scripts/deploy.sh` switches intake on in both
+environments: it sets `COLLECTOR_INTAKE_ENABLED=1` and the other intake
+settings on both service revisions, and updates both intake jobs (see "Worker
+jobs and recovery"). Switching an environment's intake off past its next
+release therefore takes a change to `scripts/deploy.sh`.
 
 Once `0002_artifact_intake` is applied, an image without it cannot run against
 the database. That includes every earlier collector release and the old copy in
@@ -115,19 +114,33 @@ every submission and job in them. Run it with this release's code, for
 example as its migration job with overridden arguments, and as the migration
 database user, before deploying the older image: the older code can't find
 the revision either, and the runtime user doesn't own the tables. That is an
-exception to the rule below that downgrades are for disposable test databases;
-while intake is off, both tables stay empty.
+exception to the rule below that downgrades are for disposable test databases.
+Both tables stay empty only while an environment's intake has never been
+switched on. In an environment whose intake is or was on, the downgrade
+deletes the record of every submission and job; the files stay in the
+bucket.
 
-| Setting | Read by | Value |
-|---|---|---|
-| `COLLECTOR_INTAKE_ENABLED` | service | `1` switches intake on |
-| `COLLECTOR_INTAKE_BUCKET` | service, worker | the private intake bucket's name |
-| `COLLECTOR_INTAKE_SIGNING_SERVICE_ACCOUNT` | service | the runtime service account, which signs upload URLs through IAM `signBlob` |
-| `COLLECTOR_WORKER_QUEUE` | service, operations | `projects/<project>/locations/<region>/queues/<queue>` |
-| `COLLECTOR_WORKER_JOB` | service, operations | `projects/<project>/locations/<region>/jobs/<job>` |
-| `COLLECTOR_WORKER_INVOKER_SERVICE_ACCOUNT` | service, operations | the account whose OAuth token each Cloud Task uses to run the worker job |
-| `COLLECTOR_WORKER_JOB_ID` | worker | set on each execution by its Cloud Task |
-| `DATABASE_URL` | worker, operations | the runtime database secret, as for the service |
+| Setting | Read by | Value | The deploy sets it from |
+|---|---|---|---|
+| `COLLECTOR_INTAKE_ENABLED` | service | `1` switches intake on | always `1` |
+| `COLLECTOR_INTAKE_BUCKET` | service, worker | the private intake bucket's name | `TELEMETRY_INTAKE_BUCKET` |
+| `COLLECTOR_INTAKE_SIGNING_SERVICE_ACCOUNT` | service | the runtime service account, which signs upload URLs through IAM `signBlob` | `TELEMETRY_RUNTIME_SERVICE_ACCOUNT` |
+| `COLLECTOR_WORKER_QUEUE` | service, operations | `projects/<project>/locations/<region>/queues/<queue>` | `TELEMETRY_WORKER_QUEUE`, the queue's name, in the deployment's project and region |
+| `COLLECTOR_WORKER_JOB` | service, operations | `projects/<project>/locations/<region>/jobs/<job>` | `TELEMETRY_WORKER_JOB`, the worker job's name, likewise |
+| `COLLECTOR_WORKER_INVOKER_SERVICE_ACCOUNT` | service, operations | the account whose OAuth token each Cloud Task uses to run the worker job | `TELEMETRY_WORKER_INVOKER_SERVICE_ACCOUNT` |
+| `COLLECTOR_WORKER_JOB_ID` | worker | set on each execution by its Cloud Task | not set by the deploy |
+| `DATABASE_URL` | worker, operations | the runtime database secret, as for the service | `TELEMETRY_DATABASE_SECRET_NAME` |
+
+The `TELEMETRY_*` names are GitHub `staging` and `production` environment
+variables, which `.github/workflows/push.yaml` passes to `scripts/deploy.sh`.
+The deploy also reads these, to update the two jobs:
+
+| Variable | Value |
+|---|---|
+| `TELEMETRY_RECOVERY_JOB` | the recovery job's name |
+| `TELEMETRY_WORKER_SERVICE_ACCOUNT` | the worker job's service account |
+| `TELEMETRY_RECOVERY_SERVICE_ACCOUNT` | the recovery job's service account |
+| `TELEMETRY_HF_READ_SECRET_NAME` | the environment's own Hugging Face read token's secret, mounted on the worker job (see "Hugging Face read access") |
 
 The two service-account settings accept only user-managed accounts,
 `<name>@<project>.iam.gserviceaccount.com`. The collector refuses to start
@@ -209,20 +222,18 @@ identity column needs no sequence privilege to insert rows.
   or locally through the Cloud SQL Auth Proxy with Application Default
   Credentials that may enqueue on the queue and act as the invoker account.
 
-None of these values is secret. Switching intake on for an environment needs,
-in that environment's project and region:
+None of these values is secret. Intake needs, in each environment's project
+and region, these resources, created by hand (both environments have them):
 
 - **A bucket** with uniform bucket-level access, public access prevention
   enforced, and no lifecycle deletion, so intake files stay available for
   back-building.
 - **A Cloud Tasks queue** for worker jobs.
-- **The worker Cloud Run Job** described above, running the released image
-  with the worker command, with the runtime database secret as `DATABASE_URL`,
-  the Cloud SQL connection and `COLLECTOR_INTAKE_BUCKET`.
-- **The recovery Cloud Run Job** on the same image with the recovery command,
-  the runtime database secret as `DATABASE_URL`, the Cloud SQL connection and
-  the three `COLLECTOR_WORKER_*` queue settings, and a Cloud Scheduler job that
-  runs it every 10 minutes.
+- **The worker Cloud Run Job** described above and **the recovery Cloud Run
+  Job**, and a Cloud Scheduler job that runs the recovery job every 10
+  minutes. The deploy updates both jobs but never creates one, so each must
+  exist, with the permissions below, before the release that first deploys
+  to its environment.
 - **Database access:** after the migration, the runtime database user has
   `SELECT`, `INSERT`, `UPDATE` and `DELETE` on `artifact_submissions` and
   `artifact_jobs`, through the migration user's default privileges, which
@@ -232,13 +243,48 @@ in that environment's project and region:
   itself), enqueue on the queue, and act as the invoker account; the invoker
   account may run the worker job with overrides; the worker's service account
   may read the bucket, connect to Cloud SQL and read the runtime database
-  secret; the recovery job's service account may connect to Cloud SQL, read the
-  runtime database secret, enqueue on the queue and act as the invoker
-  account; Cloud Scheduler's account may run the recovery job.
-- **Deployment wiring:** `scripts/deploy.sh` passing the settings to the
-  service and updating both jobs' images on every release, from new `staging`
-  and `production` environment variables. That change is the one that
-  switches intake on.
+  secret and its environment's Hugging Face read token's secret; the recovery
+  job's service account may connect to Cloud SQL, read the runtime database
+  secret, enqueue on the queue and act as the invoker account; Cloud
+  Scheduler's account may run the recovery job; and the deployment service
+  account may update both jobs and act as the worker and recovery accounts.
+
+Each release, in each environment, `scripts/deploy.sh`:
+
+1. checks, before it changes anything:
+   - that every intake name has the shape the collector accepts
+     (`require-configuration`, before it authenticates), so a malformed name
+     stops the deploy before a revision or job that reads it fails to start;
+   - that each job exists, already runs as the service account the deploy
+     gives it, and connects to the environment's own Cloud SQL instance
+     (`check-intake-jobs`), so a variable naming the other environment's job
+     stops the deploy. To move a job to another account, update the job by
+     hand first;
+   - that the environment's Hugging Face read token's secret exists
+     (`check-secrets-exist`);
+2. passes the intake settings in the first table to the maintenance and
+   candidate revisions;
+3. after the migration and before the candidate revision, updates the worker
+   job (`configure-worker-job`) and then the recovery job
+   (`configure-recovery-job`) to the released image, with their whole
+   configuration: service account, Cloud SQL connection, secrets, settings,
+   command, task count, retries, task timeout, CPU and memory. Each update
+   sets the job's secrets with `--set-secrets`, which replaces every mount,
+   so the worker job's lists `DATABASE_URL` and `COLLECTOR_HF_READ_TOKEN`
+   together. The deploy changes neither the
+   schedule nor any job's permissions.
+
+Maintenance mode holds only the service. An execution of either job keeps the
+image it started with, for all its attempts: a worker execution that is
+running during a migration (up to three attempts of an hour each), or one that
+a scheduled recovery run or a Cloud Tasks retry starts before the job is
+updated, runs the previous release's code against the migrated schema. A
+migration that changes the intake tables must therefore keep working with the
+previous release's worker and recovery code.
+
+Each dispatch is a `jobs.run` call that returns once the execution is created,
+so the queue's limit on concurrent dispatches does not limit how many worker
+executions run at once.
 
 ## Local development
 
@@ -316,8 +362,10 @@ this copy is the only one, and changes to the projection are made here.
 Only the collector's worker jobs read Hugging Face, for backfills, old
 releases and back-building. The service itself holds no Hugging Face
 credential: a build's own token reaches it only at the token exchange, and is
-never stored. The worker jobs read with one purpose-specific, fine-grained
-read token, never a generic `HF_TOKEN`:
+never stored. The worker jobs read with a purpose-specific, fine-grained
+read token, never a generic `HF_TOKEN`. Staging and production each have
+their own token, with the same scope, so either can be replaced or revoked
+without the other:
 
 | Setting | Read by | Provider |
 |---|---|---|
@@ -341,23 +389,29 @@ The datasets the worker jobs read are listed once, in `HUGGINGFACE_DATASETS`:
 | `policyengine/populace-us-staging` | US staging builds and run files | yes |
 | `policyengine/populace-uk-staging` | UK staging builds and run files | yes |
 
-Setting up the token is a manual step, repeated whenever a dataset is added
-here:
+Setting up each environment's token is a manual step, repeated whenever a
+dataset is added here:
 
 1. **Token:** a fine-grained Hugging Face token whose only permission is
    "Read access to contents of selected repos", for every dataset in the
    token's scope above. It has no write, organization, inference or webhook
    permission.
-2. **Secret:** the token is the latest version of one Secret Manager secret in
-   the collector's Google Cloud project. It is never copied into GitHub.
-3. **Access:** only the collector's worker service account may read the
-   secret's value, through `roles/secretmanager.secretAccessor` on that secret
-   alone.
-4. **Mount:** each worker job that reads Hugging Face mounts the secret as
-   `COLLECTOR_HF_READ_TOKEN`, for example with
+2. **Secret:** the token is the latest version of the environment's own
+   Secret Manager secret in the collector's Google Cloud project. It is
+   never copied into GitHub.
+3. **Access:** only the environment's worker service account may read the
+   secret's value, through `roles/secretmanager.secretAccessor` on that
+   secret alone; the other environment's worker cannot read it.
+4. **Mount:** each environment's worker job mounts its secret as
+   `COLLECTOR_HF_READ_TOKEN`. Each release's deploy sets it in both
+   environments (`scripts/deploy.sh configure-worker-job`), naming the secret
+   from the environment variable `TELEMETRY_HF_READ_SECRET_NAME`, and first
+   checks that the secret exists. Any other job that reads Hugging Face
+   mounts it too, for example with
    `gcloud run jobs update JOB --update-secrets COLLECTOR_HF_READ_TOKEN=SECRET:latest`.
    A command that sets a job's secrets with `--set-secrets` replaces all of
-   its mounts, so any such command for these jobs must list this one too.
+   its mounts, so any such command for these jobs must list this one too, as
+   the deploy's does.
 
 ## Releases
 
@@ -409,9 +463,12 @@ is enabled, it then authenticates to Google Cloud with GitHub OIDC and pushes
 one image identified by the commit SHA. It first applies the migration to the
 persistent staging PostgreSQL database, verifies both the Alembic revision and
 the complete SQLAlchemy metadata, and deploys the staging collector. Production receives that exact image only when the staging sequence
-succeeds. Before either environment changes, deployment checks only that its
-runtime database, migration database, JWT signing, and read-token secret
-resources exist. It does not access their payloads or test their values. The
+succeeds. Before either environment changes, deployment checks only that the
+environment's five secrets exist (the runtime database URL, the migration
+database URL, the JWT signing secret, the dashboard's read token and the
+Hugging Face read token), and that its worker and recovery jobs exist and
+belong to that environment (see "Worker jobs and recovery"). It does not
+access the secrets' payloads or test their values. The
 previous HF authentication and write/read deployment qualification is removed.
 
 Each deployment first routes traffic to a verified maintenance revision that
@@ -474,11 +531,17 @@ The deployment's access and configuration are provisioned:
 - The `staging` and `production` environments each hold the secrets
   `TELEMETRY_GCP_WIF_PROVIDER` (this repo's provider) and
   `TELEMETRY_GCP_DEPLOY_SERVICE_ACCOUNT`, and the 15 `TELEMETRY_*` variables
-  that `.github/workflows/push.yaml` reads. They were first copied from the
-  calibration-diagnostics `staging` and `Production` environments; the project
-  move pointed each environment's project, Cloud SQL connections, service
-  accounts, provider and deployment account at the collector's project (the
-  runbook's section 14 lists them).
+  for the service and its migration that `.github/workflows/push.yaml`
+  reads. They were first copied from the calibration-diagnostics `staging`
+  and `Production` environments; the project move pointed each environment's
+  project, Cloud SQL connections, service accounts, provider and deployment
+  account at the collector's project (the runbook's section 14 lists them).
+- For intake, each environment also holds the seven `TELEMETRY_*` variables
+  for its bucket, queue, jobs and the service accounts that run them, and
+  `TELEMETRY_HF_READ_SECRET_NAME` for its own Hugging Face read token's
+  secret (see "Artifact intake").
+  `scripts/deploy.sh require-configuration` names any that is missing, and
+  the deployment stops before it authenticates.
 
 The move from calibration-diagnostics is complete:
 
