@@ -140,7 +140,7 @@ The deploy also reads these, to update the two jobs:
 | `TELEMETRY_RECOVERY_JOB` | the recovery job's name |
 | `TELEMETRY_WORKER_SERVICE_ACCOUNT` | the worker job's service account |
 | `TELEMETRY_RECOVERY_SERVICE_ACCOUNT` | the recovery job's service account |
-| `TELEMETRY_HF_READ_SECRET_NAME` | production only: the Hugging Face read token's secret, mounted on the worker job (see "Hugging Face read access") |
+| `TELEMETRY_HF_READ_SECRET_NAME` | the environment's own Hugging Face read token's secret, mounted on the worker job (see "Hugging Face read access") |
 
 The two service-account settings accept only user-managed accounts,
 `<name>@<project>.iam.gserviceaccount.com`. The collector refuses to start
@@ -243,7 +243,7 @@ and region, these resources, created by hand (both environments have them):
   itself), enqueue on the queue, and act as the invoker account; the invoker
   account may run the worker job with overrides; the worker's service account
   may read the bucket, connect to Cloud SQL and read the runtime database
-  secret, and in production the Hugging Face read token's secret; the recovery
+  secret and its environment's Hugging Face read token's secret; the recovery
   job's service account may connect to Cloud SQL, read the runtime database
   secret, enqueue on the queue and act as the invoker account; Cloud
   Scheduler's account may run the recovery job; and the deployment service
@@ -260,7 +260,7 @@ Each release, in each environment, `scripts/deploy.sh`:
      (`check-intake-jobs`), so a variable naming the other environment's job
      stops the deploy. To move a job to another account, update the job by
      hand first;
-   - in production, that the Hugging Face read token's secret exists
+   - that the environment's Hugging Face read token's secret exists
      (`check-secrets-exist`);
 2. passes the intake settings in the first table to the maintenance and
    candidate revisions;
@@ -270,8 +270,8 @@ Each release, in each environment, `scripts/deploy.sh`:
    configuration: service account, Cloud SQL connection, secrets, settings,
    command, task count, retries, task timeout, CPU and memory. Each update
    sets the job's secrets with `--set-secrets`, which replaces every mount,
-   so the worker job's lists `DATABASE_URL` and, in production,
-   `COLLECTOR_HF_READ_TOKEN` together. The deploy changes neither the
+   so the worker job's lists `DATABASE_URL` and `COLLECTOR_HF_READ_TOKEN`
+   together. The deploy changes neither the
    schedule nor any job's permissions.
 
 Maintenance mode holds only the service. An execution of either job keeps the
@@ -362,8 +362,10 @@ this copy is the only one, and changes to the projection are made here.
 Only the collector's worker jobs read Hugging Face, for backfills, old
 releases and back-building. The service itself holds no Hugging Face
 credential: a build's own token reaches it only at the token exchange, and is
-never stored. The worker jobs read with one purpose-specific, fine-grained
-read token, never a generic `HF_TOKEN`:
+never stored. The worker jobs read with a purpose-specific, fine-grained
+read token, never a generic `HF_TOKEN`. Staging and production each have
+their own token, with the same scope, so either can be replaced or revoked
+without the other:
 
 | Setting | Read by | Provider |
 |---|---|---|
@@ -387,24 +389,25 @@ The datasets the worker jobs read are listed once, in `HUGGINGFACE_DATASETS`:
 | `policyengine/populace-us-staging` | US staging builds and run files | yes |
 | `policyengine/populace-uk-staging` | UK staging builds and run files | yes |
 
-Setting up the token is a manual step, repeated whenever a dataset is added
-here:
+Setting up each environment's token is a manual step, repeated whenever a
+dataset is added here:
 
 1. **Token:** a fine-grained Hugging Face token whose only permission is
    "Read access to contents of selected repos", for every dataset in the
    token's scope above. It has no write, organization, inference or webhook
    permission.
-2. **Secret:** the token is the latest version of one Secret Manager secret in
-   the collector's Google Cloud project. It is never copied into GitHub.
-3. **Access:** only the collector's production worker service account may
-   read the secret's value, through `roles/secretmanager.secretAccessor` on
-   that secret alone.
-4. **Mount:** production's worker job mounts the secret as
-   `COLLECTOR_HF_READ_TOKEN`. Each release's production deploy sets it
-   (`scripts/deploy.sh configure-worker-job`), naming the secret from the
-   production environment variable `TELEMETRY_HF_READ_SECRET_NAME`, and first
-   checks that the secret exists. Staging's worker job mounts no token. Any
-   other job that reads Hugging Face mounts it too, for example with
+2. **Secret:** the token is the latest version of the environment's own
+   Secret Manager secret in the collector's Google Cloud project. It is
+   never copied into GitHub.
+3. **Access:** only the environment's worker service account may read the
+   secret's value, through `roles/secretmanager.secretAccessor` on that
+   secret alone; the other environment's worker cannot read it.
+4. **Mount:** each environment's worker job mounts its secret as
+   `COLLECTOR_HF_READ_TOKEN`. Each release's deploy sets it in both
+   environments (`scripts/deploy.sh configure-worker-job`), naming the secret
+   from the environment variable `TELEMETRY_HF_READ_SECRET_NAME`, and first
+   checks that the secret exists. Any other job that reads Hugging Face
+   mounts it too, for example with
    `gcloud run jobs update JOB --update-secrets COLLECTOR_HF_READ_TOKEN=SECRET:latest`.
    A command that sets a job's secrets with `--set-secrets` replaces all of
    its mounts, so any such command for these jobs must list this one too, as
@@ -462,7 +465,7 @@ persistent staging PostgreSQL database, verifies both the Alembic revision and
 the complete SQLAlchemy metadata, and deploys the staging collector. Production receives that exact image only when the staging sequence
 succeeds. Before either environment changes, deployment checks only that its
 runtime database, migration database, JWT signing, and read-token secret
-resources exist, in production also the Hugging Face read token's secret,
+resources exist, and the environment's Hugging Face read token's secret,
 and that its worker and recovery jobs exist and belong to that environment
 (see "Worker jobs and recovery"). It does not access the secrets' payloads or
 test their values. The
@@ -535,7 +538,8 @@ The deployment's access and configuration are provisioned:
   account at the collector's project (the runbook's section 14 lists them).
 - For intake, each environment also holds the seven `TELEMETRY_*` variables
   for its bucket, queue, jobs and the service accounts that run them, and
-  production holds `TELEMETRY_HF_READ_SECRET_NAME` (see "Artifact intake").
+  `TELEMETRY_HF_READ_SECRET_NAME` for its own Hugging Face read token's
+  secret (see "Artifact intake").
   `scripts/deploy.sh require-configuration` names any that is missing, and
   the deployment stops before it authenticates.
 

@@ -43,10 +43,8 @@ require_configuration() {
     WORKER_SERVICE_ACCOUNT
     WORKER_INVOKER_SERVICE_ACCOUNT
     RECOVERY_SERVICE_ACCOUNT
+    HF_READ_SECRET_NAME
   )
-  if [[ "${DEPLOYMENT_ENVIRONMENT-}" == production ]]; then
-    names+=(HF_READ_SECRET_NAME)
-  fi
 
   require_variables "${names[@]}"
   require_intake_resource_names
@@ -94,15 +92,14 @@ require_intake_resource_names() {
   return "$failed"
 }
 
-# Only production's worker job reads Hugging Face: the collector has one read
-# token, and only production's worker service account may read its secret.
-# Prints that secret's name in production and nothing in staging.
+# Each environment's worker job reads Hugging Face with that environment's
+# own read token: each token has its own secret, which only that
+# environment's worker service account may read. Prints the secret's name.
 worker_huggingface_secret() {
   require_variables DEPLOYMENT_ENVIRONMENT || return 1
 
   case "$DEPLOYMENT_ENVIRONMENT" in
-    staging) ;;
-    production)
+    staging | production)
       require_variables HF_READ_SECRET_NAME || return 1
       printf '%s\n' "$HF_READ_SECRET_NAME"
       ;;
@@ -205,18 +202,14 @@ check_secrets_exist() {
     JWT_SECRET_NAME READ_SECRET_NAME
 
   local huggingface_secret
-  local secret_names=(
-    "$DATABASE_SECRET_NAME"
-    "$MIGRATION_DATABASE_SECRET_NAME"
-    "$JWT_SECRET_NAME"
-    "$READ_SECRET_NAME"
-  )
-  huggingface_secret="$(worker_huggingface_secret)"
-  if [[ -n "$huggingface_secret" ]]; then
-    secret_names+=("$huggingface_secret")
-  fi
+  huggingface_secret="$(worker_huggingface_secret)" || return 1
 
-  bash "$(dirname "$0")/check-secrets-exist.sh" "${secret_names[@]}"
+  bash "$(dirname "$0")/check-secrets-exist.sh" \
+    "$DATABASE_SECRET_NAME" \
+    "$MIGRATION_DATABASE_SECRET_NAME" \
+    "$JWT_SECRET_NAME" \
+    "$READ_SECRET_NAME" \
+    "$huggingface_secret"
 }
 
 # The worker and recovery jobs, and who may run them, are created by hand; a
@@ -328,7 +321,7 @@ configure_migration_job() {
 # Task that sets COLLECTOR_WORKER_JOB_ID. Two task retries give the three
 # attempts the worker counts (MAX_JOB_ATTEMPTS), each within the worker's
 # one-hour task timeout (WORKER_TASK_TIMEOUT_SECONDS). --set-secrets replaces
-# every mount, so it lists the database and, in production, the Hugging Face
+# every mount, so it lists the database and the environment's Hugging Face
 # read token together. `update` never creates a job: the job and the
 # invoker's permission to run it are created by hand.
 configure_worker_job() {
@@ -344,12 +337,9 @@ configure_worker_job() {
   require_resource_name INTAKE_BUCKET "$BUCKET_NAME_PATTERN"
 
   local huggingface_secret
-  local secrets
-  huggingface_secret="$(worker_huggingface_secret)"
-  secrets="DATABASE_URL=${DATABASE_SECRET_NAME}:latest"
-  if [[ -n "$huggingface_secret" ]]; then
-    secrets+=",COLLECTOR_HF_READ_TOKEN=${huggingface_secret}:latest"
-  fi
+  huggingface_secret="$(worker_huggingface_secret)" || return 1
+  local secrets="DATABASE_URL=${DATABASE_SECRET_NAME}:latest"
+  secrets+=",COLLECTOR_HF_READ_TOKEN=${huggingface_secret}:latest"
 
   gcloud run jobs update "$WORKER_JOB" \
     --project "$PROJECT_ID" \

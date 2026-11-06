@@ -114,6 +114,9 @@ jobs:
       WORKER_SERVICE_ACCOUNT: ${{ vars.TELEMETRY_WORKER_SERVICE_ACCOUNT }}
       WORKER_INVOKER_SERVICE_ACCOUNT: ${{ vars.TELEMETRY_WORKER_INVOKER_SERVICE_ACCOUNT }}
       RECOVERY_SERVICE_ACCOUNT: ${{ vars.TELEMETRY_RECOVERY_SERVICE_ACCOUNT }}
+      # This environment's own Hugging Face read token, which only its
+      # worker job mounts and only its worker service account may read.
+      HF_READ_SECRET_NAME: ${{ vars.TELEMETRY_HF_READ_SECRET_NAME }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -237,8 +240,8 @@ jobs:
       WORKER_SERVICE_ACCOUNT: ${{ vars.TELEMETRY_WORKER_SERVICE_ACCOUNT }}
       WORKER_INVOKER_SERVICE_ACCOUNT: ${{ vars.TELEMETRY_WORKER_INVOKER_SERVICE_ACCOUNT }}
       RECOVERY_SERVICE_ACCOUNT: ${{ vars.TELEMETRY_RECOVERY_SERVICE_ACCOUNT }}
-      # Only production's worker job mounts the collector's Hugging Face read
-      # token: there is one token, readable only by production's worker.
+      # This environment's own Hugging Face read token, which only its
+      # worker job mounts and only its worker service account may read.
       HF_READ_SECRET_NAME: ${{ vars.TELEMETRY_HF_READ_SECRET_NAME }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
