@@ -22,6 +22,9 @@ WORKLOAD_IDENTITY_SECRETS = {
     "TELEMETRY_GCP_WIF_PROVIDER",
     "TELEMETRY_GCP_DEPLOY_SERVICE_ACCOUNT",
 }
+# npm's trusted publishing takes this job's GitHub OIDC token; it never
+# authenticates to Google Cloud (tests/test_calibration_tree_package.py).
+NPM_PUBLISH_JOB = ("publish-calibration-tree.yaml", "publish")
 
 
 def load_workflow(workflow_path: Path) -> dict:
@@ -64,7 +67,9 @@ def test_deployment_runs_only_when_collector_deploy_is_enabled() -> None:
         assert jobs[job_name]["if"] == DEPLOY_CONDITION, job_name
     for workflow_path in workflow_paths():
         for job_name, job in load_workflow(workflow_path)["jobs"].items():
-            if "environment" in job:
+            if "environment" in job and (workflow_path.name, job_name) != (
+                NPM_PUBLISH_JOB
+            ):
                 assert job_name in DEPLOY_JOBS, (workflow_path.name, job_name)
 
 
@@ -75,6 +80,7 @@ def test_google_cloud_authentication_runs_only_on_pushes_to_main() -> None:
         for workflow in [load_workflow(workflow_path)]
         for job_name, job in workflow["jobs"].items()
         if authenticates_to_google_cloud(job)
+        and (workflow_path.name, job_name) != NPM_PUBLISH_JOB
     }
 
     # Only the release pass of push.yaml reaches these jobs, and pull requests,
@@ -112,7 +118,10 @@ def test_only_deployment_jobs_hold_oidc_tokens_and_workload_identity_secrets() -
             if job.get("permissions", {}).get("id-token") == "write"
         }
         expected_jobs = DEPLOY_JOBS if workflow_path == PUSH_WORKFLOW else set()
+        if workflow_path.name == NPM_PUBLISH_JOB[0]:
+            expected_jobs = {NPM_PUBLISH_JOB[1]}
         assert oidc_jobs == expected_jobs, workflow_path.name
+    assert NPM_PUBLISH_JOB[0] in {path.name for path in workflow_paths()}
 
     jobs = load_workflow(PUSH_WORKFLOW)["jobs"]
     for job_name in DEPLOY_JOBS:
@@ -132,9 +141,14 @@ def test_pull_requests_report_one_required_check() -> None:
     required = jobs["required"]
     assert required["name"] == "Required checks"
     assert required["if"] == "always()"
-    assert set(required["needs"]) == {"lint-workflows", "changelog", "verify"}
+    assert set(required["needs"]) == {
+        "lint-workflows",
+        "changelog",
+        "verify",
+        "calibration-tree",
+    }
     assert required["steps"][-1]["run"] == (
-        'test "$RESULTS" = "success success success"'
+        'test "$RESULTS" = "success success success success"'
     )
 
 
