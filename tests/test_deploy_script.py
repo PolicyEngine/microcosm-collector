@@ -341,6 +341,8 @@ def revision_environment(stub_directory: Path, command_log: Path) -> dict[str, s
         "JWT_SECRET_NAME": "jwt-secret",
         "JWT_SIGNING_KEY_SECRET_NAME": "jwt-signing-key-secret",
         "READ_SECRET_NAME": "read-secret",
+        # Every revision deployment chooses its minimum instances from it.
+        "DEPLOYMENT_ENVIRONMENT": "staging",
     }
 
 
