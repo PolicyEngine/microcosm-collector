@@ -463,12 +463,12 @@ is enabled, it then authenticates to Google Cloud with GitHub OIDC and pushes
 one image identified by the commit SHA. It first applies the migration to the
 persistent staging PostgreSQL database, verifies both the Alembic revision and
 the complete SQLAlchemy metadata, and deploys the staging collector. Production receives that exact image only when the staging sequence
-succeeds. Before either environment changes, deployment checks only that its
-runtime database, migration database, JWT signing, and read-token secret
-resources exist, and the environment's Hugging Face read token's secret,
-and that its worker and recovery jobs exist and belong to that environment
-(see "Worker jobs and recovery"). It does not access the secrets' payloads or
-test their values. The
+succeeds. Before either environment changes, deployment checks only that the
+environment's five secrets exist (the runtime database URL, the migration
+database URL, the JWT signing secret, the dashboard's read token and the
+Hugging Face read token), and that its worker and recovery jobs exist and
+belong to that environment (see "Worker jobs and recovery"). It does not
+access the secrets' payloads or test their values. The
 previous HF authentication and write/read deployment qualification is removed.
 
 Each deployment first routes traffic to a verified maintenance revision that
