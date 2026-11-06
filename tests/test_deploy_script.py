@@ -26,7 +26,6 @@ INVOKER_ACCOUNT = "collector-invoker@example-project.iam.gserviceaccount.com"
 RECOVERY_ACCOUNT = "collector-recovery@example-project.iam.gserviceaccount.com"
 # What the deploy reads to configure intake, in both environments.
 DEPLOY_INTAKE_SETTINGS = {
-    "INTAKE_ENABLED": "1",
     "INTAKE_BUCKET": "intake-bucket",
     "WORKER_QUEUE": "worker-queue",
     "WORKER_JOB": "worker-job",
@@ -90,7 +89,7 @@ def test_require_configuration_lists_every_missing_variable() -> None:
         "DATABASE_SECRET_NAME MIGRATION_DATABASE_SECRET_NAME JWT_SECRET_NAME "
         "READ_SECRET_NAME DEPLOYMENT_ENVIRONMENT "
         "PRODUCTION_CLOUD_SQL_CONNECTION PRODUCTION_SERVICE "
-        "INTAKE_ENABLED INTAKE_BUCKET WORKER_QUEUE WORKER_JOB RECOVERY_JOB "
+        "INTAKE_BUCKET WORKER_QUEUE WORKER_JOB RECOVERY_JOB "
         "WORKER_SERVICE_ACCOUNT WORKER_INVOKER_SERVICE_ACCOUNT "
         "RECOVERY_SERVICE_ACCOUNT\n"
     )
@@ -149,19 +148,6 @@ def test_require_configuration_requires_the_read_token_secret_only_in_production
         "Missing telemetry deployment configuration: HF_READ_SECRET_NAME\n"
     )
     assert staging_result.returncode == 0, staging_result.stderr
-
-
-@pytest.mark.parametrize("intake_switch", ["true", "on", "2", "1 "])
-def test_require_configuration_accepts_only_0_or_1_as_the_intake_switch(
-    intake_switch: str,
-) -> None:
-    configuration = complete_configuration("staging")
-    configuration["INTAKE_ENABLED"] = intake_switch
-
-    result = run_deploy("require-configuration", environment=configuration)
-
-    assert result.returncode == 1
-    assert result.stderr == "INTAKE_ENABLED must be 0 or 1.\n"
 
 
 @pytest.mark.parametrize(
@@ -671,10 +657,10 @@ def service_deploy_environment(
     }
 
 
-def expected_service_settings(maintenance_mode: str, intake_switch: str) -> str:
+def expected_service_settings(maintenance_mode: str) -> str:
     return (
         f"<--set-env-vars> <TELEMETRY_MAINTENANCE_MODE={maintenance_mode},"
-        f"COLLECTOR_INTAKE_ENABLED={intake_switch},"
+        "COLLECTOR_INTAKE_ENABLED=1,"
         "COLLECTOR_INTAKE_BUCKET=intake-bucket,"
         f"COLLECTOR_INTAKE_SIGNING_SERVICE_ACCOUNT={RUNTIME_ACCOUNT},"
         "COLLECTOR_WORKER_QUEUE=projects/project/locations/region/queues/worker-queue,"
@@ -687,48 +673,33 @@ def expected_service_settings(maintenance_mode: str, intake_switch: str) -> str:
     ("deploy_command", "maintenance_mode"),
     [("deploy-maintenance", "1"), ("deploy-candidate", "0")],
 )
+@pytest.mark.parametrize("deployment_environment", ["staging", "production"])
 @pytest.mark.parametrize(
-    ("deployment_environment", "intake_switch"),
-    [("staging", "1"), ("staging", "0"), ("production", "1"), ("production", "0")],
+    "leftover_switch",
+    [None, "0"],
+    ids=["no switch variable", "an earlier switch variable at 0"],
 )
-def test_service_revisions_receive_the_environment_intake_settings(
+def test_service_revisions_switch_intake_on_in_every_environment(
     tmp_path: Path,
     deploy_command: str,
     maintenance_mode: str,
     deployment_environment: str,
-    intake_switch: str,
+    leftover_switch: str | None,
 ) -> None:
     command_log = tmp_path / "commands.log"
     install_command_stub(tmp_path, "gcloud", LOGGING_GCLOUD)
     environment = service_deploy_environment(
         tmp_path, command_log, deployment_environment
     )
-    environment["INTAKE_ENABLED"] = intake_switch
+    if leftover_switch is not None:
+        environment["INTAKE_ENABLED"] = leftover_switch
 
     result = run_deploy(deploy_command, environment=environment)
 
     assert result.returncode == 0, result.stderr
     command = command_log.read_text()
-    assert f" {expected_service_settings(maintenance_mode, intake_switch)} " in (
-        command
-    )
+    assert f" {expected_service_settings(maintenance_mode)} " in command
     assert command.count("<--set-env-vars>") == 1
-
-
-@pytest.mark.parametrize("deploy_command", ["deploy-maintenance", "deploy-candidate"])
-def test_service_deploy_refuses_an_intake_switch_other_than_0_or_1(
-    tmp_path: Path, deploy_command: str
-) -> None:
-    command_log = tmp_path / "commands.log"
-    install_command_stub(tmp_path, "gcloud", LOGGING_GCLOUD)
-    environment = service_deploy_environment(tmp_path, command_log, "staging")
-    environment["INTAKE_ENABLED"] = "true"
-
-    result = run_deploy(deploy_command, environment=environment)
-
-    assert result.returncode == 1
-    assert result.stderr == "INTAKE_ENABLED must be 0 or 1.\n"
-    assert not command_log.exists()
 
 
 def job_deploy_environment(
