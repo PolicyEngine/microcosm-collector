@@ -14,6 +14,7 @@ WORKFLOWS = ROOT / ".github" / "workflows"
 PULL_REQUEST_WORKFLOW = WORKFLOWS / "pr.yaml"
 PUBLISH_WORKFLOW = WORKFLOWS / "publish-calibration-tree.yaml"
 PUBLISH_SCRIPT = ROOT / "tools" / "publish-calibration-tree.sh"
+TOOLCHAIN_SCRIPT = ROOT / "tools" / "check-npm-toolchain.sh"
 PACKAGE_DIRECTORY = "packages/calibration-tree"
 PUBLISH_SWITCH = "vars.CALIBRATION_TREE_NPM_PUBLISH_ENABLED == 'true'"
 MAIN_GUARD = "github.ref == 'refs/heads/main'"
@@ -33,6 +34,14 @@ def step_commands(job: dict) -> list[str]:
 def step_using(job: dict, action: str) -> dict:
     steps = [step for step in job["steps"] if step.get("uses", "").startswith(action)]
     assert len(steps) == 1, action
+    return steps[0]
+
+
+def step_running(job: dict, command_start: str) -> dict:
+    steps = [
+        step for step in job["steps"] if step.get("run", "").startswith(command_start)
+    ]
+    assert len(steps) == 1, command_start
     return steps[0]
 
 
@@ -99,15 +108,88 @@ def test_publishing_tests_the_package_before_publishing_it() -> None:
     job = load_workflow(PUBLISH_WORKFLOW)["jobs"]["publish"]
     commands = step_commands(job)
 
-    assert commands[:3] == [
+    assert commands == [
         "bun install --frozen-lockfile",
         "bun test",
         "bun run typecheck",
+        "bash ../../tools/check-npm-toolchain.sh 24.21.0 11.19.0",
+        "bash ../../tools/publish-calibration-tree.sh",
     ]
-    # Trusted publishing needs npm 11.5.1 or later.
-    assert 'test "$(npm --version)" = "11.19.0"' in commands[3]
-    assert commands[-1] == "bash ../../tools/publish-calibration-tree.sh"
     assert job["defaults"]["run"]["working-directory"] == PACKAGE_DIRECTORY
+
+
+def test_publishing_checks_the_npm_toolchain_after_installing_node() -> None:
+    assert PUBLISH_WORKFLOW.is_file()
+    job = load_workflow(PUBLISH_WORKFLOW)["jobs"]["publish"]
+    steps = job["steps"]
+    node = step_using(job, "actions/setup-node@")
+    toolchain_check = step_running(job, "bash ../../tools/check-npm-toolchain.sh ")
+    publication = step_running(job, "bash ../../tools/publish-calibration-tree.sh")
+
+    # Trusted publishing needs npm 11.5.1 or later; Node 24.21.0 bundles 11.19.0.
+    assert toolchain_check["run"].split()[2:] == [
+        node["with"]["node-version"],
+        "11.19.0",
+    ]
+    assert steps.index(node) < steps.index(toolchain_check) < steps.index(publication)
+
+
+def run_toolchain_script(
+    tmp_path: Path, *, node_version: str, npm_version: str
+) -> subprocess.CompletedProcess[str]:
+    bin_directory = tmp_path / "bin"
+    bin_directory.mkdir()
+    for command_name, printed_version in (("node", node_version), ("npm", npm_version)):
+        fake_command = bin_directory / command_name
+        fake_command.write_text(
+            "#!/usr/bin/env bash\n"
+            '[[ "$*" == --version ]] || exit 3\n'
+            f"echo {printed_version}\n"
+        )
+        fake_command.chmod(0o755)
+    return subprocess.run(
+        ["bash", str(TOOLCHAIN_SCRIPT), "24.21.0", "11.19.0"],
+        env={"PATH": f"{bin_directory}{os.pathsep}{os.environ['PATH']}"},
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+
+def test_toolchain_check_accepts_the_pinned_node_and_npm(tmp_path: Path) -> None:
+    assert TOOLCHAIN_SCRIPT.is_file()
+
+    result = run_toolchain_script(
+        tmp_path, node_version="v24.21.0", npm_version="11.19.0"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "v24.21.0" in result.stdout
+    assert "11.19.0" in result.stdout
+
+
+def test_toolchain_check_refuses_another_node(tmp_path: Path) -> None:
+    assert TOOLCHAIN_SCRIPT.is_file()
+
+    result = run_toolchain_script(
+        tmp_path, node_version="v24.20.0", npm_version="11.19.0"
+    )
+
+    assert result.returncode == 1
+    assert "v24.21.0" in result.stderr
+    assert "v24.20.0" in result.stderr
+
+
+def test_toolchain_check_refuses_another_npm(tmp_path: Path) -> None:
+    assert TOOLCHAIN_SCRIPT.is_file()
+
+    result = run_toolchain_script(
+        tmp_path, node_version="v24.21.0", npm_version="11.4.2"
+    )
+
+    assert result.returncode == 1
+    assert "11.19.0" in result.stderr
+    assert "11.4.2" in result.stderr
 
 
 def run_publish_script(

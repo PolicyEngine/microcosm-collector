@@ -1,5 +1,6 @@
 """The collector validates every change and deploys only once deployment is enabled."""
 
+import json
 import re
 from pathlib import Path
 
@@ -25,6 +26,7 @@ WORKLOAD_IDENTITY_SECRETS = {
 # npm's trusted publishing takes this job's GitHub OIDC token; it never
 # authenticates to Google Cloud (tests/test_calibration_tree_package.py).
 NPM_PUBLISH_JOB = ("publish-calibration-tree.yaml", "publish")
+CALIBRATION_TREE_PACKAGE = Path("packages") / "calibration-tree"
 
 
 def load_workflow(workflow_path: Path) -> dict:
@@ -34,6 +36,19 @@ def load_workflow(workflow_path: Path) -> dict:
 
 def workflow_paths() -> list[Path]:
     return sorted(WORKFLOWS.glob("*.y*ml"))
+
+
+def copied_unchanged_package_files() -> set[Path]:
+    provenance = json.loads(
+        (ROOT / CALIBRATION_TREE_PACKAGE / "provenance.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    return {
+        ROOT / CALIBRATION_TREE_PACKAGE / copied_file
+        for copied_file in provenance["files"]
+        if copied_file not in provenance["changed"]
+    }
 
 
 def authenticates_to_google_cloud(job: dict) -> bool:
@@ -257,13 +272,26 @@ def test_collector_uses_store_vocabulary() -> None:
         ".yaml",
         ".yml",
     }
-    ignored_parts = {".git", ".pytest_cache", ".ruff_cache", ".venv", "__pycache__"}
+    ignored_parts = {
+        ".git",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".venv",
+        "__pycache__",
+        "node_modules",
+    }
+    # Files of the calibration tree package that provenance.json records as
+    # copied unchanged from calibration-diagnostics keep that repo's words:
+    # src/provenance.test.ts requires their recorded blob IDs, and a fixture
+    # generator writes the word as a key of the fixture it reproduces.
+    copied_unchanged = copied_unchanged_package_files()
     source_files = [
         source_path
         for source_path in ROOT.rglob("*")
         if source_path.is_file()
         and source_path.suffix in source_suffixes
         and not ignored_parts.intersection(source_path.relative_to(ROOT).parts)
+        and source_path not in copied_unchanged
     ]
 
     def own_words(source_path: Path) -> str:
@@ -280,6 +308,7 @@ def test_collector_uses_store_vocabulary() -> None:
     ]
 
     assert WORKFLOWS / "push.yaml" in source_files
+    assert ROOT / CALIBRATION_TREE_PACKAGE / "README.md" in source_files
     assert matches == []
 
 
