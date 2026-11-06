@@ -243,13 +243,14 @@ def test_release_switches_intake_on_without_a_per_environment_switch() -> None:
         assert "INTAKE_ENABLED" not in jobs[job_name]["env"], job_name
 
 
-def test_only_production_reads_the_hugging_face_read_token_secret_name() -> None:
+def test_both_deploy_jobs_read_their_hugging_face_read_token_secret_name() -> None:
     jobs = load_workflow(PUSH_WORKFLOW)["jobs"]
     mapping = "${{ vars.TELEMETRY_HF_READ_SECRET_NAME }}"
 
-    assert jobs["deploy-production"]["env"].get("HF_READ_SECRET_NAME") == mapping
-    assert "HF_READ_SECRET_NAME" not in jobs["deploy-staging"]["env"]
-    assert PUSH_WORKFLOW.read_text(encoding="utf-8").count(mapping) == 1
+    # Each environment names its own secret, which only its worker may read.
+    for job_name in DEPLOY_JOBS:
+        assert jobs[job_name]["env"].get("HF_READ_SECRET_NAME") == mapping, job_name
+    assert PUSH_WORKFLOW.read_text(encoding="utf-8").count(mapping) == 2
 
 
 def deploy_step(job: dict, command: str) -> dict:

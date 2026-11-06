@@ -34,8 +34,8 @@ DEPLOY_INTAKE_SETTINGS = {
     "WORKER_INVOKER_SERVICE_ACCOUNT": INVOKER_ACCOUNT,
     "RECOVERY_SERVICE_ACCOUNT": RECOVERY_ACCOUNT,
 }
-# Only production's worker job mounts the collector's Hugging Face read token.
-PRODUCTION_ONLY_SETTINGS = {"HF_READ_SECRET_NAME": "hugging-face-read-token"}
+# Each environment's worker job mounts its own Hugging Face read token.
+HUGGINGFACE_SETTINGS = {"HF_READ_SECRET_NAME": "hugging-face-read-token"}
 LOGGING_GCLOUD = (
     "printf 'gcloud' >> \"$COMMAND_LOG\"\n"
     'printf \' <%s>\' "$@" >> "$COMMAND_LOG"\n'
@@ -91,7 +91,7 @@ def test_require_configuration_lists_every_missing_variable() -> None:
         "PRODUCTION_CLOUD_SQL_CONNECTION PRODUCTION_SERVICE "
         "INTAKE_BUCKET WORKER_QUEUE WORKER_JOB RECOVERY_JOB "
         "WORKER_SERVICE_ACCOUNT WORKER_INVOKER_SERVICE_ACCOUNT "
-        "RECOVERY_SERVICE_ACCOUNT\n"
+        "RECOVERY_SERVICE_ACCOUNT HF_READ_SECRET_NAME\n"
     )
 
 
@@ -114,9 +114,8 @@ def complete_configuration(deployment_environment: str) -> dict[str, str]:
         "PRODUCTION_CLOUD_SQL_CONNECTION": "project:region:production",
         "PRODUCTION_SERVICE": "production-service",
         **DEPLOY_INTAKE_SETTINGS,
+        **HUGGINGFACE_SETTINGS,
     }
-    if deployment_environment == "production":
-        configuration.update(PRODUCTION_ONLY_SETTINGS)
     return configuration
 
 
@@ -132,42 +131,24 @@ def test_require_configuration_accepts_complete_environment(
     assert result.returncode == 0, result.stderr
 
 
-def test_require_configuration_requires_the_read_token_secret_only_in_production() -> (
-    None
-):
-    production = complete_configuration("production")
-    del production["HF_READ_SECRET_NAME"]
+@pytest.mark.parametrize("deployment_environment", ["staging", "production"])
+def test_require_configuration_requires_the_read_token_secret_in_both_environments(
+    deployment_environment: str,
+) -> None:
+    configuration = complete_configuration(deployment_environment)
+    del configuration["HF_READ_SECRET_NAME"]
 
-    production_result = run_deploy("require-configuration", environment=production)
-    staging_result = run_deploy(
-        "require-configuration", environment=complete_configuration("staging")
-    )
+    result = run_deploy("require-configuration", environment=configuration)
 
-    assert production_result.returncode == 1
-    assert production_result.stderr == (
+    assert result.returncode == 1
+    assert result.stderr == (
         "Missing telemetry deployment configuration: HF_READ_SECRET_NAME\n"
     )
-    assert staging_result.returncode == 0, staging_result.stderr
 
 
-@pytest.mark.parametrize(
-    ("deployment_environment", "expected_secrets"),
-    [
-        ("staging", ["database-url", "migration-database-url", "jwt", "read"]),
-        (
-            "production",
-            [
-                "database-url",
-                "migration-database-url",
-                "jwt",
-                "read",
-                "hugging-face-read-token",
-            ],
-        ),
-    ],
-)
-def test_check_secrets_exist_includes_the_read_token_secret_only_in_production(
-    tmp_path: Path, deployment_environment: str, expected_secrets: list[str]
+@pytest.mark.parametrize("deployment_environment", ["staging", "production"])
+def test_check_secrets_exist_includes_the_read_token_secret_in_both_environments(
+    tmp_path: Path, deployment_environment: str
 ) -> None:
     command_log = tmp_path / "commands.log"
     install_command_stub(tmp_path, "gcloud", LOGGING_GCLOUD)
@@ -183,14 +164,20 @@ def test_check_secrets_exist_includes_the_read_token_secret_only_in_production(
             "MIGRATION_DATABASE_SECRET_NAME": "migration-database-url",
             "JWT_SECRET_NAME": "jwt",
             "READ_SECRET_NAME": "read",
-            **PRODUCTION_ONLY_SETTINGS,
+            **HUGGINGFACE_SETTINGS,
         },
     )
 
     assert result.returncode == 0, result.stderr
     assert command_log.read_text().splitlines() == [
         f"gcloud <secrets> <describe> <{secret}> <--project> <project> <--format=none>"
-        for secret in expected_secrets
+        for secret in [
+            "database-url",
+            "migration-database-url",
+            "jwt",
+            "read",
+            "hugging-face-read-token",
+        ]
     ]
 
 
@@ -877,23 +864,13 @@ def job_deploy_environment(
         "DATABASE_SECRET_NAME": "database-url",
         "DEPLOYMENT_ENVIRONMENT": deployment_environment,
         **DEPLOY_INTAKE_SETTINGS,
-        **PRODUCTION_ONLY_SETTINGS,
+        **HUGGINGFACE_SETTINGS,
     }
 
 
-@pytest.mark.parametrize(
-    ("deployment_environment", "expected_secrets"),
-    [
-        ("staging", "DATABASE_URL=database-url:latest"),
-        (
-            "production",
-            "DATABASE_URL=database-url:latest,"
-            "COLLECTOR_HF_READ_TOKEN=hugging-face-read-token:latest",
-        ),
-    ],
-)
-def test_worker_job_update_mounts_the_read_token_only_in_production(
-    tmp_path: Path, deployment_environment: str, expected_secrets: str
+@pytest.mark.parametrize("deployment_environment", ["staging", "production"])
+def test_worker_job_update_mounts_the_read_token_in_both_environments(
+    tmp_path: Path, deployment_environment: str
 ) -> None:
     command_log = tmp_path / "commands.log"
     install_command_stub(tmp_path, "gcloud", LOGGING_GCLOUD)
@@ -912,7 +889,8 @@ def test_worker_job_update_mounts_the_read_token_only_in_production(
         "<--image> <registry/image:sha> "
         f"<--service-account> <{WORKER_ACCOUNT}> "
         "<--set-cloudsql-instances> <project:region:database> "
-        f"<--set-secrets> <{expected_secrets}> "
+        "<--set-secrets> <DATABASE_URL=database-url:latest,"
+        "COLLECTOR_HF_READ_TOKEN=hugging-face-read-token:latest> "
         "<--set-env-vars> <COLLECTOR_INTAKE_BUCKET=intake-bucket> "
         "<--command> <uv> "
         "<--args> <run,--no-sync,python,-m,telemetry_collector.worker> "
@@ -941,12 +919,13 @@ def test_worker_job_gives_each_job_the_attempts_and_time_the_worker_counts_on(
     assert int(timeout_hours.group(1)) * 60 * 60 == WORKER_TASK_TIMEOUT_SECONDS
 
 
-def test_production_worker_job_update_requires_the_read_token_secret(
-    tmp_path: Path,
+@pytest.mark.parametrize("deployment_environment", ["staging", "production"])
+def test_worker_job_update_requires_the_read_token_secret(
+    tmp_path: Path, deployment_environment: str
 ) -> None:
     command_log = tmp_path / "commands.log"
     install_command_stub(tmp_path, "gcloud", LOGGING_GCLOUD)
-    environment = job_deploy_environment(tmp_path, command_log, "production")
+    environment = job_deploy_environment(tmp_path, command_log, deployment_environment)
     del environment["HF_READ_SECRET_NAME"]
 
     result = run_deploy("configure-worker-job", environment=environment)
