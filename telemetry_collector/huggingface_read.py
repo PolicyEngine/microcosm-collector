@@ -114,6 +114,10 @@ class HuggingFaceDataset:
     purpose: DatasetPurpose
     #: Public datasets are readable without the token, so it is not scoped to them.
     public: bool = False
+    #: The daily check applies the releases.json rules to this dataset. Set it
+    #: only once the dataset publishes builds side by side with releases.json
+    #: and its latest*.json pointer files are deleted.
+    checks_releases_record: bool = False
 
 
 #: The calibration dashboard's registered countries, without its fixtures.
