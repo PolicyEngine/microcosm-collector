@@ -19,6 +19,7 @@ import { UnsupportedCalibrationDiagnosticsSchemaError } from "./target-represent
 import {
   GZIP_HEADER_WITHOUT_OS,
   goldenReleaseInputs,
+  goldenSourceBuild,
   type CalibrationTreeGoldenRecord,
   type GoldenFileRecord,
   type GoldenReleaseInput,
@@ -145,6 +146,7 @@ interface WorkerSummary {
   buildArtifactId: string;
   index: { path: string; sha256: string; rawBytes: number; gzipBytes: number };
   files: Array<{ part: string; path: string; sha256: string; rawBytes: number; gzipBytes: number }>;
+  manifestEntry?: Record<string, unknown>;
 }
 
 for (const name of RELEASE_CASES) {
@@ -181,7 +183,7 @@ for (const name of RELEASE_CASES) {
 }
 
 function writtenIndex(outputDirectory: string, summary: WorkerSummary): {
-  build: { releaseId: string };
+  build: Record<string, unknown> & { releaseId: string };
   targetComparison: { releaseId: string };
 } {
   return JSON.parse(gunzipSync(readFileSync(join(outputDirectory, summary.index.path))).toString("utf8"));
@@ -227,6 +229,152 @@ test("a release folder compares under the release its diagnostics name", () => {
   const index = writtenIndex(outputDirectory, JSON.parse(run.stdout) as WorkerSummary);
   expect(index.build.releaseId).toBe(folder);
   expect(index.targetComparison.releaseId).toBe(release.releaseId);
+});
+
+test(
+  "the manifest entry for a recorded release is the one the publisher records",
+  async () => {
+    const { requestPath } = releaseRequest(goldenReleaseInputs()["uk-release"]);
+    const outputDirectory = join(temporaryDirectory(), "trees");
+
+    const run = runWorker(requestPath, outputDirectory);
+
+    expect({ exitCode: run.exitCode, stderr: run.stderr }).toEqual({ exitCode: 0, stderr: "" });
+    const summary = JSON.parse(run.stdout) as WorkerSummary;
+    expect(summary.manifestEntry).toEqual({ ...(await goldenSourceBuild("uk-release")).manifestEntry });
+  },
+  BUILD_TIMEOUT_MS,
+);
+
+test("a tag read from its release's folder records the folder in its manifest entry", () => {
+  const release = goldenReleaseInputs()["uk-release"];
+  const tag = `${release.releaseId}-20261004`;
+  const { requestPath } = releaseRequest(release, { releaseId: tag, releaseDirectory: release.releaseId });
+  const outputDirectory = join(temporaryDirectory(), "trees");
+
+  const run = runWorker(requestPath, outputDirectory);
+
+  expect({ exitCode: run.exitCode, stderr: run.stderr }).toEqual({ exitCode: 0, stderr: "" });
+  const summary = JSON.parse(run.stdout) as WorkerSummary;
+  expect(summary.manifestEntry).toMatchObject({
+    kind: "release",
+    releaseId: tag,
+    releaseDirectory: release.releaseId,
+    stagingRunId: null,
+  });
+});
+
+const STAGED_RUN_ID = "uk-frs-calibration-attempt-20261019T083323Z-6cba5d71";
+const STAGED_LABEL = "microcosm-uk-2024-25-national";
+const STAGED_ACCEPTED_AT = "2026-10-19T09:41:07.000Z";
+
+// Writes a recorded release's diagnostics where a staged bundle's submitted
+// files would be downloaded, and a staging request naming them.
+function stagingRequest(overrides: Record<string, unknown> = {}): { requestPath: string } {
+  const release = goldenReleaseInputs()["uk-release"];
+  const inputDirectory = temporaryDirectory();
+  writeFileSync(join(inputDirectory, "calibration_diagnostics.json"), release.diagnosticsText);
+  const request = {
+    kind: "staging",
+    country: "uk",
+    runId: STAGED_RUN_ID,
+    label: STAGED_LABEL,
+    hfRepo: microcosmRepo("uk"),
+    hfCommitSha: release.hfCommitSha,
+    createdAt: STAGED_ACCEPTED_AT,
+    artifacts: {
+      calibrationDiagnostics: {
+        path: `staged/${STAGED_RUN_ID}/calibration_diagnostics.json`,
+        file: join(inputDirectory, "calibration_diagnostics.json"),
+      },
+      buildManifest: null,
+      releaseManifest: null,
+      demographics: null,
+    },
+    ...overrides,
+  };
+  const requestPath = join(inputDirectory, "request.json");
+  writeFileSync(requestPath, JSON.stringify(request));
+  return { requestPath };
+}
+
+test("a staged bundle's tree is a staging build of its run, with the requested label and time", () => {
+  const release = goldenReleaseInputs()["uk-release"];
+  const { requestPath } = stagingRequest();
+  const outputDirectory = join(temporaryDirectory(), "trees");
+
+  const run = runWorker(requestPath, outputDirectory);
+
+  expect({ exitCode: run.exitCode, stderr: run.stderr }).toEqual({ exitCode: 0, stderr: "" });
+  const summary = JSON.parse(run.stdout) as WorkerSummary;
+  const index = writtenIndex(outputDirectory, summary);
+  expect(index.build).toMatchObject({
+    buildArtifactId: summary.buildArtifactId,
+    kind: "staging",
+    sourceId: STAGED_RUN_ID,
+    label: STAGED_LABEL,
+    releaseId: STAGED_LABEL,
+    hfRepo: microcosmRepo("uk"),
+    hfCommitSha: release.hfCommitSha,
+    createdAt: STAGED_ACCEPTED_AT,
+  });
+  // As the publisher's staging builds do, it compares under the release its
+  // diagnostics name.
+  expect(index.targetComparison.releaseId).toBe(release.releaseId);
+  expect(summary.manifestEntry).toEqual({
+    buildArtifactId: summary.buildArtifactId,
+    kind: "staging",
+    sourceId: STAGED_RUN_ID,
+    label: STAGED_LABEL,
+    releaseId: null,
+    stagingRunId: STAGED_RUN_ID,
+    hfRepo: microcosmRepo("uk"),
+    hfCommitSha: release.hfCommitSha,
+    treeSchemaVersion: 6,
+    indexSha256: summary.index.sha256,
+    indexBytes: summary.index.rawBytes,
+    createdAt: STAGED_ACCEPTED_AT,
+    updatedAt: STAGED_ACCEPTED_AT,
+  });
+});
+
+test("the same staging request writes the same tree again, so reprocessing changes nothing", () => {
+  const { requestPath } = stagingRequest();
+  const firstDirectory = join(temporaryDirectory(), "trees");
+  const secondDirectory = join(temporaryDirectory(), "trees");
+
+  const first = runWorker(requestPath, firstDirectory);
+  const second = runWorker(requestPath, secondDirectory);
+
+  expect([first.exitCode, second.exitCode]).toEqual([0, 0]);
+  expect(second.stdout).toBe(first.stdout);
+  const firstSummary = JSON.parse(first.stdout) as WorkerSummary;
+  for (const file of firstSummary.files) {
+    expect(sha256(readFileSync(join(secondDirectory, file.path)))).toBe(
+      sha256(readFileSync(join(firstDirectory, file.path))),
+    );
+  }
+});
+
+test("a staging request names its run and label and takes no release fields", () => {
+  const accepted = stagingRequest();
+  expect(runWorker(accepted.requestPath, join(temporaryDirectory(), "trees")).exitCode).toBe(0);
+  const cases: Array<Record<string, unknown>> = [
+    { runId: "" },
+    { runId: "../uk-run" },
+    { label: "" },
+    { releaseId: STAGED_LABEL },
+    { releaseDirectory: STAGED_LABEL },
+  ];
+  for (const overrides of cases) {
+    const { requestPath } = stagingRequest(overrides);
+    const outputDirectory = join(temporaryDirectory(), "trees");
+
+    const run = runWorker(requestPath, outputDirectory);
+
+    expect({ overrides, exitCode: run.exitCode }).toEqual({ overrides, exitCode: EXIT_REQUEST_ERROR });
+    expect(writtenFiles(outputDirectory)).toEqual([]);
+  }
 });
 
 test("diagnostics that are not a JSON object are refused as unbuildable and nothing is written", () => {
