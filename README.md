@@ -128,6 +128,7 @@ while intake is off, both tables stay empty.
 | `COLLECTOR_WORKER_INVOKER_SERVICE_ACCOUNT` | service, operations | the account whose OAuth token each Cloud Task uses to run the worker job |
 | `COLLECTOR_WORKER_JOB_ID` | worker | set on each execution by its Cloud Task |
 | `DATABASE_URL` | worker, operations | the runtime database secret, as for the service |
+| `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN` | worker | the read-write token of the environment's own calibration tree Vercel Blob store, a Secret Manager secret; without it, `calibration-diagnostics` submissions stay in intake storage (see "Building trees from submissions") |
 
 The two service-account settings accept only user-managed accounts,
 `<name>@<project>.iam.gserviceaccount.com`. The collector refuses to start
@@ -385,18 +386,73 @@ compiles it through `transpilePackages`. Its own
 
 ### The tree worker
 
-`src/calibration-tree-worker.ts` builds one release's tree from local files
-and writes its gzip parts to a directory, as its own Bun process:
+`src/calibration-tree-worker.ts` builds one release's or one staged run's
+tree from local files and writes its gzip parts to a directory, as its own Bun
+process, and `src/calibration-tree-publication.ts` uploads those parts and adds
+the build to the manifest:
 
 ```bash
 cd packages/calibration-tree
 bun run src/calibration-tree-worker.ts REQUEST.json OUTPUT_DIRECTORY
+CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN=... \
+  bun run src/calibration-tree-publication.ts PUBLICATION.json
 ```
 
-It builds exactly what the publisher builds from the same files, commit and
-publication time. Nothing in the collector runs it yet; the calibration-tree
-worker (K4) will run it for each `calibration-diagnostics` submission, so the
-worker image will need Bun then.
+The worker builds a release exactly as the publisher builds it from the same
+files, commit and publication time, and a staged run as the publisher builds a
+staging tree, from the files it is given. It prints the manifest entry the
+publisher would record. The publication command uploads each part to its
+immutable path (keeping a part already stored with the same bytes), then
+writes the manifest with a compare-and-swap: it creates the manifest only if
+it is still absent and replaces it only if its ETag is still the one read, so
+a manifest another writer changed is never overwritten. Exit 2 means the
+manifest refuses the entry, for example because another build is already
+recorded for the same release build or staged run.
+
+### Building trees from submissions
+
+The worker job builds a calibration tree from each `calibration-diagnostics`
+submission (`telemetry_collector/calibration_trees.py`) where it has
+`COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN`, the read-write token of its
+environment's own Vercel Blob store. Each environment has its own store, which
+nothing reads until the dashboard switches to it. Without the token,
+submissions stay in intake storage and can be reprocessed later. Nothing here
+reads Hugging Face: every value comes from the submission.
+
+- **Which tree.** A build folder, `releases/<release>/<build>`, gives a release
+  tree whose release ID is `<release>/<build>`; its `release` and `build_id`
+  must name the same release and build. A staged bundle, `staged/<run_id>`,
+  gives a staging tree of that run, labelled with the submission's `release`
+  (the candidate release) or, when that is null, the run ID; its `run_id`
+  must be the folder's. Files must come from the country's release repo, or,
+  for a staged bundle, its staging repo. Contradicting provenance and other
+  repos reject the submission. Other folders, and countries the collector
+  does not list, stay in intake storage with the reason in the result.
+- **Time.** The tree records the submission's `accepted_at` as its
+  publication time, so reprocessing a submission builds the same tree.
+- **Latest.** A release build becomes its country's latest when its release
+  is the country's default release, listed in `DEFAULT_RELEASES`: the UK's is
+  `microcosm-uk-2024-25-national`; the US's is added once its stable releases
+  are agreed. Builds of other releases are recorded without moving the latest.
+- **How.** Each attempt downloads the files into a new temporary directory
+  and runs the tree worker with only `PATH`, `LANG` and the package's size
+  limits (`CALIBRATION_TREE_MAX_RAW_BYTES`, `CALIBRATION_TREE_MAX_GZIP_BYTES`)
+  in its environment, never the Blob token. It then runs the publication
+  command, with the token, inside a Postgres transaction lock
+  (`pg_advisory_xact_lock`), so the collector's writers change the manifest
+  one at a time.
+- **Results.** A published tree's result names its build ID, kind, how many
+  parts were uploaded or already stored, and whether it became the latest.
+  The worker refusing the files (`calibration_tree_unbuildable`) or the
+  manifest refusing the entry (`calibration_tree_refused`) rejects the
+  submission; any other failure, including a manifest another writer changed
+  meanwhile, fails the attempt so it runs again.
+
+The image holds Bun 1.4.2, copied from the official image by digest, and the
+package's production install, without its tests, fixtures and test support.
+CI checks the built image with `tools/check-calibration-tree-image.sh`, which
+builds a small staged run's tree inside it and runs the publication command
+without a token, which must refuse to run.
 
 ### Tests
 
