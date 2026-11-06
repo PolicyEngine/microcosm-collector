@@ -15,6 +15,7 @@ from pydantic import (
     Field,
     RootModel,
     StrictBool,
+    StrictFloat,
     StrictInt,
     ValidationError,
     field_validator,
@@ -111,13 +112,13 @@ class OuterProgress(_EmitterDetail):
 class ReadingProgress(_EmitterDetail):
     """The latest progress the build reported, as a reading repeats it.
 
-    ``done``, ``total`` and ``unit`` are as the build sent them.
+    ``done`` and ``total`` are null unless the build sent numbers.
     """
 
     stage_id: _Identifier
-    done: Any
-    total: Any
-    unit: Any
+    done: StrictInt | StrictFloat | None
+    total: StrictInt | StrictFloat | None
+    unit: _Text | None
     outer: OuterProgress | None
     reported_at: AwareDatetime
 
