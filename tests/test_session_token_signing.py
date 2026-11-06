@@ -40,7 +40,10 @@ def generated_signing_key() -> tuple[ec.EllipticCurvePrivateKey, SessionSigningK
 
 
 def collector_client(
-    *, signing_key: SessionSigningKey | None, hs256_secret: str | None
+    *,
+    signing_key: SessionSigningKey | None,
+    hs256_secret: str | None,
+    maintenance_mode: bool = False,
 ) -> TestClient:
     settings = CollectorSettings(
         jwt_secret=hs256_secret,
@@ -48,6 +51,7 @@ def collector_client(
         signing_key=signing_key,
         collector_issuer=ISSUER,
         collector_audience=AUDIENCE,
+        maintenance_mode=maintenance_mode,
     )
     return TestClient(
         create_app(
@@ -401,6 +405,18 @@ def test_jwks_is_empty_until_a_signing_key_is_configured() -> None:
     assert response.json() == {"keys": []}
 
 
+def test_jwks_answers_503_while_the_maintenance_revision_serves() -> None:
+    _, signing_key = generated_signing_key()
+    client = collector_client(
+        signing_key=signing_key, hs256_secret=HS256_SECRET, maintenance_mode=True
+    )
+
+    response = client.get("/.well-known/jwks.json")
+
+    assert response.status_code == 503
+    assert "keys" not in response.text
+
+
 def test_a_verifier_holding_only_the_jwks_accepts_issued_tokens() -> None:
     _, signing_key = generated_signing_key()
     client = collector_client(signing_key=signing_key, hs256_secret=HS256_SECRET)
@@ -473,7 +489,7 @@ def switching_section() -> str:
     return readme.split(heading, 1)[1].split("\n## ", 1)[0].split("\n### ", 1)[0]
 
 
-def test_the_switch_accepts_hs256_tokens_for_the_longest_token_lifetime() -> None:
+def test_readme_keeps_hs256_accepted_for_the_longest_token_lifetime() -> None:
     section = switching_section()
 
     assert (

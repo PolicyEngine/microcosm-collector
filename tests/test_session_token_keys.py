@@ -362,18 +362,10 @@ def switch_window_token(
     [
         ({"aud": "another-service"}, InvalidAudienceError),
         ({"iss": "another-issuer"}, InvalidIssuerError),
-        (
-            {"exp": datetime.now(UTC) - timedelta(minutes=1)},
-            ExpiredSignatureError,
-        ),
-        (
-            {"nbf": datetime.now(UTC) + timedelta(minutes=5)},
-            ImmatureSignatureError,
-        ),
-        (
-            {"iat": datetime.now(UTC) + timedelta(minutes=5)},
-            ImmatureSignatureError,
-        ),
+        # Times are offsets from when the test runs, not from collection.
+        ({"exp": timedelta(minutes=-1)}, ExpiredSignatureError),
+        ({"nbf": timedelta(minutes=5)}, ImmatureSignatureError),
+        ({"iat": timedelta(minutes=5)}, ImmatureSignatureError),
     ],
     ids=["audience", "issuer", "expired", "not-before-later", "issued-later"],
 )
@@ -386,9 +378,14 @@ def test_token_must_carry_the_collectors_registered_claims(
     # ES256 tokens issued after it.
     private_key = p256_private_key()
     signing_key = SessionSigningKey.from_pem(private_key_pem(private_key))
-    token = switch_window_token(
-        algorithm, private_key, signing_key, session_claims(**claim_overrides)
+    now = datetime.now(UTC)
+    claims = session_claims(
+        **{
+            claim_name: now + value if isinstance(value, timedelta) else value
+            for claim_name, value in claim_overrides.items()
+        }
     )
+    token = switch_window_token(algorithm, private_key, signing_key, claims)
 
     with pytest.raises(expected_error):
         verify(token, signing_key=signing_key, hs256_secret=HS256_SECRET)
