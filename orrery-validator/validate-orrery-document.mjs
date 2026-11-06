@@ -15,7 +15,8 @@
 // It prints one JSON line. Exit 0: {"valid": true, "orrery_version": ...}.
 // Exit 2, the document is refused: {"valid": false, "orrery_version": ...,
 // "code": ..., "message": ..., "issues": [{"path", "message"}, ...]}, with at
-// most 100 issues of at most 500 characters each, all encodable as UTF-8. A
+// most 100 issues of at most 500 characters each, all encodable as UTF-8 and
+// free of NUL. A
 // refusal says where a
 // link is, never what it holds, since a link may carry a credential. Exit 1:
 // the validator could not run (a wrong argument, an unreadable file, an
@@ -34,15 +35,27 @@ const ORRERY_VERSION = JSON.parse(
 const MAX_ISSUES = 100;
 const MAX_ISSUE_CHARACTERS = 500;
 
-// Counts and keeps whole characters (code points, as Python counts them), and
-// replaces any unpaired surrogate with U+FFFD: a document's JSON can escape
-// one ("\ud83d"), Orrery repeats identities in its issues, and UTF-8 cannot
-// encode it.
+// A document's JSON can escape characters that a refusal cannot carry, and
+// Orrery repeats identities in its issues: an unpaired surrogate ("\ud83d"),
+// which UTF-8 cannot encode, and NUL ("\u0000"), which PostgreSQL cannot
+// store in jsonb, where a rejection is recorded. Each becomes U+FFFD.
+function storable(character) {
+  const unpairedSurrogate = character.length === 1 && character >= "\ud800" && character <= "\udfff";
+  return unpairedSurrogate || character === "\u0000" ? "\ufffd" : character;
+}
+
+// Keeps at most MAX_ISSUE_CHARACTERS whole characters (code points, as Python
+// counts them), reading no further into the text than that.
 function shortened(text) {
-  const characters = Array.from(text.toWellFormed());
-  return characters.length > MAX_ISSUE_CHARACTERS
-    ? `${characters.slice(0, MAX_ISSUE_CHARACTERS - 1).join("")}…`
-    : characters.join("");
+  const kept = [];
+  for (const character of text) {
+    if (kept.length === MAX_ISSUE_CHARACTERS) {
+      kept[MAX_ISSUE_CHARACTERS - 1] = "…";
+      break;
+    }
+    kept.push(storable(character));
+  }
+  return kept.join("");
 }
 
 class DocumentRefusal extends Error {

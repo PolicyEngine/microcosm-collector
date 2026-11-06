@@ -335,9 +335,10 @@ graph file contents microcosm-runs' publication accepts (`lib/service.ts`):
 
 A refusal says where a link is (its JSON path), never what it holds, since a
 link may carry a credential, and keeps at most 100 issues of at most 500
-characters (code points) each. Issue text always encodes as UTF-8: shortening
-keeps whole characters, and an unpaired surrogate, which a document's JSON can
-escape and Orrery repeats in its issues, becomes U+FFFD. microcosm-runs also
+characters (code points) each. Issue text always encodes as UTF-8 and can be
+stored in PostgreSQL's `jsonb`: shortening keeps whole characters, and an
+unpaired surrogate or a NUL, which a document's JSON can escape and Orrery
+repeats in its issues, becomes U+FFFD. microcosm-runs also
 refuses a graph file over 64 MiB and file names outside its role patterns;
 those are checks on the publication, which the Orrery worker (O4) makes, not
 on the document.
@@ -348,7 +349,8 @@ published_file_names)` runs it and returns the Orrery version, raises
 refused document, and raises `OrreryValidatorError` when the validator could
 not run. Node gets only `PATH` and `LANG=C.UTF-8`, so none of the worker's
 settings or credentials, such as `DATABASE_URL`, reach it, and its answer is
-read as UTF-8 whatever the worker's locale. By hand:
+read as UTF-8 whatever the worker's locale; output that is not UTF-8 is a
+validator error. By hand:
 
 ```bash
 uv run python -m telemetry_collector.orrery.validation graph.orrery.json NAME...

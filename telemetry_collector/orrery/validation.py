@@ -118,6 +118,10 @@ def validate_orrery_document(
         raise OrreryValidatorError(
             f"The Orrery validator did not finish within {timeout_seconds} seconds."
         ) from error
+    except UnicodeDecodeError as error:
+        raise OrreryValidatorError(
+            "The Orrery validator's output is not UTF-8."
+        ) from error
     except (OSError, ValueError) as error:
         # ValueError: an argument Node cannot take, such as one with a NUL.
         raise OrreryValidatorError(
