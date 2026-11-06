@@ -1,25 +1,40 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Publish the read API client to npm, unless its version is already there.
-# push.yaml's publish-client job runs this after production deployed the
-# release whose read API the client describes, with the client's dependencies
-# installed. npm accepts the job's GitHub OIDC token instead of a stored npm
+# Publish the packed read API client to npm, unless its version is already
+# there. push.yaml's publish-client job runs this after production deployed the
+# release whose read API the client describes, on the tarball pack-client made
+# with `npm pack`. It installs nothing and runs no package script, because the
+# job can request an OIDC token. npm accepts that token instead of a stored npm
 # token (trusted publishing, which needs npm 11.5.1 or later) and attaches a
-# provenance attestation. Publishing runs the client's prepack build first.
+# provenance attestation.
 #
-#   publish-client.sh [COLLECTOR_ROOT]
-root="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
-cd "$root/packages/collector-client"
+#   publish-client.sh TARBALL_DIRECTORY [COLLECTOR_ROOT]
+tarball_directory="$1"
+root="${2:-$(cd "$(dirname "$0")/.." && pwd)}"
 
-package_field() {
-  python3 -c 'import json, sys; print(json.load(open("package.json"))[sys.argv[1]])' "$1"
+shopt -s nullglob
+tarballs=("$tarball_directory"/*.tgz)
+shopt -u nullglob
+if [ "${#tarballs[@]}" -ne 1 ]; then
+  echo "Expected exactly one packed client in $tarball_directory, found ${#tarballs[@]}." >&2
+  exit 1
+fi
+tarball="${tarballs[0]}"
+
+manifest_field() {
+  python3 -c 'import json, sys; print(json.load(sys.stdin)[sys.argv[1]])' "$1"
 }
-name="$(package_field name)"
-version="$(package_field version)"
+name="$(manifest_field name < "$root/packages/collector-client/package.json")"
 release="$(python3 -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["project"]["version"])' "$root/pyproject.toml")"
-if [ "$version" != "$release" ]; then
-  echo "The client's version $version is not the release's version $release." >&2
+packed_name="$(tar -xOzf "$tarball" package/package.json | manifest_field name)"
+packed_version="$(tar -xOzf "$tarball" package/package.json | manifest_field version)"
+if [ "$packed_name" != "$name" ]; then
+  echo "The packed client is $packed_name, not $name." >&2
+  exit 1
+fi
+if [ "$packed_version" != "$release" ]; then
+  echo "The client's version $packed_version is not the release's version $release." >&2
   exit 1
 fi
 
@@ -29,9 +44,12 @@ if ! python3 -c 'import sys; sys.exit(tuple(map(int, sys.argv[1].split("."))) < 
   exit 1
 fi
 
-published="$(npm view "$name@$version" version 2>/dev/null || true)"
-if [ "$published" = "$version" ]; then
-  echo "$name@$version is already on npm."
+# `npm view` exits 1 both for a package that does not exist yet and for a
+# version it lacks. A network failure also leaves this empty; `npm publish`
+# then fails on its own, or refuses a version that is already there.
+published="$(npm view "$name@$release" version 2>/dev/null || true)"
+if [ "$published" = "$release" ]; then
+  echo "$name@$release is already on npm."
   exit 0
 fi
-npm publish --access public
+npm publish "$tarball" --access public --ignore-scripts

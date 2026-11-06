@@ -18,9 +18,11 @@ export type RunFailure = Schemas["RunFailure"];
 export type RunBlock = Schemas["RunBlock"];
 export type RunStatus = RunSummary["status"];
 
+/** The request header that carries the dashboard read credential. */
 export const READ_TOKEN_HEADER = "X-Telemetry-Read-Token";
-// The collector refuses a page larger than this.
+/** The largest page the collector answers; it refuses a larger `limit`. */
 export const MAX_PAGE_SIZE = 200;
+/** How long a request may take, from sending it to reading its whole answer. */
 export const DEFAULT_TIMEOUT_MS = 30_000;
 
 const RUN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/;
@@ -31,48 +33,61 @@ const RUN_NOT_FOUND = "Run was not found.";
 const MISSING_RUN = Symbol("missing run");
 
 export interface CollectorClientOptions {
-  // The collector's address: HTTPS, or HTTP on localhost or 127.0.0.1.
+  /** The collector's address: HTTPS, or HTTP on localhost or 127.0.0.1. */
   baseUrl: string;
-  // The dashboard read credential, or a function that returns it; the
-  // function is called for every request, so it may rotate.
+  /**
+   * The dashboard read credential, or a function that returns it. The
+   * function is called for every request, so the credential may rotate.
+   */
   readToken: string | (() => string | Promise<string>);
-  fetch?: typeof globalThis.fetch;
-  timeoutMs?: number;
+  /** The `fetch` to send requests with; the global one by default. */
+  fetch?: typeof globalThis.fetch | undefined;
+  /**
+   * How long a request may take, in whole milliseconds, from sending it to
+   * reading its whole answer; `DEFAULT_TIMEOUT_MS` by default.
+   */
+  timeoutMs?: number | undefined;
 }
 
 export interface ListRunsQuery {
-  // Only runs of this country: two capital letters, such as "US" or "GB".
-  country?: string;
-  // From 1 to 200; the collector's default is 60.
-  limit?: number;
-  // The previous page's `next_before`.
-  before?: string | null;
+  /** Only runs of this country: two capital letters, such as "US" or "GB". */
+  country?: string | undefined;
+  /** From 1 to 200; the collector's default is 60. */
+  limit?: number | undefined;
+  /** The previous page's `next_before`. */
+  before?: string | null | undefined;
 }
 
 export interface RecentRunsQuery {
-  country?: string;
-  // How many of the most recently registered runs to return, at least 1.
+  /** Only runs of this country: two capital letters, such as "US" or "GB". */
+  country?: string | undefined;
+  /** How many of the most recently registered runs to return, at least 1. */
   count: number;
 }
 
 export interface CollectorClient {
-  // One page of runs, newest registration first.
+  /** One page of runs, newest registration first. */
   listRuns(query?: ListRunsQuery): Promise<RunPage>;
-  // The `count` most recently registered runs, newest first, read page by
-  // page; each page asks only for the runs still needed.
+  /**
+   * The `count` most recently registered runs, newest first, read page by
+   * page; each page asks only for the runs still needed.
+   */
   listRecentRuns(query: RecentRunsQuery): Promise<RunSummary[]>;
-  // A run's state and the events it was rebuilt from, or null when the
-  // collector has no record of the run.
+  /**
+   * A run's state and the events it was rebuilt from, or null when the
+   * collector has no record of the run.
+   */
   getRun(runId: string): Promise<RunDetail | null>;
 }
 
-// The collector answered with an error status.
+/** The collector answered with an error status. */
 export class CollectorRequestError extends Error {
   readonly status: number;
-  // 408, 429 and 5xx, including the 503 a deployment answers with.
+  /** True for 408, 429 and 5xx, including the 503 a deployment answers with. */
   readonly retryable: boolean;
+  /** The answer's `Retry-After` in seconds, when it gave one. */
   readonly retryAfterSeconds: number | null;
-  // The answer's `detail`: a sentence, or FastAPI's validation errors.
+  /** The answer's `detail`: a sentence, or FastAPI's validation errors. */
   readonly detail: unknown;
 
   constructor(
@@ -89,7 +104,7 @@ export class CollectorRequestError extends Error {
   }
 }
 
-// The collector answered 200 with something that is not a read API v2 answer.
+/** The collector answered 200 with something that is not a read API v2 answer. */
 export class CollectorResponseError extends Error {
   constructor(message: string) {
     super(message);
@@ -125,12 +140,30 @@ function collectorBaseUrl(value: string): string {
   if (url.protocol !== "https:" && !(local && url.protocol === "http:")) {
     throw new Error("The collector address must use HTTPS except on localhost.");
   }
-  if (url.username || url.password || url.search || url.hash) {
+  // A bare trailing "?" or "#" leaves `search` and `hash` empty but would
+  // still end up in every request's URL.
+  if (url.username || url.password || /[?#]/.test(url.href)) {
     throw new Error(
       "The collector address must not contain credentials or query data.",
     );
   }
   return url.toString().replace(/\/+$/, "");
+}
+
+function requestTimeout(value: number | undefined): number {
+  if (value === undefined) return DEFAULT_TIMEOUT_MS;
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new RangeError("A timeout is a positive whole number of milliseconds.");
+  }
+  return value;
+}
+
+// The timeout aborted the request, possibly while its answer was being read.
+function isAbandoned(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    (error.name === "TimeoutError" || error.name === "AbortError")
+  );
 }
 
 function retryAfterSeconds(response: Response): number | null {
@@ -218,7 +251,7 @@ export function createCollectorClient(
 ): CollectorClient {
   const baseUrl = collectorBaseUrl(options.baseUrl);
   const fetchFunction = options.fetch ?? globalThis.fetch;
-  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const timeoutMs = requestTimeout(options.timeoutMs);
 
   async function readToken(): Promise<string> {
     const token =
@@ -249,7 +282,8 @@ export function createCollectorClient(
     if (response.ok) {
       try {
         return await response.json();
-      } catch {
+      } catch (error) {
+        if (isAbandoned(error)) throw error;
         throw new CollectorResponseError("Collector answer is not JSON.");
       }
     }
@@ -280,7 +314,7 @@ export function createCollectorClient(
     let before: string | null = null;
     do {
       const page: RunPage = await listRuns({
-        ...(query.country === undefined ? {} : { country: query.country }),
+        country: query.country,
         limit: Math.min(query.count - runs.length, MAX_PAGE_SIZE),
         before,
       });

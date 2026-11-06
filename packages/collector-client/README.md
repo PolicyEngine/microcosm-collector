@@ -30,8 +30,11 @@ console.log(detail?.run.status, detail?.events.length);
 An error answer throws `CollectorRequestError`, with `status`, `detail`, and
 `retryable` for 408, 429 and 5xx, including the 503 that a collector answers
 with while it deploys (`retryAfterSeconds` holds its `Retry-After`). An answer
-that is not a read API v2 answer throws `CollectorResponseError`. Arguments the
-collector would refuse throw `RangeError` before any request.
+that is not a read API v2 answer throws `CollectorResponseError`. A request
+that takes longer than `timeoutMs` (30 seconds by default), including reading
+its answer, rejects with `fetch`'s `TimeoutError`. Arguments the collector
+would refuse throw `RangeError` before any request, and so does creating a
+client with a `timeoutMs` that is not a positive whole number.
 
 The version of this package is the version of the collector release whose read
 API it describes. Its types are generated from that release's OpenAPI document,

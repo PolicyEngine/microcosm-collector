@@ -268,7 +268,7 @@ def test_service_deployment_uses_oidc_and_verifies_before_promotion() -> None:
 
 def test_service_deployment_checks_secret_existence_before_changing_traffic() -> None:
     staging_job = push_job_text("deploy-staging", "deploy-production")
-    production_job = push_job_text("deploy-production", PUBLISH_CLIENT_JOB)
+    production_job = push_job_text("deploy-production", "pack-client")
 
     assert "environment: staging" in staging_job
     assert "image_uri: ${{ steps.image.outputs.uri }}" in staging_job

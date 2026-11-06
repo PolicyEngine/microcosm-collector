@@ -126,37 +126,63 @@ CI fails if the generated types are out of date. Each release gives the client
 the collector's version (`tools/set-client-version.py`, run by
 `tools/update-version.sh`).
 
-Once production runs a release, the Push workflow's `publish-client` job
-publishes that version to npm, if the repo variable
-`COLLECTOR_CLIENT_PUBLISH_ENABLED` is `true` and the version is not on npm
-yet (`tools/publish-client.sh`). It runs in the GitHub environment `npm` and
-uses npm's trusted publishing: npm accepts the job's GitHub OIDC token for
-this workflow file and environment, so no npm token is stored anywhere, and
-npm attaches a provenance attestation.
+Once production runs a release, and if the repo variable
+`COLLECTOR_CLIENT_PUBLISH_ENABLED` is `true`, the Push workflow publishes that
+version to npm in two jobs:
+
+- `pack-client` installs the client's dependencies and runs `npm pack`, which
+  builds it. It has no OIDC token.
+- `publish-client` publishes that tarball with `tools/publish-client.sh`, which
+  checks that it is this package at the release's version, skips a version
+  already on npm, and runs `npm publish --ignore-scripts`. It installs nothing
+  and runs no package script, so the only code that can request its OIDC token
+  is the npm CLI that ships with Node and GitHub's own actions. It runs in the
+  GitHub environment `npm` and uses npm's trusted publishing: npm accepts the
+  job's GitHub OIDC token for this workflow file and environment, so no npm
+  token is stored anywhere, and npm attaches a provenance attestation.
+
+Both jobs follow `deploy-production`, so they run only while
+`COLLECTOR_DEPLOY_ENABLED` is `true`; while it is not, releases are not
+published either, without any job failing.
 
 Publishing is not switched on. Switching it on is a manual step, after the
 first release that contains the client has reached production:
 
-1. **First version.** npm can trust a workflow only for a package that already
+1. **Google Cloud.** Make the Workload Identity provider accept only the
+   deployment environments ("Google Cloud access"), so that `publish-client`'s
+   token cannot obtain Google credentials. `TELEMETRY_GCP_WIF_PROVIDER`, a
+   secret of the `staging` and `production` environments, holds the provider's
+   resource name, which names its project, pool and provider:
+
+   ```bash
+   gcloud iam workload-identity-pools providers update-oidc <provider> \
+     --project <collector project> --location global --workload-identity-pool <pool> \
+     --attribute-condition "assertion.repository=='PolicyEngine/microcosm-collector' && assertion.ref=='refs/heads/main' && assertion.environment in ['staging', 'production']"
+   ```
+
+   The next release's deployment jobs then check that deployments still
+   authenticate. To undo it, run the same command with the condition without
+   its last clause.
+2. **First version.** npm can trust a workflow only for a package that already
    exists, so a maintainer of the `@policyengine` npm scope, logged in with
    two-factor authentication, publishes that release's version once from its
    tag: `git switch --detach <version>`, then in `packages/collector-client`,
    `npm ci` and `npm publish --access public`. This version has no provenance
    attestation.
-2. **Environment.** Create the GitHub environment `npm` with a deployment
+3. **Environment.** Create the GitHub environment `npm` with a deployment
    branch policy that accepts only `main`, as `staging` and `production` do.
-3. **Trusted publisher**, on a day when a pull request is ready to merge: npm
-   discards a new trusted publisher configuration whose first publication has
-   not succeeded within 2 days. With npm 11.15.0 or later:
+4. **Trusted publisher**, on a day when a pull request is ready to merge: a new
+   trusted publisher configuration expires if its first publication has not
+   succeeded within 2 days. With npm 11.15.0 or later:
    `npm trust github @policyengine/microcosm-collector-client --file push.yaml --repo PolicyEngine/microcosm-collector --env npm --allow-publish`
    (or, on npmjs.com, the package's settings, "Trusted publishing", GitHub
    Actions, with the same organization, repo, workflow file and environment).
-4. **Switch.** Set the repo variable `COLLECTOR_CLIENT_PUBLISH_ENABLED` to
+5. **Switch.** Set the repo variable `COLLECTOR_CLIENT_PUBLISH_ENABLED` to
    `true`, then merge the pull request. Its release's `publish-client` job
    publishes its version, and `npm view @policyengine/microcosm-collector-client`
    then lists it. If no publication succeeded within the 2 days, remove the
    configuration (`npm trust list`, then `npm trust revoke --id <id>`) and
-   repeat step 3.
+   repeat step 4.
 
 To stop publishing, set the variable to anything else; to stop npm trusting the
 workflow, `npm trust revoke` the configuration that `npm trust list` shows.
@@ -531,7 +557,20 @@ assertion.repository=='PolicyEngine/microcosm-collector' && assertion.ref=='refs
 The service account grants `roles/iam.workloadIdentityUser` to this repo's
 principal set (`attribute.repository/PolicyEngine/microcosm-collector`). A job
 running for a tag, a pull request or any other branch cannot obtain Google
-credentials. No other job requests an OIDC token.
+credentials.
+
+One other job requests an OIDC token: `publish-client`, which publishes the
+read API client to npm in the `npm` environment ("The TypeScript client"). The
+condition above does not check the environment, so a token from that job would
+pass it too. Before publishing is switched on, the condition must become:
+
+```
+assertion.repository=='PolicyEngine/microcosm-collector' && assertion.ref=='refs/heads/main' && assertion.environment in ['staging', 'production']
+```
+
+The deployment jobs run in those two environments, so they keep their access,
+and a token from a job in any other environment, or in none, is refused. From
+then on, every job that authenticates to Google Cloud must name one of the two.
 
 Both deployment jobs also require
 `github.event_name == 'push' && github.ref == 'refs/heads/main'`. The Push
