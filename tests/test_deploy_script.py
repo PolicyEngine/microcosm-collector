@@ -260,6 +260,7 @@ def service_deploy_environment(
         "CLOUD_SQL_CONNECTION": "project:region:database",
         "DATABASE_SECRET_NAME": "database-url",
         "JWT_SECRET_NAME": "jwt-secret",
+        "JWT_SIGNING_KEY_SECRET_NAME": "jwt-signing-key-secret",
         "READ_SECRET_NAME": "read-token",
         "DEPLOYMENT_ENVIRONMENT": deployment_environment,
     }
