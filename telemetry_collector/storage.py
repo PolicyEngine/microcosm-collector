@@ -69,6 +69,8 @@ class TelemetryStore(Protocol):
 
     def get_run(self, run_id: str) -> dict[str, Any] | None: ...
 
+    def get_run_record(self, run_id: str) -> RunRecord | None: ...
+
     def is_ready(self) -> bool: ...
 
 
@@ -778,9 +780,15 @@ class PostgresTelemetryStore:
             return [run_summary(_run_mapping(run)) for run in runs]
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
+        record = self.get_run_record(run_id)
+        if record is None:
+            return None
+        return run_documents(record.registered_run, record.events)
+
+    def get_run_record(self, run_id: str) -> RunRecord | None:
         with self._sessions() as session:
             run = session.get(TelemetryRun, run_id)
             if run is None:
                 return None
             events = self._events_for_run(session, run_id)
-            return run_documents(_run_mapping(run), events)
+            return RunRecord(_run_mapping(run), events)

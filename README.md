@@ -81,6 +81,86 @@ sending the same request again cannot succeed:
   event without a valid block (a safe-identifier `phase`, a
   `blocking_failure_count` of at least 1, and `blocking_gate_ids`).
 
+## Read API
+
+Both versions take the dashboard read credential in `X-Telemetry-Read-Token`.
+
+- **Version 1**, `GET /v1/runs` and `GET /v1/runs/{run_id}`, is what the
+  dashboard reads today. A run comes back as the documents the dashboard used
+  to read from Hugging Face run files (`progress`, `run_manifest`,
+  `calibration_progress` and lifecycle `events`). It does not change:
+  `tests/fixtures/read_api_v1` records its answers, and a test fails if they
+  change.
+- **Version 2**, `GET /v2/runs` and `GET /v2/runs/{run_id}`, returns typed
+  answers. The list takes the same `country`, `limit` and `before` as version 1
+  and returns each run's registration and stored state. A run comes back as
+  `{"run": ..., "events": [...]}`: every stored event with the fields its
+  producer sent (an optional field it left out is null, and `details` an empty
+  object), in the order the collector applies them (producers by registration
+  time, then producer id, then sequence), and the run's state folded from
+  exactly those events, so the two agree while the run is still receiving
+  events. All timestamps are in UTC. Bad parameters, including an invalid cursor or run id,
+  answer 422 with FastAPI's validation errors; an unknown run answers 404.
+
+`contracts/read-api-v2` holds version 2's contract:
+
+- `openapi.json`, its OpenAPI document, which the collector also serves at
+  `GET /v2/openapi.json`;
+- `telemetry.json`, telemetry for a few runs (completed, failed, blocked,
+  restarted and only registered);
+- `interactions/`, one file per request, with the collector's answer once that
+  telemetry is stored.
+
+`tests/test_read_api_v2.py` checks that the collector serves exactly that
+document and those answers, from the in-memory store and from PostgreSQL, and
+that each answer matches the document's schema. After an intended change to
+either version, run `uv run python tools/update-read-api-contract.py`, review
+the changed files, and regenerate the client's types (below).
+
+### The TypeScript client
+
+`packages/collector-client` is `@policyengine/microcosm-collector-client`, a
+typed client for version 2. Its types are generated from `openapi.json`
+(`npm run generate`), and its tests answer it with the recorded interactions.
+CI fails if the generated types are out of date. Each release gives the client
+the collector's version (`tools/set-client-version.py`, run by
+`tools/update-version.sh`).
+
+Once production runs a release, the Push workflow's `publish-client` job
+publishes that version to npm, if the repo variable
+`COLLECTOR_CLIENT_PUBLISH_ENABLED` is `true` and the version is not on npm
+yet (`tools/publish-client.sh`). It runs in the GitHub environment `npm` and
+uses npm's trusted publishing: npm accepts the job's GitHub OIDC token for
+this workflow file and environment, so no npm token is stored anywhere, and
+npm attaches a provenance attestation.
+
+Publishing is not switched on. Switching it on is a manual step, after the
+first release that contains the client has reached production:
+
+1. **First version.** npm can trust a workflow only for a package that already
+   exists, so a maintainer of the `@policyengine` npm scope, logged in with
+   two-factor authentication, publishes that release's version once from its
+   tag: `git switch --detach <version>`, then in `packages/collector-client`,
+   `npm ci` and `npm publish --access public`. This version has no provenance
+   attestation.
+2. **Environment.** Create the GitHub environment `npm` with a deployment
+   branch policy that accepts only `main`, as `staging` and `production` do.
+3. **Trusted publisher**, on a day when a pull request is ready to merge: npm
+   discards a new trusted publisher configuration whose first publication has
+   not succeeded within 2 days. With npm 11.15.0 or later:
+   `npm trust github @policyengine/microcosm-collector-client --file push.yaml --repo PolicyEngine/microcosm-collector --env npm --allow-publish`
+   (or, on npmjs.com, the package's settings, "Trusted publishing", GitHub
+   Actions, with the same organization, repo, workflow file and environment).
+4. **Switch.** Set the repo variable `COLLECTOR_CLIENT_PUBLISH_ENABLED` to
+   `true`, then merge the pull request. Its release's `publish-client` job
+   publishes its version, and `npm view @policyengine/microcosm-collector-client`
+   then lists it. If no publication succeeded within the 2 days, remove the
+   configuration (`npm trust list`, then `npm trust revoke --id <id>`) and
+   repeat step 3.
+
+To stop publishing, set the variable to anything else; to stop npm trusting the
+workflow, `npm trust revoke` the configuration that `npm trust list` shows.
+
 ## Artifact intake
 
 Builds hand calibration diagnostics and Orrery inputs to the collector as

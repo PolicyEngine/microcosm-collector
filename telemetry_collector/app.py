@@ -14,8 +14,19 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
 import jwt
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
+from fastapi import (
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Path,
+    Query,
+    Security,
+    status,
+)
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.security import APIKeyHeader
 from jwt import InvalidTokenError
 from pydantic import ValidationError
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -35,6 +46,7 @@ from telemetry_collector.intake_api import (
     submission_router,
 )
 from telemetry_collector.models import (
+    SAFE_IDENTIFIER,
     CollectorToken,
     EventBatch,
     PageCursor,
@@ -42,6 +54,13 @@ from telemetry_collector.models import (
     SessionScope,
     TokenExchangeRequest,
     require_telemetry_scope_for_lifetime,
+)
+from telemetry_collector.read_api_v2 import (
+    ErrorMessage,
+    RunDetail,
+    RunPage,
+    openapi_document,
+    run_detail,
 )
 from telemetry_collector.storage import (
     PostgresTelemetryStore,
@@ -217,9 +236,14 @@ def _page_cursor(registered_at: datetime, run_id: str) -> str:
     return base64.urlsafe_b64encode(payload).decode().rstrip("=")
 
 
-def _parse_page_cursor(value: str | None) -> tuple[datetime, str] | None:
-    if value is None:
-        return None
+class InvalidPageCursorError(ValueError):
+    """Raised for a pagination cursor that the collector did not issue."""
+
+
+INVALID_PAGE_CURSOR = "Pagination cursor is invalid."
+
+
+def _decode_page_cursor(value: str) -> tuple[datetime, str]:
     try:
         padded = value + "=" * (-len(value) % 4)
         raw = base64.b64decode(padded, altchars=b"-_", validate=True)
@@ -232,10 +256,59 @@ def _parse_page_cursor(value: str | None) -> tuple[datetime, str] | None:
         binascii.Error,
         ValidationError,
     ) as error:
-        raise HTTPException(
-            status_code=422, detail="Pagination cursor is invalid."
-        ) from error
+        raise InvalidPageCursorError(INVALID_PAGE_CURSOR) from error
     return timestamp, run_id
+
+
+def _parse_page_cursor(value: str | None) -> tuple[datetime, str] | None:
+    if value is None:
+        return None
+    try:
+        return _decode_page_cursor(value)
+    except InvalidPageCursorError as error:
+        raise HTTPException(status_code=422, detail=INVALID_PAGE_CURSOR) from error
+
+
+def _parse_page_cursor_v2(value: str | None) -> tuple[datetime, str] | None:
+    """Parse a cursor, refusing a bad one as FastAPI refuses other parameters."""
+
+    if value is None:
+        return None
+    try:
+        return _decode_page_cursor(value)
+    except InvalidPageCursorError as error:
+        raise RequestValidationError(
+            [
+                {
+                    "type": "value_error",
+                    "loc": ("query", "before"),
+                    "msg": INVALID_PAGE_CURSOR,
+                    "input": value,
+                }
+            ]
+        ) from error
+
+
+READ_TOKEN_HEADER = APIKeyHeader(
+    name="X-Telemetry-Read-Token",
+    scheme_name="ReadToken",
+    description="The dashboard read credential.",
+    auto_error=False,
+)
+
+V2_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
+    401: {
+        "model": ErrorMessage,
+        "description": "The read credential is missing or wrong.",
+    },
+    503: {
+        "model": ErrorMessage,
+        "description": (
+            "A deployment is in progress; retry after the `Retry-After` header's "
+            "seconds."
+        ),
+    },
+}
 
 
 SCOPE_REFUSALS: dict[str, str] = {
@@ -386,6 +459,13 @@ def create_app(
                 detail="A valid dashboard read credential is required.",
             )
 
+    # The same credential for read API v2, declared as a security scheme so
+    # that its OpenAPI document and typed client describe it.
+    def require_read_token_v2(
+        token: Annotated[str | None, Security(READ_TOKEN_HEADER)] = None,
+    ) -> None:
+        require_read_token(token)
+
     def session_claims(
         authorization: Annotated[str | None, Header()] = None,
     ) -> SessionTokenClaims:
@@ -519,6 +599,67 @@ def create_app(
         if run is None:
             raise HTTPException(status_code=404, detail="Run was not found.")
         return run
+
+    @application.get(
+        "/v2/runs",
+        response_model=RunPage,
+        dependencies=[Depends(require_read_token_v2)],
+        responses=V2_ERROR_RESPONSES,
+        operation_id="listRuns",
+        summary="List runs, newest registration first",
+        tags=["read API v2"],
+    )
+    def list_runs_v2(
+        country: Annotated[
+            str | None,
+            Query(
+                pattern=r"^[A-Z]{2}$",
+                description="Only runs of this country, such as `US` or `GB`.",
+            ),
+        ] = None,
+        limit: Annotated[
+            int, Query(ge=1, le=200, description="The most runs to return.")
+        ] = 60,
+        before: Annotated[
+            str | None,
+            Query(description="The previous page's `next_before`."),
+        ] = None,
+    ) -> RunPage:
+        runs = store.list_runs(
+            country=country,
+            limit=limit,
+            before=_parse_page_cursor_v2(before),
+        )
+        next_before = (
+            _page_cursor(runs[-1]["registered_at"], runs[-1]["run_id"])
+            if len(runs) == limit
+            else None
+        )
+        return RunPage.model_validate({"runs": runs, "next_before": next_before})
+
+    @application.get(
+        "/v2/runs/{run_id}",
+        response_model=RunDetail,
+        dependencies=[Depends(require_read_token_v2)],
+        responses={
+            **V2_ERROR_RESPONSES,
+            404: {"model": ErrorMessage, "description": "The run was not found."},
+        },
+        operation_id="getRun",
+        summary="A run's state and the events it was rebuilt from",
+        tags=["read API v2"],
+    )
+    def get_run_v2(
+        run_id: Annotated[str, Path(pattern=SAFE_IDENTIFIER)],
+    ) -> RunDetail:
+        record = store.get_run_record(run_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="Run was not found.")
+        return run_detail(record.registered_run, record.events)
+
+    @application.get("/v2/openapi.json", include_in_schema=False)
+    def read_api_v2_openapi() -> dict[str, Any]:
+        return openapi_document(application)
 
     return application
 

@@ -39,3 +39,26 @@ jobs:
       - run: DATABASE_URL="$TEST_DATABASE_URL" uv run alembic check
       - run: bash tools/check-quality.sh
       - run: docker build --tag microcosm-collector:validation .
+
+  client:
+    name: Read API client
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/collector-client
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "24.22.1"
+          package-manager-cache: false
+      - run: npm ci
+      # The client's types must be generated from the checked-in spec, which
+      # the Python tests compare with the collector's own.
+      - run: npm run generate
+      - run: git diff --exit-code -- src/schema.ts
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm pack --dry-run
