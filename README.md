@@ -261,9 +261,14 @@ a destination environment variable.
 
 ```bash
 uv sync --locked --dev
+npm ci --prefix orrery-validator --omit=dev --omit=peer --ignore-scripts
 uv run pytest -q
 bash tools/check-quality.sh
 ```
+
+The Orrery validator's tests (`tests/test_orrery_validation.py`) run the
+real validator, so they need Node 22.14 or later and the validator's
+packages installed as above; CI uses Node 24.21.0, the release the image holds.
 
 `tools/check-quality.sh` runs Ruff's lint and format checks and syntax-checks
 every shell script in `tools/` and `scripts/` with `bash -n`, as CI does.
@@ -310,6 +315,43 @@ modules named in `provenance.py`, in
 
 Once Microcosm hands its Orrery inputs to the collector and removes its copy,
 this copy is the only one, and changes to the projection are made here.
+
+### Orrery validation
+
+`orrery-validator/validate-orrery-document.mjs` validates an Orrery graph
+document under Node with one version of `@axiom-foundation/orrery`, pinned in
+`orrery-validator/package.json` and its lockfile (0.6.2; its validation code
+is identical to 0.6.1's, which microcosm-runs uses). It accepts exactly what
+microcosm-runs' publication accepts for a graph file (`lib/service.ts`):
+
+- the bytes decode as strict UTF-8 and parse as JSON, or the answer is
+  `invalid_json`;
+- Orrery's `parseGraphDocument` accepts the document, or it is
+  `invalid_graph`, with Orrery's issues;
+- `checkSources`: every `url` is an `https://` URL without a user name or
+  password, or names, before any `#`, a file published with the document, or
+  it is `invalid_source`. An `https://` value that is not a URL is refused
+  here; microcosm-runs fails the request on it instead.
+
+`telemetry_collector.orrery.validation.validate_orrery_document(document,
+published_file_names)` runs it and returns the Orrery version, raises
+`OrreryDocumentRefusedError` with the code for a refused document, and raises
+`OrreryValidatorError` when the validator could not run. By hand:
+
+```bash
+uv run python -m telemetry_collector.orrery.validation graph.orrery.json NAME...
+```
+
+The image holds Node 24.21.0, copied from the official image by digest, and the
+validator installed with `npm ci`. npm is not in the image. CI checks the built
+image with `tools/check-worker-image.sh`, which runs the validator inside it on
+a projected document and on one Orrery refuses. Nothing in the service or the
+worker validates documents yet; the collector's Orrery worker will.
+
+To move to another Orrery version, change the version in
+`orrery-validator/package.json`, run `npm install --prefix orrery-validator
+--package-lock-only --ignore-scripts`, and update `ORRERY_VERSION` in
+`tests/test_orrery_validation.py`.
 
 ## Hugging Face read access
 
