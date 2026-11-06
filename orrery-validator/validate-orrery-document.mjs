@@ -1,6 +1,8 @@
 // Validates one Orrery graph document with the pinned @axiom-foundation/orrery,
-// accepting exactly what microcosm-runs' publication accepts for a graph file
-// (lib/service.ts at PolicyEngine/microcosm-runs 204aa72247fd1589d3ee3a07fc4fe453f3692d93):
+// accepting exactly the graph file contents microcosm-runs' publication
+// accepts (lib/service.ts at PolicyEngine/microcosm-runs
+// 204aa72247fd1589d3ee3a07fc4fe453f3692d93). Its checks on the publication
+// itself (file sizes and names) are the Orrery worker's.
 //
 // 1. the bytes decode as strict UTF-8 and parse as JSON ("invalid_json");
 // 2. Orrery's parseGraphDocument accepts the document ("invalid_graph");
@@ -12,7 +14,9 @@
 //
 // It prints one JSON line. Exit 0: {"valid": true, "orrery_version": ...}.
 // Exit 2, the document is refused: {"valid": false, "orrery_version": ...,
-// "code": ..., "message": ..., "issues": [{"path", "message"}, ...]}. Exit 1:
+// "code": ..., "message": ..., "issues": [{"path", "message"}, ...]}, with at
+// most 100 issues of at most 500 characters each. A refusal says where a
+// link is, never what it holds, since a link may carry a credential. Exit 1:
 // the validator could not run (a wrong argument, an unreadable file, an
 // unexpected error), with the reason on standard error.
 import { readFileSync } from "node:fs";
@@ -24,8 +28,14 @@ import { GraphValidationError, parseGraphDocument } from "@axiom-foundation/orre
 const ORRERY_VERSION = JSON.parse(
   readFileSync(new URL("./node_modules/@axiom-foundation/orrery/package.json", import.meta.url), "utf8"),
 ).version;
-// Keeps the answer small for a document with many problems.
+// Keeps the answer small for a document with many problems, or with long
+// identities, which Orrery repeats in its messages.
 const MAX_ISSUES = 100;
+const MAX_ISSUE_CHARACTERS = 500;
+
+function shortened(text) {
+  return text.length > MAX_ISSUE_CHARACTERS ? `${text.slice(0, MAX_ISSUE_CHARACTERS - 1)}…` : text;
+}
 
 class DocumentRefusal extends Error {
   constructor(code, message, issues = []) {
@@ -35,30 +45,41 @@ class DocumentRefusal extends Error {
   }
 }
 
-// microcosm-runs' checkSources, except that an https:// value that is not a
-// URL is refused here; microcosm-runs fails the request on it instead.
+// A JSON path such as $.nodes[3].url, for a key of an array or an object.
+function childPath(path, parent, key) {
+  return Array.isArray(parent) ? `${path}[${key}]` : `${path}.${key}`;
+}
+
+function sourceRefusal(path, message) {
+  return new DocumentRefusal("invalid_source", message, [{ path: shortened(path), message }]);
+}
+
+// microcosm-runs' checkSources, visiting the same values, except that an
+// https:// value that is not a URL is refused here, where microcosm-runs
+// answers 503 for it.
 function checkSources(value, names) {
-  const pending = [value];
+  const pending = [[value, "$"]];
   while (pending.length) {
-    const current = pending.pop();
+    const [current, path] = pending.pop();
     if (!current || typeof current !== "object") continue;
     for (const [key, item] of Object.entries(current)) {
+      const itemPath = childPath(path, current, key);
       if (key === "url" && typeof item === "string") {
         if (item.startsWith("https://")) {
           let url;
           try {
             url = new URL(item);
           } catch {
-            throw new DocumentRefusal("invalid_source", `${item} is not a URL.`);
+            throw sourceRefusal(itemPath, "A link is not a URL.");
           }
           if (url.username || url.password) {
-            throw new DocumentRefusal("invalid_source", "A source URL carries a user name or password.");
+            throw sourceRefusal(itemPath, "A link carries a user name or password.");
           }
         } else if (!names.has(item.split("#", 1)[0])) {
-          throw new DocumentRefusal("invalid_source", `${item} names no file published with the document.`);
+          throw sourceRefusal(itemPath, "A link is neither an https:// URL nor a file published with the document.");
         }
       }
-      if (item && typeof item === "object") pending.push(item);
+      if (item && typeof item === "object") pending.push([item, itemPath]);
     }
   }
 }
@@ -78,7 +99,10 @@ function validate(bytes, names) {
     throw new DocumentRefusal(
       "invalid_graph",
       "Orrery refused the document.",
-      issues.slice(0, MAX_ISSUES).map(({ path, message }) => ({ path, message })),
+      issues.slice(0, MAX_ISSUES).map(({ path, message }) => ({
+        path: shortened(String(path)),
+        message: shortened(String(message)),
+      })),
     );
   }
   checkSources(document, names);

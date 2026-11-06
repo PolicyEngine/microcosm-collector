@@ -321,8 +321,8 @@ this copy is the only one, and changes to the projection are made here.
 `orrery-validator/validate-orrery-document.mjs` validates an Orrery graph
 document under Node with one version of `@axiom-foundation/orrery`, pinned in
 `orrery-validator/package.json` and its lockfile (0.6.2; its validation code
-is identical to 0.6.1's, which microcosm-runs uses). It accepts exactly what
-microcosm-runs' publication accepts for a graph file (`lib/service.ts`):
+is identical to 0.6.1's, which microcosm-runs uses). It accepts exactly the
+graph file contents microcosm-runs' publication accepts (`lib/service.ts`):
 
 - the bytes decode as strict UTF-8 and parse as JSON, or the answer is
   `invalid_json`;
@@ -331,12 +331,19 @@ microcosm-runs' publication accepts for a graph file (`lib/service.ts`):
 - `checkSources`: every `url` is an `https://` URL without a user name or
   password, or names, before any `#`, a file published with the document, or
   it is `invalid_source`. An `https://` value that is not a URL is refused
-  here; microcosm-runs fails the request on it instead.
+  here; microcosm-runs answers 503 for it instead.
+
+A refusal says where a link is (its JSON path), never what it holds, since a
+link may carry a credential, and keeps at most 100 issues of at most 500
+characters each. microcosm-runs also refuses a graph file over 64 MiB and file
+names outside its role patterns; those are checks on the publication, which
+the Orrery worker (O4) makes, not on the document.
 
 `telemetry_collector.orrery.validation.validate_orrery_document(document,
 published_file_names)` runs it and returns the Orrery version, raises
-`OrreryDocumentRefusedError` with the code for a refused document, and raises
-`OrreryValidatorError` when the validator could not run. By hand:
+`OrreryDocumentRefusedError` with the code, issues and Orrery version for a
+refused document, and raises `OrreryValidatorError` when the validator could
+not run. By hand:
 
 ```bash
 uv run python -m telemetry_collector.orrery.validation graph.orrery.json NAME...

@@ -1,8 +1,8 @@
 """Validate Orrery graph documents with the pinned ``@axiom-foundation/orrery``.
 
 ``orrery-validator/validate-orrery-document.mjs`` runs under Node with the one
-Orrery version its lockfile pins, and accepts exactly what microcosm-runs'
-publication accepts for a graph file: strict UTF-8 JSON, Orrery's
+Orrery version its lockfile pins, and accepts exactly the graph file contents
+microcosm-runs' publication accepts: strict UTF-8 JSON, Orrery's
 ``parseGraphDocument``, and microcosm-runs' ``checkSources`` (every ``url`` is
 an ``https://`` URL without a user name or password, or names a file
 published with the document). The image the worker job runs holds Node and
@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-from collections.abc import Iterable
+from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -45,11 +45,18 @@ class OrreryValidation:
 class OrreryDocumentRefusedError(Exception):
     """The document is not one microcosm-runs would publish as a graph file."""
 
-    def __init__(self, code: str, message: str, issues: list[dict[str, str]]) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        issues: list[dict[str, str]],
+        orrery_version: str,
+    ) -> None:
         super().__init__(f"{code}: {message}")
         self.code = code
         self.message = message
         self.issues = issues
+        self.orrery_version = orrery_version
 
 
 class OrreryValidatorError(RuntimeError):
@@ -72,7 +79,7 @@ def _answer(stdout: str) -> dict[str, Any]:
 
 def validate_orrery_document(
     document: Path,
-    published_file_names: Iterable[str],
+    published_file_names: Collection[str],
     *,
     node: str = "node",
     validator: Path = VALIDATOR_SCRIPT,
@@ -81,9 +88,12 @@ def validate_orrery_document(
     """Validate ``document``, whose links may name ``published_file_names``.
 
     Raises ``OrreryDocumentRefusedError`` for a document the checks refuse and
-    ``OrreryValidatorError`` when the validator could not run.
+    ``OrreryValidatorError`` when the validator could not run. A refusal says
+    where a link is, never what it holds, since a link may carry a credential.
     """
 
+    if isinstance(published_file_names, str):
+        raise TypeError("published_file_names must be a collection of names.")
     command = [node, str(validator), str(document), *sorted(published_file_names)]
     try:
         completed = subprocess.run(
@@ -97,7 +107,8 @@ def validate_orrery_document(
         raise OrreryValidatorError(
             f"The Orrery validator did not finish within {timeout_seconds} seconds."
         ) from error
-    except OSError as error:
+    except (OSError, ValueError) as error:
+        # ValueError: an argument Node cannot take, such as one with a NUL.
         raise OrreryValidatorError(
             f"The Orrery validator could not start: {error}"
         ) from error
@@ -114,6 +125,7 @@ def validate_orrery_document(
             answer["code"],
             str(answer.get("message", "")),
             list(answer.get("issues", [])),
+            answer["orrery_version"],
         )
     raise OrreryValidatorError(
         f"The Orrery validator exited with {completed.returncode}: "
@@ -139,6 +151,7 @@ def main(argv: list[str]) -> int:
             json.dumps(
                 {
                     "valid": False,
+                    "orrery_version": refusal.orrery_version,
                     "code": refusal.code,
                     "message": refusal.message,
                     "issues": refusal.issues,
