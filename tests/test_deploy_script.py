@@ -359,6 +359,80 @@ def test_check_intake_jobs_refuses_a_job_of_another_environment_or_account(
     assert result.stderr == expected_error
 
 
+@pytest.mark.parametrize(
+    ("description", "expected_error"),
+    [
+        (
+            {"spec": {"template": {"metadata": {"annotations": {}}}}},
+            "Cloud Run job worker-job runs as another service account than "
+            "this deployment gives it.\n",
+        ),
+        (
+            {
+                "spec": {
+                    "template": {
+                        "spec": {
+                            "template": {"spec": {"serviceAccountName": WORKER_ACCOUNT}}
+                        }
+                    }
+                }
+            },
+            "Cloud Run job worker-job connects to another Cloud SQL instance "
+            "than this environment's.\n",
+        ),
+        (
+            {
+                "spec": {
+                    "template": {
+                        "metadata": {
+                            "annotations": {
+                                "run.googleapis.com/cloudsql-instances": (
+                                    f"{STAGING_CONNECTION},{PRODUCTION_CONNECTION}"
+                                )
+                            }
+                        },
+                        "spec": {
+                            "template": {"spec": {"serviceAccountName": WORKER_ACCOUNT}}
+                        },
+                    }
+                }
+            },
+            "Cloud Run job worker-job connects to another Cloud SQL instance "
+            "than this environment's.\n",
+        ),
+        (
+            "not a job description",
+            "Cannot read the description of Cloud Run job: worker-job\n",
+        ),
+    ],
+    ids=["no account", "no Cloud SQL instance", "two instances", "unreadable"],
+)
+def test_check_intake_jobs_refuses_a_description_it_cannot_match(
+    tmp_path: Path, description: dict | str, expected_error: str
+) -> None:
+    descriptions = tmp_path / "jobs"
+    install_command_stub(tmp_path, "gcloud", DESCRIBING_GCLOUD)
+    write_job_description(
+        descriptions,
+        "recovery-job",
+        account=RECOVERY_ACCOUNT,
+        connection=STAGING_CONNECTION,
+    )
+    (descriptions / "worker-job.json").write_text(
+        description if isinstance(description, str) else json.dumps(description)
+    )
+
+    result = run_deploy(
+        "check-intake-jobs",
+        environment=job_check_environment(
+            tmp_path, tmp_path / "commands.log", descriptions
+        ),
+    )
+
+    assert result.returncode == 1
+    assert result.stderr == expected_error
+
+
 PROJECT_RESOURCES = "projects/project/locations/region"
 # Each name the deploy checks, the collector's pattern for the setting it
 # becomes, and how the deploy turns the name into that setting.
@@ -398,6 +472,37 @@ COLLECTOR_SETTING_SHAPES = {
             "WORKER_INVOKER_SERVICE_ACCOUNT",
             "Invoker-1@example-project.iam.gserviceaccount.com",
         ),
+        # Each pattern's length bounds, on both sides.
+        ("INTAKE_BUCKET", "abc"),
+        ("INTAKE_BUCKET", "ab"),
+        ("INTAKE_BUCKET", "a" * 63),
+        ("INTAKE_BUCKET", "a" * 64),
+        ("WORKER_QUEUE", "q"),
+        ("WORKER_QUEUE", "q" * 100),
+        ("WORKER_QUEUE", "q" * 101),
+        ("WORKER_JOB", "w"),
+        ("WORKER_JOB", "w" * 63),
+        ("WORKER_JOB", "w" * 64),
+        (
+            "RUNTIME_SERVICE_ACCOUNT",
+            "a" * 6 + "@example-project.iam.gserviceaccount.com",
+        ),
+        (
+            "RUNTIME_SERVICE_ACCOUNT",
+            "a" * 5 + "@example-project.iam.gserviceaccount.com",
+        ),
+        (
+            "RUNTIME_SERVICE_ACCOUNT",
+            "a" * 30 + "@example-project.iam.gserviceaccount.com",
+        ),
+        (
+            "RUNTIME_SERVICE_ACCOUNT",
+            "a" * 31 + "@example-project.iam.gserviceaccount.com",
+        ),
+        (
+            "RUNTIME_SERVICE_ACCOUNT",
+            "runtime-1-@example-project.iam.gserviceaccount.com",
+        ),
     ],
 )
 def test_require_configuration_refuses_exactly_the_names_the_collector_refuses(
@@ -415,6 +520,63 @@ def test_require_configuration_refuses_exactly_the_names_the_collector_refuses(
     else:
         assert result.returncode == 1
         assert result.stderr == f"{variable} is not a valid resource name.\n"
+
+
+def deploy_script_pattern(name: str) -> str:
+    match = re.search(rf"^{name}='([^']*)'$", DEPLOY_SCRIPT.read_text(), re.MULTILINE)
+    assert match is not None, name
+    return match.group(1)
+
+
+def test_deploy_script_patterns_are_the_collectors() -> None:
+    # The queue and job patterns name the last part of a resource name, which
+    # is all the deploy reads; the other two are whole settings.
+    assert deploy_script_pattern("BUCKET_NAME_PATTERN") == BUCKET_PATTERN
+    assert deploy_script_pattern("SERVICE_ACCOUNT_PATTERN") == SERVICE_ACCOUNT_PATTERN
+    queue_name = deploy_script_pattern("QUEUE_NAME_PATTERN")
+    job_name = deploy_script_pattern("JOB_NAME_PATTERN")
+    assert queue_name.startswith("^")
+    assert QUEUE_PATTERN.endswith("/queues/" + queue_name.removeprefix("^"))
+    assert job_name.startswith("^")
+    assert JOB_PATTERN.endswith("/jobs/" + job_name.removeprefix("^"))
+
+
+@pytest.mark.parametrize(
+    ("deploy_command", "variable", "value"),
+    [
+        ("deploy-maintenance", "WORKER_QUEUE", "worker_queue"),
+        ("deploy-candidate", "INTAKE_BUCKET", "Intake-Bucket"),
+        (
+            "deploy-candidate",
+            "WORKER_INVOKER_SERVICE_ACCOUNT",
+            "invoker@example.invalid",
+        ),
+        ("configure-worker-job", "INTAKE_BUCKET", "gs://intake-bucket"),
+        ("configure-recovery-job", "WORKER_QUEUE", PROJECT_RESOURCES + "/queues/q"),
+        ("configure-recovery-job", "WORKER_JOB", "Worker-Job"),
+        (
+            "configure-recovery-job",
+            "WORKER_INVOKER_SERVICE_ACCOUNT",
+            "invoker@x.invalid",
+        ),
+    ],
+)
+def test_commands_that_write_intake_settings_check_the_names_again(
+    tmp_path: Path, deploy_command: str, variable: str, value: str
+) -> None:
+    command_log = tmp_path / "commands.log"
+    install_command_stub(tmp_path, "gcloud", LOGGING_GCLOUD)
+    if deploy_command.startswith("deploy-"):
+        environment = service_deploy_environment(tmp_path, command_log, "production")
+    else:
+        environment = job_deploy_environment(tmp_path, command_log, "production")
+    environment[variable] = value
+
+    result = run_deploy(deploy_command, environment=environment)
+
+    assert result.returncode == 1
+    assert result.stderr == f"{variable} is not a valid resource name.\n"
+    assert not command_log.exists()
 
 
 def logged_setting_values(command: str) -> dict[str, str]:
