@@ -380,12 +380,25 @@ PolicyEngine/calibration-diagnostics, and its history was extracted here.
 This repo has deployed staging and production since release 0.3.2 on
 2026-10-21; calibration-diagnostics no longer deploys the service (see
 "Enabling deployment" below). The Docker build context is the root of this repo.
-Cloud Run assigns the production service address. Microcosm fixes that origin
-in its delivery service; the address is intentionally not repeated in
-documentation.
 
-Infrastructure was provisioned once with disposable scripts kept outside the
-source tree. The source tree intentionally contains no bootstrap script or
+Both environments run in the collector's own Google Cloud project, separate
+from the project that hosts the Public API. Each environment is reached through
+its own hostname: a global external Application Load Balancer with a static IP
+address, a Google-managed certificate from Certificate Manager, and a
+serverless network endpoint group for that environment's Cloud Run service.
+The emitter's default collector origin is the production hostname. The
+hostnames are intentionally not repeated in documentation; the dashboard's
+`MICROCOSM_TELEMETRY_COLLECTOR_URL` settings hold them.
+[`docs/project-and-domain-decision.md`](docs/project-and-domain-decision.md)
+records why, and [`docs/project-move-runbook.md`](docs/project-move-runbook.md)
+how the services, databases and secrets moved there. Cloud Run's default
+addresses stay on: the deployment checks each maintenance and candidate
+revision through its tagged default address. The services left in the earlier
+project stay in maintenance mode, answering 503, until the runbook's section 13
+retires them.
+
+The load balancers and the collector's project were created by hand, following
+the runbook. The source tree intentionally contains no bootstrap script or
 mutable infrastructure template.
 
 `.github/workflows/pr.yaml` runs actionlint and `.github/workflows/ci.yml`
@@ -424,8 +437,9 @@ Hugging Face authentication.
 ### Google Cloud access
 
 The deployment jobs exchange their GitHub OIDC token through a Workload
-Identity provider dedicated to this repo, then act as the same deployment
-service account that calibration-diagnostics uses. The provider maps
+Identity provider in the collector's project, dedicated to this repo, then act
+as a deployment service account in that project that only this repo uses. The
+provider maps
 `google.subject=assertion.sub`, `attribute.actor=assertion.actor`,
 `attribute.ref=assertion.ref` and `attribute.repository=assertion.repository`,
 and accepts a token only when:
@@ -460,8 +474,11 @@ The deployment's access and configuration are provisioned:
 - The `staging` and `production` environments each hold the secrets
   `TELEMETRY_GCP_WIF_PROVIDER` (this repo's provider) and
   `TELEMETRY_GCP_DEPLOY_SERVICE_ACCOUNT`, and the 15 `TELEMETRY_*` variables
-  that `.github/workflows/push.yaml` reads, copied by name and value from the
-  calibration-diagnostics `staging` and `Production` environments.
+  that `.github/workflows/push.yaml` reads. They were first copied from the
+  calibration-diagnostics `staging` and `Production` environments; the project
+  move pointed each environment's project, Cloud SQL connections, service
+  accounts, provider and deployment account at the collector's project (the
+  runbook's section 14 lists them).
 
 The move from calibration-diagnostics is complete:
 
@@ -469,10 +486,10 @@ The move from calibration-diagnostics is complete:
   (PolicyEngine/calibration-diagnostics#219) were carried over, as
   `tools/extraction-source.env` records (see below).
 - PolicyEngine/calibration-diagnostics#233 stopped its `telemetry-service.yml`
-  workflow from deploying on push. That workflow keeps a manual redeploy of
-  calibration-diagnostics' `main`, for moving deployment back there; whoever
-  dispatches it must first unset `COLLECTOR_DEPLOY_ENABLED` here, and confirms
-  that in the dispatch form.
+  workflow from deploying on push. Since the project move, that workflow's
+  manual redeploy must never be run: its settings name the earlier project,
+  and its code predates migration `0002_artifact_intake`
+  (PolicyEngine/calibration-diagnostics#234 removes it).
 - `COLLECTOR_DEPLOY_ENABLED` was set to `true` on 2026-10-20. Release 0.3.2,
   on 2026-10-21, was the first that this repo deployed to staging and
   production.

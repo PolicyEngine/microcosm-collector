@@ -1,3 +1,17 @@
+## [0.7.3] - 2026-11-05
+
+### Changed
+
+- The README describes the collector's own Google Cloud project: each environment behind its own hostname on a global external Application Load Balancer, deployments authenticating through a provider and deployment account in that project, and calibration-diagnostics' old `telemetry-service.yml` redeploy never to be run.
+
+
+## [0.7.2] - 2026-11-04
+
+### Fixed
+
+- The project-move runbook keeps database passwords out of gcloud's log files: gcloud writes every flag's value to `~/.config/gcloud/logs`, so the commands that pass a password in `--password` now run with `CLOUDSDK_CORE_DISABLE_FILE_LOGGING=1`.
+
+
 ## [0.7.1] - 2026-11-04
 
 ### Changed
