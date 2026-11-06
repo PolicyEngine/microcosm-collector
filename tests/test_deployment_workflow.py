@@ -4,6 +4,7 @@ import json
 import re
 from pathlib import Path
 
+import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -244,6 +245,13 @@ def test_service_deployment_reads_resource_names_from_environment_variables() ->
             "TELEMETRY_PRODUCTION_CLOUD_SQL_CONNECTION"
         ),
         "PRODUCTION_SERVICE": "TELEMETRY_PRODUCTION_SERVICE",
+        "INTAKE_BUCKET": "TELEMETRY_INTAKE_BUCKET",
+        "WORKER_QUEUE": "TELEMETRY_WORKER_QUEUE",
+        "WORKER_JOB": "TELEMETRY_WORKER_JOB",
+        "RECOVERY_JOB": "TELEMETRY_RECOVERY_JOB",
+        "WORKER_SERVICE_ACCOUNT": "TELEMETRY_WORKER_SERVICE_ACCOUNT",
+        "WORKER_INVOKER_SERVICE_ACCOUNT": "TELEMETRY_WORKER_INVOKER_SERVICE_ACCOUNT",
+        "RECOVERY_SERVICE_ACCOUNT": "TELEMETRY_RECOVERY_SERVICE_ACCOUNT",
     }
     for environment_name, github_variable_name in expected_variables.items():
         assert (
@@ -251,7 +259,66 @@ def test_service_deployment_reads_resource_names_from_environment_variables() ->
                 f"{environment_name}: ${{{{ vars.{github_variable_name} }}}}"
             )
             == 2
-        )
+        ), environment_name
+
+
+def test_release_switches_intake_on_without_a_per_environment_switch() -> None:
+    jobs = load_workflow(PUSH_WORKFLOW)["jobs"]
+
+    # Every release switches intake on in both environments together; the
+    # deploy script's tests check the setting each revision gets.
+    assert "TELEMETRY_INTAKE_ENABLED" not in PUSH_WORKFLOW.read_text(encoding="utf-8")
+    for job_name in DEPLOY_JOBS:
+        assert "INTAKE_ENABLED" not in jobs[job_name]["env"], job_name
+
+
+def test_both_deploy_jobs_read_their_hugging_face_read_token_secret_name() -> None:
+    jobs = load_workflow(PUSH_WORKFLOW)["jobs"]
+    mapping = "${{ vars.TELEMETRY_HF_READ_SECRET_NAME }}"
+
+    # Each environment names its own secret, which only its worker may read.
+    for job_name in DEPLOY_JOBS:
+        assert jobs[job_name]["env"].get("HF_READ_SECRET_NAME") == mapping, job_name
+    assert PUSH_WORKFLOW.read_text(encoding="utf-8").count(mapping) == 2
+
+
+def deploy_step(job: dict, command: str) -> dict:
+    matching_steps = [
+        step
+        for step in job["steps"]
+        if step.get("run") == f"scripts/deploy.sh {command}"
+    ]
+    assert len(matching_steps) == 1, (command, len(matching_steps))
+    return matching_steps[0]
+
+
+def step_position(job: dict, command: str) -> int:
+    return job["steps"].index(deploy_step(job, command))
+
+
+@pytest.mark.parametrize(
+    ("job_name", "image_source"),
+    [
+        ("deploy-staging", "${{ steps.image.outputs.uri }}"),
+        ("deploy-production", "${{ needs.deploy-staging.outputs.image_uri }}"),
+    ],
+)
+def test_release_updates_both_intake_jobs_between_migration_and_candidate(
+    job_name: str, image_source: str
+) -> None:
+    job = load_workflow(PUSH_WORKFLOW)["jobs"][job_name]
+
+    # Both jobs are checked before anything changes, and updated to
+    # the released image once the database has its schema, before a revision
+    # that can dispatch to them is deployed.
+    assert step_position(job, "check-intake-jobs") < step_position(
+        job, "deploy-maintenance"
+    )
+    for command in ("configure-worker-job", "configure-recovery-job"):
+        assert step_position(job, "apply-migrations") < step_position(job, command)
+        assert step_position(job, command) < step_position(job, "deploy-candidate")
+        assert deploy_step(job, command)["env"] == {"IMAGE_URI": image_source}
+    assert deploy_step(job, "deploy-candidate")["env"] == {"IMAGE_URI": image_source}
 
 
 def test_collector_uses_store_vocabulary() -> None:
@@ -341,11 +408,14 @@ def test_workflow_shell_logic_lives_in_scripts() -> None:
                     assert "\n" not in step["run"].strip(), (workflow_path.name, step)
 
     workflow = PUSH_WORKFLOW.read_text(encoding="utf-8")
-    assert workflow.count("run: scripts/deploy.sh") == 28
+    assert workflow.count("run: scripts/deploy.sh") == 34
     for command in (
         "require-configuration",
         "validate-environment-target",
         "check-secrets-exist",
+        "check-intake-jobs",
+        "configure-worker-job",
+        "configure-recovery-job",
         "build-and-push-image",
         "deploy-maintenance",
         "resolve-and-verify-maintenance",
