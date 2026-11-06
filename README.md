@@ -181,11 +181,13 @@ first release that contains the client has reached production:
    `true`, then merge the pull request. Its release's `publish-client` job
    publishes its version, and `npm view @policyengine/microcosm-collector-client`
    then lists it. If no publication succeeded within the 2 days, remove the
-   configuration (`npm trust list`, then `npm trust revoke --id <id>`) and
-   repeat step 4.
+   configuration and repeat step 4:
+   `npm trust list @policyengine/microcosm-collector-client` shows its id, and
+   `npm trust revoke --id <id> @policyengine/microcosm-collector-client`
+   removes it.
 
 To stop publishing, set the variable to anything else; to stop npm trusting the
-workflow, `npm trust revoke` the configuration that `npm trust list` shows.
+workflow, revoke the configuration in the same way.
 
 ## Artifact intake
 

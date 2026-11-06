@@ -453,7 +453,11 @@ def create_app(
     def require_read_token(
         token: Annotated[str | None, Header(alias="X-Telemetry-Read-Token")] = None,
     ) -> None:
-        if token is None or not hmac.compare_digest(token, settings.read_token):
+        # Compared as UTF-8 bytes: compare_digest refuses strings with
+        # characters above ASCII, which a Latin-1 decoded header can hold.
+        if token is None or not hmac.compare_digest(
+            token.encode("utf-8"), settings.read_token.encode("utf-8")
+        ):
             raise HTTPException(
                 status_code=401,
                 detail="A valid dashboard read credential is required.",

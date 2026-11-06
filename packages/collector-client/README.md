@@ -34,7 +34,8 @@ that is not a read API v2 answer throws `CollectorResponseError`. A request
 that takes longer than `timeoutMs` (30 seconds by default), including reading
 its answer, rejects with `fetch`'s `TimeoutError`. Arguments the collector
 would refuse throw `RangeError` before any request, and so does creating a
-client with a `timeoutMs` that is not a positive whole number.
+client with a `timeoutMs` that is not a whole number of milliseconds from 1 to
+2,147,483,647, the longest delay Node's timers allow.
 
 The version of this package is the version of the collector release whose read
 API it describes. Its types are generated from that release's OpenAPI document,

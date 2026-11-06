@@ -152,10 +152,16 @@ function collectorBaseUrl(value: string): string {
   return url.toString().replace(/\/+$/, "");
 }
 
+// Node's timers take at most this many milliseconds: a longer delay fires
+// after 1 millisecond, and from 2^32 `AbortSignal.timeout` throws.
+const LONGEST_TIMEOUT_MS = 2 ** 31 - 1;
+
 function requestTimeout(value: number | undefined): number {
   if (value === undefined) return DEFAULT_TIMEOUT_MS;
-  if (!Number.isSafeInteger(value) || value < 1) {
-    throw new RangeError("A timeout is a positive whole number of milliseconds.");
+  if (!Number.isInteger(value) || value < 1 || value > LONGEST_TIMEOUT_MS) {
+    throw new RangeError(
+      `A timeout is a whole number of milliseconds from 1 to ${LONGEST_TIMEOUT_MS}.`,
+    );
   }
   return value;
 }
@@ -253,7 +259,6 @@ export function createCollectorClient(
   options: CollectorClientOptions,
 ): CollectorClient {
   const baseUrl = collectorBaseUrl(options.baseUrl);
-  const fetchFunction = options.fetch ?? globalThis.fetch;
   const timeoutMs = requestTimeout(options.timeoutMs);
 
   async function readToken(): Promise<string> {
@@ -273,6 +278,9 @@ export function createCollectorClient(
     pathAndQuery: string,
     { missingRunAllowed = false } = {},
   ): Promise<unknown> {
+    // The global fetch is looked up for each request, so one that a test or
+    // framework installs after the client is created is used.
+    const fetchFunction = options.fetch ?? globalThis.fetch;
     const response = await fetchFunction(`${baseUrl}${pathAndQuery}`, {
       method: "GET",
       cache: "no-store",
