@@ -391,8 +391,12 @@ workflow's first job tests and typechecks the package. Its second job, the
 only one that can request a GitHub OIDC token, installs nothing: it checks
 that Node and npm are the pinned versions (`tools/check-npm-toolchain.sh`),
 then runs `tools/publish-calibration-tree.sh`, which asks npm for the version
-and publishes only if npm does not have it. The workflow can be run again by
-hand from `main` (`workflow_dispatch`) to retry a failed publication.
+and publishes only if npm does not have it. It publishes under npm's default
+`latest` tag, which npm refuses for a prerelease version or one lower than the
+latest, so a release raises the version to a new highest one. One run goes at
+a time, so versions merged one after another publish in that order. The
+workflow can be run again by hand from `main` (`workflow_dispatch`) to retry a
+failed publication.
 
 The workflow uses npm's trusted publishing: npm accepts the publish job's
 GitHub OIDC token in place of a stored npm token, and adds provenance because

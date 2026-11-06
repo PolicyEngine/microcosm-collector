@@ -38,6 +38,13 @@
 //   3  anything else: a size limit configured as something other than a
 //      positive integer, or an unexpected error, such as a defect in the
 //      builder, which may succeed once fixed.
+//
+// The split between 2 and 3 follows the error's class, so it is approximate:
+// the builder refuses most bad content with plain Errors (2), but a malformed
+// row can also end in a TypeError (3), and the bundle's checks of its own
+// output throw plain Errors (2) that only a defect should cause. A non-zero
+// exit can leave parts already written when a write fails, so each attempt
+// needs a new output directory.
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createHash } from "node:crypto";

@@ -23,6 +23,12 @@ on:
 permissions:
   contents: read
 
+# One run at a time, tests included, so two runs never publish the same
+# version and versions merged one after another publish in that order.
+concurrency:
+  group: calibration-tree-npm-publication
+  cancel-in-progress: false
+
 jobs:
   # Tests without an OIDC token, so nothing installed or run here can obtain
   # npm's trust.
@@ -57,10 +63,6 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    # One publication at a time, so two runs never publish the same version.
-    concurrency:
-      group: calibration-tree-npm-publication
-      cancel-in-progress: false
     defaults:
       run:
         working-directory: packages/calibration-tree
