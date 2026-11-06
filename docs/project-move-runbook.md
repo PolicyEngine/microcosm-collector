@@ -1150,8 +1150,9 @@ resources once, in the new project, and needs nothing in the current project.
 
 1. **The collector's own Hugging Face token and its daily check (S1, S2;
    #13, #18, #19).** Before merging each PR, create in the new project what
-   its README section names. For S1: the secret, readable only by the
-   account the worker jobs run as, which they read as
+   its README section names. For S1: one secret per environment, each
+   holding that environment's own token and readable only by the account
+   that environment's worker job runs as, which reads it as
    `COLLECTOR_HF_READ_TOKEN`. For
    S2: production's check job, its Cloud Scheduler job and the account it
    starts the job as, a notification channel and two Cloud Monitoring alert
