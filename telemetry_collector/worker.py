@@ -249,4 +249,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # `python -m telemetry_collector.worker` runs this file as `__main__`, a
+    # second copy of the module whose classes, SubmissionRejectedError among
+    # them, are not the ones the handlers import. The job runs through the
+    # imported module, so a handler's rejection is caught as one.
+    from telemetry_collector.worker import main as imported_main
+
+    raise SystemExit(imported_main())

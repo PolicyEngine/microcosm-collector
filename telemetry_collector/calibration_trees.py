@@ -4,11 +4,13 @@ The handler plans a tree from the submission's provenance: a build folder
 ``releases/<release>/<build>`` gives a release tree whose release ID is
 ``<release>/<build>``, and a staged bundle ``staged/<run_id>`` gives a staging
 tree of that run. It downloads the files into a new directory for each
-attempt and runs the tree package's Bun worker on them, without the Blob
-token, so the process that parses the submitted files cannot write to the
-store. It then runs the package's publication command, which holds the token,
-inside one Postgres transaction lock, so collector writers add to the
-manifest one at a time.
+attempt and runs the tree package's Bun worker on them with the Blob token
+left out of its environment, so the token never reaches the builder's
+arguments, environment or output. (This is not isolation: the builder runs as
+the same user as the worker, which holds the token in its own environment.)
+It then runs the package's publication command, which holds the token, inside
+one Postgres transaction lock, so collector writers add to the manifest one
+at a time.
 
 Nothing here reads Hugging Face: every value comes from the submission. The
 publication time recorded in the tree is the submission's ``accepted_at``, so

@@ -199,9 +199,11 @@ upload URLs; `POST /v1/submissions/{id}/complete` checks the stored objects'
 sizes and recorded digests and dispatches a worker job through Cloud Tasks; the
 worker, a Cloud Run Job running
 `uv run --no-sync python -m telemetry_collector.worker`, recomputes every
-file's SHA-256 and runs the handler registered for the kind. Until the
-calibration-tree and Orrery workers register theirs, both kinds are only
-checked and kept.
+file's SHA-256 and runs the handler registered for the kind. Where the
+worker job has its calibration tree Blob token, `calibration-diagnostics`
+submissions build calibration trees ("Building trees from submissions");
+`orrery-inputs` submissions are only checked and kept until the Orrery worker
+registers its handler.
 
 Intake is off unless `COLLECTOR_INTAKE_ENABLED` is exactly `1`. While it is
 off, the collector reads no other intake setting, and the token exchange for
@@ -353,7 +355,8 @@ and region, these resources, created by hand (both environments have them):
   itself), enqueue on the queue, and act as the invoker account; the invoker
   account may run the worker job with overrides; the worker's service account
   may read the bucket, connect to Cloud SQL and read the runtime database
-  secret and its environment's Hugging Face read token's secret; the recovery
+  secret, its environment's Hugging Face read token's secret and its
+  environment's calibration tree Blob token's secret; the recovery
   job's service account may connect to Cloud SQL, read the runtime database
   secret, enqueue on the queue and act as the invoker account; Cloud
   Scheduler's account may run the recovery job; and the deployment service
@@ -370,8 +373,8 @@ Each release, in each environment, `scripts/deploy.sh`:
      (`check-intake-jobs`), so a variable naming the other environment's job
      stops the deploy. To move a job to another account, update the job by
      hand first;
-   - that the environment's Hugging Face read token's secret exists
-     (`check-secrets-exist`);
+   - that the environment's six secrets exist, its Hugging Face read token's
+     and its calibration tree Blob token's among them (`check-secrets-exist`);
 2. passes the intake settings in the first table to the maintenance and
    candidate revisions;
 3. after the migration and before the candidate revision, updates the worker
@@ -380,9 +383,9 @@ Each release, in each environment, `scripts/deploy.sh`:
    configuration: service account, Cloud SQL connection, secrets, settings,
    command, task count, retries, task timeout, CPU and memory. Each update
    sets the job's secrets with `--set-secrets`, which replaces every mount,
-   so the worker job's lists `DATABASE_URL` and `COLLECTOR_HF_READ_TOKEN`
-   together. The deploy changes neither the
-   schedule nor any job's permissions.
+   so the worker job's lists `DATABASE_URL`, `COLLECTOR_HF_READ_TOKEN` and
+   `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN` together. The deploy changes
+   neither the schedule nor any job's permissions.
 
 Maintenance mode holds only the service. An execution of either job keeps the
 image it started with, for all its attempts: a worker execution that is
@@ -560,9 +563,13 @@ publisher would record. The publication command uploads each part to its
 immutable path (keeping a part already stored with the same bytes), then
 writes the manifest with a compare-and-swap: it creates the manifest only if
 it is still absent and replaces it only if its ETag is still the one read, so
-a manifest another writer changed is never overwritten. Exit 2 means the
-manifest refuses the entry, for example because another build is already
-recorded for the same release build or staged run.
+a manifest another writer changed is never overwritten, and a manifest read
+without an ETag is never replaced. A build asked to become its country's
+latest does so only if it is at least as new (`createdAt`) as the current
+latest. Exit 2 means the build is refused: another build is already recorded
+for the same release build or staged run, or the same build was already
+recorded from another submission of the same files, whose index records
+another time or label.
 
 ### Building trees from submissions
 
@@ -591,20 +598,26 @@ reads Hugging Face: every value comes from the submission.
 - **Latest.** A release build becomes its country's latest when its release
   is the country's default release, listed in `DEFAULT_RELEASES`: the UK's is
   `microcosm-uk-2024-25-national`; the US's is added once its stable releases
-  are agreed. Builds of other releases are recorded without moving the latest.
+  are agreed. It takes the latest only from an older build, by publication
+  time, so a retried or reprocessed older build never takes the latest back.
+  Builds of other releases are recorded without moving the latest.
 - **How.** Each attempt downloads the files into a new temporary directory
   and runs the tree worker with only `PATH`, `LANG` and the package's size
   limits (`CALIBRATION_TREE_MAX_RAW_BYTES`, `CALIBRATION_TREE_MAX_GZIP_BYTES`)
-  in its environment, never the Blob token. It then runs the publication
-  command, with the token, inside a Postgres transaction lock
-  (`pg_advisory_xact_lock`), so the collector's writers change the manifest
-  one at a time.
+  in its environment, never the Blob token. That keeps the token out of the
+  builder's environment, arguments and output, but it is not isolation: the
+  builder runs as the same user as the worker, which holds the token in its
+  own environment. It then runs the publication command, with the token,
+  inside a Postgres transaction lock (`pg_advisory_xact_lock`), so the
+  collector's writers change the manifest one at a time.
 - **Results.** A published tree's result names its build ID, kind, how many
   parts were uploaded or already stored, and whether it became the latest.
-  The worker refusing the files (`calibration_tree_unbuildable`) or the
-  manifest refusing the entry (`calibration_tree_refused`) rejects the
-  submission; any other failure, including a manifest another writer changed
-  meanwhile, fails the attempt so it runs again.
+  The worker refusing the files (`calibration_tree_unbuildable`), or the
+  build being refused (`calibration_tree_refused`: another build already
+  recorded for the same release build or staged run, or the same files
+  already recorded from another submission), rejects the submission; any
+  other failure, including a manifest another writer changed meanwhile, fails
+  the attempt so it runs again.
 
 The image holds Bun 1.4.2, copied from the official image by digest, and the
 package's production install, without its tests, fixtures and test support.

@@ -19,15 +19,19 @@
 // bytes is kept; one stored with other bytes stops the publication. The index
 // goes last. The manifest is created only if it is still absent, and an
 // existing one is replaced only if its ETag is still the one read, so a
-// manifest another writer changed is never overwritten. On success it prints
-// one JSON line and exits 0. The other exit codes:
+// manifest another writer changed is never overwritten. A build asked to
+// become the country's latest does so only when it is at least as new
+// (createdAt) as the current latest, so a retried or reprocessed older build
+// never takes the latest back. On success it prints one JSON line and exits
+// 0. The other exit codes:
 //
 //   1  the request could not be followed: no token, a malformed request, or a
 //      part on disk that differs from the worker's record;
-//   2  the manifest refuses the entry: another build is already recorded for
-//      the same release or staged run, or the same build with other content,
-//      or a staging build was to become the latest release; running again on
-//      the same tree cannot help;
+//   2  the build is refused: another build is already recorded for the same
+//      release or staged run, or the same build with other content (another
+//      submission of the same files, whose index records another time or
+//      label), or a staging build was to become the latest release; running
+//      again on the same tree cannot help;
 //   3  anything else, including a manifest another writer changed meanwhile
 //      and any error from the store; running again may succeed.
 import { createHash } from "node:crypto";
@@ -45,8 +49,11 @@ import {
 } from "./calibration-tree-blob";
 import {
   CALIBRATION_TREE_MANIFEST_PATH,
+  CALIBRATION_TREE_MANIFEST_SCHEMA_VERSION,
+  parseCalibrationTreeManifest,
   serializeCalibrationTreeManifest,
   withCalibrationTreeManifestEntry,
+  type CalibrationTreeManifest,
   type CalibrationTreeManifestEntry,
 } from "./calibration-tree-manifest";
 import { isCountry, type MicrocosmCountry } from "./countries";
@@ -64,7 +71,7 @@ const SHA256_RE = /^[0-9a-f]{64}$/;
 /** The request could not be followed; nothing was published. */
 export class CalibrationTreePublicationRequestError extends Error {}
 
-/** The manifest refuses the build's entry; nothing in the manifest changed. */
+/** The build is refused; nothing in the manifest changed. */
 export class CalibrationTreeEntryRefusedError extends Error {}
 
 /** Another writer changed the manifest after it was read; nothing was overwritten. */
@@ -161,6 +168,18 @@ export function parseCalibrationTreePublicationRequest(value: unknown): Calibrat
     throw new CalibrationTreePublicationRequestError("worker.files must hold exactly one index.");
   }
   const manifestEntry = requestObject(worker.manifestEntry, "worker.manifestEntry") as unknown as CalibrationTreeManifestEntry;
+  // The manifest's own rules, checked before anything is uploaded: a
+  // malformed entry is a defect in the request, not a refusal of the build.
+  try {
+    parseCalibrationTreeManifest({
+      schemaVersion: CALIBRATION_TREE_MANIFEST_SCHEMA_VERSION,
+      countries: { [country]: { latestReleaseBuildArtifactId: null, builds: [manifestEntry] } },
+    });
+  } catch (error) {
+    throw new CalibrationTreePublicationRequestError(
+      `worker.manifestEntry is not a manifest entry: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
   const index = files.find((file) => file.part === "index")!;
   if (
     manifestEntry.buildArtifactId !== buildArtifactId ||
@@ -218,7 +237,12 @@ async function uploadPart(
   const existing = await stored();
   if (existing) {
     if (await calibrationTreeBlobText(existing.stream) !== part.serialized) {
-      throw new Error(`Immutable calibration tree part ${part.path} already exists with different content.`);
+      // The build ID covers the files, not the time or label the index
+      // records, so another submission of the same files lands here.
+      throw new CalibrationTreeEntryRefusedError(
+        `Immutable calibration tree part ${part.path} already exists with different content: ` +
+          "this build is already recorded from another submission.",
+      );
     }
     return false;
   }
@@ -237,15 +261,44 @@ async function uploadPart(
   return true;
 }
 
+// When a build was published: createdAt, else updatedAt; an undated build is
+// older than any dated one.
+function publishedInstant(entry: CalibrationTreeManifestEntry): number {
+  const instant = Date.parse(entry.createdAt ?? entry.updatedAt ?? "");
+  return Number.isFinite(instant) ? instant : Number.NEGATIVE_INFINITY;
+}
+
+// Whether the build is at least as new as the country's current latest.
+function isAtLeastAsNewAsLatest(
+  manifest: CalibrationTreeManifest,
+  country: MicrocosmCountry,
+  entry: CalibrationTreeManifestEntry,
+): boolean {
+  const current = manifest.countries[country];
+  const latest = current?.builds.find((build) => build.buildArtifactId === current.latestReleaseBuildArtifactId);
+  return !latest || latest.buildArtifactId === entry.buildArtifactId ||
+    publishedInstant(entry) >= publishedInstant(latest);
+}
+
 async function addManifestEntry(
   request: CalibrationTreePublicationRequest,
   token: string,
   client: CalibrationTreeBlobClient,
-): Promise<void> {
+): Promise<boolean> {
   const current = await readCalibrationTreeManifest({ token, consistent: true, client });
+  // An existing manifest is replaced only on its ETag; without one, the write
+  // would carry no condition.
+  if (current.etag !== null && !current.etag) {
+    throw new CalibrationTreeManifestConflictError(
+      "The stored calibration tree manifest was read without an ETag, so it cannot be replaced safely.",
+    );
+  }
+  const makeLatest = request.makeLatest &&
+    (request.manifestEntry.kind !== "release" ||
+      isAtLeastAsNewAsLatest(current.manifest, request.country, request.manifestEntry));
   let updated;
   try {
-    updated = withCalibrationTreeManifestEntry(current.manifest, request.country, request.manifestEntry, request.makeLatest);
+    updated = withCalibrationTreeManifestEntry(current.manifest, request.country, request.manifestEntry, makeLatest);
   } catch (error) {
     throw new CalibrationTreeEntryRefusedError(error instanceof Error ? error.message : String(error));
   }
@@ -271,10 +324,11 @@ async function addManifestEntry(
   if (
     !entry ||
     entry.indexSha256 !== request.manifestEntry.indexSha256 ||
-    (request.makeLatest && recorded?.latestReleaseBuildArtifactId !== request.buildArtifactId)
+    (makeLatest && recorded?.latestReleaseBuildArtifactId !== request.buildArtifactId)
   ) {
     throw new Error("Calibration tree manifest verification failed.");
   }
+  return makeLatest;
 }
 
 const DEFAULT_CLIENT: CalibrationTreeBlobClient = { get, put };
@@ -292,13 +346,13 @@ export async function publishBuiltCalibrationTree(options: {
   for (const part of ordered) {
     if (await uploadPart(part, request, token, client)) uploadedParts += 1;
   }
-  await addManifestEntry(request, token, client);
+  const madeLatest = await addManifestEntry(request, token, client);
   return {
     buildArtifactId: request.buildArtifactId,
     kind: request.manifestEntry.kind,
     uploadedParts,
     keptParts: parts.length - uploadedParts,
-    madeLatest: request.makeLatest,
+    madeLatest,
   };
 }
 
