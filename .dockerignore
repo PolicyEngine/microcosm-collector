@@ -9,6 +9,7 @@ changelog.d
 tools
 .git
 **/node_modules
+packages
 packages/calibration-tree/src/**/*.test.ts
 packages/calibration-tree/src/fixtures
 packages/calibration-tree/src/test-support

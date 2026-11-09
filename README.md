@@ -81,6 +81,114 @@ sending the same request again cannot succeed:
   event without a valid block (a safe-identifier `phase`, a
   `blocking_failure_count` of at least 1, and `blocking_gate_ids`).
 
+## Read API
+
+Both versions take the dashboard read credential in `X-Telemetry-Read-Token`.
+
+- **Version 1**, `GET /v1/runs` and `GET /v1/runs/{run_id}`, is what the
+  dashboard reads today. A run comes back as the documents the dashboard used
+  to read from Hugging Face run files (`progress`, `run_manifest`,
+  `calibration_progress` and lifecycle `events`). It does not change:
+  `tests/fixtures/read_api_v1` records its answers, and a test fails if they
+  change.
+- **Version 2**, `GET /v2/runs` and `GET /v2/runs/{run_id}`, returns typed
+  answers. The list takes the same `country`, `limit` and `before` as version 1
+  and returns each run's registration and stored state. A run comes back as
+  `{"run": ..., "events": [...]}`: every stored event with the fields its
+  producer sent (an optional field it left out is null, and `details` an empty
+  object), in the order the collector applies them (producers by registration
+  time, then producer id, then sequence), and the run's state folded from
+  exactly those events, so the two agree while the run is still receiving
+  events. All timestamps are in UTC. Bad parameters, including an invalid cursor or run id,
+  answer 422 with FastAPI's validation errors; an unknown run answers 404.
+
+`contracts/read-api-v2` holds version 2's contract:
+
+- `openapi.json`, its OpenAPI document, which the collector also serves at
+  `GET /v2/openapi.json`;
+- `telemetry.json`, telemetry for a few runs (completed, failed, blocked,
+  restarted and only registered);
+- `interactions/`, one file per request, with the collector's answer once that
+  telemetry is stored.
+
+`tests/test_read_api_v2.py` checks that the collector serves exactly that
+document and those answers, from the in-memory store and from PostgreSQL, and
+that each answer matches the document's schema. After an intended change to
+either version, run `uv run python tools/update-read-api-contract.py`, review
+the changed files, and regenerate the client's types (below).
+
+### The TypeScript client
+
+`packages/collector-client` is `@policyengine/microcosm-collector-client`, a
+typed client for version 2. Its types are generated from `openapi.json`
+(`npm run generate`), and its tests answer it with the recorded interactions.
+CI fails if the generated types are out of date. Each release gives the client
+the collector's version (`tools/set-client-version.py`, run by
+`tools/update-version.sh`).
+
+Once production runs a release, and if the repo variable
+`COLLECTOR_CLIENT_PUBLISH_ENABLED` is `true`, the Push workflow publishes that
+version to npm in two jobs:
+
+- `pack-client` installs the client's dependencies and runs `npm pack`, which
+  builds it. It has no OIDC token.
+- `publish-client` publishes that tarball with `tools/publish-client.sh`, which
+  checks that it is this package at the release's version, skips a version
+  already on npm, and runs `npm publish --ignore-scripts`. It installs nothing
+  and runs no package script, so the only code that can request its OIDC token
+  is the npm CLI that ships with Node and GitHub's own actions. It runs in the
+  GitHub environment `npm` and uses npm's trusted publishing: npm accepts the
+  job's GitHub OIDC token for this workflow file and environment, so no npm
+  token is stored anywhere, and npm attaches a provenance attestation.
+
+Both jobs follow `deploy-production`, so they run only while
+`COLLECTOR_DEPLOY_ENABLED` is `true`; while it is not, releases are not
+published either, without any job failing.
+
+Publishing is not switched on. Switching it on is a manual step, after the
+first release that contains the client has reached production:
+
+1. **Google Cloud.** Make the Workload Identity provider accept only the
+   deployment environments ("Google Cloud access"), so that `publish-client`'s
+   token cannot obtain Google credentials. `TELEMETRY_GCP_WIF_PROVIDER`, a
+   secret of the `staging` and `production` environments, holds the provider's
+   resource name, which names its project, pool and provider:
+
+   ```bash
+   gcloud iam workload-identity-pools providers update-oidc <provider> \
+     --project <collector project> --location global --workload-identity-pool <pool> \
+     --attribute-condition "assertion.repository=='PolicyEngine/microcosm-collector' && assertion.ref=='refs/heads/main' && assertion.environment in ['staging', 'production']"
+   ```
+
+   The next release's deployment jobs then check that deployments still
+   authenticate. To undo it, run the same command with the condition without
+   its last clause.
+2. **First version.** npm can trust a workflow only for a package that already
+   exists, so a maintainer of the `@policyengine` npm scope, logged in with
+   two-factor authentication, publishes that release's version once from its
+   tag: `git switch --detach <version>`, then in `packages/collector-client`,
+   `npm ci` and `npm publish --access public`. This version has no provenance
+   attestation.
+3. **Environment.** Create the GitHub environment `npm` with a deployment
+   branch policy that accepts only `main`, as `staging` and `production` do.
+4. **Trusted publisher**, on a day when a pull request is ready to merge: a new
+   trusted publisher configuration expires if its first publication has not
+   succeeded within 2 days. With npm 11.15.0 or later:
+   `npm trust github @policyengine/microcosm-collector-client --file push.yaml --repo PolicyEngine/microcosm-collector --env npm --allow-publish`
+   (or, on npmjs.com, the package's settings, "Trusted publishing", GitHub
+   Actions, with the same organization, repo, workflow file and environment).
+5. **Switch.** Set the repo variable `COLLECTOR_CLIENT_PUBLISH_ENABLED` to
+   `true`, then merge the pull request. Its release's `publish-client` job
+   publishes its version, and `npm view @policyengine/microcosm-collector-client`
+   then lists it. If no publication succeeded within the 2 days, remove the
+   configuration and repeat step 4:
+   `npm trust list @policyengine/microcosm-collector-client` shows its id, and
+   `npm trust revoke --id <id> @policyengine/microcosm-collector-client`
+   removes it.
+
+To stop publishing, set the variable to anything else; to stop npm trusting the
+workflow, revoke the configuration in the same way.
+
 ## Artifact intake
 
 Builds hand calibration diagnostics and Orrery inputs to the collector as
@@ -567,25 +675,35 @@ rule is what keeps other branches out. Nothing is published until the repo
 variable `CALIBRATION_TREE_NPM_PUBLISH_ENABLED` is `true`, which needs this
 one-time setup first, in this order:
 
-1. **The first version, by hand.** npm can only trust a workflow for a package
+1. **Google Cloud.** Unless it was already done for the read API client ("The
+   TypeScript client", step 1), make the Workload Identity provider accept
+   only the deployment environments ("Google Cloud access"), so that the
+   publish job's token cannot obtain Google credentials. Its condition must
+   then be:
+
+   ```
+   assertion.repository=='PolicyEngine/microcosm-collector' && assertion.ref=='refs/heads/main' && assertion.environment in ['staging', 'production']
+   ```
+
+2. **The first version, by hand.** npm can only trust a workflow for a package
    that exists, so a member of the `policyengine` npm organization publishes
    the first version from a clean checkout of the `main` commit that added the
    package: `bun install --frozen-lockfile`, then `npm pack --dry-run` to check
    the file list, then `npm publish --access public` in
    `packages/calibration-tree`.
-2. **The environment.** In this repo's settings, create the `npm` environment
+3. **The environment.** In this repo's settings, create the `npm` environment
    and allow deployments from `main` only, so a run from any other branch
    cannot obtain npm's trust. Create it before the trusted publisher: GitHub
    creates a missing environment, without that rule, when a job first names
    it.
-3. **The trusted publisher.** In the package's settings on npmjs.com, add a
+4. **The trusted publisher.** In the package's settings on npmjs.com, add a
    GitHub Actions trusted publisher: organization `PolicyEngine`, repo
    `microcosm-collector`, workflow `publish-calibration-tree.yaml`,
    environment `npm`. A new trusted publisher expires unless a publication
    through it succeeds within two days, so add it when a pull request that
    raises the version is ready to merge, and merge that pull request after
-   step 4. An expired one is deleted and added again.
-4. **The switch.** Set the repo variable
+   step 5. An expired one is deleted and added again.
+5. **The switch.** Set the repo variable
    `CALIBRATION_TREE_NPM_PUBLISH_ENABLED` to `true`.
 
 ## Hugging Face read access
@@ -740,7 +858,23 @@ assertion.repository=='PolicyEngine/microcosm-collector' && assertion.ref=='refs
 The service account grants `roles/iam.workloadIdentityUser` to this repo's
 principal set (`attribute.repository/PolicyEngine/microcosm-collector`). A job
 running for a tag, a pull request or any other branch cannot obtain Google
-credentials. No other job requests an OIDC token.
+credentials.
+
+Two other jobs request an OIDC token, both to publish to npm in the `npm`
+environment: `publish-client`, which publishes the read API client ("The
+TypeScript client"), and the `publish` job of
+`publish-calibration-tree.yaml`, which publishes the calibration tree package
+("Publishing to npm"). The condition above does not check the environment, so
+a token from either job would pass it too. Before either is switched on, the
+condition must become:
+
+```
+assertion.repository=='PolicyEngine/microcosm-collector' && assertion.ref=='refs/heads/main' && assertion.environment in ['staging', 'production']
+```
+
+The deployment jobs run in those two environments, so they keep their access,
+and a token from a job in any other environment, or in none, is refused. From
+then on, every job that authenticates to Google Cloud must name one of the two.
 
 Both deployment jobs also require
 `github.event_name == 'push' && github.ref == 'refs/heads/main'`. The Push
