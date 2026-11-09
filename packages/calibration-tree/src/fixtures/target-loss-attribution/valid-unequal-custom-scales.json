@@ -1,0 +1,37 @@
+{
+  "schema_version": 6,
+  "final_loss": 0.275,
+  "diagnostic_warnings": [],
+  "target_loss_basis": {
+    "formula": "weighted_mean(min(abs((estimate - target) / scale), cap))",
+    "cap": 0.5,
+    "target_count": 2,
+    "total_target_weight": 8.0,
+    "weight_kind": "provided",
+    "scale_kind": "provided",
+    "hash_algorithm": "sha256_utf8len32_f64be_v1",
+    "sha256": "80522115f344bf4726dad7a2c063f0d289428e247493b184bded04beb2ad61c7"
+  },
+  "targets": [
+    {
+      "name": "population@2024",
+      "target": 100.0,
+      "final_estimate": 125.0,
+      "target_loss_weight": 2.0,
+      "target_loss_weight_share": 0.25,
+      "target_loss_scale": 50.0,
+      "final_capped_scaled_error": 0.5,
+      "final_loss_contribution": 0.125
+    },
+    {
+      "name": "income@2024",
+      "target": 200.0,
+      "final_estimate": 180.0,
+      "target_loss_weight": 6.0,
+      "target_loss_weight_share": 0.75,
+      "target_loss_scale": 100.0,
+      "final_capped_scaled_error": 0.2,
+      "final_loss_contribution": 0.15
+    }
+  ]
+}

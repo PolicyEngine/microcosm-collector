@@ -1,0 +1,44 @@
+{
+  "deliberate_opt_out": {
+    "configured_repository": null,
+    "contract_version": 2,
+    "enabled": false,
+    "last_error_code": null,
+    "mode": "disabled",
+    "opt_out_reason": "--no-staging",
+    "read_back": "not_requested",
+    "run_id": null,
+    "upload_attempts": 0,
+    "upload_successes": 0
+  },
+  "delivery_failure": {
+    "configured_repository": "policyengine/populace-uk-staging",
+    "contract_version": 2,
+    "enabled": true,
+    "last_error_code": "READ_BACK_FAILED",
+    "mode": "local_and_remote",
+    "opt_out_reason": null,
+    "read_back": "failed",
+    "run_id": "uk-delivery-failure",
+    "upload_attempts": 3,
+    "upload_successes": 0
+  },
+  "delivery_success": {
+    "configured_repository": "policyengine/populace-uk-staging",
+    "contract_version": 2,
+    "enabled": true,
+    "last_error_code": null,
+    "mode": "local_and_remote",
+    "opt_out_reason": null,
+    "read_back": "passed",
+    "run_id": "uk-delivery-success",
+    "upload_attempts": 6,
+    "upload_successes": 6
+  },
+  "schema_name": "microcosm.staging.fixture-cases",
+  "schema_version": 2,
+  "unknown_version": {
+    "schema_name": "microcosm.staging.run-manifest",
+    "schema_version": 999
+  }
+}
