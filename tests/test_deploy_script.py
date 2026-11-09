@@ -925,7 +925,7 @@ def test_worker_job_update_mounts_the_read_token_in_both_environments(
         "<--command> <uv> "
         "<--args> <run,--no-sync,python,-m,telemetry_collector.worker> "
         "<--tasks> <1> <--max-retries> <2> <--task-timeout> <1h> "
-        "<--cpu> <1> <--memory> <2Gi> <--quiet>\n"
+        "<--cpu> <2> <--memory> <8Gi> <--quiet>\n"
     )
 
 
