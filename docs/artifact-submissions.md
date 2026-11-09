@@ -161,7 +161,8 @@ build today. The Orrery roles are the inputs the projection needs
 (`orrery_json_from_schema(schema, execution=overlay)`), plus the native evidence
 files that stay in private intake storage. Intake checks each file's role,
 count and size, not its name; the Orrery graph handler rejects a submission
-whose files it cannot use (see "Orrery graph files").
+whose files it cannot use, including a schema over 32 MiB (see "Orrery graph
+files").
 
 ### The roles the emitter sends
 
@@ -490,14 +491,23 @@ written.
   `orrery_version` is the Orrery version that validated it, `visibility` is
   `private` or `public` (see "Disclosure"), and `removed_links` counts the
   removed `url` and `uri` keys.
-- **Rejections:** `orrery_inputs_unusable` when the schema or overlay is not
-  strict JSON (UTF-8, no key repeated within an object, no `NaN` or
-  infinity), when the projection refuses them (its message, shortened to 500
-  characters), or when an upstream file is named `graph.orrery.json`;
-  `orrery_document_refused` when the validator refuses the document, naming
-  its code and its first issue's path. Any other failure, such as a validator
-  that could not run or an object already stored with other content, fails
-  the attempt, so it runs again.
+- **Rejections:** the handler treats the schema and overlay as Microcosm's
+  own command treats its input at the projection's source commit.
+  - `orrery_inputs_unusable` when:
+    - the schema or overlay is over 32 MiB, Microcosm's reader's limit (so a
+      schema intake accepts, up to 64 MiB, can still be rejected here);
+    - it is not strict JSON: UTF-8, no key repeated within an object, no
+      `NaN` or infinity;
+    - it is nested too deeply for Python's JSON decoder to parse;
+    - the projection raises a `TypeError`, `ValueError` or `RecursionError`
+      for it (its message, shortened to 500 characters);
+    - or an upstream file is named `graph.orrery.json`.
+  - `orrery_document_refused` when the validator refuses the document,
+    naming its code and its first issue's path.
+
+  Any other failure fails the attempt, so it runs again: for example, a
+  `KeyError` from the projection, a validator that could not run, or an
+  object already stored with other content.
 - **Reprocessing** with the same code writes the same folder and keeps the
   objects already there and the document's first record; after the
   projection changes, it writes the new document to a new folder. A change of

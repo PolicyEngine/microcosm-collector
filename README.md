@@ -706,14 +706,22 @@ calibration tree handler.
   links are removed, and only those the document still links to: removing
   links needs only their names, from the submission's file list, and the
   projection doesn't read them. Evidence files are never downloaded. The
-  schema and overlay must be strict JSON, as
-  Microcosm's own command reads them: UTF-8, no key repeated within an
-  object, and no `NaN` or infinity. The projection,
-  `orrery_json_from_schema(schema, execution=overlay)`, builds the document.
-  Inputs that are not strict JSON, a `ValueError` from the projection (its
-  message, shortened to 500 characters), and an upstream file named
-  `graph.orrery.json`, the document's own name, reject the submission with
-  `orrery_inputs_unusable`.
+  handler reads the schema and overlay as Microcosm's own command reads its
+  input (`_read_json` at the projection's source commit): at most 32 MiB,
+  strict JSON in UTF-8, no key repeated within an object, no `NaN` or
+  infinity, and nested no deeper than Python's JSON decoder can parse. The
+  projection, `orrery_json_from_schema(schema, execution=overlay)`, builds
+  the document. These reject the submission with `orrery_inputs_unusable`:
+  - a schema or overlay that fails those reading rules. A schema over
+    32 MiB is rejected here, although intake accepts schemas up to 64 MiB;
+  - a `TypeError`, `ValueError` or `RecursionError` from the projection, with
+    its message shortened to 500 characters. Microcosm's command treats these
+    as input errors, and also `OSError` and `GraphRuntimeError`, which the
+    copied projection never raises;
+  - an upstream file named `graph.orrery.json`, the document's own name.
+
+  Any other error from the projection, such as a `KeyError`, fails the
+  attempt, so the job runs again.
 - **Links.** Evidence files stay in private intake storage, so a published
   document doesn't link to them: each evidence reference keeps its label and
   SHA-256 but loses its link, whatever the link's scheme, `https://`

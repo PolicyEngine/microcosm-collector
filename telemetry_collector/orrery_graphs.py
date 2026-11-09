@@ -64,6 +64,9 @@ from telemetry_collector.google_cloud import GoogleCloudStorageOrreryGraphs
 from telemetry_collector.intake import BUCKET_PATTERN
 from telemetry_collector.orrery.projection import orrery_json_from_schema
 from telemetry_collector.orrery.projection.orrery import (
+    _MAX_INPUT_BYTES as MAX_INPUT_BYTES,
+)
+from telemetry_collector.orrery.projection.orrery import (
     _revision as projection_revision,
 )
 from telemetry_collector.orrery.projection.provenance import MICROCOSM_COMMIT
@@ -88,6 +91,19 @@ COLLECTOR_DISTRIBUTION = "microcosm-collector"
 MAX_MESSAGE_CHARACTERS = 500
 UNUSABLE_INPUTS = "orrery_inputs_unusable"
 DOCUMENT_REFUSED = "orrery_document_refused"
+
+#: The errors from the projection that reject the submission. Microcosm's
+#: command (``orrery.main`` at ``MICROCOSM_COMMIT``) treats ``OSError``,
+#: ``TypeError``, ``ValueError``, ``RecursionError`` and ``GraphRuntimeError``
+#: as input errors; the copied projection reads and writes no file, and no
+#: copied module defines or raises ``GraphRuntimeError`` (Microcosm's runtime
+#: and content-store errors), so neither applies here. Any other error, such
+#: as a ``KeyError``, fails the attempt, so the job runs again.
+PROJECTION_INPUT_ERRORS: tuple[type[Exception], ...] = (
+    TypeError,
+    ValueError,
+    RecursionError,
+)
 
 # The projection's own serialisation (orrery._bounded_json), so a document
 # from which nothing is removed keeps the projection's exact bytes.
@@ -317,15 +333,28 @@ def _no_constant(constant: str) -> None:
 def read_input(path: Path, description: str) -> object:
     """Parse one input as strict JSON, as Microcosm's command reads it.
 
-    A file that is not UTF-8, is not JSON, repeats a key within an object or
-    holds the constant ``NaN``, ``Infinity`` or ``-Infinity`` rejects the
-    submission. A number too large for a float, such as ``1e999``, parses here
-    as an infinity, as in Microcosm's command; the projection then refuses it
-    with a ``ValueError``, which rejects the submission too.
+    These reject the submission with ``orrery_inputs_unusable``, as Microcosm's
+    reader (``orrery._read_json`` at ``MICROCOSM_COMMIT``) refuses them: a file
+    over 32 MiB (``MAX_INPUT_BYTES``, the reader's limit), one that is not
+    UTF-8 or not JSON, one that repeats a key within an object or holds the
+    constant ``NaN``, ``Infinity`` or ``-Infinity``, and one nested too deeply
+    for Python's JSON decoder, which raises ``RecursionError``. A number too
+    large for a float, such as ``1e999``, parses here as an infinity, as in
+    Microcosm's command; the projection then refuses it with a ``ValueError``,
+    which rejects the submission too. ``path`` is the worker's own download,
+    so an ``OSError`` reading it is the worker's fault, not the input's, and
+    fails the attempt.
     """
 
+    with path.open("rb") as stream:
+        raw = stream.read(MAX_INPUT_BYTES + 1)
+    if len(raw) > MAX_INPUT_BYTES:
+        raise SubmissionRejectedError(
+            UNUSABLE_INPUTS,
+            f"The {description} is larger than {MAX_INPUT_BYTES // 2**20} MiB.",
+        )
     try:
-        text = path.read_bytes().decode("utf-8")
+        text = raw.decode("utf-8")
     except UnicodeDecodeError as error:
         raise SubmissionRejectedError(
             UNUSABLE_INPUTS, f"The {description} is not UTF-8."
@@ -334,6 +363,10 @@ def read_input(path: Path, description: str) -> object:
         return json.loads(
             text, object_pairs_hook=_unique_keys, parse_constant=_no_constant
         )
+    except RecursionError as error:
+        raise SubmissionRejectedError(
+            UNUSABLE_INPUTS, f"The {description} nests too deeply."
+        ) from error
     except ValueError as error:
         raise SubmissionRejectedError(
             UNUSABLE_INPUTS,
@@ -397,7 +430,7 @@ def orrery_graph_handler(
             overlay = read_input(overlay_path, "execution overlay")
             try:
                 projected = orrery_json_from_schema(schema, execution=overlay)
-            except ValueError as error:
+            except PROJECTION_INPUT_ERRORS as error:
                 raise SubmissionRejectedError(
                     UNUSABLE_INPUTS, _shortened(str(error))
                 ) from error
