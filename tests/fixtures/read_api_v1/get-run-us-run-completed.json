@@ -35,6 +35,7 @@
           "rss_bytes": 4096,
           "peak_rss_bytes": 8192
         },
+        "reading": null,
         "work": {
           "stage": "calibrate",
           "done": 50,
@@ -70,6 +71,7 @@
           "microcosm_version": "0.40.0",
           "country": "us"
         },
+        "environment": null,
         "failure": null,
         "block": null,
         "delivery": {
@@ -229,7 +231,8 @@
           "producer_id": "us-completed-producer",
           "event_id": "us-run-completed-7"
         }
-      ]
+      ],
+      "sleeps": []
     }
   }
 }

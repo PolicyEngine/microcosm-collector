@@ -224,6 +224,571 @@
         "type": "object",
         "title": "HTTPValidationError"
       },
+      "MachineEnvironment": {
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "local",
+              "modal_container"
+            ],
+            "title": "Kind"
+          },
+          "os": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Os"
+          },
+          "os_version": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Os Version"
+          },
+          "architecture": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Architecture"
+          },
+          "cpu_model": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cpu Model"
+          },
+          "logical_cpus": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Logical Cpus"
+          },
+          "memory_total_bytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Total Bytes"
+          },
+          "cgroup_cpu_limit_cores": {
+            "anyOf": [
+              {
+                "type": "number",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cgroup Cpu Limit Cores"
+          },
+          "cgroup_memory_limit_bytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cgroup Memory Limit Bytes"
+          },
+          "modal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ModalContainer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "emitter_version": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Emitter Version"
+          },
+          "python_version": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Python Version"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "kind",
+          "os",
+          "os_version",
+          "architecture",
+          "cpu_model",
+          "logical_cpus",
+          "memory_total_bytes",
+          "cgroup_cpu_limit_cores",
+          "cgroup_memory_limit_bytes",
+          "modal",
+          "emitter_version",
+          "python_version"
+        ],
+        "title": "MachineEnvironment",
+        "description": "Where a build runs, on its run's start (``details.environment``)."
+      },
+      "MachineReading": {
+        "properties": {
+          "memory_available_bytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Available Bytes"
+          },
+          "memory_compressed_bytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Compressed Bytes"
+          },
+          "memory_pressure_level": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "normal",
+                  "warning",
+                  "critical"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Pressure Level"
+          },
+          "memory_stall_some_share": {
+            "anyOf": [
+              {
+                "type": "number",
+                "maximum": 1.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Stall Some Share"
+          },
+          "memory_stall_full_share": {
+            "anyOf": [
+              {
+                "type": "number",
+                "maximum": 1.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Stall Full Share"
+          },
+          "swap_used_bytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Swap Used Bytes"
+          },
+          "swap_total_bytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Swap Total Bytes"
+          },
+          "swap_in_bytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Swap In Bytes"
+          },
+          "swap_out_bytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Swap Out Bytes"
+          },
+          "cpu_busy_share": {
+            "anyOf": [
+              {
+                "type": "number",
+                "maximum": 1.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cpu Busy Share"
+          },
+          "load_average_1m": {
+            "anyOf": [
+              {
+                "type": "number",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Load Average 1M"
+          },
+          "on_battery": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "On Battery"
+          },
+          "disk_free_bytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Disk Free Bytes"
+          },
+          "cgroup_memory_bytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cgroup Memory Bytes"
+          },
+          "cgroup_memory_limit_bytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cgroup Memory Limit Bytes"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "memory_available_bytes",
+          "memory_compressed_bytes",
+          "memory_pressure_level",
+          "memory_stall_some_share",
+          "memory_stall_full_share",
+          "swap_used_bytes",
+          "swap_total_bytes",
+          "swap_in_bytes",
+          "swap_out_bytes",
+          "cpu_busy_share",
+          "load_average_1m",
+          "on_battery",
+          "disk_free_bytes",
+          "cgroup_memory_bytes",
+          "cgroup_memory_limit_bytes"
+        ],
+        "title": "MachineReading",
+        "description": "The machine at one reading; each value the emitter can't read is null."
+      },
+      "ModalContainer": {
+        "properties": {
+          "task_id": {
+            "type": "string",
+            "maxLength": 200,
+            "title": "Task Id"
+          },
+          "region": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Region"
+          },
+          "cloud_provider": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cloud Provider"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "task_id",
+          "region",
+          "cloud_provider"
+        ],
+        "title": "ModalContainer",
+        "description": "The Modal container a build runs in."
+      },
+      "OuterProgress": {
+        "properties": {
+          "done": {
+            "type": "integer",
+            "title": "Done"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "unit": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unit"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "done",
+          "total",
+          "unit"
+        ],
+        "title": "OuterProgress",
+        "description": "The counter one level above a stage's own, such as the pass of a batch."
+      },
+      "ProcessTreeReading": {
+        "properties": {
+          "processes": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Processes"
+          },
+          "memory_bytes": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Memory Bytes"
+          },
+          "memory_peak_bytes": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Memory Peak Bytes"
+          },
+          "interval_memory_peak_bytes": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Interval Memory Peak Bytes"
+          },
+          "cpu_user_cores": {
+            "anyOf": [
+              {
+                "type": "number",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cpu User Cores"
+          },
+          "cpu_system_cores": {
+            "anyOf": [
+              {
+                "type": "number",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cpu System Cores"
+          },
+          "disk_read_bytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Disk Read Bytes"
+          },
+          "disk_written_bytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Disk Written Bytes"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "processes",
+          "memory_bytes",
+          "memory_peak_bytes",
+          "interval_memory_peak_bytes",
+          "cpu_user_cores",
+          "cpu_system_cores",
+          "disk_read_bytes",
+          "disk_written_bytes"
+        ],
+        "title": "ProcessTreeReading",
+        "description": "The build and every descendant process at one reading.\n\nMemory is the physical footprint on macOS and RSS elsewhere; the CPU\nshares are cores in use and the disk bytes those moved during the\nreading's interval."
+      },
+      "ProducerSleep": {
+        "properties": {
+          "started_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Started At"
+          },
+          "ended_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Ended At"
+          },
+          "seconds": {
+            "type": "number",
+            "minimum": 0.0,
+            "title": "Seconds"
+          },
+          "producer_id": {
+            "type": "string",
+            "title": "Producer Id"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "started_at",
+          "ended_at",
+          "seconds",
+          "producer_id"
+        ],
+        "title": "ProducerSleep",
+        "description": "One system sleep, with the producer that recorded it."
+      },
       "RawEvent": {
         "properties": {
           "schema_version": {
@@ -330,6 +895,82 @@
         ],
         "title": "RawEvent",
         "description": "An event as the collector stored it.\n\nEvery field of the event model is present: an optional field the producer\nleft out is null (`details` an empty object), and the timestamp is in UTC."
+      },
+      "ReadingProgress": {
+        "properties": {
+          "stage_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$",
+            "title": "Stage Id"
+          },
+          "done": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Done"
+          },
+          "total": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total"
+          },
+          "unit": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unit"
+          },
+          "outer": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OuterProgress"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reported_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Reported At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "stage_id",
+          "done",
+          "total",
+          "unit",
+          "outer",
+          "reported_at"
+        ],
+        "title": "ReadingProgress",
+        "description": "The latest progress the build reported, as a reading repeats it.\n\n``done`` and ``total`` are null unless the build sent numbers."
       },
       "Resources": {
         "properties": {
@@ -655,6 +1296,33 @@
                 "type": "null"
               }
             ]
+          },
+          "environment": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MachineEnvironment"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reading": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TimedReading"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "sleeps": {
+            "items": {
+              "$ref": "#/components/schemas/ProducerSleep"
+            },
+            "type": "array",
+            "title": "Sleeps"
           }
         },
         "additionalProperties": false,
@@ -676,10 +1344,13 @@
           "resources",
           "work",
           "failure",
-          "block"
+          "block",
+          "environment",
+          "reading",
+          "sleeps"
         ],
         "title": "RunState",
-        "description": "A run's state, rebuilt from the events returned with it."
+        "description": "A run's state, rebuilt from the events returned with it.\n\n`environment`, `reading` and `sleeps` come from the details microcosm-emitter\n0.14.0 and later write: the latest run start's machine description, the\ncurrent attempt's latest reading, and every attempt's sleeps. A stored value\nthat doesn't match its model is left out."
       },
       "RunSummary": {
         "properties": {
@@ -845,6 +1516,64 @@
         ],
         "title": "RunWork",
         "description": "The latest progress event that reported `done` and `total`.\n\nExcept for `stage` and `updated_at`, the values are the event's details as\nthe producer sent them."
+      },
+      "TimedReading": {
+        "properties": {
+          "interval_seconds": {
+            "type": "number",
+            "minimum": 0.0,
+            "title": "Interval Seconds"
+          },
+          "late_seconds": {
+            "type": "number",
+            "minimum": 0.0,
+            "title": "Late Seconds"
+          },
+          "stages": {
+            "items": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$"
+            },
+            "type": "array",
+            "maxItems": 32,
+            "title": "Stages"
+          },
+          "progress": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ReadingProgress"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "process_tree": {
+            "$ref": "#/components/schemas/ProcessTreeReading"
+          },
+          "machine": {
+            "$ref": "#/components/schemas/MachineReading"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Timestamp",
+            "description": "The heartbeat's timestamp."
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "interval_seconds",
+          "late_seconds",
+          "stages",
+          "progress",
+          "process_tree",
+          "machine",
+          "timestamp"
+        ],
+        "title": "TimedReading",
+        "description": "A heartbeat's reading of the build and its machine, with its time."
       },
       "ValidationError": {
         "properties": {

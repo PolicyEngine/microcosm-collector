@@ -56,6 +56,144 @@ export interface components {
             detail?: components["schemas"]["ValidationError"][];
         };
         /**
+         * MachineEnvironment
+         * @description Where a build runs, on its run's start (``details.environment``).
+         */
+        MachineEnvironment: {
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "local" | "modal_container";
+            /** Os */
+            os: string | null;
+            /** Os Version */
+            os_version: string | null;
+            /** Architecture */
+            architecture: string | null;
+            /** Cpu Model */
+            cpu_model: string | null;
+            /** Logical Cpus */
+            logical_cpus: number | null;
+            /** Memory Total Bytes */
+            memory_total_bytes: number | null;
+            /** Cgroup Cpu Limit Cores */
+            cgroup_cpu_limit_cores: number | null;
+            /** Cgroup Memory Limit Bytes */
+            cgroup_memory_limit_bytes: number | null;
+            modal: components["schemas"]["ModalContainer"] | null;
+            /** Emitter Version */
+            emitter_version: string | null;
+            /** Python Version */
+            python_version: string | null;
+        };
+        /**
+         * MachineReading
+         * @description The machine at one reading; each value the emitter can't read is null.
+         */
+        MachineReading: {
+            /** Memory Available Bytes */
+            memory_available_bytes: number | null;
+            /** Memory Compressed Bytes */
+            memory_compressed_bytes: number | null;
+            /** Memory Pressure Level */
+            memory_pressure_level: ("normal" | "warning" | "critical") | null;
+            /** Memory Stall Some Share */
+            memory_stall_some_share: number | null;
+            /** Memory Stall Full Share */
+            memory_stall_full_share: number | null;
+            /** Swap Used Bytes */
+            swap_used_bytes: number | null;
+            /** Swap Total Bytes */
+            swap_total_bytes: number | null;
+            /** Swap In Bytes */
+            swap_in_bytes: number | null;
+            /** Swap Out Bytes */
+            swap_out_bytes: number | null;
+            /** Cpu Busy Share */
+            cpu_busy_share: number | null;
+            /** Load Average 1M */
+            load_average_1m: number | null;
+            /** On Battery */
+            on_battery: boolean | null;
+            /** Disk Free Bytes */
+            disk_free_bytes: number | null;
+            /** Cgroup Memory Bytes */
+            cgroup_memory_bytes: number | null;
+            /** Cgroup Memory Limit Bytes */
+            cgroup_memory_limit_bytes: number | null;
+        };
+        /**
+         * ModalContainer
+         * @description The Modal container a build runs in.
+         */
+        ModalContainer: {
+            /** Task Id */
+            task_id: string;
+            /** Region */
+            region: string | null;
+            /** Cloud Provider */
+            cloud_provider: string | null;
+        };
+        /**
+         * OuterProgress
+         * @description The counter one level above a stage's own, such as the pass of a batch.
+         */
+        OuterProgress: {
+            /** Done */
+            done: number;
+            /** Total */
+            total: number;
+            /** Unit */
+            unit: string | null;
+        };
+        /**
+         * ProcessTreeReading
+         * @description The build and every descendant process at one reading.
+         *
+         *     Memory is the physical footprint on macOS and RSS elsewhere; the CPU
+         *     shares are cores in use and the disk bytes those moved during the
+         *     reading's interval.
+         */
+        ProcessTreeReading: {
+            /** Processes */
+            processes: number;
+            /** Memory Bytes */
+            memory_bytes: number;
+            /** Memory Peak Bytes */
+            memory_peak_bytes: number;
+            /** Interval Memory Peak Bytes */
+            interval_memory_peak_bytes: number;
+            /** Cpu User Cores */
+            cpu_user_cores: number | null;
+            /** Cpu System Cores */
+            cpu_system_cores: number | null;
+            /** Disk Read Bytes */
+            disk_read_bytes: number | null;
+            /** Disk Written Bytes */
+            disk_written_bytes: number | null;
+        };
+        /**
+         * ProducerSleep
+         * @description One system sleep, with the producer that recorded it.
+         */
+        ProducerSleep: {
+            /**
+             * Started At
+             * Format: date-time
+             */
+            started_at: string;
+            /**
+             * Ended At
+             * Format: date-time
+             */
+            ended_at: string;
+            /** Seconds */
+            seconds: number;
+            /** Producer Id */
+            producer_id: string;
+        };
+        /**
          * RawEvent
          * @description An event as the collector stored it.
          *
@@ -100,6 +238,28 @@ export interface components {
                 [key: string]: unknown;
             };
             resources: components["schemas"]["Resources"] | null;
+        };
+        /**
+         * ReadingProgress
+         * @description The latest progress the build reported, as a reading repeats it.
+         *
+         *     ``done`` and ``total`` are null unless the build sent numbers.
+         */
+        ReadingProgress: {
+            /** Stage Id */
+            stage_id: string;
+            /** Done */
+            done: number | null;
+            /** Total */
+            total: number | null;
+            /** Unit */
+            unit: string | null;
+            outer: components["schemas"]["OuterProgress"] | null;
+            /**
+             * Reported At
+             * Format: date-time
+             */
+            reported_at: string;
         };
         /**
          * Resources
@@ -171,6 +331,11 @@ export interface components {
         /**
          * RunState
          * @description A run's state, rebuilt from the events returned with it.
+         *
+         *     `environment`, `reading` and `sleeps` come from the details microcosm-emitter
+         *     0.14.0 and later write: the latest run start's machine description, the
+         *     current attempt's latest reading, and every attempt's sleeps. A stored value
+         *     that doesn't match its model is left out.
          */
         RunState: {
             /** Run Id */
@@ -215,6 +380,10 @@ export interface components {
             work: components["schemas"]["RunWork"] | null;
             failure: components["schemas"]["RunFailure"] | null;
             block: components["schemas"]["RunBlock"] | null;
+            environment: components["schemas"]["MachineEnvironment"] | null;
+            reading: components["schemas"]["TimedReading"] | null;
+            /** Sleeps */
+            sleeps: components["schemas"]["ProducerSleep"][];
         };
         /**
          * RunSummary
@@ -288,6 +457,27 @@ export interface components {
             details: {
                 [key: string]: unknown;
             };
+        };
+        /**
+         * TimedReading
+         * @description A heartbeat's reading of the build and its machine, with its time.
+         */
+        TimedReading: {
+            /** Interval Seconds */
+            interval_seconds: number;
+            /** Late Seconds */
+            late_seconds: number;
+            /** Stages */
+            stages: string[];
+            progress: components["schemas"]["ReadingProgress"] | null;
+            process_tree: components["schemas"]["ProcessTreeReading"];
+            machine: components["schemas"]["MachineReading"];
+            /**
+             * Timestamp
+             * Format: date-time
+             * @description The heartbeat's timestamp.
+             */
+            timestamp: string;
         };
         /** ValidationError */
         ValidationError: {

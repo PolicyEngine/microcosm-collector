@@ -35,6 +35,7 @@
           "rss_bytes": 65536,
           "peak_rss_bytes": 131072
         },
+        "reading": null,
         "work": {
           "stage": "calibrate",
           "done": 10,
@@ -65,6 +66,7 @@
         "status": "running",
         "current_stage": "calibrate",
         "identity": null,
+        "environment": null,
         "failure": null,
         "block": null,
         "delivery": {
@@ -167,7 +169,8 @@
           "producer_id": "gb-restarted-second-attempt",
           "event_id": "gb-run-restarted-second-3"
         }
-      ]
+      ],
+      "sleeps": []
     }
   }
 }

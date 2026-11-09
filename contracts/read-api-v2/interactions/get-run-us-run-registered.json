@@ -26,7 +26,10 @@
         "resources": null,
         "work": null,
         "failure": null,
-        "block": null
+        "block": null,
+        "environment": null,
+        "reading": null,
+        "sleeps": []
       },
       "events": []
     }

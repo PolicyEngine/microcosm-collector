@@ -1,8 +1,8 @@
 """Response models and documents for version 2 of the read API.
 
 Version 1 (``GET /v1/runs`` and ``GET /v1/runs/{run_id}``) returns the
-documents the dashboard rebuilt from Hugging Face run files, and stays
-unchanged for it. Version 2 returns each run's state together with the events
+documents the dashboard rebuilt from Hugging Face run files, and changes for
+it only by gaining keys. Version 2 returns each run's state together with the events
 its producers sent, as the collector stored them: every field of the event
 model, with an optional field the producer left out as null (``details`` as an
 empty object), and the timestamp in UTC. ``contracts/read-api-v2/openapi.json``
@@ -18,7 +18,12 @@ from typing import Annotated, Any, Literal
 from fastapi import FastAPI
 from pydantic import AfterValidator, AwareDatetime, BaseModel, ConfigDict, Field
 
-from telemetry_collector.storage import canonical_events, materialize_run
+from telemetry_collector.models import MachineEnvironment, Reading, SleepRecord
+from telemetry_collector.storage import (
+    canonical_events,
+    emitter_summaries,
+    materialize_run,
+)
 
 OPENAPI_TITLE = "Microcosm collector read API"
 OPENAPI_VERSION = "2"
@@ -117,13 +122,34 @@ class RunBlock(_Response):
     blocking_gate_ids: list[str]
 
 
+class TimedReading(Reading):
+    """A heartbeat's reading of the build and its machine, with its time."""
+
+    timestamp: UtcDatetime = Field(description="The heartbeat's timestamp.")
+
+
+class ProducerSleep(SleepRecord):
+    """One system sleep, with the producer that recorded it."""
+
+    producer_id: str
+
+
 class RunState(RunSummary):
-    """A run's state, rebuilt from the events returned with it."""
+    """A run's state, rebuilt from the events returned with it.
+
+    `environment`, `reading` and `sleeps` come from the details microcosm-emitter
+    0.14.0 and later write: the latest run start's machine description, the
+    current attempt's latest reading, and every attempt's sleeps. A stored value
+    that doesn't match its model is left out.
+    """
 
     resources: Resources | None
     work: RunWork | None
     failure: RunFailure | None
     block: RunBlock | None
+    environment: MachineEnvironment | None
+    reading: TimedReading | None
+    sleeps: list[ProducerSleep]
 
 
 class RawEvent(_Response):
@@ -180,7 +206,10 @@ def run_detail(
     """
 
     ordered = canonical_events(events)
-    state = materialize_run(registered_run, ordered)
+    state = {
+        **materialize_run(registered_run, ordered),
+        **emitter_summaries(ordered),
+    }
     return RunDetail(
         run=RunState.model_validate(
             {field: state.get(field) for field in RUN_STATE_FIELDS}
