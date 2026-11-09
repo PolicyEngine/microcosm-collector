@@ -1,6 +1,6 @@
 {
   "name": "@policyengine/calibration-tree",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Builds, validates, reads and publishes Microcosm calibration tree artifacts (tree schema 6), with the release and staging readers they are built from.",
   "license": "MIT",
   "repository": {

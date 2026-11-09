@@ -1,0 +1,1 @@
+The calibration tree package is at version 0.1.1, with no other change, so that the publish workflow has a version npm doesn't have yet: its first publication through npm's trusted publishing can then follow the one-time setup within the 48 hours npm allows (microcosm-collector#48).
