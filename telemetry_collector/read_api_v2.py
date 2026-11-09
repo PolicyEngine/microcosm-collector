@@ -1,8 +1,8 @@
 """Response models and documents for version 2 of the read API.
 
 Version 1 (``GET /v1/runs`` and ``GET /v1/runs/{run_id}``) returns the
-documents the dashboard rebuilt from Hugging Face run files, and stays
-unchanged for it. Version 2 returns each run's state together with the events
+documents the dashboard rebuilt from Hugging Face run files, and changes for
+it only by gaining keys. Version 2 returns each run's state together with the events
 its producers sent, as the collector stored them: every field of the event
 model, with an optional field the producer left out as null (``details`` as an
 empty object), and the timestamp in UTC. ``contracts/read-api-v2/openapi.json``

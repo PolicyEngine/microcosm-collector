@@ -79,10 +79,10 @@
           "run_kind": "build",
           "status": "completed",
           "current_stage": "complete",
-          "registered_at": "2026-10-20T12:00:00Z",
-          "started_at": "2026-10-20T12:00:00Z",
-          "updated_at": "2026-10-20T12:30:47Z",
-          "ended_at": "2026-10-20T12:30:47Z",
+          "registered_at": "2026-10-20T11:59:55Z",
+          "started_at": "2026-10-20T11:59:55Z",
+          "updated_at": "2026-10-20T12:31:11Z",
+          "ended_at": "2026-10-20T12:31:11Z",
           "heartbeat_at": "2026-10-20T12:30:41Z"
         },
         {

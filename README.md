@@ -250,7 +250,8 @@ Both versions take the dashboard read credential in `X-Telemetry-Read-Token`.
 - `openapi.json`, its OpenAPI document, which the collector also serves at
   `GET /v2/openapi.json`;
 - `telemetry.json`, telemetry for a few runs (completed, failed, blocked,
-  restarted and only registered);
+  restarted, only registered, and one whose emitter sent readings, a sleep,
+  its machine description and stage spans);
 - `interactions/`, one file per request, with the collector's answer once that
   telemetry is stored.
 

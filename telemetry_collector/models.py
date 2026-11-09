@@ -5,11 +5,12 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Annotated, Any, Final, Literal
 
 from pydantic import (
+    AfterValidator,
     AwareDatetime,
     BaseModel,
     BeforeValidator,
@@ -103,17 +104,28 @@ def _require_text(value: object) -> object:
     return value
 
 
+def _in_utc(value: datetime) -> datetime:
+    return value.astimezone(UTC)
+
+
 # Numbers are strict: an int or a float, never a boolean or numeric text.
 _Count = Annotated[StrictInt, Field(ge=0)]
 _Amount = Annotated[float, Strict(), Field(ge=0, allow_inf_nan=False)]
 _Share = Annotated[float, Strict(), Field(ge=0, le=1, allow_inf_nan=False)]
-_Time = Annotated[AwareDatetime, BeforeValidator(_require_text)]
+# Read API v2 serves every time in UTC; the stored details keep the producer's.
+_Time = Annotated[
+    AwareDatetime, BeforeValidator(_require_text), AfterValidator(_in_utc)
+]
 _Text = Annotated[str, Field(max_length=200)]
 _Identifier = Annotated[str, Field(pattern=SAFE_IDENTIFIER)]
 
 
 class _EmitterDetail(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    # Read API v2's contract marks every field required, as the collector
+    # always sends each one.
+    model_config = ConfigDict(
+        extra="forbid", json_schema_serialization_defaults_required=True
+    )
 
 
 class OuterProgress(_EmitterDetail):

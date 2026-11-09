@@ -664,7 +664,8 @@
         "type": "object",
         "required": [
           "done",
-          "total"
+          "total",
+          "unit"
         ],
         "title": "OuterProgress",
         "description": "The counter one level above a stage's own, such as the pass of a batch."

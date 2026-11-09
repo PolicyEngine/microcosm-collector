@@ -145,7 +145,7 @@ export interface components {
             /** Total */
             total: number;
             /** Unit */
-            unit?: string | null;
+            unit: string | null;
         };
         /**
          * ProcessTreeReading

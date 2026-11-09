@@ -16,6 +16,10 @@ export type Resources = Schemas["Resources"];
 export type RunWork = Schemas["RunWork"];
 export type RunFailure = Schemas["RunFailure"];
 export type RunBlock = Schemas["RunBlock"];
+export type MachineEnvironment = Schemas["MachineEnvironment"];
+export type ModalContainer = Schemas["ModalContainer"];
+export type TimedReading = Schemas["TimedReading"];
+export type ProducerSleep = Schemas["ProducerSleep"];
 export type RunStatus = RunSummary["status"];
 
 /** The request header that carries the dashboard read credential. */

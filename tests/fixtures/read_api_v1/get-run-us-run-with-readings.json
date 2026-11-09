@@ -24,8 +24,8 @@
         "release_id": null,
         "run_kind": "build",
         "non_release": true,
-        "started_at": "2026-10-20T12:00:00Z",
-        "updated_at": "2026-10-20T12:30:47Z",
+        "started_at": "2026-10-20T11:59:55Z",
+        "updated_at": "2026-10-20T12:31:11Z",
         "status": "completed",
         "current_stage": "complete",
         "heartbeat_at": "2026-10-20T12:30:41Z",
@@ -73,7 +73,7 @@
               "total": 101,
               "unit": "pass"
             },
-            "reported_at": "2026-10-20T12:00:08Z",
+            "reported_at": "2026-10-20T12:00:03+00:00",
             "stage_id": "reform_validation",
             "total": 177,
             "unit": "scoring_batch"
@@ -89,7 +89,7 @@
           "total": 177,
           "unit": "scoring_batch",
           "elapsed_seconds": 0,
-          "updated_at": "2026-10-20T12:00:08+00:00",
+          "updated_at": "2026-10-20T12:00:03+00:00",
           "details": {
             "outer": {
               "done": 57,
@@ -115,8 +115,8 @@
         "release_id": null,
         "run_kind": "build",
         "non_release": true,
-        "started_at": "2026-10-20T12:00:00Z",
-        "updated_at": "2026-10-20T12:30:47Z",
+        "started_at": "2026-10-20T11:59:55Z",
+        "updated_at": "2026-10-20T12:31:11Z",
         "status": "completed",
         "current_stage": "complete",
         "identity": {
@@ -150,8 +150,8 @@
         {
           "schema_version": 2,
           "sequence": 1,
-          "timestamp": "2026-10-20T12:00:05Z",
-          "time": "2026-10-20T12:00:05Z",
+          "timestamp": "2026-10-20T12:00:00Z",
+          "time": "2026-10-20T12:00:00Z",
           "event_type": "stage",
           "run_id": "us-run-with-readings",
           "stage_id": "created",
@@ -190,8 +190,8 @@
         {
           "schema_version": 2,
           "sequence": 2,
-          "timestamp": "2026-10-20T12:00:06Z",
-          "time": "2026-10-20T12:00:06Z",
+          "timestamp": "2026-10-20T12:00:01Z",
+          "time": "2026-10-20T12:00:01Z",
           "event_type": "stage",
           "run_id": "us-run-with-readings",
           "stage_id": "post_export_scoring",
@@ -216,8 +216,8 @@
         {
           "schema_version": 2,
           "sequence": 3,
-          "timestamp": "2026-10-20T12:00:07Z",
-          "time": "2026-10-20T12:00:07Z",
+          "timestamp": "2026-10-20T12:00:02Z",
+          "time": "2026-10-20T12:00:02Z",
           "event_type": "stage",
           "run_id": "us-run-with-readings",
           "stage_id": "reform_validation",
@@ -242,8 +242,8 @@
         {
           "schema_version": 2,
           "sequence": 4,
-          "timestamp": "2026-10-20T12:00:08Z",
-          "time": "2026-10-20T12:00:08Z",
+          "timestamp": "2026-10-20T12:00:03Z",
+          "time": "2026-10-20T12:00:03Z",
           "event_type": "stage",
           "run_id": "us-run-with-readings",
           "stage_id": "reform_validation",
@@ -319,7 +319,7 @@
                   "total": 101,
                   "unit": "pass"
                 },
-                "reported_at": "2026-10-20T12:00:08Z",
+                "reported_at": "2026-10-20T12:00:03+00:00",
                 "stage_id": "reform_validation",
                 "total": 177,
                 "unit": "scoring_batch"
@@ -388,7 +388,7 @@
                   "total": 101,
                   "unit": "pass"
                 },
-                "reported_at": "2026-10-20T12:00:08Z",
+                "reported_at": "2026-10-20T12:00:03+00:00",
                 "stage_id": "reform_validation",
                 "total": 177,
                 "unit": "scoring_batch"
@@ -416,8 +416,8 @@
         {
           "schema_version": 2,
           "sequence": 7,
-          "timestamp": "2026-10-20T12:30:45Z",
-          "time": "2026-10-20T12:30:45Z",
+          "timestamp": "2026-10-20T12:31:10Z",
+          "time": "2026-10-20T12:31:10Z",
           "event_type": "stage",
           "run_id": "us-run-with-readings",
           "stage_id": "reform_validation",
@@ -445,8 +445,8 @@
         {
           "schema_version": 2,
           "sequence": 8,
-          "timestamp": "2026-10-20T12:30:46Z",
-          "time": "2026-10-20T12:30:46Z",
+          "timestamp": "2026-10-20T12:31:11Z",
+          "time": "2026-10-20T12:31:11Z",
           "event_type": "stage",
           "run_id": "us-run-with-readings",
           "stage_id": "post_export_scoring",
@@ -474,8 +474,8 @@
         {
           "schema_version": 2,
           "sequence": 9,
-          "timestamp": "2026-10-20T12:30:47Z",
-          "time": "2026-10-20T12:30:47Z",
+          "timestamp": "2026-10-20T12:31:11Z",
+          "time": "2026-10-20T12:31:11Z",
           "event_type": "stage",
           "run_id": "us-run-with-readings",
           "stage_id": "complete",

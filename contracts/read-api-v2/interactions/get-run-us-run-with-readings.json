@@ -18,10 +18,10 @@
         "run_kind": "build",
         "status": "completed",
         "current_stage": "complete",
-        "registered_at": "2026-10-20T12:00:00Z",
-        "started_at": "2026-10-20T12:00:00Z",
-        "updated_at": "2026-10-20T12:30:47Z",
-        "ended_at": "2026-10-20T12:30:47Z",
+        "registered_at": "2026-10-20T11:59:55Z",
+        "started_at": "2026-10-20T11:59:55Z",
+        "updated_at": "2026-10-20T12:31:11Z",
+        "ended_at": "2026-10-20T12:31:11Z",
         "heartbeat_at": "2026-10-20T12:30:41Z",
         "resources": {
           "cpu_user_seconds": 0.303434304,
@@ -35,7 +35,7 @@
           "total": 177,
           "unit": "scoring_batch",
           "elapsed_seconds": 0,
-          "updated_at": "2026-10-20T12:00:08Z",
+          "updated_at": "2026-10-20T12:00:03Z",
           "details": {
             "outer": {
               "done": 57,
@@ -78,7 +78,7 @@
               "total": 101,
               "unit": "pass"
             },
-            "reported_at": "2026-10-20T12:00:08Z"
+            "reported_at": "2026-10-20T12:00:03Z"
           },
           "process_tree": {
             "processes": 1,
@@ -125,7 +125,7 @@
           "run_id": "us-run-with-readings",
           "producer_id": "us-readings-producer",
           "sequence": 1,
-          "timestamp": "2026-10-20T12:00:05Z",
+          "timestamp": "2026-10-20T12:00:00Z",
           "event_type": "run",
           "stage_id": "created",
           "status": "started",
@@ -163,7 +163,7 @@
           "run_id": "us-run-with-readings",
           "producer_id": "us-readings-producer",
           "sequence": 2,
-          "timestamp": "2026-10-20T12:00:06Z",
+          "timestamp": "2026-10-20T12:00:01Z",
           "event_type": "stage",
           "stage_id": "post_export_scoring",
           "status": "started",
@@ -187,7 +187,7 @@
           "run_id": "us-run-with-readings",
           "producer_id": "us-readings-producer",
           "sequence": 3,
-          "timestamp": "2026-10-20T12:00:07Z",
+          "timestamp": "2026-10-20T12:00:02Z",
           "event_type": "stage",
           "stage_id": "reform_validation",
           "status": "started",
@@ -211,7 +211,7 @@
           "run_id": "us-run-with-readings",
           "producer_id": "us-readings-producer",
           "sequence": 4,
-          "timestamp": "2026-10-20T12:00:08Z",
+          "timestamp": "2026-10-20T12:00:03Z",
           "event_type": "progress",
           "stage_id": "reform_validation",
           "status": "progress",
@@ -283,7 +283,7 @@
                   "total": 101,
                   "unit": "pass"
                 },
-                "reported_at": "2026-10-20T12:00:08Z",
+                "reported_at": "2026-10-20T12:00:03+00:00",
                 "stage_id": "reform_validation",
                 "total": 177,
                 "unit": "scoring_batch"
@@ -350,7 +350,7 @@
                   "total": 101,
                   "unit": "pass"
                 },
-                "reported_at": "2026-10-20T12:00:08Z",
+                "reported_at": "2026-10-20T12:00:03+00:00",
                 "stage_id": "reform_validation",
                 "total": 177,
                 "unit": "scoring_batch"
@@ -379,7 +379,7 @@
           "run_id": "us-run-with-readings",
           "producer_id": "us-readings-producer",
           "sequence": 7,
-          "timestamp": "2026-10-20T12:30:45Z",
+          "timestamp": "2026-10-20T12:31:10Z",
           "event_type": "stage",
           "stage_id": "reform_validation",
           "status": "completed",
@@ -406,7 +406,7 @@
           "run_id": "us-run-with-readings",
           "producer_id": "us-readings-producer",
           "sequence": 8,
-          "timestamp": "2026-10-20T12:30:46Z",
+          "timestamp": "2026-10-20T12:31:11Z",
           "event_type": "stage",
           "stage_id": "post_export_scoring",
           "status": "completed",
@@ -433,7 +433,7 @@
           "run_id": "us-run-with-readings",
           "producer_id": "us-readings-producer",
           "sequence": 9,
-          "timestamp": "2026-10-20T12:30:47Z",
+          "timestamp": "2026-10-20T12:31:11Z",
           "event_type": "run",
           "stage_id": "complete",
           "status": "completed",
