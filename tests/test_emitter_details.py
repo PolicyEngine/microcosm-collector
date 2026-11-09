@@ -427,3 +427,101 @@ def test_a_repeated_event_with_a_dropped_key_is_a_duplicate() -> None:
     assert [event["details"] for event in document["events"]] == [
         {DROPPED: ["reading"]}
     ]
+
+
+def read_client(store: FakeTelemetryStore) -> TestClient:
+    """Return a client whose run fixture-run holds the emitter's events."""
+    client = TestClient(
+        create_app(
+            settings=settings(),
+            store=store,
+            huggingface_authenticator=StubHuggingFaceAuthenticator(),
+        )
+    )
+    headers = {"Authorization": f"Bearer {exchange(client)}"}
+    registration = {
+        "run_id": "fixture-run",
+        "producer_id": "fixture-producer",
+        "country_code": "US",
+        "pipeline": "fixture-pipeline",
+    }
+    assert (
+        client.post("/v1/runs", headers=headers, json=registration).status_code == 201
+    )
+    return client
+
+
+def post_events(client: TestClient, events: list[dict[str, Any]]) -> None:
+    headers = {"Authorization": f"Bearer {exchange(client)}"}
+    response = client.post(
+        "/v1/runs/fixture-run/events", headers=headers, json={"events": events}
+    )
+    assert response.status_code == 202, response.text
+
+
+READ_HEADERS = {"X-Telemetry-Read-Token": "dashboard-read-token"}
+
+
+def test_v2_serves_the_environment_latest_reading_and_sleeps() -> None:
+    client = read_client(FakeTelemetryStore())
+    raws = emitter_events()
+    post_events(client, raws)
+    run = client.get("/v2/runs/fixture-run", headers=READ_HEADERS).json()["run"]
+    latest = [raw for raw in raws if raw["event_type"] == "heartbeat"][-1]
+    assert run.get("environment") == raws[0]["details"]["environment"]
+    reading = run.get("reading") or {}
+    assert datetime.fromisoformat(reading.get("timestamp", "")) == (
+        TelemetryEvent.model_validate(latest).timestamp
+    )
+    assert {name: value for name, value in reading.items() if name != "timestamp"} == (
+        latest["details"]["reading"]
+    )
+    sleeps = run.get("sleeps") or []
+    assert [sleep["producer_id"] for sleep in sleeps] == ["fixture-producer"]
+    assert sleeps[0]["seconds"] == latest["details"]["sleep"]["seconds"]
+    assert datetime.fromisoformat(sleeps[0]["started_at"]) == datetime.fromisoformat(
+        latest["details"]["sleep"]["started_at"]
+    )
+
+
+def stored_without_checks(
+    store: FakeTelemetryStore, raws: list[dict[str, Any]]
+) -> None:
+    """Store events as a collector without these checks stored them."""
+    events = [
+        TelemetryEvent.model_construct(
+            **{**raw, "timestamp": datetime.fromisoformat(raw["timestamp"])}
+        )
+        for raw in raws
+    ]
+    store.append_events("fixture-run", "hf-user-1", events)
+
+
+@pytest.mark.parametrize("version", ["v1", "v2"])
+def test_a_stored_key_that_does_not_match_its_model_is_not_served(version: str) -> None:
+    store = FakeTelemetryStore()
+    client = read_client(store)
+    raws = emitter_events()
+    raws[0]["details"]["environment"]["kind"] = "server"
+    heartbeats = [raw for raw in raws if raw["event_type"] == "heartbeat"]
+    heartbeats[-1]["details"]["reading"]["machine"]["cpu_busy_share"] = "high"
+    heartbeats[-1]["details"]["sleep"]["seconds"] = -1
+    stored_without_checks(store, raws)
+    response = client.get(f"/{version}/runs/fixture-run", headers=READ_HEADERS)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    if version == "v1":
+        environment = body["run_manifest"].get("environment", "missing")
+        reading = body["progress"].get("reading") or {}
+        sleeps = body.get("sleeps", "missing")
+    else:
+        environment = body["run"].get("environment", "missing")
+        reading = body["run"].get("reading") or {}
+        sleeps = body["run"].get("sleeps", "missing")
+    assert environment is None
+    # The latest reading that matches its model is served instead.
+    earlier = heartbeats[0]
+    assert {name: value for name, value in reading.items() if name != "timestamp"} == (
+        earlier["details"]["reading"]
+    )
+    assert sleeps == []

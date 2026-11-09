@@ -43,6 +43,7 @@ RUN_IDS = (
     "gb-run-blocked",
     "gb-run-restarted",
     "us-run-registered",
+    "us-run-with-readings",
 )
 
 
