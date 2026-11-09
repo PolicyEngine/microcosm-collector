@@ -12,6 +12,8 @@ IMPORT_PACKAGE = "telemetry_collector"
 EMITTER_LICENSE_SHA256 = (
     "919d42904bc9c6bb0621ab4eb7e4c9828d1467ea5ee64da7ca88eed53af1530b"
 )
+# node_modules holds installed npm packages, such as the Orrery validator's
+# (orrery-validator) and the read API client's.
 IGNORED_PARTS = {
     ".git",
     ".pytest_cache",
