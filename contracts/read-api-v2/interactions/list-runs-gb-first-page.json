@@ -1,0 +1,32 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/v2/runs?country=GB&limit=1",
+    "headers": {
+      "X-Telemetry-Read-Token": "dashboard-read-token"
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "runs": [
+        {
+          "run_id": "gb-run-restarted",
+          "country_code": "GB",
+          "pipeline": "uk-national",
+          "candidate_id": null,
+          "release_id": null,
+          "run_kind": "calibration",
+          "status": "running",
+          "current_stage": "calibrate",
+          "registered_at": "2026-10-23T07:00:00Z",
+          "started_at": "2026-10-23T08:00:05Z",
+          "updated_at": "2026-10-23T08:21:00Z",
+          "ended_at": null,
+          "heartbeat_at": "2026-10-23T08:21:00Z"
+        }
+      ],
+      "next_before": "WyIyMDI2LTEwLTIzVDA3OjAwOjAwKzAwOjAwIiwiZ2ItcnVuLXJlc3RhcnRlZCJd"
+    }
+  }
+}
