@@ -1,17 +1,28 @@
 """Build, check and publish Orrery graph files from ``orrery-inputs`` submissions.
 
-Each attempt downloads the submission's schema, execution overlay and
-upstream files into a new temporary directory; evidence files are never
-downloaded. It projects the two inputs with the collector's copy of
+Each attempt downloads the submission's schema and execution overlay into a
+new temporary directory. It projects them with the collector's copy of
 Microcosm's projection (``orrery_json_from_schema(schema, execution=overlay)``)
-and then removes every link the published document could not resolve: a
-``url`` stays only when it is an ``https://`` URL or names, before any ``#``,
-a submitted upstream file, and a relative ``uri`` only when it names a
-submitted upstream file. Evidence references so keep their label and SHA-256
-but lose their link, since evidence files stay in private intake storage. The
-document is serialised exactly as the projection serialises it and validated
-with the pinned Orrery validator, which may resolve links only to the
-upstream files the document still names.
+and then removes every link the published document could not resolve, which
+needs only the upstream files' names, from the submission's file list:
+
+- Evidence files stay in private intake storage, so each evidence reference
+  keeps its label and SHA-256 but loses its link, whatever the link's scheme.
+  The evidence references are the overlay's phase references
+  (``metadata.execution.phases[].references``) and the document's
+  ``artifacts``, which the projection builds only from the overlay
+  (``orrery_evidence.apply_execution`` copies a phase reference's ``url``
+  into its artifact's ``uri``). There every ``url`` and ``uri`` is removed
+  unless it names a submitted upstream file before any ``#``.
+- Everywhere else, a ``url`` or ``uri`` stays only when it starts with
+  ``https://`` or names a submitted upstream file before any ``#``.
+
+Each node or edge that lost a link gets the projection's own ``revision``
+digest of the record as published. The document is serialised exactly as the
+projection serialises it, so a document with nothing removed keeps the
+projection's bytes, and validated with the pinned Orrery validator, which may
+resolve links only to the upstream files the document still names. Only those
+upstream files are then downloaded; evidence files never are.
 
 The document and those upstream files are written to the environment's
 private Orrery bucket under ``graphs/<submission_id>/<document sha256>/``.
@@ -42,7 +53,6 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
-from urllib.parse import urlsplit
 
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import insert
@@ -53,6 +63,9 @@ from telemetry_collector.disclosure import OutputVisibility
 from telemetry_collector.google_cloud import GoogleCloudStorageOrreryGraphs
 from telemetry_collector.intake import BUCKET_PATTERN
 from telemetry_collector.orrery.projection import orrery_json_from_schema
+from telemetry_collector.orrery.projection.orrery import (
+    _revision as projection_revision,
+)
 from telemetry_collector.orrery.projection.provenance import MICROCOSM_COMMIT
 from telemetry_collector.orrery.validation import (
     OrreryDocumentRefusedError,
@@ -168,21 +181,20 @@ def _names_upstream_file(link: str, upstream_names: Collection[str]) -> str | No
     return name if name in upstream_names else None
 
 
-def remove_unpublished_links(
-    document: object, upstream_names: Collection[str]
-) -> PublishedLinks:
-    """Remove, in place, every link the published document cannot resolve.
+def _remove_links(
+    value: object,
+    upstream_names: Collection[str],
+    linked: set[str],
+    *,
+    keep_https: bool,
+) -> int:
+    """Remove, in place, each ``url`` and ``uri`` within ``value`` that names
+    no submitted upstream file before any ``#``, except, with ``keep_https``,
+    one that starts with ``https://``. Add the upstream files still named to
+    ``linked``, and return how many links were removed."""
 
-    A ``url`` stays when it starts with ``https://`` or names a submitted
-    upstream file before any ``#``; any other ``url`` is removed. A ``uri``
-    stays unless it is a relative reference that names no submitted upstream
-    file. The rest of each object, such as its ``label`` and ``sha256``,
-    stays. Values that are not strings are not links and stay.
-    """
-
-    linked: set[str] = set()
     removed = 0
-    pending: list[object] = [document]
+    pending: list[object] = [value]
     while pending:
         current = pending.pop()
         if isinstance(current, dict):
@@ -193,16 +205,84 @@ def remove_unpublished_links(
                 upstream_name = _names_upstream_file(link, upstream_names)
                 if upstream_name is not None:
                     linked.add(upstream_name)
-                    continue
-                if key == "url" and link.startswith("https://"):
-                    continue
-                if key == "uri" and urlsplit(link).scheme:
-                    continue
-                del current[key]
-                removed += 1
+                elif not (keep_https and link.startswith("https://")):
+                    del current[key]
+                    removed += 1
             pending.extend(current.values())
         elif isinstance(current, list):
             pending.extend(current)
+    return removed
+
+
+def _evidence_references(document: object) -> list[object]:
+    """Where the projection writes the overlay's evidence references.
+
+    ``orrery_evidence.apply_execution`` copies the overlay into
+    ``metadata.execution``, whose ``phases[].references`` are the phase
+    references, and builds the document's ``artifacts`` only from the
+    overlay: one for each content-store object, and one for each phase
+    reference, with the reference's ``url`` as its ``uri``.
+    """
+
+    if not isinstance(document, dict):
+        return []
+    references: list[object] = []
+    artifacts = document.get("artifacts")
+    if isinstance(artifacts, list):
+        references.extend(artifacts)
+    metadata = document.get("metadata")
+    execution = metadata.get("execution") if isinstance(metadata, dict) else None
+    phases = execution.get("phases") if isinstance(execution, dict) else None
+    for phase in phases if isinstance(phases, list) else []:
+        phase_references = phase.get("references") if isinstance(phase, dict) else None
+        if isinstance(phase_references, dict):
+            references.extend(phase_references.values())
+    return references
+
+
+def _revise(record: dict[str, Any]) -> None:
+    """Give a node or edge the projection's digest of its content, as
+    ``orrery_document_from_schema`` computes it: over every key but
+    ``revision``."""
+
+    record["revision"] = projection_revision(
+        {key: value for key, value in record.items() if key != "revision"}
+    )
+
+
+def remove_unpublished_links(
+    document: object, upstream_names: Collection[str]
+) -> PublishedLinks:
+    """Remove, in place, every link the published document cannot resolve.
+
+    In the evidence references (``_evidence_references``), every ``url`` and
+    ``uri`` that names no submitted upstream file before any ``#`` is
+    removed, whatever its scheme. Everywhere else, a ``url`` or ``uri`` stays
+    only when it starts with ``https://`` or names a submitted upstream file
+    before any ``#``. The rest of each object, such as its ``label`` and
+    ``sha256``, stays, and values that are not strings are not links. Each
+    node or edge that lost a link gets the projection's ``revision`` of the
+    record as published; nothing else changes, so a document with nothing
+    removed is unchanged.
+    """
+
+    linked: set[str] = set()
+    removed = 0
+    for reference in _evidence_references(document):
+        removed += _remove_links(reference, upstream_names, linked, keep_https=False)
+    if isinstance(document, dict):
+        for collection in ("nodes", "edges"):
+            records = document.get(collection)
+            for record in records if isinstance(records, list) else []:
+                record_removed = _remove_links(
+                    record, upstream_names, linked, keep_https=True
+                )
+                if record_removed and isinstance(record, dict):
+                    _revise(record)
+                removed += record_removed
+    # The rest of the document. The evidence references, nodes and edges
+    # now hold only links this keeps, so nothing more is removed from them.
+    removed += _remove_links(document, upstream_names, linked, keep_https=True)
     return PublishedLinks(upstream_names=frozenset(linked), removed=removed)
 
 
@@ -238,7 +318,10 @@ def read_input(path: Path, description: str) -> object:
     """Parse one input as strict JSON, as Microcosm's command reads it.
 
     A file that is not UTF-8, is not JSON, repeats a key within an object or
-    holds ``NaN`` or an infinity rejects the submission.
+    holds the constant ``NaN``, ``Infinity`` or ``-Infinity`` rejects the
+    submission. A number too large for a float, such as ``1e999``, parses here
+    as an infinity, as in Microcosm's command; the projection then refuses it
+    with a ``ValueError``, which rejects the submission too.
     """
 
     try:
@@ -310,8 +393,6 @@ def orrery_graph_handler(
             overlay_path = context.download(
                 overlay_file["name"], inputs / overlay_file["name"]
             )
-            for name in upstream_files:
-                context.download(name, inputs / name)
             schema = read_input(schema_path, "schema")
             overlay = read_input(overlay_path, "execution overlay")
             try:
@@ -321,6 +402,8 @@ def orrery_graph_handler(
                     UNUSABLE_INPUTS, _shortened(str(error))
                 ) from error
             document = json.loads(projected)
+            # Needs only the upstream files' names, from the file list; the
+            # projection never reads the upstream files themselves.
             links = remove_unpublished_links(document, upstream_files)
             graph_bytes = graph_json(document).encode("utf-8")
             graph_path = attempt_directory / GRAPH_FILE_NAME
@@ -334,12 +417,13 @@ def orrery_graph_handler(
                 ) from refusal
             document_sha256 = hashlib.sha256(graph_bytes).hexdigest()
             prefix = object_prefix(submission.submission_id, document_sha256)
-            # The upstream files first, so every link resolves once the
+            # Only the upstream files the document links to are downloaded,
+            # and they are written first, so every link resolves once the
             # document exists.
             for name in linked_names:
                 objects.create_object(
                     prefix + name,
-                    inputs / name,
+                    context.download(name, inputs / name),
                     sha256=upstream_files[name]["sha256"],
                     content_type=GRAPH_CONTENT_TYPE,
                 )

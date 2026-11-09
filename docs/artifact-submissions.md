@@ -426,7 +426,8 @@ latest processing round.
   including when `licensed_data` is `true`.
 - **Native evidence is never published,** whatever `licensed_data` says. A
   published graph file doesn't link to it: each evidence reference keeps its
-  label and SHA-256 but loses its link (see "Orrery graph files").
+  label and SHA-256 but loses its link, whatever the link's scheme (see
+  "Orrery graph files").
 - **`licensed_data` has no default,** so a producer must state it. The worker
   framework applies these rules for every handler, so no handler derives them
   again.
@@ -458,17 +459,32 @@ The Orrery graph handler projects the schema and execution overlay with
 published document could not resolve, validates the document with the
 collector's pinned Orrery validator, and writes it, with the upstream files it
 links to, to `graphs/<submission_id>/<document sha256>/` in the collector's
-private Orrery bucket. Evidence files are never downloaded, written or linked.
+private Orrery bucket. Evidence files are never downloaded, written or linked,
+and upstream files the document doesn't link to are neither downloaded nor
+written.
 
-- **Links a published document keeps:** a `url` that is an `https://` URL or
-  names a submitted upstream file before any `#`, such as
-  `upstream-<sha256>.json` or `upstream-<sha256>.json#nodes`; and a `uri`
-  that is an absolute URL or names a submitted upstream file. Every other
-  `url`, and every other relative `uri`, is removed, and the rest of its
-  object, such as `label` and `sha256`, stays. So each evidence reference
-  keeps its label and SHA-256 but no link, and an upstream reference to a
-  file that was not submitted keeps its label and SHA-256 too. Upstream files
-  the document doesn't link to are not written.
+- **Links a published document keeps:**
+  - In evidence references, only a `url` or `uri` that names a submitted
+    upstream file before any `#`, such as `upstream-<sha256>.json` or
+    `upstream-<sha256>.json#nodes`. The evidence references are the
+    overlay's phase references (`metadata.execution.phases[].references`)
+    and the document's `artifacts`, which the projection builds from the
+    overlay, copying each phase reference's `url` into its artifact's `uri`.
+    So each evidence reference keeps its label and SHA-256 but no link,
+    whatever the link's scheme, `https://` included.
+  - Everywhere else, a `url` or `uri` that starts with `https://` or names a
+    submitted upstream file before any `#`.
+
+  Every other `url` and `uri` is removed, and the rest of its object, such as
+  `label` and `sha256`, stays, so an upstream reference to a file that was
+  not submitted keeps its label and SHA-256 too.
+- **What removal changes:** each node or edge that lost a link has the
+  projection's `revision` digest of the record as published.
+  `metadata.execution` is the submitted overlay with its links removed as
+  above, and `metadata.microcosm.extensions` the schema's extensions
+  likewise; `metadata.microcosm.schema_sha256` and the document's own
+  `revision` still describe the schema and overlay as submitted. A document
+  with nothing removed has the projection's exact bytes.
 - **Result:** `{"processed_by": "orrery-graph", "object_prefix": "graphs/<submission_id>/<document sha256>/", "document_sha256", "document_bytes", "upstream_files", "orrery_version", "visibility", "removed_links"}`.
   `upstream_files` counts the upstream files written beside the document,
   `orrery_version` is the Orrery version that validated it, `visibility` is

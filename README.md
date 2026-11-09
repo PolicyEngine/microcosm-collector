@@ -701,9 +701,12 @@ orrery-inputs --intake-only`). The handler is registered in
 `telemetry_collector/handlers.py`, the worker's one registry, beside the
 calibration tree handler.
 
-- **Inputs.** Each attempt downloads the schema, the execution overlay and
-  every upstream file into a new temporary directory. Evidence files are
-  never downloaded. The schema and overlay must be strict JSON, as
+- **Inputs.** Each attempt downloads the schema and the execution overlay
+  into a new temporary directory. Upstream files are downloaded only after
+  links are removed, and only those the document still links to: removing
+  links needs only their names, from the submission's file list, and the
+  projection doesn't read them. Evidence files are never downloaded. The
+  schema and overlay must be strict JSON, as
   Microcosm's own command reads them: UTF-8, no key repeated within an
   object, and no `NaN` or infinity. The projection,
   `orrery_json_from_schema(schema, execution=overlay)`, builds the document.
@@ -713,14 +716,25 @@ calibration tree handler.
   `orrery_inputs_unusable`.
 - **Links.** Evidence files stay in private intake storage, so a published
   document doesn't link to them: each evidence reference keeps its label and
-  SHA-256 but loses its link. A `url` stays only when it is an `https://` URL
-  or names a submitted upstream file before any `#`, as Microcosm writes
-  those links (`upstream-<sha256>.json`). Every other `url` is removed, as is
-  every relative `uri` that names no submitted upstream file (the projection
-  copies an evidence reference's `url` into its artifact's `uri`). The rest of
-  each object stays. The document is then serialised exactly as the
-  projection serialises it, so a document with nothing removed keeps the
-  projection's bytes.
+  SHA-256 but loses its link, whatever the link's scheme, `https://`
+  included. The evidence references are the overlay's phase references
+  (`metadata.execution.phases[].references`) and the document's `artifacts`,
+  which the projection builds only from the overlay: it copies a phase
+  reference's `url` into its artifact's `uri`. There every `url` and `uri` is
+  removed unless it names a submitted upstream file before any `#`.
+  Everywhere else, a `url` or `uri` stays only when it starts with
+  `https://` or names a submitted upstream file before any `#`, as Microcosm
+  writes those links (`upstream-<sha256>.json`), and every other one is
+  removed. The rest of each object stays.
+- **What removal changes.** Each node or edge that lost a link gets a new
+  `revision`: the projection's digest of the record as published, computed as
+  the projection computes it. `metadata.execution` is the submitted overlay
+  with its links removed as above, and `metadata.microcosm.extensions` the
+  schema's extensions likewise. The digests that describe the submitted files
+  are not changed: `metadata.microcosm.schema_sha256` and the document's own
+  `revision` still describe the schema and overlay as submitted. The document
+  is serialised exactly as the projection serialises it, so a document with
+  nothing removed has the projection's bytes.
 - **Checks.** The pinned validator ("Orrery validation") validates the
   document, with the upstream files it still links to as its published
   files. A refusal rejects the submission with `orrery_document_refused`,
@@ -754,8 +768,10 @@ calibration tree handler.
   "orrery_version", "visibility", "removed_links"}`, where `removed_links`
   counts the `url` and `uri` keys removed.
 
-Each environment's bucket was created by hand, as the calibration tree Blob
-stores were:
+Each environment's bucket, and the worker account's access to it, are set up
+before the first deploy, as the permissions list in "Worker jobs and
+recovery" describes. The deploy neither creates nor checks them. Each
+bucket needs:
 
 - **Private:** uniform bucket-level access, with public access prevention
   enforced.
