@@ -126,7 +126,7 @@ because of it.
 | `provenance.run_id` | The telemetry run ID: 1–192 characters from `A-Z`, `a-z`, `0-9`, `.`, `_`, `:` and `-`, starting with a letter or digit (`[A-Za-z0-9][A-Za-z0-9._:-]{0,191}`), as for `POST /v1/runs`. The run does not have to be registered with the collector. |
 | `provenance.build_id` | The build: the attempt ID Microcosm assigns, the same from staging through release. 1–128 characters from `A-Z`, `a-z`, `0-9`, `.`, `_` and `-`, starting with a letter or digit (`[A-Za-z0-9][A-Za-z0-9._-]{0,127}`). This is the emitter interface's `safe_identifier` rule. |
 | `provenance.country_code` | Two upper-case letters, as in run registration. |
-| `provenance.release` | The release ID, with the `build_id` syntax, or `null` for a staged build that is not a release. |
+| `provenance.release` | The release ID, with the `build_id` syntax. For a staged build, the candidate release it was staged for, or `null` when it names none; a staging calibration tree is labelled with it, or with the run ID. |
 | `provenance.huggingface` | Where the same bytes live on Hugging Face: an object with exactly `repo`, `commit` and `folder`, or `null`. Required (not `null`) for `calibration-diagnostics`. For `orrery-inputs` it may be `null`, for a build that exists only on the build machine. |
 | `provenance.huggingface.repo` | The dataset repo, `owner/name`. Each of the two parts is 1–96 characters with the `build_id` character set, starting with a letter or digit. |
 | `provenance.huggingface.commit` | 40 lowercase hex characters: the full ID of the Hugging Face commit that added the folder, which is the commit that wrote these files there. Never a later commit, a branch or a tag, so the same folder always gives the same submission ID. |
@@ -147,7 +147,7 @@ recorded something it ignored.
 
 | Kind | Role | Count | Size limit per file | Consumer |
 |---|---|---|---|---|
-| `calibration-diagnostics` | `calibration_diagnostics` | exactly 1 | 1 GiB | calibration-tree worker (K4) |
+| `calibration-diagnostics` | `calibration_diagnostics` | exactly 1 | 1 GiB | calibration tree handler |
 | | `build_manifest` | 0 or 1 | 64 MiB | |
 | | `release_manifest` | 0 or 1 | 64 MiB | |
 | | `demographics` | 0 or 1 | 64 MiB | |
@@ -434,11 +434,16 @@ The worker framework claims a job (one holder at a time, through a lease),
 checks every file's bytes, and then calls the handler registered for the kind
 with the submission record and a reader for each file at its recorded
 generation. A handler returns a JSON result, which goes into the receipt, or
-refuses the content, which rejects the submission. The calibration-tree worker
-(K4) and the Orrery worker (O4) register the handlers for their kinds. Until
-they do, both kinds only have their bytes checked and are kept in intake
+refuses the content, which rejects the submission. Where the worker job has
+its calibration tree Blob token, `calibration-diagnostics` submissions build
+calibration trees (the README's "Building trees from submissions"); the Orrery
+worker (O4) will register the handler for `orrery-inputs`. Until a kind has a
+handler, its submissions only have their bytes checked and are kept in intake
 storage, with the result `{"processed_by": "intake-only", "verified_files": <count>}`;
-an operator reprocesses them once a handler exists.
+an operator reprocesses them once a handler exists. The calibration tree
+handler also keeps a submission in intake storage, with a `reason`, when its
+folder is neither a build folder nor a staged bundle, or its country is not
+one the collector lists.
 
 ### Attempts, dispatches and recovery
 
