@@ -21,6 +21,7 @@ from telemetry_collector.intake import (
 )
 from telemetry_collector.models import RunRegistration, TelemetryEvent
 from telemetry_collector.storage import (
+    RunRecord,
     RunRegistrationConflictError,
     canonical_events,
     initial_run_state,
@@ -114,6 +115,9 @@ class FakeTelemetryStore:
             stored = self._events[run_id]
             for model in events:
                 event = model.model_dump(mode="python")
+                # PostgreSQL returns timestamptz values in the session's time
+                # zone, UTC, whatever offset the producer sent.
+                event["timestamp"] = event["timestamp"].astimezone(UTC)
                 sequence_key = (run_id, event["producer_id"], event["sequence"])
                 if event["event_id"] in stored or sequence_key in self._sequences:
                     duplicates += 1
@@ -152,11 +156,17 @@ class FakeTelemetryStore:
             return [run_summary(deepcopy(run)) for run in runs[:limit]]
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
+        record = self.get_run_record(run_id)
+        if record is None:
+            return None
+        return run_documents(record.registered_run, record.events)
+
+    def get_run_record(self, run_id: str) -> RunRecord | None:
         with self._lock:
             run = self._runs.get(run_id)
             if run is None:
                 return None
-            return run_documents(
+            return RunRecord(
                 deepcopy(run), deepcopy(list(self._events[run_id].values()))
             )
 

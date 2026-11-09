@@ -1,0 +1,28 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/v2/runs?limit=0",
+    "headers": {
+      "X-Telemetry-Read-Token": "dashboard-read-token"
+    }
+  },
+  "response": {
+    "status": 422,
+    "body": {
+      "detail": [
+        {
+          "type": "greater_than_equal",
+          "loc": [
+            "query",
+            "limit"
+          ],
+          "msg": "Input should be greater than or equal to 1",
+          "input": "0",
+          "ctx": {
+            "ge": 1
+          }
+        }
+      ]
+    }
+  }
+}
