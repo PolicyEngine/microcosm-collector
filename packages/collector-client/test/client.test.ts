@@ -135,6 +135,7 @@ const CASES: Record<string, (client: CollectorClient) => Promise<unknown>> = {
   "get-run-gb-run-blocked": (client) => client.getRun("gb-run-blocked"),
   "get-run-gb-run-restarted": (client) => client.getRun("gb-run-restarted"),
   "get-run-us-run-registered": (client) => client.getRun("us-run-registered"),
+  "get-run-us-run-with-readings": (client) => client.getRun("us-run-with-readings"),
 };
 
 // Recorded refusals, and how the client meets each.
