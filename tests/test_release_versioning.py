@@ -1,8 +1,11 @@
 """Each release takes its version and changelog from typed Towncrier fragments."""
 
+import json
 import re
 import runpy
 import shutil
+import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
@@ -125,6 +128,59 @@ def test_release_updates_the_version_changelog_and_lock_together() -> None:
     assert "tools/bump-version.py" in update_script
     assert re.search(r'towncrier==\d+\.\d+\.\d+" towncrier build --yes', update_script)
     assert update_script.rstrip().endswith("uv lock")
+    # The client takes the bumped version before the release commit is made.
+    assert "uv run --no-project python tools/set-client-version.py" in update_script
+    assert (
+        update_script.index("tools/bump-version.py")
+        < update_script.index("uv run --no-project python tools/set-client-version.py")
+        < update_script.index("towncrier build")
+    )
+
+
+def test_release_gives_the_read_api_client_the_collector_version(
+    tmp_path: Path,
+) -> None:
+    client_dir = Path("packages") / "collector-client"
+    (tmp_path / client_dir).mkdir(parents=True)
+    pyproject_text = (ROOT / VERSIONED_FILE).read_text()
+    (tmp_path / VERSIONED_FILE).write_text(
+        re.sub(
+            r'^version = "[^"]+"$',
+            'version = "7.6.5"',
+            pyproject_text,
+            count=1,
+            flags=re.MULTILINE,
+        )
+    )
+    for file_name in ("package.json", "package-lock.json"):
+        assert (ROOT / client_dir / file_name).is_file(), file_name
+        shutil.copy(ROOT / client_dir / file_name, tmp_path / client_dir / file_name)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "tools" / "set-client-version.py"),
+            "--root",
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    package_text = (tmp_path / client_dir / "package.json").read_text()
+    lock = json.loads((tmp_path / client_dir / "package-lock.json").read_text())
+    assert json.loads(package_text)["version"] == "7.6.5"
+    assert lock["version"] == "7.6.5"
+    assert lock["packages"][""]["version"] == "7.6.5"
+    # Only the version changes, in npm's own layout.
+    original_text = (ROOT / client_dir / "package.json").read_text()
+    assert package_text == original_text.replace(
+        f'"version": "{json.loads(original_text)["version"]}"',
+        '"version": "7.6.5"',
+        1,
+    )
 
 
 def test_pull_requests_require_a_changelog_fragment() -> None:
