@@ -208,11 +208,20 @@ are ISO 8601 text. The same keys on other
 event types are stored as sent, and only the collector writes
 `dropped_emitter_details`.
 
-`GET /v1/runs/{run_id}` serves them beside the events:
+Both read APIs serve them beside the events, in version 1 as
+`run_manifest.environment`, `progress.reading` and a top-level `sleeps`, and
+in version 2 as the run's `environment`, `reading` and `sleeps`:
 
-- `run_manifest.environment`: the latest run start's machine description;
-- `progress.reading`: the latest reading of the run's current attempt, with its `timestamp`, or `null` until that attempt sends one;
-- `sleeps`: every attempt's sleeps, in event order, each with its `producer_id`.
+- the environment: the latest run start's machine description;
+- the reading: the latest reading of the run's current attempt, with its
+  heartbeat's `timestamp`, or `null` until that attempt sends one;
+- the sleeps: every attempt's sleeps, in event order, each with its
+  `producer_id`.
+
+Each is checked against its model again when it is served, and left out if it
+doesn't match, since a collector without these checks stored the keys as sent.
+Only the latest reading is checked, then the one before it, so a long run
+costs one check.
 
 ## Read API
 
@@ -221,7 +230,8 @@ Both versions take the dashboard read credential in `X-Telemetry-Read-Token`.
 - **Version 1**, `GET /v1/runs` and `GET /v1/runs/{run_id}`, is what the
   dashboard reads today. A run comes back as the documents the dashboard used
   to read from Hugging Face run files (`progress`, `run_manifest`,
-  `calibration_progress` and lifecycle `events`). It does not change:
+  `calibration_progress` and lifecycle `events`). It changes only by gaining
+  keys the dashboard doesn't yet read, such as the emitter's readings below:
   `tests/fixtures/read_api_v1` records its answers, and a test fails if they
   change.
 - **Version 2**, `GET /v2/runs` and `GET /v2/runs/{run_id}`, returns typed

@@ -71,6 +71,21 @@
           "heartbeat_at": null
         },
         {
+          "run_id": "us-run-with-readings",
+          "country_code": "US",
+          "pipeline": "us-fiscal-refresh",
+          "candidate_id": null,
+          "release_id": null,
+          "run_kind": "build",
+          "status": "completed",
+          "current_stage": "complete",
+          "registered_at": "2026-10-20T12:00:00Z",
+          "started_at": "2026-10-20T12:00:00Z",
+          "updated_at": "2026-10-20T12:30:47Z",
+          "ended_at": "2026-10-20T12:30:47Z",
+          "heartbeat_at": "2026-10-20T12:30:41Z"
+        },
+        {
           "run_id": "us-run-completed",
           "country_code": "US",
           "pipeline": "us-fiscal-refresh",

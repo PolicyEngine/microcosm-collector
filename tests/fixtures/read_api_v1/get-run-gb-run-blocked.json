@@ -30,6 +30,7 @@
         "current_stage": "blocked",
         "heartbeat_at": null,
         "resources": null,
+        "reading": null,
         "work": null,
         "failure": null,
         "block": {
@@ -59,6 +60,7 @@
         "status": "blocked",
         "current_stage": "blocked",
         "identity": null,
+        "environment": null,
         "failure": null,
         "block": {
           "phase": "candidate",
@@ -136,7 +138,8 @@
           "producer_id": "gb-blocked-producer",
           "event_id": "gb-run-blocked-3"
         }
-      ]
+      ],
+      "sleeps": []
     }
   }
 }

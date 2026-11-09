@@ -32,7 +32,10 @@
           "failure_class": "acceptance",
           "failed_during": "release_acceptance"
         },
-        "block": null
+        "block": null,
+        "environment": null,
+        "reading": null,
+        "sleeps": []
       },
       "events": [
         {

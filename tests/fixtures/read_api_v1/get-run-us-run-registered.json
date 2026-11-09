@@ -30,6 +30,7 @@
         "current_stage": "created",
         "heartbeat_at": null,
         "resources": null,
+        "reading": null,
         "work": null,
         "failure": null,
         "block": null
@@ -52,6 +53,7 @@
         "status": "running",
         "current_stage": "created",
         "identity": null,
+        "environment": null,
         "failure": null,
         "block": null,
         "delivery": {
@@ -61,7 +63,8 @@
         }
       },
       "calibration_progress": null,
-      "events": []
+      "events": [],
+      "sleeps": []
     }
   }
 }

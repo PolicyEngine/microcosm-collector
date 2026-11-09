@@ -30,6 +30,7 @@
         "current_stage": "failed",
         "heartbeat_at": null,
         "resources": null,
+        "reading": null,
         "work": null,
         "failure": {
           "message": "Release acceptance checks failed: 1 critical target is outside its tolerance.",
@@ -58,6 +59,7 @@
         "status": "failed",
         "current_stage": "failed",
         "identity": null,
+        "environment": null,
         "failure": {
           "message": "Release acceptance checks failed: 1 critical target is outside its tolerance.",
           "error_type": "ReleaseAcceptanceError",
@@ -127,7 +129,8 @@
           "producer_id": "us-failed-producer",
           "event_id": "us-run-failed-3"
         }
-      ]
+      ],
+      "sleeps": []
     }
   }
 }

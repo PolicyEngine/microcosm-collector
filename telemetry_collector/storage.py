@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import Select, and_, func, select, tuple_
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Engine
@@ -24,7 +25,13 @@ from telemetry_collector.database import (
     create_database_engine,
     create_session_factory,
 )
-from telemetry_collector.models import RunRegistration, TelemetryEvent
+from telemetry_collector.models import (
+    MachineEnvironment,
+    Reading,
+    RunRegistration,
+    SleepRecord,
+    TelemetryEvent,
+)
 
 
 class RunRegistrationConflictError(ValueError):
@@ -400,6 +407,57 @@ def run_summary(run: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _matching(model: type[BaseModel], value: object) -> dict[str, Any] | None:
+    """Return a copy of ``value`` when it matches ``model``, otherwise None."""
+
+    if not isinstance(value, dict):
+        return None
+    try:
+        model.model_validate(value)
+    except ValidationError:
+        return None
+    return deepcopy(value)
+
+
+def emitter_summaries(ordered_events: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """Return what both read APIs serve of the emitter's own details keys.
+
+    ``environment`` is the latest run start's machine description, ``reading``
+    the current attempt's latest reading with its heartbeat's ``timestamp``
+    (a later producer is a restarted attempt, whose readings start again), and
+    ``sleeps`` every attempt's sleeps, each with its ``producer_id``. A stored
+    value that doesn't match its model is left out: a collector without these
+    checks stored them as sent. Only the latest reading is checked, then the
+    one before it, and so on, so a long run costs one check.
+    """
+
+    environment: dict[str, Any] | None = None
+    readings: list[dict[str, Any]] = []
+    sleeps: list[dict[str, Any]] = []
+    active_producer_id: str | None = None
+    for event in ordered_events:
+        details = event.get("details") or {}
+        if event["producer_id"] != active_producer_id:
+            active_producer_id = event["producer_id"]
+            readings = []
+        if event["event_type"] == "run" and event["status"] == "started":
+            environment = _matching(MachineEnvironment, details.get("environment"))
+        if event["event_type"] != "heartbeat":
+            continue
+        if "reading" in details:
+            readings.append(event)
+        sleep = _matching(SleepRecord, details.get("sleep"))
+        if sleep is not None:
+            sleeps.append({"producer_id": event["producer_id"], **sleep})
+    reading = None
+    for event in reversed(readings):
+        latest = _matching(Reading, event["details"]["reading"])
+        if latest is not None:
+            reading = {"timestamp": event["timestamp"], **latest}
+            break
+    return {"environment": environment, "reading": reading, "sleeps": sleeps}
+
+
 def run_documents(
     registered_run: dict[str, Any], events: Iterable[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -410,29 +468,11 @@ def run_documents(
     lifecycle_events: list[dict[str, Any]] = []
     calibration_events: list[dict[str, Any]] = []
     identity: dict[str, Any] | None = None
-    environment: dict[str, Any] | None = None
-    reading: dict[str, Any] | None = None
-    sleeps: list[dict[str, Any]] = []
-    active_producer_id: str | None = None
+    summaries = emitter_summaries(ordered)
     for sequence, event in enumerate(ordered, start=1):
         details = deepcopy(event.get("details") or {})
-        if event["producer_id"] != active_producer_id:
-            # A later producer is a restarted attempt: the previous attempt's
-            # reading no longer describes the run.
-            active_producer_id = event["producer_id"]
-            reading = None
         if event["event_type"] == "run" and isinstance(details.get("identity"), dict):
             identity = details["identity"]
-        if event["event_type"] == "run" and event["status"] == "started":
-            started_environment = details.get("environment")
-            environment = (
-                started_environment if isinstance(started_environment, dict) else None
-            )
-        if event["event_type"] == "heartbeat":
-            if isinstance(details.get("reading"), dict):
-                reading = {"timestamp": event["timestamp"], **details["reading"]}
-            if isinstance(details.get("sleep"), dict):
-                sleeps.append({"producer_id": event["producer_id"], **details["sleep"]})
         event_type = "calibration" if event["event_type"] == "calibration" else "stage"
         lifecycle_events.append(
             {
@@ -475,7 +515,7 @@ def run_documents(
         **common,
         "heartbeat_at": run.get("heartbeat_at"),
         "resources": run.get("resources"),
-        "reading": reading,
+        "reading": summaries["reading"],
         "work": run.get("work"),
         "failure": run.get("failure"),
         "block": run.get("block"),
@@ -483,7 +523,7 @@ def run_documents(
     manifest = {
         **common,
         "identity": identity,
-        "environment": environment,
+        "environment": summaries["environment"],
         "failure": run.get("failure"),
         "block": run.get("block"),
         "delivery": {
@@ -507,7 +547,7 @@ def run_documents(
         if calibration_events
         else None,
         "events": lifecycle_events,
-        "sleeps": sleeps,
+        "sleeps": summaries["sleeps"],
     }
 
 

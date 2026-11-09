@@ -33,7 +33,10 @@
             "local-area-totals",
             "household-weights"
           ]
-        }
+        },
+        "environment": null,
+        "reading": null,
+        "sleeps": []
       },
       "events": [
         {
