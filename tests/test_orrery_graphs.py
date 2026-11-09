@@ -67,6 +67,11 @@ PRINCIPAL = HuggingFacePrincipal("hf-user-1", "builder", ("policyengine",))
 # orrery_submission()'s provenance.
 RUN_ID = "uk-run-1"
 BUILD_ID = "uk-frs-calibration-attempt-1"
+# Microcosm's command reads at most this many bytes of an input
+# (orrery._MAX_INPUT_BYTES at MICROCOSM_COMMIT).
+MICROCOSM_INPUT_BYTE_LIMIT = 32 * 1024 * 1024
+# Deeper than Python's JSON decoder can parse: it raises RecursionError.
+TOO_DEEPLY_NESTED = b"[" * 100_000 + b"]" * 100_000
 
 UPSTREAM_CONTENT = b'{"spine":true}'
 UPSTREAM_SHA256 = hashlib.sha256(UPSTREAM_CONTENT).hexdigest()
@@ -784,6 +789,126 @@ def test_inputs_that_are_not_strict_json_reject_the_submission(
     assert publishing.bucket.stored == {}
 
 
+@pytest.mark.parametrize(
+    ("name", "description"),
+    [(SCHEMA, "schema"), (OVERLAY, "execution overlay")],
+    ids=["schema", "overlay"],
+)
+def test_inputs_nested_too_deeply_to_parse_reject_the_submission(
+    name: str, description: str
+) -> None:
+    inputs = fixture_inputs(EVIDENCE_CASE)
+    inputs[name] = (inputs[name][0], TOO_DEEPLY_NESTED)
+    submission = accepted(inputs)
+    publishing = Publishing()
+
+    outcome = submission.run(publishing)
+
+    assert outcome is JobOutcome.FINISHED
+    assert submission.record().status == "rejected"
+    assert submission.record().rejection == {
+        "code": "orrery_inputs_unusable",
+        "message": f"The {description} nests too deeply.",
+    }
+    assert publishing.bucket.stored == {}
+
+
+def schema_padded_to(size: int) -> bytes:
+    """The linkless fixture's schema, preceded by enough spaces to be ``size``
+    bytes long. JSON allows whitespace before a value, so it parses to the
+    same schema."""
+
+    schema = fixture_bytes(LINKLESS_CASE, SCHEMA)
+    return b" " * (size - len(schema)) + schema
+
+
+def test_a_schema_over_microcosm_s_input_byte_limit_rejects_the_submission() -> None:
+    padded_schema = schema_padded_to(MICROCOSM_INPUT_BYTE_LIMIT + 1)
+    submission = accepted(
+        {**fixture_inputs(LINKLESS_CASE), SCHEMA: ("schema", padded_schema)}
+    )
+    publishing = Publishing()
+
+    outcome = submission.run(publishing)
+
+    assert outcome is JobOutcome.FINISHED
+    assert submission.record().status == "rejected"
+    assert submission.record().rejection == {
+        "code": "orrery_inputs_unusable",
+        "message": "The schema is larger than 32 MiB.",
+    }
+    assert publishing.bucket.stored == {}
+
+
+def test_a_schema_at_microcosm_s_input_byte_limit_is_published() -> None:
+    padded_schema = schema_padded_to(MICROCOSM_INPUT_BYTE_LIMIT)
+
+    _, publishing, result = published_run(
+        {**fixture_inputs(LINKLESS_CASE), SCHEMA: ("schema", padded_schema)}
+    )
+
+    assert publishing.published(result) == fixture_bytes(LINKLESS_CASE, GRAPH)
+
+
+def schema_whose_sources_are_an_object() -> Inputs:
+    schema = fixture_json(EVIDENCE_CASE, SCHEMA)
+    [source] = schema["graph"]["sources"]
+    schema["graph"]["sources"] = {"survey": source}
+    return {**fixture_inputs(EVIDENCE_CASE), SCHEMA: ("schema", json_bytes(schema))}
+
+
+def overlay_whose_summary_is_an_array() -> Inputs:
+    overlay = fixture_json(EVIDENCE_CASE, OVERLAY)
+    overlay["summaries"] = [[]]
+    return with_overlay(fixture_inputs(EVIDENCE_CASE), overlay)
+
+
+@pytest.mark.parametrize(
+    ("inputs", "message"),
+    [
+        (schema_whose_sources_are_an_object, "graph.sources must be a JSON array"),
+        (
+            overlay_whose_summary_is_an_array,
+            "list indices must be integers or slices, not str",
+        ),
+    ],
+    ids=["schema-sources-object", "overlay-summary-array"],
+)
+def test_inputs_that_make_the_projection_raise_type_error_reject_the_submission(
+    inputs: Callable[[], Inputs], message: str
+) -> None:
+    submission = accepted(inputs())
+    publishing = Publishing()
+
+    outcome = submission.run(publishing)
+
+    assert outcome is JobOutcome.FINISHED
+    assert submission.record().status == "rejected"
+    assert submission.record().rejection == {
+        "code": "orrery_inputs_unusable",
+        "message": message,
+    }
+    assert publishing.bucket.stored == {}
+
+
+def test_a_key_error_from_the_projection_fails_the_attempt() -> None:
+    overlay = fixture_json(EVIDENCE_CASE, OVERLAY)
+    # A summary without its key. The projection raises KeyError, which can't
+    # tell a malformed overlay from a fault in the copied projection, so the
+    # job runs again rather than rejecting the submission.
+    overlay["summaries"] = [{}]
+    submission = accepted(with_overlay(fixture_inputs(EVIDENCE_CASE), overlay))
+    publishing = Publishing()
+
+    outcome = submission.run(publishing)
+
+    assert outcome is JobOutcome.RETRY
+    assert submission.record().status == "queued"
+    assert submission.record().rejection is None
+    assert publishing.bucket.stored == {}
+    assert publishing.records.records == {}
+
+
 def test_inputs_the_projection_cannot_use_reject_the_submission() -> None:
     overlay = fixture_json(EVIDENCE_CASE, OVERLAY)
     # An overlay recorded for another graph.
@@ -806,17 +931,22 @@ def test_inputs_the_projection_cannot_use_reject_the_submission() -> None:
     assert publishing.bucket.stored == {}
 
 
+# The errors Microcosm's command treats as input errors around the projection
+# (orrery.main at MICROCOSM_COMMIT), less those the copied projection cannot
+# raise.
+@pytest.mark.parametrize("error_type", [ValueError, TypeError, RecursionError])
 def test_a_long_projection_refusal_is_shortened_to_500_characters(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, error_type: type[Exception]
 ) -> None:
     def refuse(schema: object, *, execution: object) -> str:
-        raise ValueError("Orrery adapter: " + "unusable " * 300)
+        raise error_type("Orrery adapter: " + "unusable " * 300)
 
     monkeypatch.setattr(graphs(), "orrery_json_from_schema", refuse)
     submission = accepted(fixture_inputs(EVIDENCE_CASE))
 
     submission.run(Publishing())
 
+    assert submission.record().status == "rejected"
     rejection = submission.record().rejection
     assert rejection["code"] == "orrery_inputs_unusable"
     assert rejection["message"].startswith("Orrery adapter: unusable")
