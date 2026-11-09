@@ -496,14 +496,16 @@ def test_each_attempt_builds_in_a_new_directory_that_is_removed_afterwards() -> 
 
 
 def test_the_tree_handler_is_registered_only_where_its_blob_token_is_set() -> None:
-    trees_module = trees()
+    # The worker's one registry, which each handler module adds its own to.
+    registry = importlib.import_module("telemetry_collector.handlers")
 
-    without_token = trees_module.handlers_from_environment(engine=None, environ={})
-    with_token = trees_module.handlers_from_environment(
+    without_token = registry.handlers_from_environment(engine=None, environ={})
+    with_token = registry.handlers_from_environment(
         engine=None,
         environ={"COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN": BLOB_TOKEN},
     )
 
+    assert trees().registered_handlers(engine=None, environ={}) == {}
     assert without_token == DEFAULT_HANDLERS
     assert with_token["orrery-inputs"] is DEFAULT_HANDLERS["orrery-inputs"]
     assert (
@@ -571,6 +573,7 @@ def test_the_worker_job_builds_trees_where_its_blob_token_is_set(
     monkeypatch.setenv("DATABASE_URL", "postgresql://user:password@127.0.0.1:1/none")
     monkeypatch.setenv("COLLECTOR_INTAKE_BUCKET", "collector-intake")
     monkeypatch.setenv("COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN", BLOB_TOKEN)
+    monkeypatch.delenv("COLLECTOR_ORRERY_BUCKET", raising=False)
 
     assert worker.main() == 0
     assert (

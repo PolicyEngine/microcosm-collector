@@ -27,6 +27,7 @@ def test_orm_metadata_defines_telemetry_and_artifact_intake_tables() -> None:
         "telemetry_events",
         "artifact_submissions",
         "artifact_jobs",
+        "orrery_graph_files",
     }
     assert set(inspect(ArtifactSubmission).relationships.keys()) == {"jobs"}
     assert set(inspect(ArtifactJob).relationships.keys()) == {"submission"}
@@ -89,17 +90,14 @@ def test_application_modules_do_not_import_psycopg_directly() -> None:
     )
 
 
-def _artifact_intake_migration():
+def _migration(file_name: str = "0002_artifact_intake.py"):
     import importlib.util
 
     migration_path = (
-        Path(__file__).resolve().parents[1]
-        / "migrations"
-        / "versions"
-        / "0002_artifact_intake.py"
+        Path(__file__).resolve().parents[1] / "migrations" / "versions" / file_name
     )
     specification = importlib.util.spec_from_file_location(
-        "artifact_intake_migration", migration_path
+        migration_path.stem, migration_path
     )
     assert specification is not None and specification.loader is not None
     migration = importlib.util.module_from_spec(specification)
@@ -117,9 +115,27 @@ def _status_constraint(table) -> str:
 
 
 def test_the_migration_keeps_the_models_status_sets() -> None:
-    migration = _artifact_intake_migration()
+    migration = _migration()
 
     assert migration.SUBMISSION_STATUSES == _status_constraint(
         ArtifactSubmission.__table__
     )
     assert migration.JOB_STATUSES == _status_constraint(ArtifactJob.__table__)
+
+
+def test_the_orrery_graph_migration_keeps_the_models_visibilities() -> None:
+    import importlib
+
+    from telemetry_collector.disclosure import output_visibility
+
+    database = importlib.import_module("telemetry_collector.database")
+    migration = _migration("0003_orrery_graph_files.py")
+
+    assert migration.down_revision == "0002_artifact_intake"
+    assert migration.VISIBILITIES == _status_constraint(
+        database.OrreryGraphFile.__table__
+    )
+    # Every visibility a worker can record passes the check.
+    for licensed_data in (True, False):
+        visibility = output_visibility("orrery_artifact", licensed_data=licensed_data)
+        assert f"'{visibility}'" in migration.VISIBILITIES

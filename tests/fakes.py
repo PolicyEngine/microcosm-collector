@@ -550,3 +550,19 @@ class FakeWorkerQueue:
         task_id = cloud_task_id(job_id, dispatch_number)
         if task_id not in self.task_ids:
             self.task_ids.append(task_id)
+
+
+class FakeOrreryGraphStore:
+    """In-memory ``orrery_graph_files``: the first record of each document stays."""
+
+    def __init__(self) -> None:
+        self.records: dict[tuple[str, str], Any] = {}
+        self.repeated: list[Any] = []
+
+    def record_graph(self, record: Any) -> bool:
+        key = (record.submission_id, record.document_sha256)
+        if key in self.records:
+            self.repeated.append(record)
+            return False
+        self.records[key] = record
+        return True

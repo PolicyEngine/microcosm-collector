@@ -19,9 +19,13 @@ from telemetry_collector.migrate import (
     verify_database,
 )
 
-HEAD_REVISION = "0002_artifact_intake"
+HEAD_REVISION = "0003_orrery_graph_files"
 TELEMETRY_TABLES = {"telemetry_runs", "telemetry_producers", "telemetry_events"}
 ARTIFACT_TABLES = {"artifact_submissions", "artifact_jobs"}
+ORRERY_GRAPH_TABLES = {"orrery_graph_files"}
+# Every table created after the telemetry tables, which the runtime user gets
+# through the migration user's default privileges.
+TABLES_SINCE_TELEMETRY = ARTIFACT_TABLES | ORRERY_GRAPH_TABLES
 
 
 def _current_revision(database_url: str) -> tuple[str | None, str | None]:
@@ -115,6 +119,7 @@ def test_upgrades_empty_postgres_database_to_head(postgres_url: str) -> None:
             "alembic_version",
             *TELEMETRY_TABLES,
             *ARTIFACT_TABLES,
+            *ORRERY_GRAPH_TABLES,
         }
         assert _current_revision(postgres_url) == (HEAD_REVISION, HEAD_REVISION)
     finally:
@@ -169,6 +174,7 @@ def test_hard_cutover_replaces_populated_unversioned_database(
             "alembic_version",
             *TELEMETRY_TABLES,
             *ARTIFACT_TABLES,
+            *ORRERY_GRAPH_TABLES,
         }
         metadata = sa.MetaData()
         runs = sa.Table("telemetry_runs", metadata, autoload_with=engine)
@@ -214,6 +220,29 @@ def test_verification_rejects_schema_drift_at_alembic_head(
 
     with pytest.raises(RuntimeError, match="differs from SQLAlchemy metadata"):
         verify_database(postgres_url)
+
+
+def test_downgrading_orrery_graph_files_keeps_the_intake_schema(
+    postgres_url: str,
+) -> None:
+    upgrade_database(postgres_url)
+    engine = create_database_engine(postgres_url)
+    config = alembic_config()
+    try:
+        with engine.begin() as connection:
+            config.attributes["connection"] = connection
+            command.downgrade(config, "0002_artifact_intake")
+        assert set(inspect(engine).get_table_names()) == {
+            "alembic_version",
+            *TELEMETRY_TABLES,
+            *ARTIFACT_TABLES,
+        }
+        assert _current_revision(postgres_url) == (
+            "0002_artifact_intake",
+            HEAD_REVISION,
+        )
+    finally:
+        engine.dispose()
 
 
 def test_downgrading_artifact_intake_keeps_the_telemetry_schema(
@@ -281,12 +310,12 @@ def _table_privileges(connection: sa.Connection, role: str) -> dict[str, set[str
                 {"role": role, "table": table, "privilege": privilege},
             )
         }
-        for table in sorted(ARTIFACT_TABLES)
+        for table in sorted(TABLES_SINCE_TELEMETRY)
     }
 
 
 def _upgrade_to_intake_with_default_privileges(postgres_url: str) -> IntakeUpgrade:
-    """Upgrade as a deployed database is upgraded, recording what 0002 runs.
+    """Upgrade as a deployed database is upgraded, recording what 0002 and 0003 run.
 
     The migration role owns the tables, as the migration user does. The
     telemetry tables are granted by hand, as the deployments' were, to the
@@ -352,6 +381,7 @@ def test_artifact_intake_migration_issues_no_grant(postgres_url: str) -> None:
     upgrade = _upgrade_to_intake_with_default_privileges(postgres_url)
 
     assert any("CREATE TABLE artifact_jobs" in sql for sql in upgrade.statements)
+    assert any("CREATE TABLE orrery_graph_files" in sql for sql in upgrade.statements)
     assert [sql for sql in upgrade.statements if GRANT_STATEMENT.match(sql)] == []
 
 
@@ -361,10 +391,10 @@ def test_default_privileges_give_the_runtime_role_the_intake_tables(
     upgrade = _upgrade_to_intake_with_default_privileges(postgres_url)
 
     assert upgrade.privileges_by_role[RUNTIME_ROLE] == {
-        table: set(TABLE_PRIVILEGES) for table in ARTIFACT_TABLES
+        table: set(TABLE_PRIVILEGES) for table in TABLES_SINCE_TELEMETRY
     }
     assert upgrade.privileges_by_role[UNGRANTED_ROLE] == {
-        table: set() for table in ARTIFACT_TABLES
+        table: set() for table in TABLES_SINCE_TELEMETRY
     }
 
 
@@ -374,5 +404,5 @@ def test_artifact_intake_gives_telemetry_grantees_no_intake_access(
     upgrade = _upgrade_to_intake_with_default_privileges(postgres_url)
 
     assert upgrade.privileges_by_role[TELEMETRY_ONLY_ROLE] == {
-        table: set() for table in ARTIFACT_TABLES
+        table: set() for table in TABLES_SINCE_TELEMETRY
     }
