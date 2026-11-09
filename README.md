@@ -713,8 +713,9 @@ and publishes only if npm does not have it. It publishes under npm's default
 `latest` tag, which npm refuses for a prerelease version or one lower than the
 latest, so a release raises the version to a new highest one. One run goes at
 a time, so versions merged one after another publish in that order. The
-workflow can be run again by hand from `main` (`workflow_dispatch`) to retry a
-failed publication.
+workflow can be run by hand from `main` (`workflow_dispatch`) to retry a
+failed publication, or to publish a version that was merged while publishing
+was switched off.
 
 The workflow uses npm's trusted publishing: npm accepts the publish job's
 GitHub OIDC token in place of a stored npm token, and adds provenance because
@@ -748,9 +749,11 @@ one-time setup first, in this order:
    GitHub Actions trusted publisher: organization `PolicyEngine`, repo
    `microcosm-collector`, workflow `publish-calibration-tree.yaml`,
    environment `npm`. A new trusted publisher expires unless a publication
-   through it succeeds within two days, so add it when a pull request that
-   raises the version is ready to merge, and merge that pull request after
-   step 5. An expired one is deleted and added again.
+   through it succeeds within two days, so add it only when step 5 and a
+   publication can follow within that time: merge a pull request that raises
+   the version after step 5, or, if `main` already has a version npm doesn't
+   have, run the workflow by hand from `main` after step 5. An expired one is
+   deleted and added again.
 5. **The switch.** Set the repo variable
    `CALIBRATION_TREE_NPM_PUBLISH_ENABLED` to `true`.
 
