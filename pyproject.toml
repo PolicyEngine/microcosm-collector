@@ -1,11 +1,12 @@
 [project]
 name = "microcosm-collector"
-version = "0.10.0"
+version = "0.11.0"
 description = "Authenticated ingestion and query API for Microcosm build telemetry"
 requires-python = ">=3.13"
 license = "MIT"
 dependencies = [
   "alembic>=1.16,<2",
+  "cryptography>=44,<51",
   "fastapi>=0.115,<1",
   "google-api-core>=2.20,<3",
   "google-auth>=2.35,<3",
