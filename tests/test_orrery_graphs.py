@@ -33,6 +33,11 @@ from google.api_core.exceptions import PreconditionFailed
 from telemetry_collector.auth import HuggingFacePrincipal
 from telemetry_collector.database import create_database_engine
 from telemetry_collector.migrate import upgrade_database
+from telemetry_collector.orrery.projection import orrery_json_from_schema
+from telemetry_collector.orrery.projection.orrery import (
+    _revision as projection_revision,
+)
+from telemetry_collector.orrery.projection.presentation import presentation_id
 from telemetry_collector.orrery.projection.provenance import MICROCOSM_COMMIT
 from telemetry_collector.orrery.validation import (
     OrreryValidatorError,
@@ -71,6 +76,10 @@ UNLINKED_NAME = f"upstream-{hashlib.sha256(UNLINKED_CONTENT).hexdigest()}.json"
 NOT_SUBMITTED_SHA256 = "f" * 64
 NOT_SUBMITTED_NAME = f"upstream-{NOT_SUBMITTED_SHA256}.json"
 EVIDENCE_NAME = "evidence-numerical-binding.json"
+# A host that only evidence links in these tests name.
+EVIDENCE_HOST = "evidence.example.org"
+# The evidence fixture's source link, which is not an evidence reference.
+SOURCE_LINK = "https://example.org/survey"
 UPSTREAM_REFERENCES = [
     {
         "label": "Producing graph declaration",
@@ -162,6 +171,40 @@ def upstream_inputs() -> Inputs:
         UPSTREAM_NAME: ("upstream", UPSTREAM_CONTENT),
         UNLINKED_NAME: ("upstream", UNLINKED_CONTENT),
     }
+
+
+def with_overlay(inputs: Inputs, overlay: object) -> Inputs:
+    return {**inputs, OVERLAY: ("execution_overlay", json_bytes(overlay))}
+
+
+def overlay_with_binding_link(link: str) -> dict[str, Any]:
+    """The evidence fixture's overlay, whose first phase's binding reference
+    links to ``link``."""
+
+    overlay = fixture_json(EVIDENCE_CASE, OVERLAY)
+    overlay["phases"][0]["references"]["binding"]["url"] = link
+    return overlay
+
+
+def run_artifact(document: Any, phase: Mapping[str, Any], kind: str) -> Any:
+    """The artifact the projection builds from one of a phase's references."""
+
+    identity = presentation_id(
+        "run-artifact", phase["attempt_id"], phase["phase"], kind
+    )
+    [artifact] = [
+        artifact for artifact in document["artifacts"] if artifact["id"] == identity
+    ]
+    return artifact
+
+
+def projected_document(inputs: Inputs) -> Any:
+    """The projection's own document from a submission's schema and overlay."""
+
+    projected = orrery_json_from_schema(
+        json.loads(inputs[SCHEMA][1]), execution=json.loads(inputs[OVERLAY][1])
+    )
+    return json.loads(projected)
 
 
 def links_in(document: object) -> set[str]:
@@ -486,6 +529,178 @@ def test_evidence_files_are_never_downloaded_published_or_linked() -> None:
     assert submission.reads(EVIDENCE_NAME) == 1
     assert submission.reads(SCHEMA) == 2
     assert submission.reads(OVERLAY) == 2
+
+
+@pytest.mark.parametrize(
+    "link",
+    [
+        f"http://reader:secret@{EVIDENCE_HOST}/execution.evidence.json",
+        f"HTTPS://{EVIDENCE_HOST}/execution.evidence.json",
+        f"https://{EVIDENCE_HOST}/execution.evidence.json",
+    ],
+    ids=["http-with-password", "upper-case-https", "https"],
+)
+def test_an_evidence_reference_loses_its_link_whatever_its_scheme(link: str) -> None:
+    overlay = overlay_with_binding_link(link)
+    phase = overlay["phases"][0]
+    reference = phase["references"]["binding"]
+
+    _, publishing, result = published_run(
+        with_overlay(fixture_inputs(EVIDENCE_CASE), overlay)
+    )
+
+    published = publishing.published_document(result)
+    without_link = {"label": reference["label"], "sha256": reference["sha256"]}
+    # The phase reference, as metadata.execution holds it, and the run
+    # artifact the projection builds from it both keep only their label and
+    # digest.
+    published_phase = published["metadata"]["execution"]["phases"][0]
+    assert published_phase["references"]["binding"] == without_link
+    artifact = run_artifact(published, phase, "binding")
+    assert artifact == {"id": artifact["id"], **without_link}
+    assert EVIDENCE_HOST not in publishing.published(result).decode("utf-8")
+    # A source's https:// link is not an evidence reference, so it stays.
+    assert links_in(published) == {SOURCE_LINK}
+
+
+def test_an_evidence_link_to_a_submitted_upstream_file_stays() -> None:
+    link = f"{UPSTREAM_NAME}#binding"
+    overlay = overlay_with_binding_link(link)
+    phase = overlay["phases"][0]
+    inputs = {
+        **with_overlay(fixture_inputs(EVIDENCE_CASE), overlay),
+        UPSTREAM_NAME: ("upstream", UPSTREAM_CONTENT),
+    }
+
+    _, publishing, result = published_run(inputs)
+
+    published = publishing.published_document(result)
+    published_phase = published["metadata"]["execution"]["phases"][0]
+    assert published_phase["references"]["binding"]["url"] == link
+    assert run_artifact(published, phase, "binding")["uri"] == link
+    assert links_in(published) == {link, SOURCE_LINK}
+    assert result["upstream_files"] == 1
+    stored = publishing.bucket.stored[result["object_prefix"] + UPSTREAM_NAME]
+    assert stored.content == UPSTREAM_CONTENT
+
+
+def test_outside_evidence_references_a_uri_follows_the_url_rule() -> None:
+    overlay = fixture_json(EVIDENCE_CASE, OVERLAY)
+    # An operation's record is not an evidence reference. The projection
+    # copies it into the operation's node, its activity and
+    # metadata.execution.
+    overlay["phases"][0]["operations"]["survey"]["logs"] = [
+        {"label": "upper-case", "uri": "HTTPS://logs.example.org/upper"},
+        {"label": "password", "uri": "http://reader:secret@logs.example.org/pw"},
+        {"label": "plain http", "url": "http://logs.example.org/plain"},
+        {"label": "https", "uri": "https://logs.example.org/kept"},
+        {"label": "upstream", "uri": UPSTREAM_NAME},
+    ]
+    inputs = {
+        **with_overlay(fixture_inputs(EVIDENCE_CASE), overlay),
+        UPSTREAM_NAME: ("upstream", UPSTREAM_CONTENT),
+    }
+
+    _, publishing, result = published_run(inputs)
+
+    published = publishing.published_document(result)
+    assert links_in(published) == {
+        SOURCE_LINK,
+        "https://logs.example.org/kept",
+        UPSTREAM_NAME,
+    }
+    [survey] = [
+        node
+        for node in published["nodes"]
+        if node["id"] == presentation_id("operation", "survey")
+    ]
+    [record] = [
+        record
+        for record in survey["data"]["execution_history"]
+        if record["phase"] == "numerical"
+    ]
+    assert record["logs"] == [
+        {"label": "upper-case"},
+        {"label": "password"},
+        {"label": "plain http"},
+        {"label": "https", "uri": "https://logs.example.org/kept"},
+        {"label": "upstream", "uri": UPSTREAM_NAME},
+    ]
+    assert result["upstream_files"] == 1
+
+
+def test_node_and_edge_revisions_describe_the_records_as_published() -> None:
+    inputs = upstream_inputs()
+
+    _, publishing, result = published_run(inputs)
+
+    published = publishing.published_document(result)
+    for record in [*published["nodes"], *published["edges"]]:
+        content = {key: value for key, value in record.items() if key != "revision"}
+        assert record["revision"] == projection_revision(content), record["id"]
+    # Only the survey operation's node lost a link (to an upstream file that
+    # was not submitted), so only its revision differs from the projection's.
+    projected = projected_document(inputs)
+    projected_revisions = {
+        record["id"]: record["revision"]
+        for record in [*projected["nodes"], *projected["edges"]]
+    }
+    changed = {
+        record["id"]
+        for record in [*published["nodes"], *published["edges"]]
+        if record["revision"] != projected_revisions[record["id"]]
+    }
+    assert changed == {presentation_id("operation", "survey")}
+    # The digests of the submitted schema and overlay stay.
+    assert published["revision"] == projected["revision"]
+    assert (
+        published["metadata"]["microcosm"]["schema_sha256"]
+        == projected["metadata"]["microcosm"]["schema_sha256"]
+    )
+
+
+def test_a_document_with_nothing_to_remove_has_the_projection_s_bytes() -> None:
+    overlay = fixture_json(EVIDENCE_CASE, OVERLAY)
+    # Every evidence reference names the submitted upstream file, and every
+    # other link is an https:// URL or names that file.
+    for phase in overlay["phases"]:
+        for kind, reference in phase["references"].items():
+            reference["url"] = f"{UPSTREAM_NAME}#{kind}"
+    references = [
+        UPSTREAM_REFERENCES[0],
+        UPSTREAM_REFERENCES[1],
+        UPSTREAM_REFERENCES[3],
+    ]
+    inputs = {
+        SCHEMA: ("schema", schema_with_upstream_references(references)),
+        OVERLAY: ("execution_overlay", json_bytes(overlay)),
+        UPSTREAM_NAME: ("upstream", UPSTREAM_CONTENT),
+    }
+
+    _, publishing, result = published_run(inputs)
+
+    projected = orrery_json_from_schema(
+        json.loads(inputs[SCHEMA][1]), execution=overlay
+    ).encode("utf-8")
+    assert result["removed_links"] == 0
+    assert publishing.published(result) == projected
+    assert result["document_sha256"] == hashlib.sha256(projected).hexdigest()
+    assert links_in(json.loads(projected)) >= {
+        UPSTREAM_NAME,
+        f"{UPSTREAM_NAME}#binding",
+        "https://example.org/method",
+        SOURCE_LINK,
+    }
+
+
+def test_only_the_upstream_files_the_document_links_to_are_downloaded() -> None:
+    submission, _, result = published_run(upstream_inputs())
+
+    assert result["upstream_files"] == 1
+    # The worker framework reads every file once to check its SHA-256; the
+    # handler downloads only the upstream file the document links to.
+    assert submission.reads(UPSTREAM_NAME) == 2
+    assert submission.reads(UNLINKED_NAME) == 1
 
 
 def test_the_published_document_passes_the_pinned_orrery_validator(
