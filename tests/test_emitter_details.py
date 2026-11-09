@@ -462,6 +462,21 @@ def post_events(client: TestClient, events: list[dict[str, Any]]) -> None:
 READ_HEADERS = {"X-Telemetry-Read-Token": "dashboard-read-token"}
 
 
+def without_timestamp(reading: dict[str, Any]) -> dict[str, Any]:
+    """Return a served reading without its heartbeat's time, its own time parsed.
+
+    Version 2 writes every time in UTC with a trailing Z, version 1 as sent.
+    """
+    served = {name: value for name, value in reading.items() if name != "timestamp"}
+    progress = served.get("progress")
+    if progress is not None:
+        served["progress"] = {
+            **progress,
+            "reported_at": datetime.fromisoformat(progress["reported_at"]),
+        }
+    return served
+
+
 def test_v2_serves_the_environment_latest_reading_and_sleeps() -> None:
     client = read_client(FakeTelemetryStore())
     raws = emitter_events()
@@ -473,9 +488,7 @@ def test_v2_serves_the_environment_latest_reading_and_sleeps() -> None:
     assert datetime.fromisoformat(reading.get("timestamp", "")) == (
         TelemetryEvent.model_validate(latest).timestamp
     )
-    assert {name: value for name, value in reading.items() if name != "timestamp"} == (
-        latest["details"]["reading"]
-    )
+    assert without_timestamp(reading) == without_timestamp(latest["details"]["reading"])
     sleeps = run.get("sleeps") or []
     assert [sleep["producer_id"] for sleep in sleeps] == ["fixture-producer"]
     assert sleeps[0]["seconds"] == latest["details"]["sleep"]["seconds"]
@@ -521,7 +534,7 @@ def test_a_stored_key_that_does_not_match_its_model_is_not_served(version: str) 
     assert environment is None
     # The latest reading that matches its model is served instead.
     earlier = heartbeats[0]
-    assert {name: value for name, value in reading.items() if name != "timestamp"} == (
+    assert without_timestamp(reading) == without_timestamp(
         earlier["details"]["reading"]
     )
     assert sleeps == []
