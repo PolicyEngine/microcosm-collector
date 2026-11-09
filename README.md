@@ -559,25 +559,35 @@ rule is what keeps other branches out. Nothing is published until the repo
 variable `CALIBRATION_TREE_NPM_PUBLISH_ENABLED` is `true`, which needs this
 one-time setup first, in this order:
 
-1. **The first version, by hand.** npm can only trust a workflow for a package
+1. **Google Cloud.** Unless it was already done for the read API client ("The
+   TypeScript client", step 1), make the Workload Identity provider accept
+   only the deployment environments ("Google Cloud access"), so that the
+   publish job's token cannot obtain Google credentials. Its condition must
+   then be:
+
+   ```
+   assertion.repository=='PolicyEngine/microcosm-collector' && assertion.ref=='refs/heads/main' && assertion.environment in ['staging', 'production']
+   ```
+
+2. **The first version, by hand.** npm can only trust a workflow for a package
    that exists, so a member of the `policyengine` npm organization publishes
    the first version from a clean checkout of the `main` commit that added the
    package: `bun install --frozen-lockfile`, then `npm pack --dry-run` to check
    the file list, then `npm publish --access public` in
    `packages/calibration-tree`.
-2. **The environment.** In this repo's settings, create the `npm` environment
+3. **The environment.** In this repo's settings, create the `npm` environment
    and allow deployments from `main` only, so a run from any other branch
    cannot obtain npm's trust. Create it before the trusted publisher: GitHub
    creates a missing environment, without that rule, when a job first names
    it.
-3. **The trusted publisher.** In the package's settings on npmjs.com, add a
+4. **The trusted publisher.** In the package's settings on npmjs.com, add a
    GitHub Actions trusted publisher: organization `PolicyEngine`, repo
    `microcosm-collector`, workflow `publish-calibration-tree.yaml`,
    environment `npm`. A new trusted publisher expires unless a publication
    through it succeeds within two days, so add it when a pull request that
    raises the version is ready to merge, and merge that pull request after
-   step 4. An expired one is deleted and added again.
-4. **The switch.** Set the repo variable
+   step 5. An expired one is deleted and added again.
+5. **The switch.** Set the repo variable
    `CALIBRATION_TREE_NPM_PUBLISH_ENABLED` to `true`.
 
 ## Hugging Face read access
@@ -733,10 +743,13 @@ principal set (`attribute.repository/PolicyEngine/microcosm-collector`). A job
 running for a tag, a pull request or any other branch cannot obtain Google
 credentials.
 
-One other job requests an OIDC token: `publish-client`, which publishes the
-read API client to npm in the `npm` environment ("The TypeScript client"). The
-condition above does not check the environment, so a token from that job would
-pass it too. Before publishing is switched on, the condition must become:
+Two other jobs request an OIDC token, both to publish to npm in the `npm`
+environment: `publish-client`, which publishes the read API client ("The
+TypeScript client"), and the `publish` job of
+`publish-calibration-tree.yaml`, which publishes the calibration tree package
+("Publishing to npm"). The condition above does not check the environment, so
+a token from either job would pass it too. Before either is switched on, the
+condition must become:
 
 ```
 assertion.repository=='PolicyEngine/microcosm-collector' && assertion.ref=='refs/heads/main' && assertion.environment in ['staging', 'production']
