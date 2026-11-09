@@ -614,6 +614,26 @@ def test_the_image_holds_pinned_bun_and_the_tree_package_s_production_install() 
     } <= set(dockerignore)
 
 
+def test_the_image_build_context_lets_in_only_the_tree_package() -> None:
+    dockerignore = (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+    # The last matching rule wins: every package under packages/ stays out of
+    # the build context (the read API client's), the tree package is let back
+    # in, and then its local install, tests, fixtures and test support are
+    # left out again.
+    exception = "!packages/calibration-tree"
+    assert "packages" in dockerignore
+    assert exception in dockerignore
+    assert dockerignore.index("packages") < dockerignore.index(exception)
+    for left_out in (
+        "packages/calibration-tree/node_modules",
+        "packages/calibration-tree/src/**/*.test.ts",
+        "packages/calibration-tree/src/fixtures",
+        "packages/calibration-tree/src/test-support",
+    ):
+        assert left_out in dockerignore
+        assert dockerignore.index(left_out) > dockerignore.index(exception), left_out
+
+
 def test_ci_checks_the_tree_package_in_the_built_image() -> None:
     workflow = yaml.load(
         (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"),
