@@ -32,6 +32,7 @@ require_configuration() {
     DATABASE_SECRET_NAME
     MIGRATION_DATABASE_SECRET_NAME
     JWT_SECRET_NAME
+    JWT_SIGNING_KEY_SECRET_NAME
     READ_SECRET_NAME
     DEPLOYMENT_ENVIRONMENT
     PRODUCTION_CLOUD_SQL_CONNECTION
@@ -200,7 +201,8 @@ minimum_instances() {
 check_secrets_exist() {
   require_variables \
     PROJECT_ID DATABASE_SECRET_NAME MIGRATION_DATABASE_SECRET_NAME \
-    JWT_SECRET_NAME READ_SECRET_NAME CALIBRATION_TREE_BLOB_SECRET_NAME
+    JWT_SECRET_NAME JWT_SIGNING_KEY_SECRET_NAME READ_SECRET_NAME \
+    CALIBRATION_TREE_BLOB_SECRET_NAME
 
   local huggingface_secret
   huggingface_secret="$(worker_huggingface_secret)" || return 1
@@ -209,6 +211,7 @@ check_secrets_exist() {
     "$DATABASE_SECRET_NAME" \
     "$MIGRATION_DATABASE_SECRET_NAME" \
     "$JWT_SECRET_NAME" \
+    "$JWT_SIGNING_KEY_SECRET_NAME" \
     "$READ_SECRET_NAME" \
     "$huggingface_secret" \
     "$CALIBRATION_TREE_BLOB_SECRET_NAME"
@@ -455,6 +458,7 @@ deploy_maintenance() {
     CLOUD_SQL_CONNECTION \
     DATABASE_SECRET_NAME \
     JWT_SECRET_NAME \
+    JWT_SIGNING_KEY_SECRET_NAME \
     READ_SECRET_NAME \
     DEPLOYMENT_ENVIRONMENT
 
@@ -463,6 +467,8 @@ deploy_maintenance() {
   intake_settings="$(service_intake_settings)"
   minimum_instance_count="$(minimum_instances)"
 
+  # The signing key signs new session tokens with ES256. The HS256 secret stays
+  # mounted so tokens issued before the switch are accepted until it is retired.
   gcloud run deploy "$SERVICE" \
     --project "$PROJECT_ID" \
     --region "$REGION" \
@@ -470,7 +476,7 @@ deploy_maintenance() {
     --image "$IMAGE_URI" \
     --service-account "$RUNTIME_SERVICE_ACCOUNT" \
     --add-cloudsql-instances "$CLOUD_SQL_CONNECTION" \
-    --set-secrets "DATABASE_URL=${DATABASE_SECRET_NAME}:latest,TELEMETRY_JWT_SECRET=${JWT_SECRET_NAME}:latest,TELEMETRY_READ_TOKEN=${READ_SECRET_NAME}:latest" \
+    --set-secrets "DATABASE_URL=${DATABASE_SECRET_NAME}:latest,TELEMETRY_JWT_SECRET=${JWT_SECRET_NAME}:latest,TELEMETRY_JWT_SIGNING_KEY=${JWT_SIGNING_KEY_SECRET_NAME}:latest,TELEMETRY_READ_TOKEN=${READ_SECRET_NAME}:latest" \
     --set-env-vars "TELEMETRY_MAINTENANCE_MODE=1,${intake_settings}" \
     --min "$minimum_instance_count" \
     --max 4 \
@@ -538,6 +544,7 @@ deploy_candidate() {
     CLOUD_SQL_CONNECTION \
     DATABASE_SECRET_NAME \
     JWT_SECRET_NAME \
+    JWT_SIGNING_KEY_SECRET_NAME \
     READ_SECRET_NAME \
     DEPLOYMENT_ENVIRONMENT
 
@@ -546,6 +553,8 @@ deploy_candidate() {
   intake_settings="$(service_intake_settings)"
   minimum_instance_count="$(minimum_instances)"
 
+  # The signing key signs new session tokens with ES256. The HS256 secret stays
+  # mounted so tokens issued before the switch are accepted until it is retired.
   gcloud run deploy "$SERVICE" \
     --project "$PROJECT_ID" \
     --region "$REGION" \
@@ -553,7 +562,7 @@ deploy_candidate() {
     --image "$IMAGE_URI" \
     --service-account "$RUNTIME_SERVICE_ACCOUNT" \
     --add-cloudsql-instances "$CLOUD_SQL_CONNECTION" \
-    --set-secrets "DATABASE_URL=${DATABASE_SECRET_NAME}:latest,TELEMETRY_JWT_SECRET=${JWT_SECRET_NAME}:latest,TELEMETRY_READ_TOKEN=${READ_SECRET_NAME}:latest" \
+    --set-secrets "DATABASE_URL=${DATABASE_SECRET_NAME}:latest,TELEMETRY_JWT_SECRET=${JWT_SECRET_NAME}:latest,TELEMETRY_JWT_SIGNING_KEY=${JWT_SIGNING_KEY_SECRET_NAME}:latest,TELEMETRY_READ_TOKEN=${READ_SECRET_NAME}:latest" \
     --set-env-vars "TELEMETRY_MAINTENANCE_MODE=0,${intake_settings}" \
     --min "$minimum_instance_count" \
     --max 4 \

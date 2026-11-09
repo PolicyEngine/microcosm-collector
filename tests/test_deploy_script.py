@@ -91,7 +91,7 @@ def test_require_configuration_lists_every_missing_variable() -> None:
         "ARTIFACT_REGISTRY_NAME CLOUD_SQL_CONNECTION RUNTIME_SERVICE_ACCOUNT "
         "MIGRATION_SERVICE_ACCOUNT SERVICE MIGRATION_JOB IMAGE_NAME "
         "DATABASE_SECRET_NAME MIGRATION_DATABASE_SECRET_NAME JWT_SECRET_NAME "
-        "READ_SECRET_NAME DEPLOYMENT_ENVIRONMENT "
+        "JWT_SIGNING_KEY_SECRET_NAME READ_SECRET_NAME DEPLOYMENT_ENVIRONMENT "
         "PRODUCTION_CLOUD_SQL_CONNECTION PRODUCTION_SERVICE "
         "INTAKE_BUCKET WORKER_QUEUE WORKER_JOB RECOVERY_JOB "
         "WORKER_SERVICE_ACCOUNT WORKER_INVOKER_SERVICE_ACCOUNT "
@@ -114,6 +114,7 @@ def complete_configuration(deployment_environment: str) -> dict[str, str]:
         "DATABASE_SECRET_NAME": "database-secret",
         "MIGRATION_DATABASE_SECRET_NAME": "migration-database-secret",
         "JWT_SECRET_NAME": "jwt-secret",
+        "JWT_SIGNING_KEY_SECRET_NAME": "jwt-signing-key-secret",
         "READ_SECRET_NAME": "read-secret",
         "DEPLOYMENT_ENVIRONMENT": deployment_environment,
         "PRODUCTION_CLOUD_SQL_CONNECTION": "project:region:production",
@@ -169,6 +170,7 @@ def test_check_secrets_exist_includes_the_read_token_secret_in_both_environments
             "DATABASE_SECRET_NAME": "database-url",
             "MIGRATION_DATABASE_SECRET_NAME": "migration-database-url",
             "JWT_SECRET_NAME": "jwt",
+            "JWT_SIGNING_KEY_SECRET_NAME": "jwt-signing-key",
             "READ_SECRET_NAME": "read",
             **HUGGINGFACE_SETTINGS,
             **CALIBRATION_TREE_SETTINGS,
@@ -182,6 +184,7 @@ def test_check_secrets_exist_includes_the_read_token_secret_in_both_environments
             "database-url",
             "migration-database-url",
             "jwt",
+            "jwt-signing-key",
             "read",
             "hugging-face-read-token",
             "calibration-tree-blob-token",
@@ -824,6 +827,7 @@ def service_deploy_environment(
         "CLOUD_SQL_CONNECTION": "project:region:database",
         "DATABASE_SECRET_NAME": "database-url",
         "JWT_SECRET_NAME": "jwt-secret",
+        "JWT_SIGNING_KEY_SECRET_NAME": "jwt-signing-key-secret",
         "READ_SECRET_NAME": "read-token",
         "DEPLOYMENT_ENVIRONMENT": deployment_environment,
         **DEPLOY_INTAKE_SETTINGS,
@@ -994,6 +998,7 @@ def test_worker_secrets_refuse_an_unknown_environment(
     environment.update(
         MIGRATION_DATABASE_SECRET_NAME="migration-database-url",
         JWT_SECRET_NAME="jwt",
+        JWT_SIGNING_KEY_SECRET_NAME="jwt-signing-key",
         READ_SECRET_NAME="read",
     )
 
@@ -1123,3 +1128,42 @@ def test_unknown_command_fails_with_usage() -> None:
     assert result.returncode == 2
     assert "Unknown deployment command: not-a-command" in result.stderr
     assert "Usage: deploy.sh COMMAND" in result.stderr
+
+
+@pytest.mark.parametrize("command", ["deploy-maintenance", "deploy-candidate"])
+def test_every_revision_mounts_the_signing_key_beside_the_hs256_secret(
+    tmp_path: Path, command: str
+) -> None:
+    command_log = tmp_path / "commands.log"
+    install_command_stub(tmp_path, "gcloud", LOGGING_GCLOUD)
+
+    result = run_deploy(
+        command,
+        environment=service_deploy_environment(tmp_path, command_log, "staging"),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (
+        "<--set-secrets> <DATABASE_URL=database-url:latest,"
+        "TELEMETRY_JWT_SECRET=jwt-secret:latest,"
+        "TELEMETRY_JWT_SIGNING_KEY=jwt-signing-key-secret:latest,"
+        "TELEMETRY_READ_TOKEN=read-token:latest>"
+    ) in command_log.read_text()
+
+
+@pytest.mark.parametrize("command", ["deploy-maintenance", "deploy-candidate"])
+def test_no_revision_deploys_without_the_signing_key_secret_name(
+    tmp_path: Path, command: str
+) -> None:
+    command_log = tmp_path / "commands.log"
+    install_command_stub(tmp_path, "gcloud", LOGGING_GCLOUD)
+    environment = service_deploy_environment(tmp_path, command_log, "staging")
+    del environment["JWT_SIGNING_KEY_SECRET_NAME"]
+
+    result = run_deploy(command, environment=environment)
+
+    assert result.returncode == 1
+    assert result.stderr == (
+        "Missing telemetry deployment configuration: JWT_SIGNING_KEY_SECRET_NAME\n"
+    )
+    assert not command_log.exists()
