@@ -223,6 +223,27 @@ def test_publishing_waits_for_the_provider_to_check_the_environment() -> None:
     )
 
 
+def test_tree_publishing_waits_for_the_provider_to_check_the_environment() -> None:
+    workflow_name, job_name = NPM_PUBLISH_JOB
+    tree_publish_job = load_workflow(WORKFLOWS / workflow_name)["jobs"][job_name]
+    google_access = readme_section("### Google Cloud access")
+    tree_publishing = readme_section("### Publishing to npm")
+
+    # The calibration tree package's publish job also holds an OIDC token
+    # outside the deployment environments, so until the provider checks the
+    # environment its token would pass the condition as publish-client's does.
+    assert tree_publish_job["environment"] not in DEPLOYMENT_ENVIRONMENTS
+    assert f"`{PUBLISH_CLIENT_JOB}`" in google_access
+    assert f"`{workflow_name}`" in google_access
+    # The package's one-time setup changes the provider's condition before its
+    # publishing is switched on.
+    assert "**The switch.**" in tree_publishing
+    assert PROVIDER_CONDITION in tree_publishing
+    assert tree_publishing.index(PROVIDER_CONDITION) < tree_publishing.index(
+        "**The switch.**"
+    )
+
+
 def test_pull_requests_report_one_required_check() -> None:
     workflow = load_workflow(PULL_REQUEST_WORKFLOW)
     jobs = workflow["jobs"]
