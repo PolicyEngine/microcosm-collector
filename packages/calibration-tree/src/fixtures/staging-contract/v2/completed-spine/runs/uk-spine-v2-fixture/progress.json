@@ -1,0 +1,37 @@
+{
+  "candidate_id": "uk-spine-v2-fixture",
+  "country_code": "GB",
+  "current_stage": "complete",
+  "delivery": {
+    "configured_repository": null,
+    "contract_version": 2,
+    "enabled": true,
+    "last_error_code": null,
+    "mode": "local_only",
+    "opt_out_reason": null,
+    "read_back": "not_requested",
+    "run_id": "uk-spine-v2-fixture",
+    "upload_attempts": 0,
+    "upload_successes": 0
+  },
+  "details": {},
+  "failure": null,
+  "message": "Staging run completed.",
+  "non_release": true,
+  "operation_id": "uk_frs_spine",
+  "pipeline": {
+    "id": "uk_national_spine",
+    "version": "2026.09"
+  },
+  "release_id": null,
+  "run_id": "uk-spine-v2-fixture",
+  "run_kind": "smoke",
+  "sample": {
+    "mode": "full"
+  },
+  "schema_name": "microcosm.staging.progress",
+  "schema_version": 2,
+  "started_at": "2026-01-02T00:00:00+00:00",
+  "status": "completed",
+  "updated_at": "2026-01-02T00:00:07+00:00"
+}

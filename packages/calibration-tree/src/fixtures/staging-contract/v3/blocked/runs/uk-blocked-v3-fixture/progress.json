@@ -1,0 +1,54 @@
+{
+  "block": {
+    "blocking_failure_count": 1,
+    "blocking_gate_ids": [
+      "uk_target_fit"
+    ],
+    "phase": "terminal"
+  },
+  "candidate_id": "uk-blocked-v3-fixture",
+  "country_code": "GB",
+  "current_stage": "blocked",
+  "delivery": {
+    "configured_repository": null,
+    "contract_version": 2,
+    "enabled": true,
+    "last_error_code": null,
+    "mode": "local_only",
+    "opt_out_reason": null,
+    "read_back": "not_requested",
+    "run_id": "uk-blocked-v3-fixture",
+    "upload_attempts": 0,
+    "upload_successes": 0
+  },
+  "details": {
+    "blocking_failure_count": 1,
+    "blocking_gate_ids": [
+      "uk_target_fit"
+    ],
+    "gate_statuses": {
+      "uk_target_fit": "failed",
+      "uk_weight_ess": "passed"
+    },
+    "phase": "terminal"
+  },
+  "failure": null,
+  "message": "The gates refused the candidate at terminal.",
+  "non_release": true,
+  "operation_id": "uk_rowwise_candidate",
+  "pipeline": {
+    "id": "uk_local_candidate",
+    "version": "2026.10"
+  },
+  "release_id": null,
+  "run_id": "uk-blocked-v3-fixture",
+  "run_kind": "calibration",
+  "sample": {
+    "mode": "full"
+  },
+  "schema_name": "microcosm.staging.progress",
+  "schema_version": 3,
+  "started_at": "2026-01-05T00:00:00+00:00",
+  "status": "blocked",
+  "updated_at": "2026-01-05T00:00:03+00:00"
+}

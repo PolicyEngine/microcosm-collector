@@ -1,0 +1,16 @@
+{
+ "schema_version": 1,
+ "updated_at": "2026-01-01T00:00:07+00:00",
+ "runs": [
+  {
+   "run_id": "v1-us-fixture",
+   "candidate_release_id": "populace-us-2024-v1-fixture",
+   "status": "passed",
+   "stage": "complete",
+   "started_at": "2026-01-01T00:00:00+00:00",
+   "updated_at": "2026-01-01T00:00:05+00:00",
+   "progress_path": "runs/v1-us-fixture/progress.json",
+   "run_manifest_path": "runs/v1-us-fixture/run_manifest.json"
+  }
+ ]
+}

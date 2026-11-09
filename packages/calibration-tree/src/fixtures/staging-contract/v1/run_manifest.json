@@ -1,0 +1,9 @@
+{
+ "schema_version": 1,
+ "run_id": "v1-us-fixture",
+ "candidate_release_id": "populace-us-2024-v1-fixture",
+ "started_at": "2026-01-01T00:00:00+00:00",
+ "repo_id": "policyengine/populace-us-staging",
+ "path_prefix": "runs",
+ "artifacts": {}
+}
