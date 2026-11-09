@@ -304,6 +304,8 @@ def test_files_from_a_repo_not_registered_for_the_country_are_rejected(
     ("kept", "reason"),
     [
         (provenance(f"exports/{RUN_ID}"), "folder_not_recognised"),
+        # The tree worker never takes "latest" as a run ID.
+        ({**provenance("staged/latest"), "run_id": "latest"}, "folder_not_recognised"),
         (
             provenance(
                 f"staged/{RUN_ID}", repo="policyengine/populace-fr", country_code="FR"
@@ -311,7 +313,7 @@ def test_files_from_a_repo_not_registered_for_the_country_are_rejected(
             "country_not_registered",
         ),
     ],
-    ids=["other-folder", "other-country"],
+    ids=["other-folder", "staged-latest", "other-country"],
 )
 def test_other_folders_and_countries_stay_in_intake_storage_with_the_reason(
     kept: dict[str, Any], reason: str
