@@ -46,12 +46,15 @@ interface RecordedPut {
 }
 
 // Vercel Blob's write rules: without allowOverwrite an existing blob is not
-// replaced, and with ifMatch a blob whose ETag differs is not replaced.
+// replaced, and with a non-empty ifMatch a blob whose ETag differs is not
+// replaced.
 class InMemoryBlobStore {
   readonly blobs = new Map<string, StoredBlob>();
   readonly puts: RecordedPut[] = [];
   private written = 0;
   beforeManifestWrite: (() => void) | null = null;
+  // Set to answer the manifest's reads with this ETag instead of its own.
+  answeredManifestEtag: string | null = null;
 
   store(pathname: string, bytes: Uint8Array): void {
     this.written += 1;
@@ -66,7 +69,14 @@ class InMemoryBlobStore {
         statusCode: 200,
         stream: new Response(Buffer.from(stored.bytes)).body,
         headers: new Headers(),
-        blob: { pathname, etag: stored.etag, contentType: "application/octet-stream", size: stored.bytes.byteLength },
+        blob: {
+          pathname,
+          etag: pathname === CALIBRATION_TREE_MANIFEST_PATH && this.answeredManifestEtag !== null
+            ? this.answeredManifestEtag
+            : stored.etag,
+          contentType: "application/octet-stream",
+          size: stored.bytes.byteLength,
+        },
       };
     };
     const put = async (
@@ -80,7 +90,8 @@ class InMemoryBlobStore {
       if (existing && !options.allowOverwrite) {
         throw new BlobError("This blob already exists, use `allowOverwrite: true` if you want to overwrite it.");
       }
-      if (options.ifMatch !== undefined && existing?.etag !== options.ifMatch) {
+      // As @vercel/blob does, an empty ifMatch sends no condition.
+      if (options.ifMatch && existing?.etag !== options.ifMatch) {
         throw new BlobPreconditionFailedError();
       }
       this.store(pathname, typeof body === "string" ? new TextEncoder().encode(body) : new Uint8Array(body));
@@ -106,16 +117,21 @@ interface BuiltTree {
 
 // The worker's own output for a recorded release's diagnostics, as a staged
 // bundle or as a build folder of the release.
-function builtTree(kind: "staging" | "release", diagnosticsText?: string): BuiltTree {
+function builtTree(
+  kind: "staging" | "release",
+  diagnosticsText?: string,
+  options: { build?: string; createdAt?: string } = {},
+): BuiltTree {
   const release = goldenReleaseInputs()["uk-release"];
+  const build = options.build ?? RUN_ID;
   const inputDirectory = temporaryDirectory();
   writeFileSync(join(inputDirectory, "calibration_diagnostics.json"), diagnosticsText ?? release.diagnosticsText);
-  const folder = kind === "staging" ? `staged/${RUN_ID}` : `releases/${release.releaseId}/${RUN_ID}`;
+  const folder = kind === "staging" ? `staged/${RUN_ID}` : `releases/${release.releaseId}/${build}`;
   const shared = {
     country: "uk",
     hfRepo: microcosmRepo("uk"),
     hfCommitSha: release.hfCommitSha,
-    createdAt: "2026-10-19T09:41:07.000Z",
+    createdAt: options.createdAt ?? "2026-10-19T09:41:07.000Z",
     artifacts: {
       calibrationDiagnostics: {
         path: `${folder}/calibration_diagnostics.json`,
@@ -130,8 +146,8 @@ function builtTree(kind: "staging" | "release", diagnosticsText?: string): Built
     ? { kind, runId: RUN_ID, label: release.releaseId, ...shared }
     : {
         kind,
-        releaseId: `${release.releaseId}/${RUN_ID}`,
-        releaseDirectory: `${release.releaseId}/${RUN_ID}`,
+        releaseId: `${release.releaseId}/${build}`,
+        releaseDirectory: `${release.releaseId}/${build}`,
         ...shared,
       };
   const requestPath = join(inputDirectory, "request.json");
@@ -292,6 +308,67 @@ test("a staging build can never become the latest release", async () => {
 
   expect(refusal).toBeInstanceOf(publication.CalibrationTreeEntryRefusedError);
   expect(store.manifest()).toBeNull();
+});
+
+test("an older build of the default release never takes the latest from a newer one", async () => {
+  const store = new InMemoryBlobStore();
+  const newer = builtTree("release", undefined, {
+    build: "uk-frs-calibration-attempt-20261101T000000Z-0a1b2c3d",
+    createdAt: "2026-11-01T00:00:00.000Z",
+  });
+  const older = builtTree("release", undefined, { createdAt: "2026-10-19T09:41:07.000Z" });
+  await publish(store, newer, true);
+
+  // A retried or reprocessed older build publishes after the newer one.
+  const published = await publish(store, older, true);
+
+  const uk = store.manifest()?.countries.uk;
+  expect(uk?.latestReleaseBuildArtifactId).toBe(newer.worker.buildArtifactId);
+  expect(uk?.builds.map((build) => build.buildArtifactId).sort())
+    .toEqual([newer.worker.buildArtifactId, older.worker.buildArtifactId].sort());
+  expect(published.madeLatest).toBe(false);
+});
+
+test("a second submission of the same files for the same run is refused, not retried", async () => {
+  const store = new InMemoryBlobStore();
+  await publish(store, builtTree("staging"));
+  const manifestBefore = store.manifest();
+  // The same files give the same build ID, but a later accepted_at gives the
+  // index other content.
+  const resubmitted = builtTree("staging", undefined, { createdAt: "2026-11-02T08:00:00.000Z" });
+
+  const refusal = await publish(store, resubmitted).catch((error: unknown) => error);
+
+  expect(refusal).toBeInstanceOf(publication.CalibrationTreeEntryRefusedError);
+  expect(publication.calibrationTreePublicationExitCode(refusal))
+    .toBe(publication.CALIBRATION_TREE_PUBLICATION_EXIT_ENTRY_REFUSED);
+  expect(store.manifest()).toEqual(manifestBefore);
+});
+
+test("a manifest read without an ETag is never written over", async () => {
+  const store = new InMemoryBlobStore();
+  await publish(store, builtTree("staging"));
+  const manifestBefore = store.blobs.get(CALIBRATION_TREE_MANIFEST_PATH)?.bytes;
+  store.answeredManifestEtag = "";
+
+  await expect(publish(store, builtTree("release"))).rejects.toBeInstanceOf(
+    publication.CalibrationTreeManifestConflictError,
+  );
+
+  expect(store.blobs.get(CALIBRATION_TREE_MANIFEST_PATH)?.bytes).toEqual(manifestBefore);
+});
+
+test("a malformed manifest entry is a request error, found before anything is uploaded", () => {
+  const tree = builtTree("staging");
+  const { label: _label, ...withoutLabel } = tree.worker.manifestEntry;
+
+  expect(() =>
+    publication.parseCalibrationTreePublicationRequest({
+      bundleDirectory: tree.bundleDirectory,
+      worker: { ...tree.worker, manifestEntry: withoutLabel },
+      makeLatest: false,
+    })
+  ).toThrow(publication.CalibrationTreePublicationRequestError);
 });
 
 function runPublication(requestPath: string, environment: Record<string, string>) {

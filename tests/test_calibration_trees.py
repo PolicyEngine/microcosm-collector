@@ -14,8 +14,10 @@ import hashlib
 import importlib
 import importlib.util
 import json
+import runpy
 import subprocess
 import threading
+import warnings
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -731,3 +733,38 @@ def test_the_tree_image_check_fails_otherwise(
     )
 
     assert result.returncode != 0
+
+
+def test_run_as_a_module_the_worker_uses_the_module_its_handlers_import(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The worker job runs `python -m telemetry_collector.worker`, which runs the
+    # file as `__main__`: a second copy of the module, with its own
+    # SubmissionRejectedError. The tree handler raises the class of
+    # telemetry_collector.worker, so the job must run through that module, or
+    # every rejection would be retried as an error.
+    from telemetry_collector import worker
+
+    ran: list[str] = []
+
+    def imported_main() -> int:
+        ran.append("telemetry_collector.worker")
+        return 0
+
+    monkeypatch.setattr(worker, "main", imported_main)
+    monkeypatch.delenv("COLLECTOR_WORKER_JOB_ID", raising=False)
+    exit_code: object = "did not exit"
+    with warnings.catch_warnings():
+        # runpy warns that the module is already imported, as it is here.
+        warnings.simplefilter("ignore", RuntimeWarning)
+        try:
+            runpy.run_module(
+                "telemetry_collector.worker", run_name="__main__", alter_sys=True
+            )
+        except SystemExit as exit_request:
+            exit_code = exit_request.code
+        except RuntimeError as error:
+            exit_code = f"{type(error).__name__}: {error}"
+
+    assert ran == ["telemetry_collector.worker"]
+    assert exit_code == 0
