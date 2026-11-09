@@ -238,10 +238,11 @@ async function uploadPart(
   if (existing) {
     if (await calibrationTreeBlobText(existing.stream) !== part.serialized) {
       // The build ID covers the files, not the time or label the index
-      // records, so another submission of the same files lands here.
+      // records, so another submission of the same files lands here, as does
+      // a rebuild whose output changed.
       throw new CalibrationTreeEntryRefusedError(
         `Immutable calibration tree part ${part.path} already exists with different content: ` +
-          "this build is already recorded from another submission.",
+          "a tree for these files is already stored with another index.",
       );
     }
     return false;

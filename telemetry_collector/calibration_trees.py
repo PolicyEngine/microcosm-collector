@@ -150,6 +150,9 @@ def plan_tree_build(
     country = provenance["country_code"].lower()
     release_folder = _RELEASE_FOLDER.fullmatch(folder)
     staged_folder = _STAGED_FOLDER.fullmatch(folder)
+    # The tree worker never takes "latest" as a run ID.
+    if staged_folder is not None and staged_folder["run"] == "latest":
+        staged_folder = None
     if release_folder is None and staged_folder is None:
         return KeptInIntakeStorage("folder_not_recognised")
     if country not in RELEASE_REPOS:
