@@ -328,7 +328,10 @@ configure_migration_job() {
 # one-hour task timeout (WORKER_TASK_TIMEOUT_SECONDS). --set-secrets replaces
 # every mount, so it lists the database, the environment's Hugging Face read
 # token and its calibration tree Blob store's read-write token together. Only
-# the worker job mounts the Blob token. `update` never creates a job: the job and the
+# the worker job mounts the Blob token. 8 GiB fits a calibration tree build:
+# the largest current diagnostics file (128.7 MB) peaked at 3.5 GB, and Cloud
+# Run keeps the job's files in memory too. Above 4 GiB Cloud Run needs at least
+# 2 CPUs. An execution is billed only while it runs. `update` never creates a job: the job and the
 # invoker's permission to run it are created by hand.
 configure_worker_job() {
   require_variables \
@@ -362,8 +365,8 @@ configure_worker_job() {
     --tasks 1 \
     --max-retries 2 \
     --task-timeout 1h \
-    --cpu 1 \
-    --memory 2Gi \
+    --cpu 2 \
+    --memory 8Gi \
     --quiet
 }
 

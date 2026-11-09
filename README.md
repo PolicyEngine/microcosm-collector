@@ -710,6 +710,10 @@ reads Hugging Face: every value comes from the submission.
   are agreed. It takes the latest only from an older build, by publication
   time, so a retried or reprocessed older build never takes the latest back.
   Builds of other releases are recorded without moving the latest.
+- **Size.** The worker job has 8 GiB of memory and 2 CPUs: building the
+  tree for the largest current diagnostics file (a 128.7 MB US release) peaked
+  at 3.5 GB, and Cloud Run keeps the downloaded and written files in memory.
+  Each execution is billed only while it runs.
 - **How.** Each attempt downloads the files into a new temporary directory
   and runs the tree worker with only `PATH`, `LANG` and the package's size
   limits (`CALIBRATION_TREE_MAX_RAW_BYTES`, `CALIBRATION_TREE_MAX_GZIP_BYTES`)
