@@ -720,8 +720,12 @@ calibration tree handler.
     copied projection never raises;
   - an upstream file named `graph.orrery.json`, the document's own name.
 
-  Any other error from the projection, such as a `KeyError`, fails the
-  attempt, so the job runs again.
+  The worker records a NUL or an unpaired surrogate in a rejection's message,
+  such as a schema column name the projection repeats, as U+FFFD, as it does
+  for every handler, because PostgreSQL's `jsonb` cannot store them. Any
+  exception from the projection other than a `TypeError`, `ValueError` or
+  `RecursionError`, for example a `KeyError` or an `AttributeError`, fails the
+  attempt and is retried, as Microcosm's own command would crash on it.
 - **Links.** Evidence files stay in private intake storage, so a published
   document doesn't link to them: each evidence reference keeps its label and
   SHA-256 but loses its link, whatever the link's scheme, `https://`

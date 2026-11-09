@@ -309,6 +309,9 @@ def graph_json(document: object) -> str:
 
 
 def _shortened(text: str) -> str:
+    # Limits only the length. The worker framework replaces each character
+    # the database can't store when it records the rejection
+    # (``worker.storable_text``), one code point for one, so the limit holds.
     text = text.strip() or "(no message)"
     return (
         text

@@ -441,11 +441,14 @@ The worker framework claims a job (one holder at a time, through a lease),
 checks every file's bytes, and then calls the handler registered for the kind
 with the submission record and a reader for each file at its recorded
 generation. A handler returns a JSON result, which goes into the receipt, or
-refuses the content, which rejects the submission. Where the worker job has
-its calibration tree Blob token, `calibration-diagnostics` submissions build
-calibration trees (the README's "Building trees from submissions"), and where
-it has its private Orrery bucket, `orrery-inputs` submissions publish Orrery
-graph files (see "Orrery graph files"). Until a kind has a handler, its
+refuses the content, which rejects the submission. Before it records a
+result, a rejection or an error's message, the framework replaces each NUL
+and unpaired surrogate in its text with U+FFFD, because PostgreSQL's `jsonb`
+cannot store them. Where the worker job has its calibration tree Blob token,
+`calibration-diagnostics` submissions build calibration trees (the README's
+"Building trees from submissions"), and where it has its private Orrery
+bucket, `orrery-inputs` submissions publish Orrery graph files (see "Orrery
+graph files"). Until a kind has a handler, its
 submissions only have their bytes checked and are kept in intake storage,
 with the result `{"processed_by": "intake-only", "verified_files": <count>}`;
 an operator reprocesses them once a handler exists. The calibration tree
@@ -505,8 +508,10 @@ written.
   - `orrery_document_refused` when the validator refuses the document,
     naming its code and its first issue's path.
 
-  Any other failure fails the attempt, so it runs again: for example, a
-  `KeyError` from the projection, a validator that could not run, or an
+  Any other failure fails the attempt, so it runs again: for example, any
+  exception from the projection other than a `TypeError`, `ValueError` or
+  `RecursionError` (such as a `KeyError` or an `AttributeError`, on which
+  Microcosm's own command would crash), a validator that could not run, or an
   object already stored with other content.
 - **Reprocessing** with the same code writes the same folder and keeps the
   objects already there and the document's first record; after the

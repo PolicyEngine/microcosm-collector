@@ -1,0 +1,1 @@
+The worker now records a handler's rejection, an error's message and a handler's result with U+FFFD in place of each NUL and unpaired surrogate, which PostgreSQL's `jsonb` cannot store. Before, such text made the attempt crash while recording it, so a submission that should have been rejected ended `failed` once its attempts ran out.
