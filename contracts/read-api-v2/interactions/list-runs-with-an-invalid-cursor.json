@@ -1,0 +1,25 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/v2/runs?before=not-a-cursor",
+    "headers": {
+      "X-Telemetry-Read-Token": "dashboard-read-token"
+    }
+  },
+  "response": {
+    "status": 422,
+    "body": {
+      "detail": [
+        {
+          "type": "value_error",
+          "loc": [
+            "query",
+            "before"
+          ],
+          "msg": "Pagination cursor is invalid.",
+          "input": "not-a-cursor"
+        }
+      ]
+    }
+  }
+}

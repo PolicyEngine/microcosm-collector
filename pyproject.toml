@@ -1,11 +1,12 @@
 [project]
 name = "microcosm-collector"
-version = "0.9.0"
+version = "0.13.1"
 description = "Authenticated ingestion and query API for Microcosm build telemetry"
 requires-python = ">=3.13"
 license = "MIT"
 dependencies = [
   "alembic>=1.16,<2",
+  "cryptography>=44,<51",
   "fastapi>=0.115,<1",
   "google-api-core>=2.20,<3",
   "google-auth>=2.35,<3",
@@ -19,7 +20,12 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=8.3,<9", "pyyaml>=6,<7", "ruff>=0.11,<1"]
+dev = [
+    "jsonschema>=4.26,<5",
+    "pytest>=8.3,<9",
+    "pyyaml>=6,<7",
+    "ruff>=0.11,<1",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -34,6 +40,9 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 88
 target-version = "py313"
+# The calibration tree package's fixture generators are copied unchanged from
+# calibration-diagnostics, so they keep its formatting.
+extend-exclude = ["packages/calibration-tree/src/fixtures"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP", "B"]

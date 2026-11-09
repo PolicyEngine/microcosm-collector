@@ -1,3 +1,39 @@
+## [0.13.1] - 2026-11-09
+
+### Changed
+
+- The calibration tree package's version is raised to 0.1.1, so that the publish workflow has a version npm doesn't have yet. Its first publication through npm's trusted publishing, a manual run from `main` after the one-time setup, can then follow that setup within the 48 hours npm allows; the README's "Publishing to npm" now describes that order (microcosm-collector#48).
+
+
+## [0.13.0] - 2026-11-09
+
+### Added
+
+- Validate Orrery graph documents with one pinned `@axiom-foundation/orrery` (0.6.2) under Node: `orrery-validator` accepts exactly the graph file contents microcosm-runs' publication accepts (strict UTF-8 JSON, `parseGraphDocument` and `checkSources`), and its refusals never repeat a link's value, always encode as UTF-8 and never carry a NUL, and `telemetry_collector.orrery.validation` runs it from Python with only `PATH` and a UTF-8 locale in Node's environment, telling a refused document apart from a validator that could not run. The image now holds Node 24.21.0 and the installed validator, which adds about 130 MB, and CI checks the validator inside the built image. Nothing in the service or the worker validates documents yet.
+
+
+## [0.12.0] - 2026-11-09
+
+### Added
+
+- Add the calibration tree package, `packages/calibration-tree`, copied from calibration-diagnostics' `frontend/packages/calibration-tree` with a record of the commit and files it came from. A Bun worker, `src/calibration-tree-worker.ts`, builds one release's tree from local files and writes the same bytes as the publisher; pull requests run the package's tests, including the recorded golden trees, and its typecheck. `.github/workflows/publish-calibration-tree.yaml` publishes it to npm as `@policyengine/calibration-tree` through npm's trusted publishing, and stays switched off until `CALIBRATION_TREE_NPM_PUBLISH_ENABLED` is `true`; the README lists the one-time setup. Nothing in the service runs the worker yet, and the deployed image is unchanged.
+
+
+## [0.11.0] - 2026-11-09
+
+### Added
+
+- Sign session tokens with ES256 once `TELEMETRY_JWT_SIGNING_KEY` holds a P-256 private key, delegated tokens for builds on other machines included, and publish its public key at `GET /.well-known/jwks.json`. Each ES256 token names its key in the `kid` header, the RFC 7638 thumbprint of the public key. While `TELEMETRY_JWT_SECRET` is still configured, HS256 tokens signed with it are accepted too, so tokens issued before the switch keep working until they expire; once the key is set the secret is optional, and removing it from the deployment later retires HS256, no sooner than 24 hours after the last revision that issued HS256 tokens stopped serving, the longest a delegated token lasts. Either variable set but blank stops startup. Deployment mounts the key from the Secret Manager secret named by the new `TELEMETRY_JWT_SIGNING_KEY_SECRET_NAME` variable in the `staging` and `production` environments, and checks that the secret exists before changing traffic.
+
+
+## [0.10.0] - 2026-11-09
+
+### Added
+
+- Add `@policyengine/microcosm-collector-client` in `packages/collector-client`, a typed TypeScript client for read API v2 whose types are generated from the OpenAPI document and whose tests replay the recorded interactions. Each release gives it the collector's version. Once production runs a release, the Push workflow's new `pack-client` job packs it without an OIDC token, and `publish-client` publishes that tarball to npm with trusted publishing, installing nothing and running no package script. Both run only when the repo variable `COLLECTOR_CLIENT_PUBLISH_ENABLED` is `true`, which it is not yet. The README lists the manual steps that switch publishing on, starting with making the Workload Identity provider accept only tokens from the `staging` and `production` environments.
+- Serve read API v2: `GET /v2/runs` lists runs as v1 does, with typed answers, and `GET /v2/runs/{run_id}` returns a run's state together with every stored event with the fields its producer sent, the state folded from exactly those events, with all timestamps in UTC. Both take the dashboard read credential. `contracts/read-api-v2` holds the OpenAPI document, which the collector also serves at `GET /v2/openapi.json`, and recorded interactions; tests check the collector against both, from the in-memory store and from PostgreSQL, and record version 1's answers so that the dashboard's reads cannot change unnoticed.
+
+
 ## [0.9.0] - 2026-11-06
 
 ### Added

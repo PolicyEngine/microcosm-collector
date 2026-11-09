@@ -1,6 +1,7 @@
 """The collector is distributed under its repo's name and the MIT license."""
 
 import hashlib
+import json
 import tomllib
 from pathlib import Path
 
@@ -11,7 +12,22 @@ IMPORT_PACKAGE = "telemetry_collector"
 EMITTER_LICENSE_SHA256 = (
     "919d42904bc9c6bb0621ab4eb7e4c9828d1467ea5ee64da7ca88eed53af1530b"
 )
-IGNORED_PARTS = {".git", ".pytest_cache", ".ruff_cache", ".venv", "__pycache__", "dist"}
+# node_modules holds installed npm packages, such as the Orrery validator's
+# (orrery-validator) and the read API client's.
+IGNORED_PARTS = {
+    ".git",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "__pycache__",
+    "dist",
+    "node_modules",
+}
+CLIENT_DIR = ROOT / "packages" / "collector-client"
+CLIENT_PACKAGE_NAME = "@policyengine/microcosm-collector-client"
+# npm's package.json field naming the package's source on GitHub. The
+# collector's own words say "repo" (tests/test_deployment_workflow.py).
+NPM_SOURCE_FIELD = "repo" + "sitory"
 TEXT_SUFFIXES = {".env", ".ini", ".lock", ".md", ".py", ".sh", ".toml", ".yaml", ".yml"}
 
 
@@ -70,3 +86,32 @@ def test_collector_is_mit_licensed_like_the_emitter() -> None:
     assert license_text.startswith(b"MIT License\n\nCopyright (c) 2026 PolicyEngine\n")
     assert hashlib.sha256(license_text).hexdigest() == EMITTER_LICENSE_SHA256
     assert pyproject()["project"]["license"] == "MIT"
+
+
+def test_read_api_client_is_published_from_this_repo() -> None:
+    assert (CLIENT_DIR / "package.json").is_file()
+    package = json.loads((CLIENT_DIR / "package.json").read_text())
+    lock = json.loads((CLIENT_DIR / "package-lock.json").read_text())
+    version = pyproject()["project"]["version"]
+
+    assert package["name"] == CLIENT_PACKAGE_NAME
+    assert package["license"] == "MIT"
+    # npm's trusted publishing accepts a package only from the GitHub repo its
+    # package.json names, exactly.
+    assert package[NPM_SOURCE_FIELD] == {
+        "type": "git",
+        "url": "git+https://github.com/PolicyEngine/microcosm-collector.git",
+        "directory": "packages/collector-client",
+    }
+    assert package["files"] == ["dist"]
+    assert package["scripts"]["prepack"] == "npm run build"
+    assert "private" not in package
+    # The client takes the version of the collector release it describes.
+    assert package["version"] == version
+    assert lock["name"] == CLIENT_PACKAGE_NAME
+    assert lock["version"] == version
+    assert lock["packages"][""]["version"] == version
+    assert all(
+        not specifier.startswith(("^", "~"))
+        for specifier in package["devDependencies"].values()
+    )

@@ -46,8 +46,9 @@ returned JWT to the build.
   future endpoint that must not accept such tokens refuses tokens with this
   claim.
 - Until it expires, whoever holds the token can register runs and upload events
-  as the operator, and nothing else. Changing the signing secret is the only way
-  to revoke it early.
+  as the operator, and nothing else. Replacing the key that signed it is the
+  only way to revoke it early: the signing key for an ES256 token ("Switching
+  from HS256 to ES256"), or `TELEMETRY_JWT_SECRET` for an HS256 token.
 
 Without `lifetime_seconds`, the exchange is unchanged: the same lifetime, claims
 and response.
@@ -56,6 +57,110 @@ The dashboard query endpoints require `X-Telemetry-Read-Token`. The dashboard
 server retrieves this credential from Google Secret Manager at runtime. Vercel
 authenticates using its OIDC identity; the credential is never returned to the
 browser or passed through GitHub Actions.
+
+### Session tokens
+
+The collector signs its session tokens and is the only service that verifies
+them. The emitter treats a token as an opaque bearer credential: it keeps the
+token for `expires_in` seconds and exchanges again after a 401.
+
+- **Signing.** Once `TELEMETRY_JWT_SIGNING_KEY` holds an EC P-256 private key
+  (unencrypted PEM, PKCS #8 or SEC 1), new tokens are signed with ES256. Until
+  then they are signed with HS256 and `TELEMETRY_JWT_SECRET`. Either variable
+  set but blank stops startup.
+- **Key ID.** An ES256 token's header names its key in `kid`, the RFC 7638
+  SHA-256 thumbprint of the public key. The ID is derived from the key rather
+  than configured, so it cannot disagree with the key, and a new key always
+  has a new ID.
+- **Public key.** `GET /.well-known/jwks.json` publishes the public key as a
+  JSON Web Key Set, without credentials and with
+  `Cache-Control: public, max-age=300`:
+  `{"keys": [{"kty": "EC", "crv": "P-256", "x": "...", "y": "...", "kid": "...", "use": "sig", "alg": "ES256"}]}`.
+  Before a signing key is configured, `keys` is empty. Like every route but
+  `/health`, it answers 503 while the maintenance revision serves.
+- **Verification.** The header's `alg` chooses the key, and decoding then
+  allows only that algorithm. ES256 needs the configured key's `kid`. HS256
+  needs `TELEMETRY_JWT_SECRET` to be configured. Every other token, including
+  `none`, an unknown `kid` and an HS256 token keyed with the public key, gets
+  401.
+- **Claims.** `iss`, `aud`, `sub` (the Hugging Face user ID), `username`,
+  `organizations`, `scope`, `iat` and `exp`, and `"delegated": true` on a token
+  issued with `lifetime_seconds`. A token lasts
+  `TELEMETRY_SESSION_TOKEN_TTL_SECONDS`, one hour by default, or the lifetime
+  granted, at most 24 hours, when it is delegated ("Tokens for builds on other
+  machines").
+- **Scopes.** `scope` is exactly one of `telemetry:write`, which registers runs
+  and sends their events, and `artifacts:submit`, which only the artifact
+  submission endpoints accept. Each endpoint requires its own scope and answers
+  403 to the other, so neither token works for the other's endpoints. An
+  exchange without a body issues a `telemetry:write` token.
+
+### Switching from HS256 to ES256
+
+Every deployed revision mounts the signing key, as `TELEMETRY_JWT_SIGNING_KEY`,
+from the Secret Manager secret named by the `TELEMETRY_JWT_SIGNING_KEY_SECRET_NAME`
+variable of the `staging` and `production` environments. Without that
+variable, deployment stops at its first step, its configuration check. It also
+checks that the secret exists before changing traffic. Each environment has its
+own key in its own secret. As for the other secrets, grant two roles on the
+secret itself: `roles/secretmanager.secretAccessor` to the runtime service
+account, which reads the key, and `roles/secretmanager.viewer` to the
+deployment identity, whose existence check reads the secret's metadata.
+
+The switch window starts with the first deployment that mounts the signing key
+and ends with the change that stops mounting `TELEMETRY_JWT_SECRET`. During
+the window the collector issues ES256 tokens and accepts both kinds, so HS256
+tokens issued before the deployment keep working until they expire. The window
+must last at least 24 hours after the last revision that issued HS256 tokens
+stopped serving: a delegated token that revision issued to a build on another
+machine, such as a Microcosm stage on Modal, stays valid that long
+(`MAXIMUM_DELEGATED_LIFETIME_SECONDS`), and that build cannot exchange again
+for an ES256 token. Keep the window open longer, until rolling back to such a
+revision is no longer wanted.
+
+A revision from before the signing key answers 401 to ES256 tokens. After a
+rollback to one, an emitter that holds a Hugging Face token exchanges again,
+receives an HS256 token and carries on after one retry. A build holding a
+delegated ES256 token cannot exchange again, so the collector refuses its
+telemetry until that build ends; builds launched after the rollback get HS256
+tokens.
+
+To retire HS256:
+
+1. Stop mounting `TELEMETRY_JWT_SECRET`: remove it from both `--set-secrets`
+   lists in `scripts/deploy.sh`, and remove `JWT_SECRET_NAME` from every list
+   of variables the script requires, from its secret check and from
+   `.github/workflows/push.yaml`. Without the secret, the collector refuses to
+   start unless the signing key is set, and it refuses HS256 tokens.
+2. Once that release has deployed to both environments, delete the
+   `TELEMETRY_JWT_SECRET_NAME` variables and the HS256 secrets. Every revision
+   from the switch window mounts `TELEMETRY_JWT_SECRET`, so after this none of
+   them can start: delete the secrets only once rolling back to one is no
+   longer wanted.
+
+To rotate the signing key, put the new key in a new secret. Don't add a
+version to the secret the service already mounts. Cloud Run reads a secret
+mounted as an environment variable when each instance starts, so a new
+version would reach every instance the serving revision starts from then on,
+while its running instances keep the old key. Until the next deployment, a
+token signed by one instance would get 401 from another, and
+`/.well-known/jwks.json` would answer with whichever key the instance holds.
+
+1. Generate the new key straight into a new secret, and grant it the same two
+   roles as the first key.
+2. Set `TELEMETRY_JWT_SIGNING_KEY_SECRET_NAME` in that environment to the new
+   secret's name. The serving revision keeps reading the old secret.
+3. Deploy. Deployments run only from the release commit of a merge to
+   `main`, so the rotation takes effect with the next merged change; every
+   merge releases and deploys. The new revision signs with, and publishes,
+   only the new key.
+   Tokens signed with the previous key get 401 and are exchanged again. A
+   build holding a delegated token signed with the previous key cannot
+   exchange again, so the collector refuses its telemetry for the rest of its
+   run. Unless the previous key must stop working at once, rotate when no such
+   build has been launched in the previous 24 hours.
+4. Delete the old secret once rolling back to a revision that mounts it is no
+   longer wanted, since such a revision can't start without it.
 
 ## Responses a producer acts on
 
@@ -108,6 +213,114 @@ event types are stored as sent, and only the collector writes
 - `run_manifest.environment`: the latest run start's machine description;
 - `progress.reading`: the latest reading of the run's current attempt, with its `timestamp`, or `null` until that attempt sends one;
 - `sleeps`: every attempt's sleeps, in event order, each with its `producer_id`.
+
+## Read API
+
+Both versions take the dashboard read credential in `X-Telemetry-Read-Token`.
+
+- **Version 1**, `GET /v1/runs` and `GET /v1/runs/{run_id}`, is what the
+  dashboard reads today. A run comes back as the documents the dashboard used
+  to read from Hugging Face run files (`progress`, `run_manifest`,
+  `calibration_progress` and lifecycle `events`). It does not change:
+  `tests/fixtures/read_api_v1` records its answers, and a test fails if they
+  change.
+- **Version 2**, `GET /v2/runs` and `GET /v2/runs/{run_id}`, returns typed
+  answers. The list takes the same `country`, `limit` and `before` as version 1
+  and returns each run's registration and stored state. A run comes back as
+  `{"run": ..., "events": [...]}`: every stored event with the fields its
+  producer sent (an optional field it left out is null, and `details` an empty
+  object), in the order the collector applies them (producers by registration
+  time, then producer id, then sequence), and the run's state folded from
+  exactly those events, so the two agree while the run is still receiving
+  events. All timestamps are in UTC. Bad parameters, including an invalid cursor or run id,
+  answer 422 with FastAPI's validation errors; an unknown run answers 404.
+
+`contracts/read-api-v2` holds version 2's contract:
+
+- `openapi.json`, its OpenAPI document, which the collector also serves at
+  `GET /v2/openapi.json`;
+- `telemetry.json`, telemetry for a few runs (completed, failed, blocked,
+  restarted and only registered);
+- `interactions/`, one file per request, with the collector's answer once that
+  telemetry is stored.
+
+`tests/test_read_api_v2.py` checks that the collector serves exactly that
+document and those answers, from the in-memory store and from PostgreSQL, and
+that each answer matches the document's schema. After an intended change to
+either version, run `uv run python tools/update-read-api-contract.py`, review
+the changed files, and regenerate the client's types (below).
+
+### The TypeScript client
+
+`packages/collector-client` is `@policyengine/microcosm-collector-client`, a
+typed client for version 2. Its types are generated from `openapi.json`
+(`npm run generate`), and its tests answer it with the recorded interactions.
+CI fails if the generated types are out of date. Each release gives the client
+the collector's version (`tools/set-client-version.py`, run by
+`tools/update-version.sh`).
+
+Once production runs a release, and if the repo variable
+`COLLECTOR_CLIENT_PUBLISH_ENABLED` is `true`, the Push workflow publishes that
+version to npm in two jobs:
+
+- `pack-client` installs the client's dependencies and runs `npm pack`, which
+  builds it. It has no OIDC token.
+- `publish-client` publishes that tarball with `tools/publish-client.sh`, which
+  checks that it is this package at the release's version, skips a version
+  already on npm, and runs `npm publish --ignore-scripts`. It installs nothing
+  and runs no package script, so the only code that can request its OIDC token
+  is the npm CLI that ships with Node and GitHub's own actions. It runs in the
+  GitHub environment `npm` and uses npm's trusted publishing: npm accepts the
+  job's GitHub OIDC token for this workflow file and environment, so no npm
+  token is stored anywhere, and npm attaches a provenance attestation.
+
+Both jobs follow `deploy-production`, so they run only while
+`COLLECTOR_DEPLOY_ENABLED` is `true`; while it is not, releases are not
+published either, without any job failing.
+
+Publishing is not switched on. Switching it on is a manual step, after the
+first release that contains the client has reached production:
+
+1. **Google Cloud.** Make the Workload Identity provider accept only the
+   deployment environments ("Google Cloud access"), so that `publish-client`'s
+   token cannot obtain Google credentials. `TELEMETRY_GCP_WIF_PROVIDER`, a
+   secret of the `staging` and `production` environments, holds the provider's
+   resource name, which names its project, pool and provider:
+
+   ```bash
+   gcloud iam workload-identity-pools providers update-oidc <provider> \
+     --project <collector project> --location global --workload-identity-pool <pool> \
+     --attribute-condition "assertion.repository=='PolicyEngine/microcosm-collector' && assertion.ref=='refs/heads/main' && assertion.environment in ['staging', 'production']"
+   ```
+
+   The next release's deployment jobs then check that deployments still
+   authenticate. To undo it, run the same command with the condition without
+   its last clause.
+2. **First version.** npm can trust a workflow only for a package that already
+   exists, so a maintainer of the `@policyengine` npm scope, logged in with
+   two-factor authentication, publishes that release's version once from its
+   tag: `git switch --detach <version>`, then in `packages/collector-client`,
+   `npm ci` and `npm publish --access public`. This version has no provenance
+   attestation.
+3. **Environment.** Create the GitHub environment `npm` with a deployment
+   branch policy that accepts only `main`, as `staging` and `production` do.
+4. **Trusted publisher**, on a day when a pull request is ready to merge: a new
+   trusted publisher configuration expires if its first publication has not
+   succeeded within 2 days. With npm 11.15.0 or later:
+   `npm trust github @policyengine/microcosm-collector-client --file push.yaml --repo PolicyEngine/microcosm-collector --env npm --allow-publish`
+   (or, on npmjs.com, the package's settings, "Trusted publishing", GitHub
+   Actions, with the same organization, repo, workflow file and environment).
+5. **Switch.** Set the repo variable `COLLECTOR_CLIENT_PUBLISH_ENABLED` to
+   `true`, then merge the pull request. Its release's `publish-client` job
+   publishes its version, and `npm view @policyengine/microcosm-collector-client`
+   then lists it. If no publication succeeded within the 2 days, remove the
+   configuration and repeat step 4:
+   `npm trust list @policyengine/microcosm-collector-client` shows its id, and
+   `npm trust revoke --id <id> @policyengine/microcosm-collector-client`
+   removes it.
+
+To stop publishing, set the variable to anything else; to stop npm trusting the
+workflow, revoke the configuration in the same way.
 
 ## Artifact intake
 
@@ -323,10 +536,13 @@ uv run uvicorn telemetry_collector.app:create_app_from_environment \
   --factory --host 127.0.0.1 --port 8080 --no-access-log
 ```
 
-Before running the migration or service, provide the database connection, JWT
-signing secret, and dashboard read credential through the documented runtime
-environment variables. Use at least 32 random characters for the JWT signing
-secret and at least 24 for the dashboard read credential. Use Microcosm's
+Before running the migration or service, provide the database connection, a
+session signing key, and the dashboard read credential through the documented
+runtime environment variables. Generate a P-256 key for local use with
+`openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256` and pass the
+PEM text as `TELEMETRY_JWT_SIGNING_KEY`. `TELEMETRY_JWT_SECRET`, at least 32
+random characters, is needed only to issue or accept HS256 tokens. Use at
+least 24 random characters for the dashboard read credential. Use Microcosm's
 loopback-only development option when testing ingestion. Production Microcosm
 builds use the fixed collector origin shipped by the package and do not accept
 a destination environment variable.
@@ -335,9 +551,14 @@ a destination environment variable.
 
 ```bash
 uv sync --locked --dev
+npm ci --prefix orrery-validator --omit=dev --omit=peer --ignore-scripts
 uv run pytest -q
 bash tools/check-quality.sh
 ```
+
+The Orrery validator's tests (`tests/test_orrery_validation.py`) run the
+real validator, so they need Node 22.14 or later and the validator's
+packages installed as above; CI uses Node 24.21.0, the release the image holds.
 
 `tools/check-quality.sh` runs Ruff's lint and format checks and syntax-checks
 every shell script in `tools/` and `scripts/` with `bash -n`, as CI does.
@@ -384,6 +605,185 @@ modules named in `provenance.py`, in
 
 Once Microcosm hands its Orrery inputs to the collector and removes its copy,
 this copy is the only one, and changes to the projection are made here.
+
+### Orrery validation
+
+`orrery-validator/validate-orrery-document.mjs` validates an Orrery graph
+document under Node with one version of `@axiom-foundation/orrery`, pinned in
+`orrery-validator/package.json` and its lockfile (0.6.2; its validation code
+is identical to 0.6.1's, which microcosm-runs uses). It accepts exactly the
+graph file contents microcosm-runs' publication accepts (`lib/service.ts`):
+
+- the bytes decode as strict UTF-8 and parse as JSON, or the answer is
+  `invalid_json`;
+- Orrery's `parseGraphDocument` accepts the document, or it is
+  `invalid_graph`, with Orrery's issues;
+- `checkSources`: every `url` is an `https://` URL without a user name or
+  password, or names, before any `#`, a file published with the document, or
+  it is `invalid_source`. An `https://` value that is not a URL is refused
+  here; microcosm-runs answers 503 for it instead.
+
+A refusal says where a link is (its JSON path), never what it holds, since a
+link may carry a credential, and keeps at most 100 issues of at most 500
+characters (code points) each. Issue text always encodes as UTF-8 and can be
+stored in PostgreSQL's `jsonb`: shortening keeps whole characters, and an
+unpaired surrogate or a NUL, which a document's JSON can escape and Orrery
+repeats in its issues, becomes U+FFFD. microcosm-runs also
+refuses a graph file over 64 MiB and file names outside its role patterns;
+those are checks on the publication, which the Orrery worker (O4) makes, not
+on the document.
+
+`telemetry_collector.orrery.validation.validate_orrery_document(document,
+published_file_names)` runs it and returns the Orrery version, raises
+`OrreryDocumentRefusedError` with the code, issues and Orrery version for a
+refused document, and raises `OrreryValidatorError` when the validator could
+not run. Node gets only `PATH` and `LANG=C.UTF-8`, so none of the worker's
+settings or credentials, such as `DATABASE_URL`, reach it, and its answer is
+read as UTF-8 whatever the worker's locale; output that is not UTF-8 is a
+validator error. By hand:
+
+```bash
+uv run python -m telemetry_collector.orrery.validation graph.orrery.json NAME...
+```
+
+The image holds Node 24.21.0, copied from the official image by digest, and the
+validator installed with `npm ci`. npm is not in the image. CI checks the built
+image with `tools/check-worker-image.sh`, which runs the validator inside it on
+a projected document and on one Orrery refuses. Nothing in the service or the
+worker validates documents yet; the collector's Orrery worker will.
+
+To move to another Orrery version, change the version in
+`orrery-validator/package.json`, run `npm install --prefix orrery-validator
+--package-lock-only --ignore-scripts`, and update `ORRERY_VERSION` in
+`tests/test_orrery_validation.py`.
+
+## Calibration tree package
+
+`packages/calibration-tree` is the calibration tree package: the TypeScript
+tree builder, its schema-6 types and readers, the release and staging readers
+it builds from, and the GitHub Actions publisher that calibration-diagnostics
+runs today. It was copied from calibration-diagnostics'
+`frontend/packages/calibration-tree` and is published to npm as
+`@policyengine/calibration-tree`, so the dashboard can import it from npm
+instead of keeping its own copy. Until the dashboard does, calibration-diagnostics
+keeps its copy, and its GitHub Actions workflow still publishes the production
+trees with it.
+
+The package ships TypeScript source; Bun runs it directly and Next.js
+compiles it through `transpilePackages`. Its own
+[README](packages/calibration-tree/README.md) describes how to import it.
+
+### The tree worker
+
+`src/calibration-tree-worker.ts` builds one release's tree from local files
+and writes its gzip parts to a directory, as its own Bun process:
+
+```bash
+cd packages/calibration-tree
+bun run src/calibration-tree-worker.ts REQUEST.json OUTPUT_DIRECTORY
+```
+
+It builds exactly what the publisher builds from the same files, commit and
+publication time. Nothing in the collector runs it yet; the calibration-tree
+worker (K4) will run it for each `calibration-diagnostics` submission, so the
+worker image will need Bun then.
+
+### Tests
+
+The "Calibration tree package" job in `.github/workflows/pr.yaml` runs the
+package's Bun tests and its typecheck on every pull request, with Bun 1.4.2.
+The golden tests rebuild recorded US, UK and Belgian releases, staging runs
+and comparisons, and require every part's raw JSON and deflate stream to match
+`src/fixtures/calibration-tree-golden.json`, which calibration-diagnostics'
+builder recorded. The worker's tests run it as a separate process on the
+recorded releases and require the same bytes on disk.
+
+```bash
+cd packages/calibration-tree
+bun install --frozen-lockfile
+bun test src/calibration-tree-worker.test.ts
+bun run typecheck
+```
+
+### Carrying over changes from calibration-diagnostics
+
+`packages/calibration-tree/provenance.json` records the calibration-diagnostics
+commit the package was copied from, each copied file's git blob ID, the copied
+files changed here and why (only `package.json`), and the files that exist only
+here. `src/provenance.test.ts` fails when a copied file no longer has its
+recorded blob ID, when a file is neither copied nor listed as the collector's
+own, or when a file listed as changed is identical to the dashboard's.
+
+While calibration-diagnostics keeps its copy, a change merged there is carried
+over by copying the changed files from a calibration-diagnostics commit,
+keeping this repo's changes to `package.json`, and recording that commit and
+the new blob IDs, which git lists with:
+
+```bash
+git -C ../calibration-diagnostics ls-tree -r \
+  --format='%(objectname) %(path)' COMMIT -- frontend/packages/calibration-tree
+```
+
+Once the dashboard imports the published package and removes its copy, this
+copy is the only one, and the package is changed here.
+
+### Publishing to npm
+
+`.github/workflows/publish-calibration-tree.yaml` publishes the package when a
+push to `main` changes `packages/calibration-tree` and npm does not have its
+`package.json` version yet. To release a change, raise `version` in the same
+pull request; a change without a new version publishes nothing. The
+workflow's first job tests and typechecks the package. Its second job, the
+only one that can request a GitHub OIDC token, installs nothing: it checks
+that Node and npm are the pinned versions (`tools/check-npm-toolchain.sh`),
+then runs `tools/publish-calibration-tree.sh`, which asks npm for the version
+and publishes only if npm does not have it. It publishes under npm's default
+`latest` tag, which npm refuses for a prerelease version or one lower than the
+latest, so a release raises the version to a new highest one. One run goes at
+a time, so versions merged one after another publish in that order. The
+workflow can be run by hand from `main` (`workflow_dispatch`) to retry a
+failed publication, or to publish a version that was merged while publishing
+was switched off.
+
+The workflow uses npm's trusted publishing: npm accepts the publish job's
+GitHub OIDC token in place of a stored npm token, and adds provenance because
+this repo is public. npm does not check the branch, so the `npm` environment's
+rule is what keeps other branches out. Nothing is published until the repo
+variable `CALIBRATION_TREE_NPM_PUBLISH_ENABLED` is `true`, which needs this
+one-time setup first, in this order:
+
+1. **Google Cloud.** Unless it was already done for the read API client ("The
+   TypeScript client", step 1), make the Workload Identity provider accept
+   only the deployment environments ("Google Cloud access"), so that the
+   publish job's token cannot obtain Google credentials. Its condition must
+   then be:
+
+   ```
+   assertion.repository=='PolicyEngine/microcosm-collector' && assertion.ref=='refs/heads/main' && assertion.environment in ['staging', 'production']
+   ```
+
+2. **The first version, by hand.** npm can only trust a workflow for a package
+   that exists, so a member of the `policyengine` npm organization publishes
+   the first version from a clean checkout of the `main` commit that added the
+   package: `bun install --frozen-lockfile`, then `npm pack --dry-run` to check
+   the file list, then `npm publish --access public` in
+   `packages/calibration-tree`.
+3. **The environment.** In this repo's settings, create the `npm` environment
+   and allow deployments from `main` only, so a run from any other branch
+   cannot obtain npm's trust. Create it before the trusted publisher: GitHub
+   creates a missing environment, without that rule, when a job first names
+   it.
+4. **The trusted publisher.** In the package's settings on npmjs.com, add a
+   GitHub Actions trusted publisher: organization `PolicyEngine`, repo
+   `microcosm-collector`, workflow `publish-calibration-tree.yaml`,
+   environment `npm`. A new trusted publisher expires unless a publication
+   through it succeeds within two days, so add it only when step 5 and a
+   publication can follow within that time: merge a pull request that raises
+   the version after step 5, or, if `main` already has a version npm doesn't
+   have, run the workflow by hand from `main` after step 5. An expired one is
+   deleted and added again.
+5. **The switch.** Set the repo variable
+   `CALIBRATION_TREE_NPM_PUBLISH_ENABLED` to `true`.
 
 ## Hugging Face read access
 
@@ -492,11 +892,11 @@ one image identified by the commit SHA. It first applies the migration to the
 persistent staging PostgreSQL database, verifies both the Alembic revision and
 the complete SQLAlchemy metadata, and deploys the staging collector. Production receives that exact image only when the staging sequence
 succeeds. Before either environment changes, deployment checks only that the
-environment's five secrets exist (the runtime database URL, the migration
-database URL, the JWT signing secret, the dashboard's read token and the
-Hugging Face read token), and that its worker and recovery jobs exist and
-belong to that environment (see "Worker jobs and recovery"). It does not
-access the secrets' payloads or test their values. The
+environment's six secrets exist (the runtime database URL, the migration
+database URL, the HS256 JWT secret, the ES256 signing key, the dashboard's
+read token and the Hugging Face read token), and that its worker and
+recovery jobs exist and belong to that environment (see "Worker jobs and
+recovery"). It does not access the secrets' payloads or test their values. The
 previous HF authentication and write/read deployment qualification is removed.
 
 Each deployment first routes traffic to a verified maintenance revision that
@@ -536,7 +936,23 @@ assertion.repository=='PolicyEngine/microcosm-collector' && assertion.ref=='refs
 The service account grants `roles/iam.workloadIdentityUser` to this repo's
 principal set (`attribute.repository/PolicyEngine/microcosm-collector`). A job
 running for a tag, a pull request or any other branch cannot obtain Google
-credentials. No other job requests an OIDC token.
+credentials.
+
+Two other jobs request an OIDC token, both to publish to npm in the `npm`
+environment: `publish-client`, which publishes the read API client ("The
+TypeScript client"), and the `publish` job of
+`publish-calibration-tree.yaml`, which publishes the calibration tree package
+("Publishing to npm"). The condition above does not check the environment, so
+a token from either job would pass it too. Before either is switched on, the
+condition must become:
+
+```
+assertion.repository=='PolicyEngine/microcosm-collector' && assertion.ref=='refs/heads/main' && assertion.environment in ['staging', 'production']
+```
+
+The deployment jobs run in those two environments, so they keep their access,
+and a token from a job in any other environment, or in none, is refused. From
+then on, every job that authenticates to Google Cloud must name one of the two.
 
 Both deployment jobs also require
 `github.event_name == 'push' && github.ref == 'refs/heads/main'`. The Push

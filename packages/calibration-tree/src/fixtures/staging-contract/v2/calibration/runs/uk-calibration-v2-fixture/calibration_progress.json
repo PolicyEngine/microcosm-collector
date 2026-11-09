@@ -1,0 +1,21 @@
+{
+  "candidate_id": "uk-calibration-candidate",
+  "events": [
+    {
+      "budget_iteration": null,
+      "budget_iters": null,
+      "budget_search": null,
+      "epoch": 1,
+      "epochs": 3,
+      "iteration": 4,
+      "l0_lambda": null,
+      "loss": 2.5,
+      "phase": "solve",
+      "timestamp": "2026-01-03T00:00:02+00:00"
+    }
+  ],
+  "run_id": "uk-calibration-v2-fixture",
+  "schema_name": "microcosm.staging.calibration-progress",
+  "schema_version": 2,
+  "updated_at": "2026-01-03T00:00:04+00:00"
+}

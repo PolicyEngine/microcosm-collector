@@ -1,0 +1,15 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/v2/runs/no-such-run",
+    "headers": {
+      "X-Telemetry-Read-Token": "dashboard-read-token"
+    }
+  },
+  "response": {
+    "status": 404,
+    "body": {
+      "detail": "Run was not found."
+    }
+  }
+}

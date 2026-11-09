@@ -25,6 +25,17 @@ permissions:
 # This workflow runs only for pushes to main, so that check is always true; it
 # keeps a trigger added later (tags, manual dispatch) from reaching
 # authentication.
+#
+# Once production runs the release, and only if the repo variable
+# COLLECTOR_CLIENT_PUBLISH_ENABLED is 'true', pack-client installs and packs
+# the read API client in packages/collector-client, and publish-client
+# publishes that tarball to npm with the release's version. npm trusts this
+# workflow file in the npm environment (trusted publishing), so no job holds an
+# npm token. publish-client can request an OIDC token, so it installs nothing
+# and runs no package script: only the npm CLI that ships with Node runs there.
+# The Workload Identity provider must accept tokens only from the staging and
+# production environments before publishing is switched on (README, "The
+# TypeScript client").
 jobs:
   versioning:
     name: Update versioning
@@ -103,6 +114,7 @@ jobs:
       DATABASE_SECRET_NAME: ${{ vars.TELEMETRY_DATABASE_SECRET_NAME }}
       MIGRATION_DATABASE_SECRET_NAME: ${{ vars.TELEMETRY_MIGRATION_DATABASE_SECRET_NAME }}
       JWT_SECRET_NAME: ${{ vars.TELEMETRY_JWT_SECRET_NAME }}
+      JWT_SIGNING_KEY_SECRET_NAME: ${{ vars.TELEMETRY_JWT_SIGNING_KEY_SECRET_NAME }}
       READ_SECRET_NAME: ${{ vars.TELEMETRY_READ_SECRET_NAME }}
       PRODUCTION_CLOUD_SQL_CONNECTION: ${{ vars.TELEMETRY_PRODUCTION_CLOUD_SQL_CONNECTION }}
       PRODUCTION_SERVICE: ${{ vars.TELEMETRY_PRODUCTION_SERVICE }}
@@ -229,6 +241,7 @@ jobs:
       DATABASE_SECRET_NAME: ${{ vars.TELEMETRY_DATABASE_SECRET_NAME }}
       MIGRATION_DATABASE_SECRET_NAME: ${{ vars.TELEMETRY_MIGRATION_DATABASE_SECRET_NAME }}
       JWT_SECRET_NAME: ${{ vars.TELEMETRY_JWT_SECRET_NAME }}
+      JWT_SIGNING_KEY_SECRET_NAME: ${{ vars.TELEMETRY_JWT_SIGNING_KEY_SECRET_NAME }}
       READ_SECRET_NAME: ${{ vars.TELEMETRY_READ_SECRET_NAME }}
       PRODUCTION_CLOUD_SQL_CONNECTION: ${{ vars.TELEMETRY_PRODUCTION_CLOUD_SQL_CONNECTION }}
       PRODUCTION_SERVICE: ${{ vars.TELEMETRY_PRODUCTION_SERVICE }}
@@ -321,3 +334,64 @@ jobs:
 
       - name: Verify the stable service address
         run: scripts/deploy.sh verify-stable-service
+
+  pack-client:
+    name: Pack the read API client
+    needs: deploy-production
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && vars.COLLECTOR_CLIENT_PUBLISH_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: packages/collector-client
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "24.22.1"
+          package-manager-cache: false
+      - run: npm ci
+      # Packing runs the client's prepack build. npm pack does not create its
+      # destination; RUNNER_TEMP exists, and is empty, at the start of each job.
+      # ci.yml's client job runs the same command on every pull request.
+      - run: npm pack --pack-destination "$RUNNER_TEMP"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: collector-client
+          path: ${{ runner.temp }}/*.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-client:
+    name: Publish the read API client to npm
+    needs: pack-client
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && vars.COLLECTOR_CLIENT_PUBLISH_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: npm
+    concurrency:
+      group: microcosm-collector-npm
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: collector-client
+          path: ${{ runner.temp }}/collector-client
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "24.22.1"
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - run: bash tools/publish-client.sh "$RUNNER_TEMP/collector-client"

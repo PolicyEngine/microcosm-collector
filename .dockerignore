@@ -8,3 +8,5 @@ tests
 changelog.d
 tools
 .git
+**/node_modules
+packages

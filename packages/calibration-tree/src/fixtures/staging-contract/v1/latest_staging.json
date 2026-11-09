@@ -1,0 +1,12 @@
+{
+ "schema_version": 1,
+ "run_id": "v1-us-fixture",
+ "candidate_release_id": "populace-us-2024-v1-fixture",
+ "updated_at": "2026-01-01T00:00:06+00:00",
+ "paths": {
+  "run_manifest": "runs/v1-us-fixture/run_manifest.json",
+  "progress": "runs/v1-us-fixture/progress.json",
+  "calibration_progress": "runs/v1-us-fixture/calibration_progress.json",
+  "events": "runs/v1-us-fixture/events.ndjson"
+ }
+}
