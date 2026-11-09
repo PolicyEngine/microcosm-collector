@@ -30,6 +30,7 @@ from sqlalchemy.orm import (
 )
 from sqlalchemy.sql import func
 
+from telemetry_collector.disclosure import OUTPUT_VISIBILITIES
 from telemetry_collector.submissions import JOB_STATUSES, SUBMISSION_STATUSES
 
 DB_POOL_SIZE = 2
@@ -252,6 +253,51 @@ class ArtifactJob(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     submission: Mapped[ArtifactSubmission] = relationship(back_populates="jobs")
+
+
+class OrreryGraphFile(Base):
+    """An Orrery graph file the worker published from a submission.
+
+    One row per submission and document: a retry or a reprocessing that
+    builds the same document keeps the row it first recorded.
+    """
+
+    __tablename__ = "orrery_graph_files"
+    __table_args__ = (
+        CheckConstraint(_one_of("visibility", OUTPUT_VISIBILITIES), name="visibility"),
+    )
+
+    submission_id: Mapped[str] = mapped_column(
+        Text,
+        ForeignKey(
+            "artifact_submissions.submission_id",
+            name="fk_orrery_graph_files_submission_id_artifact_submissions",
+            ondelete="CASCADE",
+        ),
+        primary_key=True,
+    )
+    # The processing round that first published this document.
+    processing_round: Mapped[int] = mapped_column(Integer, nullable=False)
+    run_id: Mapped[str] = mapped_column(Text, nullable=False)
+    build_id: Mapped[str] = mapped_column(Text, nullable=False)
+    country_code: Mapped[str] = mapped_column(Text, nullable=False)
+    # graphs/<submission_id>/<document_sha256>/ in the private Orrery bucket.
+    object_prefix: Mapped[str] = mapped_column(Text, nullable=False)
+    document_sha256: Mapped[str] = mapped_column(Text, primary_key=True)
+    document_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # How many submitted upstream files the document links to and were published.
+    upstream_files: Mapped[int] = mapped_column(Integer, nullable=False)
+    # The @axiom-foundation/orrery version that validated the document.
+    orrery_version: Mapped[str] = mapped_column(Text, nullable=False)
+    # The Microcosm commit the collector's projection was copied from.
+    projection_source: Mapped[str] = mapped_column(Text, nullable=False)
+    collector_version: Mapped[str] = mapped_column(Text, nullable=False)
+    # False for a document published from a submission's own inputs.
+    reconstructed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    visibility: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
 
 
 Index("artifact_jobs_status_idx", ArtifactJob.status)

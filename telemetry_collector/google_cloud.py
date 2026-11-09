@@ -1,7 +1,9 @@
-"""Google Cloud Storage and Cloud Tasks implementations of the intake services.
+"""Google Cloud Storage and Cloud Tasks implementations of the worker's services.
 
-Only the deployed collector and worker construct these. Tests use in-memory
-fakes of the intake interfaces instead, so they never reach Google Cloud.
+Only the deployed collector and worker construct these: the intake bucket and
+queue, and the private bucket Orrery graph files are published to. Tests use
+in-memory fakes of the interfaces, or stand-ins for the Google Cloud clients,
+so they never reach Google Cloud.
 """
 
 from __future__ import annotations
@@ -11,12 +13,13 @@ import json
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
 import google.auth
 import requests
-from google.api_core.exceptions import NotFound
+from google.api_core.exceptions import NotFound, PreconditionFailed
 from google.auth.exceptions import GoogleAuthError
 from google.auth.transport.requests import AuthorizedSession, Request
 from google.cloud import storage
@@ -138,6 +141,51 @@ class GoogleCloudStorageIntake:
             raise IntakeObjectMissingError(
                 f"{object_name} generation {generation} is not stored."
             ) from error
+
+
+class StoredObjectConflictError(RuntimeError):
+    """An object already stored under a name holds other content."""
+
+
+class GoogleCloudStorageOrreryGraphs:
+    """The private bucket the Orrery worker publishes graph files to.
+
+    Every write creates its object only if no object has that name
+    (``if_generation_match=0``), so a stored object is never replaced. The
+    object records its SHA-256 in its metadata, as intake objects do. When an
+    object already exists, its recorded SHA-256 is read back: the same digest
+    keeps it, and any other digest raises ``StoredObjectConflictError``. The
+    worker's account needs only to create and read objects, never to delete
+    or replace them.
+    """
+
+    def __init__(self, *, bucket_name: str, client: Any | None = None) -> None:
+        self._client = client or storage.Client()
+        # Names the bucket without reading it, so no bucket permission is needed.
+        self._bucket = self._client.bucket(bucket_name)
+
+    def create_object(
+        self, object_name: str, source: Path, *, sha256: str, content_type: str
+    ) -> bool:
+        """Create the object from ``source``; False when an equal one is kept."""
+
+        blob = self._bucket.blob(object_name)
+        blob.metadata = {"sha256": sha256}
+        try:
+            blob.upload_from_filename(
+                str(source), content_type=content_type, if_generation_match=0
+            )
+        except PreconditionFailed:
+            stored = self._bucket.get_blob(object_name)
+            stored_sha256 = (
+                None if stored is None else (stored.metadata or {}).get("sha256")
+            )
+            if stored_sha256 != sha256:
+                raise StoredObjectConflictError(
+                    f"{object_name} is already stored without this file's SHA-256."
+                ) from None
+            return False
+        return True
 
 
 def cloud_task_id(job_id: str, dispatch_number: int) -> str:

@@ -591,7 +591,7 @@ def test_inputs_the_projection_cannot_use_reject_the_submission() -> None:
     assert publishing.bucket.stored == {}
 
 
-def test_a_long_projection_refusal_is_cut_to_500_characters(
+def test_a_long_projection_refusal_is_shortened_to_500_characters(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def refuse(schema: object, *, execution: object) -> str:

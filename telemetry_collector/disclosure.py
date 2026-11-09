@@ -1,21 +1,24 @@
-"""Who may read an output derived from a submission (decisions D5 and D10).
+"""Who may read an output derived from a submission.
 
 Workers record the visibility this module gives for every output, so the
-calibration-tree (K4) and Orrery (O4) handlers apply the same rules:
+calibration tree handler and the Orrery graph handler apply the same rules:
 
-- calibration trees may be public, including those built from licensed data
-  (D10);
-- an Orrery artifact of a licensed build stays private until output clearance,
-  which no worker grants (D5), and one of an unlicensed build may be public;
+- calibration trees may be public, including those built from licensed data;
+- an Orrery graph file of a licensed build is private: it stays in the
+  collector's private Orrery bucket, to be served only to signed-in members of
+  the PolicyEngine organization (tracker 2b · 5). There is no clearance step
+  that makes it public. One of an unlicensed build may be public;
 - native evidence is never published, whatever ``licensed_data`` says.
 """
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, get_args
 
 OutputKind = Literal["calibration_tree", "orrery_artifact", "native_evidence"]
 OutputVisibility = Literal["public", "private"]
+#: Every visibility a worker records, in the order the database checks them.
+OUTPUT_VISIBILITIES: tuple[OutputVisibility, ...] = get_args(OutputVisibility)
 
 
 class NeverPublishedError(ValueError):

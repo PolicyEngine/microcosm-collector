@@ -151,7 +151,7 @@ recorded something it ignored.
 | | `build_manifest` | 0 or 1 | 64 MiB | |
 | | `release_manifest` | 0 or 1 | 64 MiB | |
 | | `demographics` | 0 or 1 | 64 MiB | |
-| `orrery-inputs` | `schema` | exactly 1 | 64 MiB | Orrery worker (O4) |
+| `orrery-inputs` | `schema` | exactly 1 | 64 MiB | Orrery graph handler (see "Orrery graph files") |
 | | `execution_overlay` | exactly 1 | 32 MiB | |
 | | `upstream` | 0 or more | 64 MiB | |
 | | `evidence` | 0 or more | 2 GiB | kept private, never published |
@@ -160,8 +160,8 @@ The calibration roles are the files the calibration-tree publisher reads for a
 build today. The Orrery roles are the inputs the projection needs
 (`orrery_json_from_schema(schema, execution=overlay)`), plus the native evidence
 files that stay in private intake storage. Intake checks each file's role,
-count and size, not its name; the Orrery worker (O4) rejects a submission whose
-files it cannot use.
+count and size, not its name; the Orrery graph handler rejects a submission
+whose files it cannot use (see "Orrery graph files").
 
 ### The roles the emitter sends
 
@@ -188,9 +188,10 @@ as the dataset and its sidecars, are not submitted.
 
 ### The emitter's earlier Orrery publication roles
 
-The emitter's direct Orrery upload to microcosm-runs, which O7 removes, uses
-another set of roles: emitter#22's `PublicationFileRole`. When O7 submits a
-queued upload from that path as `orrery-inputs`, its files map like this:
+The emitter's direct Orrery upload to microcosm-runs, which a later emitter
+change removes, uses another set of roles: emitter#22's `PublicationFileRole`.
+When that change submits a queued upload from that path as `orrery-inputs`,
+its files map like this:
 
 | `PublicationFileRole` | File | Contract role |
 |---|---|---|
@@ -201,12 +202,13 @@ queued upload from that path as `orrery-inputs`, its files map like this:
 | `manifest` | `evidence-<phase>-manifest.json` | `evidence` |
 | `binding` | `evidence-<phase>-binding.json` | `evidence` |
 | `summaries` | `evidence-<phase>-summaries.json` | `evidence` |
-| `graph` | `graph.orrery.json` | none: the collector projects its own Orrery artifact (O4) |
+| `graph` | `graph.orrery.json` | none: the collector projects its own graph file (see "Orrery graph files") |
 
 That path has no execution overlay role: before microcosm#1295, the overlay
 existed only inside `graph.orrery.json`. A queued upload can therefore become
 an `orrery-inputs` submission only once its overlay exists as
-`graph.execution.json`. How O7 obtains the overlay is decided in O7.
+`graph.execution.json`. How the emitter obtains the overlay is decided in
+that change.
 
 ## Limits
 
@@ -412,19 +414,22 @@ latest processing round.
   bucket-level access with public access prevention enforced, and only the
   collector's own service accounts can read it. A signed URL allows only the
   upload of one object of one size.
-- **Orrery outputs of licensed builds stay private until cleared.** The Orrery
-  worker (O4) records every Orrery artifact derived from a submission with
-  `licensed_data: true` with visibility `private`, and never makes it public
-  itself; it becomes public only after output clearance (decision D5). Orrery
-  artifacts from submissions with `licensed_data: false` may be public.
+- **Orrery graph files of licensed builds stay private.** The Orrery graph
+  handler records every graph file derived from a submission with
+  `licensed_data: true` with visibility `private`. It stays in the
+  collector's private Orrery bucket, to be served only to signed-in members of
+  the PolicyEngine organization; no clearance step makes it public. Graph
+  files from submissions with `licensed_data: false` are recorded `public`
+  and may be published publicly. Serving both is still to come.
 - **Calibration data may be public, licensed or not.** Calibration trees built
-  from a `calibration-diagnostics` submission (K4) may be published publicly,
-  including when `licensed_data` is `true` (decision D10).
-- **Native evidence is never published,** whatever `licensed_data` says. Public
-  Orrery artifacts do not link to it (O4).
+  from a `calibration-diagnostics` submission may be published publicly,
+  including when `licensed_data` is `true`.
+- **Native evidence is never published,** whatever `licensed_data` says. A
+  published graph file doesn't link to it: each evidence reference keeps its
+  label and SHA-256 but loses its link (see "Orrery graph files").
 - **`licensed_data` has no default,** so a producer must state it. The worker
-  framework applies these rules for every handler, so K4 and O4 never derive
-  them again.
+  framework applies these rules for every handler, so no handler derives them
+  again.
 - **Status and receipts go only to the submitting user,** and hold names,
   sizes and digests, never file contents.
 
@@ -436,14 +441,52 @@ with the submission record and a reader for each file at its recorded
 generation. A handler returns a JSON result, which goes into the receipt, or
 refuses the content, which rejects the submission. Where the worker job has
 its calibration tree Blob token, `calibration-diagnostics` submissions build
-calibration trees (the README's "Building trees from submissions"); the Orrery
-worker (O4) will register the handler for `orrery-inputs`. Until a kind has a
-handler, its submissions only have their bytes checked and are kept in intake
-storage, with the result `{"processed_by": "intake-only", "verified_files": <count>}`;
+calibration trees (the README's "Building trees from submissions"), and where
+it has its private Orrery bucket, `orrery-inputs` submissions publish Orrery
+graph files (see "Orrery graph files"). Until a kind has a handler, its
+submissions only have their bytes checked and are kept in intake storage,
+with the result `{"processed_by": "intake-only", "verified_files": <count>}`;
 an operator reprocesses them once a handler exists. The calibration tree
 handler also keeps a submission in intake storage, with a `reason`, when its
 folder is neither a build folder nor a staged bundle, or its country is not
 one the collector lists.
+
+### Orrery graph files
+
+The Orrery graph handler projects the schema and execution overlay with
+`orrery_json_from_schema(schema, execution=overlay)`, removes the links a
+published document could not resolve, validates the document with the
+collector's pinned Orrery validator, and writes it, with the upstream files it
+links to, to `graphs/<submission_id>/<document sha256>/` in the collector's
+private Orrery bucket. Evidence files are never downloaded, written or linked.
+
+- **Links a published document keeps:** a `url` that is an `https://` URL or
+  names a submitted upstream file before any `#`, such as
+  `upstream-<sha256>.json` or `upstream-<sha256>.json#nodes`; and a `uri`
+  that is an absolute URL or names a submitted upstream file. Every other
+  `url`, and every other relative `uri`, is removed, and the rest of its
+  object, such as `label` and `sha256`, stays. So each evidence reference
+  keeps its label and SHA-256 but no link, and an upstream reference to a
+  file that was not submitted keeps its label and SHA-256 too. Upstream files
+  the document doesn't link to are not written.
+- **Result:** `{"processed_by": "orrery-graph", "object_prefix": "graphs/<submission_id>/<document sha256>/", "document_sha256", "document_bytes", "upstream_files", "orrery_version", "visibility", "removed_links"}`.
+  `upstream_files` counts the upstream files written beside the document,
+  `orrery_version` is the Orrery version that validated it, `visibility` is
+  `private` or `public` (see "Disclosure"), and `removed_links` counts the
+  removed `url` and `uri` keys.
+- **Rejections:** `orrery_inputs_unusable` when the schema or overlay is not
+  strict JSON (UTF-8, no key repeated within an object, no `NaN` or
+  infinity), when the projection refuses them (its message, shortened to 500
+  characters), or when an upstream file is named `graph.orrery.json`;
+  `orrery_document_refused` when the validator refuses the document, naming
+  its code and its first issue's path. Any other failure, such as a validator
+  that could not run or an object already stored with other content, fails
+  the attempt, so it runs again.
+- **Reprocessing** with the same code writes the same folder and keeps the
+  objects already there and the document's first record; after the
+  projection changes, it writes the new document to a new folder. A change of
+  Orrery version alone builds the same document, so its folder and first
+  record, with the Orrery version that first validated it, stay.
 
 ### Attempts, dispatches and recovery
 
@@ -478,4 +521,4 @@ new job with the next `processing_round`, which reads the same object
 generations, and returns the submission to `queued`. Earlier jobs and their
 results stay recorded. This is how stored Orrery inputs are projected again
 when the projection or Orrery changes, and how intake-only submissions are
-processed once K4 or O4 registers a handler.
+processed once a handler is registered for their kind.

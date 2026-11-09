@@ -46,10 +46,14 @@ require_configuration() {
     RECOVERY_SERVICE_ACCOUNT
     HF_READ_SECRET_NAME
     CALIBRATION_TREE_BLOB_SECRET_NAME
+    ORRERY_BUCKET
   )
 
   require_variables "${names[@]}"
-  require_intake_resource_names
+  local failed=0
+  require_intake_resource_names || failed=1
+  require_resource_name ORRERY_BUCKET "$BUCKET_NAME_PATTERN" || failed=1
+  return "$failed"
 }
 
 # The helpers below also run inside command substitutions, where bash does not
@@ -58,8 +62,9 @@ require_configuration() {
 # The collector's patterns for the intake settings (telemetry_collector.intake),
 # applied to the names the deploy builds them from, so a malformed name stops
 # the deploy before it authenticates rather than when a revision or a job
-# that reads it starts. The deploy script's tests compare these patterns and
-# their verdicts with the collector's.
+# that reads it starts. The Orrery bucket's name has the intake bucket's
+# pattern. The deploy script's tests compare these patterns and their verdicts
+# with the collector's.
 BUCKET_NAME_PATTERN='^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$'
 QUEUE_NAME_PATTERN='^[A-Za-z0-9-]{1,100}$'
 JOB_NAME_PATTERN='^[a-z][a-z0-9-]{0,62}$'
@@ -332,7 +337,9 @@ configure_migration_job() {
 # the largest current diagnostics file (128.7 MB) peaked at 3.5 GB, and Cloud
 # Run keeps the job's files in memory too. Above 4 GiB Cloud Run needs at least
 # 2 CPUs. An execution is billed only while it runs. `update` never creates a job: the job and the
-# invoker's permission to run it are created by hand.
+# invoker's permission to run it are created by hand. Only the worker job gets
+# the private Orrery bucket, which it publishes Orrery graph files to; the
+# bucket and the worker account's access to it are created by hand too.
 configure_worker_job() {
   require_variables \
     WORKER_JOB \
@@ -342,8 +349,10 @@ configure_worker_job() {
     WORKER_SERVICE_ACCOUNT \
     CLOUD_SQL_CONNECTION \
     DATABASE_SECRET_NAME \
-    INTAKE_BUCKET
+    INTAKE_BUCKET \
+    ORRERY_BUCKET
   require_resource_name INTAKE_BUCKET "$BUCKET_NAME_PATTERN"
+  require_resource_name ORRERY_BUCKET "$BUCKET_NAME_PATTERN"
 
   local huggingface_secret
   huggingface_secret="$(worker_huggingface_secret)" || return 1
@@ -359,7 +368,7 @@ configure_worker_job() {
     --service-account "$WORKER_SERVICE_ACCOUNT" \
     --set-cloudsql-instances "$CLOUD_SQL_CONNECTION" \
     --set-secrets "$secrets" \
-    --set-env-vars "COLLECTOR_INTAKE_BUCKET=${INTAKE_BUCKET}" \
+    --set-env-vars "COLLECTOR_INTAKE_BUCKET=${INTAKE_BUCKET},COLLECTOR_ORRERY_BUCKET=${ORRERY_BUCKET}" \
     --command uv \
     --args "run,--no-sync,python,-m,telemetry_collector.worker" \
     --tasks 1 \
