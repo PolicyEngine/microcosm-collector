@@ -931,6 +931,36 @@ def test_inputs_the_projection_cannot_use_reject_the_submission() -> None:
     assert publishing.bucket.stored == {}
 
 
+def test_a_nul_in_a_schema_column_name_rejects_with_u_fffd_in_the_message() -> None:
+    schema = fixture_json(EVIDENCE_CASE, SCHEMA)
+    [resources] = [
+        node for node in schema["graph"]["nodes"] if node["id"] == "resources"
+    ]
+    # json_bytes writes the NUL as the JSON escape \u0000, which intake and
+    # read_input accept. The projection's GraphError repeats the column name
+    # as it is, and PostgreSQL's jsonb, where the rejection is recorded,
+    # cannot hold a NUL.
+    resources["inputs"][0]["columns"][0] = "age\x00x"
+    submission = accepted(
+        {**fixture_inputs(EVIDENCE_CASE), SCHEMA: ("schema", json_bytes(schema))}
+    )
+    publishing = Publishing()
+
+    outcome = submission.run(publishing)
+
+    assert outcome is JobOutcome.FINISHED
+    assert submission.record().status == "rejected"
+    assert submission.record().rejection == {
+        "code": "orrery_inputs_unusable",
+        "message": (
+            "Node 'resources' reads person.age\ufffdx, which no node owns in "
+            "version 'survey' or its bases."
+        ),
+    }
+    assert publishing.bucket.stored == {}
+    assert publishing.records.records == {}
+
+
 # The errors Microcosm's command treats as input errors around the projection
 # (orrery.main at MICROCOSM_COMMIT), less those the copied projection cannot
 # raise.

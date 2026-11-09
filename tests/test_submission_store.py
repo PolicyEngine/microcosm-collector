@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import threading
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -16,6 +18,7 @@ from telemetry_collector.submission_store import (
     PostgresSubmissionStore,
     SubmissionNotReprocessableError,
     SubmissionOwnershipError,
+    SubmissionRecord,
     SubmissionStore,
 )
 from telemetry_collector.submissions import (
@@ -26,8 +29,16 @@ from telemetry_collector.submissions import (
     derive_job_id,
     derive_submission_id,
     files_digest,
+    intake_object_name,
 )
-from tests.fakes import FakeSubmissionStore
+from telemetry_collector.worker import (
+    JobContext,
+    JobHandler,
+    JobOutcome,
+    SubmissionRejectedError,
+    run_job,
+)
+from tests.fakes import FakeIntakeObjectStore, FakeSubmissionStore
 from tests.test_submissions import calibration_submission
 
 LEASE_SECONDS = 600.0
@@ -348,6 +359,122 @@ def test_a_claim_after_the_last_attempt_fails_the_job(
     assert record.rejection is not None
     assert record.rejection["code"] == "attempts_exhausted"
     assert record.job_attempts == MAX_JOB_ATTEMPTS
+
+
+# Text PostgreSQL cannot store in jsonb: a NUL, and an unpaired surrogate,
+# which UTF-8 cannot encode. The worker records each of them as U+FFFD.
+UNSTORABLE_TEXT = "Column age\x00x is unusable, and so is \ud83d."
+STORED_TEXT = "Column age\ufffdx is unusable, and so is \ufffd."
+STORED_CONTENTS = {
+    "calibration_diagnostics.json": b'{"schema_version": 8, "targets": []}',
+    "build_manifest.json": b'{"build": "uk-frs-calibration-attempt-1"}',
+}
+
+
+@dataclass
+class StoredJob:
+    """An accepted job whose files are stored as its inventory describes them."""
+
+    store: SubmissionStore
+    objects: FakeIntakeObjectStore
+    submission_id: str
+    job_id: str
+
+    def run(self, handler: JobHandler) -> JobOutcome:
+        return run_job(
+            self.job_id,
+            submissions=self.store,
+            objects=self.objects,
+            handlers={"calibration-diagnostics": handler},
+            holder="worker-1",
+        )
+
+    def record(self) -> SubmissionRecord:
+        record = self.store.get_submission(self.submission_id)
+        assert record is not None
+        return record
+
+
+def stored_job(store: SubmissionStore) -> StoredJob:
+    submission = calibration_submission()
+    for file in submission["files"]:
+        content = STORED_CONTENTS[file["name"]]
+        file["size"] = len(content)
+        file["sha256"] = hashlib.sha256(content).hexdigest()
+    record, _ = store.create_submission(
+        SubmissionRequest.model_validate(submission), builder()
+    )
+    objects = FakeIntakeObjectStore()
+    generations = {
+        file["name"]: objects.upload(
+            intake_object_name(record.submission_id, file["name"]),
+            STORED_CONTENTS[file["name"]],
+            sha256=file["sha256"],
+        )
+        for file in record.files
+    }
+    accepted = store.accept_submission(record.submission_id, generations)
+    assert accepted.job_id is not None
+    return StoredJob(store, objects, record.submission_id, accepted.job_id)
+
+
+def test_a_rejection_message_jsonb_cannot_hold_is_stored_with_u_fffd(
+    store: SubmissionStore,
+) -> None:
+    job = stored_job(store)
+
+    def refuse(context: JobContext) -> dict[str, Any]:
+        raise SubmissionRejectedError("invalid_diagnostics", UNSTORABLE_TEXT)
+
+    outcome = job.run(refuse)
+
+    assert outcome is JobOutcome.FINISHED
+    record = job.record()
+    assert record.status == "rejected"
+    assert record.rejection == {"code": "invalid_diagnostics", "message": STORED_TEXT}
+
+
+def test_a_failure_message_jsonb_cannot_hold_is_stored_with_u_fffd(
+    store: SubmissionStore,
+) -> None:
+    job = stored_job(store)
+
+    def fail(context: JobContext) -> dict[str, Any]:
+        raise RuntimeError(UNSTORABLE_TEXT)
+
+    # Each attempt before the last records the message as the job's last
+    # error, and the last records it as the submission's rejection.
+    outcomes = [job.run(fail) for _ in range(MAX_JOB_ATTEMPTS)]
+
+    assert outcomes == [JobOutcome.RETRY] * (MAX_JOB_ATTEMPTS - 1) + [
+        JobOutcome.FINISHED
+    ]
+    record = job.record()
+    assert record.status == "failed"
+    assert record.rejection == {
+        "code": "worker_error",
+        "message": f"RuntimeError: {STORED_TEXT}",
+    }
+
+
+def test_a_handler_result_jsonb_cannot_hold_is_stored_with_u_fffd(
+    store: SubmissionStore,
+) -> None:
+    job = stored_job(store)
+
+    def build(context: JobContext) -> dict[str, Any]:
+        return {"reason": UNSTORABLE_TEXT, "notes": [UNSTORABLE_TEXT], "count\x00": 2}
+
+    outcome = job.run(build)
+
+    assert outcome is JobOutcome.FINISHED
+    record = job.record()
+    assert record.status == "succeeded"
+    assert record.result == {
+        "reason": STORED_TEXT,
+        "notes": [STORED_TEXT],
+        "count\ufffd": 2,
+    }
 
 
 def test_claiming_an_unknown_job_returns_nothing(store: SubmissionStore) -> None:
