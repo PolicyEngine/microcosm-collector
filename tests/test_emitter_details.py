@@ -21,6 +21,7 @@ from fastapi.testclient import TestClient
 from telemetry_collector.app import create_app
 from telemetry_collector.auth import HuggingFacePrincipal
 from telemetry_collector.models import RunRegistration, TelemetryEvent
+from telemetry_collector.read_api_v2 import run_detail
 from telemetry_collector.storage import initial_run_state, run_documents
 from tests.fakes import FakeTelemetryStore
 from tests.test_app import StubHuggingFaceAuthenticator, exchange, settings
@@ -538,3 +539,122 @@ def test_a_stored_key_that_does_not_match_its_model_is_not_served(version: str) 
         earlier["details"]["reading"]
     )
     assert sleeps == []
+
+
+def test_v2_gives_a_readings_and_sleeps_times_in_utc() -> None:
+    client = read_client(FakeTelemetryStore())
+    raws = emitter_events()
+    heartbeat = [raw for raw in raws if "sleep" in raw["details"]][0]
+    heartbeat["details"]["reading"]["progress"]["reported_at"] = (
+        "2026-11-06T17:00:03+05:00"
+    )
+    heartbeat["details"]["sleep"].update(
+        started_at="2026-11-06T17:00:40.500000+05:00",
+        ended_at="2026-11-06T17:30:40.500000+05:00",
+    )
+    post_events(client, raws)
+    run = client.get("/v2/runs/fixture-run", headers=READ_HEADERS).json()["run"]
+    served = [
+        run["reading"]["progress"]["reported_at"],
+        run["sleeps"][0]["started_at"],
+        run["sleeps"][0]["ended_at"],
+    ]
+    assert all(text.endswith("Z") for text in served), served
+    assert [datetime.fromisoformat(text) for text in served] == [
+        datetime(2026, 11, 6, 12, 0, 3, tzinfo=UTC),
+        datetime(2026, 11, 6, 12, 0, 40, 500000, tzinfo=UTC),
+        datetime(2026, 11, 6, 12, 30, 40, 500000, tzinfo=UTC),
+    ]
+    # Version 1 serves the details as the emitter sent them.
+    document = client.get("/v1/runs/fixture-run", headers=READ_HEADERS).json()
+    assert document["sleeps"][0]["started_at"] == "2026-11-06T17:00:40.500000+05:00"
+
+
+NEW_V2_SCHEMAS = (
+    "MachineEnvironment",
+    "ModalContainer",
+    "TimedReading",
+    "ReadingProgress",
+    "OuterProgress",
+    "ProcessTreeReading",
+    "MachineReading",
+    "ProducerSleep",
+)
+
+
+def test_the_v2_contract_requires_every_field_the_collector_always_sends() -> None:
+    client = read_client(FakeTelemetryStore())
+    schemas = client.get("/v2/openapi.json").json()["components"]["schemas"]
+    for name in NEW_V2_SCHEMAS:
+        schema = schemas[name]
+        assert sorted(schema.get("required", [])) == sorted(schema["properties"]), name
+
+
+def run_state(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Return read API v2's run state for ``events``, as JSON."""
+    return run_detail(registered_run(), events).model_dump(mode="json")["run"]
+
+
+def test_v2_has_no_reading_for_a_restarted_attempt_until_it_sends_one() -> None:
+    raws = emitter_events()
+    restart = deepcopy(raws[0])
+    restart.update(
+        event_id="restart-started",
+        producer_id="restart-producer",
+        sequence=1,
+        timestamp=datetime(2026, 11, 6, 13, tzinfo=UTC).isoformat(),
+    )
+    events = [stored(raw) for raw in raws] + [
+        stored(restart, REGISTERED_AT + timedelta(hours=2))
+    ]
+    state = run_state(events)
+    assert state["reading"] is None
+    assert state["environment"] == restart["details"]["environment"]
+    assert [sleep["producer_id"] for sleep in state["sleeps"]] == ["fixture-producer"]
+
+
+def test_v2_serves_none_for_a_run_without_readings() -> None:
+    raws = [raw for raw in emitter_events() if raw["event_type"] != "heartbeat"]
+    for raw in raws:
+        raw["details"].pop("environment", None)
+    state = run_state([stored(raw) for raw in raws])
+    assert (state["environment"], state["reading"], state["sleeps"]) == (None, None, [])
+
+
+def test_the_recorded_run_with_readings_has_spans_that_match_its_times() -> None:
+    telemetry = json.loads(
+        (Path(__file__).parents[1] / "contracts/read-api-v2/telemetry.json").read_text()
+    )
+    events = next(
+        step["events"]
+        for step in telemetry["steps"]
+        if step.get("run_id") == "us-run-with-readings"
+    )
+    times = {
+        (event["stage_id"], event["details"]["stage_span"]["occurrence"]): (
+            datetime.fromisoformat(event["timestamp"])
+        )
+        for event in events
+        if event["event_type"] == "stage" and event["status"] == "started"
+    }
+    ends = [
+        event
+        for event in events
+        if event["event_type"] == "stage" and event["status"] == "completed"
+    ]
+    assert ends
+    for end in ends:
+        span = end["details"]["stage_span"]
+        elapsed = (
+            datetime.fromisoformat(end["timestamp"])
+            - times[(end["stage_id"], span["occurrence"])]
+        )
+        assert elapsed.total_seconds() == pytest.approx(
+            span["awake_seconds"] + span["asleep_seconds"]
+        ), end["stage_id"]
+    progress = next(event for event in events if event["event_type"] == "progress")
+    readings = [event for event in events if "reading" in event["details"]]
+    for reading in readings:
+        assert reading["details"]["reading"]["progress"]["reported_at"] == (
+            progress["timestamp"].replace("Z", "+00:00")
+        )
