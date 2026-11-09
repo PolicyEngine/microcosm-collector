@@ -343,9 +343,11 @@ upload URLs; `POST /v1/submissions/{id}/complete` checks the stored objects'
 sizes and recorded digests and dispatches a worker job through Cloud Tasks; the
 worker, a Cloud Run Job running
 `uv run --no-sync python -m telemetry_collector.worker`, recomputes every
-file's SHA-256 and runs the handler registered for the kind. Until the
-calibration-tree and Orrery workers register theirs, both kinds are only
-checked and kept.
+file's SHA-256 and runs the handler registered for the kind. Where the
+worker job has its calibration tree Blob token, `calibration-diagnostics`
+submissions build calibration trees ("Building trees from submissions");
+`orrery-inputs` submissions are only checked and kept until the Orrery worker
+registers its handler.
 
 Intake is off unless `COLLECTOR_INTAKE_ENABLED` is exactly `1`. While it is
 off, the collector reads no other intake setting, and the token exchange for
@@ -382,6 +384,7 @@ bucket.
 | `COLLECTOR_WORKER_INVOKER_SERVICE_ACCOUNT` | service, operations | the account whose OAuth token each Cloud Task uses to run the worker job | `TELEMETRY_WORKER_INVOKER_SERVICE_ACCOUNT` |
 | `COLLECTOR_WORKER_JOB_ID` | worker | set on each execution by its Cloud Task | not set by the deploy |
 | `DATABASE_URL` | worker, operations | the runtime database secret, as for the service | `TELEMETRY_DATABASE_SECRET_NAME` |
+| `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN` | worker | the read-write token of the environment's own calibration tree Vercel Blob store, a Secret Manager secret; without it, `calibration-diagnostics` submissions stay in intake storage (see "Building trees from submissions") | `TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME`, the secret's name |
 
 The `TELEMETRY_*` names are GitHub `staging` and `production` environment
 variables, which `.github/workflows/push.yaml` passes to `scripts/deploy.sh`.
@@ -393,6 +396,7 @@ The deploy also reads these, to update the two jobs:
 | `TELEMETRY_WORKER_SERVICE_ACCOUNT` | the worker job's service account |
 | `TELEMETRY_RECOVERY_SERVICE_ACCOUNT` | the recovery job's service account |
 | `TELEMETRY_HF_READ_SECRET_NAME` | the environment's own Hugging Face read token's secret, mounted on the worker job (see "Hugging Face read access") |
+| `TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME` | the secret holding the read-write token of the environment's own calibration tree Blob store, mounted on the worker job only as `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN` (see "Building trees from submissions") |
 
 The two service-account settings accept only user-managed accounts,
 `<name>@<project>.iam.gserviceaccount.com`. The collector refuses to start
@@ -495,7 +499,8 @@ and region, these resources, created by hand (both environments have them):
   itself), enqueue on the queue, and act as the invoker account; the invoker
   account may run the worker job with overrides; the worker's service account
   may read the bucket, connect to Cloud SQL and read the runtime database
-  secret and its environment's Hugging Face read token's secret; the recovery
+  secret, its environment's Hugging Face read token's secret and its
+  environment's calibration tree Blob token's secret; the recovery
   job's service account may connect to Cloud SQL, read the runtime database
   secret, enqueue on the queue and act as the invoker account; Cloud
   Scheduler's account may run the recovery job; and the deployment service
@@ -512,7 +517,8 @@ Each release, in each environment, `scripts/deploy.sh`:
      (`check-intake-jobs`), so a variable naming the other environment's job
      stops the deploy. To move a job to another account, update the job by
      hand first;
-   - that the environment's Hugging Face read token's secret exists
+   - that the environment's seven secrets exist, its Hugging Face read
+     token's and its calibration tree Blob token's among them
      (`check-secrets-exist`);
 2. passes the intake settings in the first table to the maintenance and
    candidate revisions;
@@ -522,9 +528,9 @@ Each release, in each environment, `scripts/deploy.sh`:
    configuration: service account, Cloud SQL connection, secrets, settings,
    command, task count, retries, task timeout, CPU and memory. Each update
    sets the job's secrets with `--set-secrets`, which replaces every mount,
-   so the worker job's lists `DATABASE_URL` and `COLLECTOR_HF_READ_TOKEN`
-   together. The deploy changes neither the
-   schedule nor any job's permissions.
+   so the worker job's lists `DATABASE_URL`, `COLLECTOR_HF_READ_TOKEN` and
+   `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN` together. The deploy changes
+   neither the schedule nor any job's permissions.
 
 Maintenance mode holds only the service. An execution of either job keeps the
 image it started with, for all its attempts: a worker execution that is
@@ -686,18 +692,90 @@ compiles it through `transpilePackages`. Its own
 
 ### The tree worker
 
-`src/calibration-tree-worker.ts` builds one release's tree from local files
-and writes its gzip parts to a directory, as its own Bun process:
+`src/calibration-tree-worker.ts` builds one release's or one staged run's
+tree from local files and writes its gzip parts to a directory, as its own Bun
+process, and `src/calibration-tree-publication.ts` uploads those parts and adds
+the build to the manifest:
 
 ```bash
 cd packages/calibration-tree
 bun run src/calibration-tree-worker.ts REQUEST.json OUTPUT_DIRECTORY
+CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN=... \
+  bun run src/calibration-tree-publication.ts PUBLICATION.json
 ```
 
-It builds exactly what the publisher builds from the same files, commit and
-publication time. Nothing in the collector runs it yet; the calibration-tree
-worker (K4) will run it for each `calibration-diagnostics` submission, so the
-worker image will need Bun then.
+The worker builds a release exactly as the publisher builds it from the same
+files, commit and publication time, and a staged run as the publisher builds a
+staging tree, from the files it is given. It prints the manifest entry the
+publisher would record. The publication command uploads each part to its
+immutable path (keeping a part already stored with the same bytes), then
+writes the manifest with a compare-and-swap: it creates the manifest only if
+it is still absent and replaces it only if its ETag is still the one read, so
+a manifest another writer changed is never overwritten, and a manifest read
+without an ETag is never replaced. A build asked to become its country's
+latest does so only if it is at least as new (`createdAt`) as the current
+latest. Exit 2 means the build is refused: another build is already recorded
+for the same release build or staged run, or the same build was already
+recorded from another submission of the same files, whose index records
+another time or label.
+
+### Building trees from submissions
+
+The worker job builds a calibration tree from each `calibration-diagnostics`
+submission (`telemetry_collector/calibration_trees.py`) where it has
+`COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN`, the read-write token of its
+environment's own Vercel Blob store, which the deploy mounts on the worker job
+only, from the secret `TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME` names.
+Each environment has its own store, which nothing reads until the dashboard
+switches to it, and its own secret, which only its worker service account may
+read. Without the token, submissions stay in intake storage and can be
+reprocessed later. Nothing here
+reads Hugging Face: every value comes from the submission.
+
+- **Which tree.** A build folder, `releases/<release>/<build>`, gives a release
+  tree whose release ID is `<release>/<build>`; its `release` and `build_id`
+  must name the same release and build. A staged bundle, `staged/<run_id>`,
+  gives a staging tree of that run, labelled with the submission's `release`
+  (the candidate release) or, when that is null, the run ID; its `run_id`
+  must be the folder's. Files must come from the country's release repo, or,
+  for a staged bundle, its staging repo. Contradicting provenance and other
+  repos reject the submission. Other folders, and countries the collector
+  does not list, stay in intake storage with the reason in the result.
+- **Time.** The tree records the submission's `accepted_at` as its
+  publication time, so reprocessing a submission builds the same tree.
+- **Latest.** A release build becomes its country's latest when its release
+  is the country's default release, listed in `DEFAULT_RELEASES`: the UK's is
+  `microcosm-uk-2024-25-national`; the US's is added once its stable releases
+  are agreed. It takes the latest only from an older build, by publication
+  time, so a retried or reprocessed older build never takes the latest back.
+  Builds of other releases are recorded without moving the latest.
+- **Size.** The worker job has 8 GiB of memory and 2 CPUs: building the
+  tree for the largest current diagnostics file (a 128.7 MB US release) peaked
+  at 3.5 GB, and Cloud Run keeps the downloaded and written files in memory.
+  Each execution is billed only while it runs.
+- **How.** Each attempt downloads the files into a new temporary directory
+  and runs the tree worker with only `PATH`, `LANG` and the package's size
+  limits (`CALIBRATION_TREE_MAX_RAW_BYTES`, `CALIBRATION_TREE_MAX_GZIP_BYTES`)
+  in its environment, never the Blob token. That keeps the token out of the
+  builder's environment, arguments and output, but it is not isolation: the
+  builder runs as the same user as the worker, which holds the token in its
+  own environment. It then runs the publication command, with the token,
+  inside a Postgres transaction lock (`pg_advisory_xact_lock`), so the
+  collector's writers change the manifest one at a time.
+- **Results.** A published tree's result names its build ID, kind, how many
+  parts were uploaded or already stored, and whether it became the latest.
+  The worker refusing the files (`calibration_tree_unbuildable`), or the
+  build being refused (`calibration_tree_refused`: another build already
+  recorded for the same release build or staged run, or the same files
+  already recorded from another submission), rejects the submission; any
+  other failure, including a manifest another writer changed meanwhile, fails
+  the attempt so it runs again.
+
+The image holds Bun 1.4.2, copied from the official image by digest, and the
+package's production install, without its tests, fixtures and test support.
+CI checks the built image with `tools/check-calibration-tree-image.sh`, which
+builds a small staged run's tree inside it and runs the publication command
+without a token, which must refuse to run.
 
 ### Tests
 
@@ -903,11 +981,12 @@ one image identified by the commit SHA. It first applies the migration to the
 persistent staging PostgreSQL database, verifies both the Alembic revision and
 the complete SQLAlchemy metadata, and deploys the staging collector. Production receives that exact image only when the staging sequence
 succeeds. Before either environment changes, deployment checks only that the
-environment's six secrets exist (the runtime database URL, the migration
+environment's seven secrets exist (the runtime database URL, the migration
 database URL, the HS256 JWT secret, the ES256 signing key, the dashboard's
-read token and the Hugging Face read token), and that its worker and
-recovery jobs exist and belong to that environment (see "Worker jobs and
-recovery"). It does not access the secrets' payloads or test their values. The
+read token, the Hugging Face read token and the calibration tree Blob token),
+and that its worker and recovery jobs exist and belong to that environment
+(see "Worker jobs and recovery"). It does not access the secrets' payloads or
+test their values. The
 previous HF authentication and write/read deployment qualification is removed.
 
 Each deployment first routes traffic to a verified maintenance revision that
@@ -994,7 +1073,9 @@ The deployment's access and configuration are provisioned:
 - For intake, each environment also holds the seven `TELEMETRY_*` variables
   for its bucket, queue, jobs and the service accounts that run them, and
   `TELEMETRY_HF_READ_SECRET_NAME` for its own Hugging Face read token's
-  secret (see "Artifact intake").
+  secret (see "Artifact intake"), and
+  `TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME` for its own calibration tree
+  Blob store's token's secret (see "Building trees from submissions").
   `scripts/deploy.sh require-configuration` names any that is missing, and
   the deployment stops before it authenticates.
 

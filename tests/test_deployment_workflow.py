@@ -414,6 +414,18 @@ def test_both_deploy_jobs_read_their_hugging_face_read_token_secret_name() -> No
     assert PUSH_WORKFLOW.read_text(encoding="utf-8").count(mapping) == 2
 
 
+def test_both_deploy_jobs_read_their_calibration_tree_blob_secret_name() -> None:
+    jobs = load_workflow(PUSH_WORKFLOW)["jobs"]
+    mapping = "${{ vars.TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME }}"
+
+    # Each environment names its own store's token, which only its worker reads.
+    for job_name in DEPLOY_JOBS:
+        assert (
+            jobs[job_name]["env"].get("CALIBRATION_TREE_BLOB_SECRET_NAME") == mapping
+        ), job_name
+    assert PUSH_WORKFLOW.read_text(encoding="utf-8").count(mapping) == 2
+
+
 def deploy_step(job: dict, command: str) -> dict:
     matching_steps = [
         step
