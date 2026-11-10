@@ -507,13 +507,18 @@ class InMemoryGraphCatalogue:
         )
 
     def graph_files(
-        self, *, run_id: str | None = None, build_id: str | None = None
+        self,
+        *,
+        run_id: str | None = None,
+        build_id: str | None = None,
+        country_code: str | None = None,
     ) -> list[Any]:
         return [
             self._recorded(key, record)
             for key, record in self.graphs.records.items()
             if (run_id is None or record.run_id == run_id)
             and (build_id is None or record.build_id == build_id)
+            and (country_code is None or record.country_code == country_code)
         ]
 
     def graph_file(self, submission_id: str, document_sha256: str) -> Any:
@@ -607,7 +612,12 @@ def orrery_files(variant: object) -> list[dict[str, Any]]:
 
 
 def submission_request(
-    *, run_id: str, build_id: str, licensed_data: bool, files: list[dict[str, Any]]
+    *,
+    run_id: str,
+    build_id: str,
+    licensed_data: bool,
+    files: list[dict[str, Any]],
+    country_code: str = "UK",
 ) -> SubmissionRequest:
     return SubmissionRequest.model_validate(
         {
@@ -617,7 +627,7 @@ def submission_request(
             "provenance": {
                 "run_id": run_id,
                 "build_id": build_id,
-                "country_code": "UK",
+                "country_code": country_code,
                 "release": None,
                 "huggingface": None,
             },
@@ -635,13 +645,14 @@ def graph_record(
     visibility: str,
     document_bytes: int = DOCUMENT_BYTES,
     upstream_files: int = 0,
+    country_code: str = "UK",
 ) -> OrreryGraphRecord:
     return OrreryGraphRecord(
         submission_id=submission_id,
         processing_round=1,
         run_id=run_id,
         build_id=build_id,
-        country_code="UK",
+        country_code=country_code,
         object_prefix=f"graphs/{submission_id}/{document_sha256}/",
         document_sha256=document_sha256,
         document_bytes=document_bytes,
@@ -719,6 +730,7 @@ class Serving:
         licensed_data: bool,
         files: list[dict[str, Any]],
         build_id: str = BUILD,
+        country_code: str = "UK",
     ) -> str:
         record, _ = self.submissions.create_submission(
             submission_request(
@@ -726,6 +738,7 @@ class Serving:
                 build_id=build_id,
                 licensed_data=licensed_data,
                 files=files,
+                country_code=country_code,
             ),
             PRINCIPAL,
         )
@@ -739,6 +752,7 @@ class Serving:
         licensed_data: bool = False,
         upstream: dict[str, bytes] | None = None,
         content: bytes | None = None,
+        country_code: str = "UK",
     ) -> PublishedDocument:
         """Record and store a document as the worker publishes one, with the
         ``upstream`` files it links to."""
@@ -751,6 +765,7 @@ class Serving:
             run_id=run_id,
             build_id=build_id,
             licensed_data=licensed_data,
+            country_code=country_code,
             files=[
                 *orrery_files(f"published-{variant}"),
                 *(
@@ -772,6 +787,7 @@ class Serving:
                 visibility="private" if licensed_data else "public",
                 document_bytes=len(content),
                 upstream_files=len(upstream_files),
+                country_code=country_code,
             )
         )
         self.published.append(published)
@@ -928,6 +944,18 @@ UNAUTHENTICATED_REQUESTS: dict[str, tuple[Callable[[], dict[str, str]], str]] = 
         lambda: bearer(identity_token(key_id="google-test-key-2")),
         "identity_token_invalid",
     ),
+    # Signed with Google's own key, so only the missing key ID refuses these:
+    # without one, google-auth would try the token against every certificate.
+    "a token without a key ID": (
+        lambda: bearer(
+            jwt.encode(identity_claims(), google_signing_key(), algorithm="RS256")
+        ),
+        "identity_token_invalid",
+    ),
+    "an empty key ID": (
+        lambda: bearer(identity_token(key_id="")),
+        "identity_token_invalid",
+    ),
     "another algorithm": (
         lambda: bearer(
             jwt.encode(
@@ -1045,6 +1073,23 @@ def test_google_s_certificates_are_fetched_once_for_as_long_as_they_last(
     service.certificate_clock.advance(1)
     service.listed()
     assert service.certificate_endpoint.fetches == 2
+
+
+def test_certificates_with_a_lifetime_of_0_are_fetched_again_on_the_next_request(
+    service: Serving,
+) -> None:
+    service.publish()
+    service.certificate_endpoint.lifetime_seconds = 0
+    fetches_after_each_request = []
+
+    for _ in range(3):
+        service.listed()
+        fetches_after_each_request.append(service.certificate_endpoint.fetches)
+        service.certificate_clock.advance(5)
+
+    # Google's endpoint answers, so the once-a-minute limit after a failed
+    # fetch doesn't apply: each request after a fetch fetches again.
+    assert fetches_after_each_request == [1, 2, 3]
 
 
 def rotated_key_token() -> dict[str, str]:
@@ -1338,6 +1383,41 @@ def test_a_certificate_fetch_that_fails_makes_the_certificates_unavailable(
         access().fetch_google_certificates(request_certificates)
 
 
+@pytest.mark.parametrize(
+    "response_headers",
+    [
+        {"Cache-Control": "no-store"},
+        {"Cache-Control": "no-cache, max-age=3600"},
+        {"Cache-Control": "public"},
+    ],
+    ids=["no-store", "no-cache", "no max-age"],
+)
+def test_certificates_google_forbids_keeping_are_fetched_again_on_the_next_request(
+    response_headers: dict[str, str],
+) -> None:
+    requests_made: list[dict[str, Any]] = []
+
+    def request(**arguments: Any) -> CertificateResponse:
+        requests_made.append(arguments)
+        return CertificateResponse(
+            200, json.dumps({KEY_ID: google_certificate()}).encode(), response_headers
+        )
+
+    clock = MonotonicClock()
+    verifier = access().GoogleIdentityTokenVerifier(
+        certificates=access().GoogleCertificates(
+            fetch=lambda: access().fetch_google_certificates(request), clock=clock
+        )
+    )
+    token = identity_token()
+
+    for _ in range(3):
+        assert verifier.verify(token)["email"] == READER
+        clock.advance(5)
+
+    assert len(requests_made) == 3
+
+
 # Listing a run's or a build's documents.
 
 
@@ -1429,6 +1509,34 @@ def test_a_newer_document_of_the_build_from_another_run_is_its_current_one(
         (document["document_sha256"], document["current"])
         for document in service.listed(run_id=CONSUMING_RUN)
     ] == [(own.document_sha256, False)]
+
+
+def test_each_country_s_documents_with_one_build_id_have_their_own_current_one(
+    service: Serving,
+) -> None:
+    older_uk = service.publish()
+    service.clock.advance(60)
+    newer_uk = service.publish(run_id="uk-run-rerun")
+    service.clock.advance(60)
+    # Another country's build that happens to have the same build ID.
+    us_document = service.publish(run_id="us-run-consumer", country_code="US")
+
+    assert [
+        (document["country_code"], document["document_sha256"], document["current"])
+        for document in service.listed(build_id=BUILD)
+    ] == [
+        ("US", us_document.document_sha256, True),
+        ("UK", newer_uk.document_sha256, True),
+        ("UK", older_uk.document_sha256, False),
+    ]
+    assert [
+        (document["document_sha256"], document["current"])
+        for document in service.listed(run_id="uk-run-rerun")
+    ] == [(newer_uk.document_sha256, True)]
+    assert [
+        (document["document_sha256"], document["current"])
+        for document in service.listed(run_id=CONSUMING_RUN)
+    ] == [(older_uk.document_sha256, False)]
 
 
 @pytest.mark.parametrize(
@@ -2251,6 +2359,7 @@ class RecordStores:
         licensed_data: bool,
         files: list[dict[str, Any]],
         build_id: str = BUILD,
+        country_code: str = "UK",
     ) -> str:
         record, _ = self.submissions.create_submission(
             submission_request(
@@ -2258,6 +2367,7 @@ class RecordStores:
                 build_id=build_id,
                 licensed_data=licensed_data,
                 files=files,
+                country_code=country_code,
             ),
             PRINCIPAL,
         )
@@ -2271,6 +2381,7 @@ class RecordStores:
         run_id: str,
         build_id: str,
         visibility: str = "public",
+        country_code: str = "UK",
     ) -> None:
         assert self.graphs.record_graph(
             graph_record(
@@ -2279,6 +2390,7 @@ class RecordStores:
                 run_id=run_id,
                 build_id=build_id,
                 visibility=visibility,
+                country_code=country_code,
             )
         )
 
@@ -2333,6 +2445,37 @@ def test_the_catalogue_finds_documents_by_run_by_build_or_both(
     assert found(run_id="run-b", build_id="build-2") == [(second, "c" * 64)]
     assert found(run_id="run-a", build_id="build-2") == []
     assert found(run_id="run-unknown") == []
+
+
+def test_the_catalogue_finds_a_build_s_documents_within_one_country(
+    record_stores: RecordStores,
+) -> None:
+    uk_submission = record_stores.submit(
+        run_id="run-uk", licensed_data=False, files=orrery_files("uk")
+    )
+    us_submission = record_stores.submit(
+        run_id="run-us",
+        licensed_data=False,
+        files=orrery_files("us"),
+        country_code="US",
+    )
+    record_stores.record(uk_submission, "a" * 64, run_id="run-uk", build_id="build-1")
+    record_stores.record(
+        us_submission, "b" * 64, run_id="run-us", build_id="build-1", country_code="US"
+    )
+
+    def found(**filters: str) -> list[tuple[str, str]]:
+        return sorted(
+            (document.submission_id, document.document_sha256)
+            for document in record_stores.catalogue.graph_files(**filters)
+        )
+
+    assert found(build_id="build-1", country_code="UK") == [(uk_submission, "a" * 64)]
+    assert found(build_id="build-1", country_code="US") == [(us_submission, "b" * 64)]
+    assert found(build_id="build-1") == sorted(
+        [(uk_submission, "a" * 64), (us_submission, "b" * 64)]
+    )
+    assert found(build_id="build-1", country_code="FR") == []
 
 
 def test_the_catalogue_reads_one_document_s_record(
