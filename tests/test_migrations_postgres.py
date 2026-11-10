@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib
+import logging
 import re
 from dataclasses import dataclass
 
@@ -124,6 +126,28 @@ def test_upgrades_empty_postgres_database_to_head(postgres_url: str) -> None:
         assert _current_revision(postgres_url) == (HEAD_REVISION, HEAD_REVISION)
     finally:
         engine.dispose()
+
+
+def test_upgrading_the_database_leaves_the_collector_s_loggers_enabled(
+    postgres_url: str,
+) -> None:
+    # The loggers exist before the upgrade, as they do in any process that
+    # imported the app, such as the test session's.
+    importlib.import_module("telemetry_collector.orrery_graph_api")
+    collector_loggers = [
+        name
+        for name, logger in logging.root.manager.loggerDict.items()
+        if isinstance(logger, logging.Logger)
+        and name.split(".")[0] == "telemetry_collector"
+    ]
+    assert "telemetry_collector.orrery_graph_api" in collector_loggers
+
+    upgrade_database(postgres_url)
+
+    # Alembic's logging setup keeps every logger it doesn't configure.
+    assert [
+        name for name in collector_loggers if logging.getLogger(name).disabled
+    ] == []
 
 
 def test_hard_cutover_replaces_populated_unversioned_database(

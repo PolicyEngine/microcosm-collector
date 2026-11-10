@@ -18,6 +18,7 @@ import importlib
 import importlib.util
 import json
 import logging
+import threading
 import time
 from collections.abc import Callable, Collection, Iterator
 from dataclasses import dataclass, field
@@ -35,6 +36,8 @@ from cryptography.x509.oid import NameOID
 from fastapi.testclient import TestClient
 from google.api_core.exceptions import NotFound, ServiceUnavailable
 from google.auth.exceptions import TransportError
+from google.cloud.storage.exceptions import DataCorruption
+from sqlalchemy.exc import OperationalError
 
 from telemetry_collector import google_cloud
 from telemetry_collector.app import CollectorSettings, create_app
@@ -66,6 +69,16 @@ ANOTHER_ACCOUNT = "someone-else@example-project.iam.gserviceaccount.com"
 READER_ACCOUNT_ID = "112233445566778899000"
 BUCKET = "collector-orrery-test"
 KEY_ID = "google-test-key-1"
+# The key ID of a key Google starts signing with while the collector still
+# holds the certificates it fetched before.
+ROTATED_KEY_ID = "google-test-key-2"
+# A token whose key the cached certificates don't hold, or a fetch that
+# failed while the cached certificates may still be used, fetches them again
+# at most this often.
+REFETCH_INTERVAL_SECONDS = 60
+# How long past their expiry the cached certificates are still used while
+# Google's endpoint can't be reached.
+CERTIFICATE_GRACE_SECONDS = 3600
 JWT_SECRET = "test-secret-that-is-long-enough-32"
 PRINCIPAL = HuggingFacePrincipal("hf-user-1", "builder", ("policyengine",))
 LISTING = "/v1/orrery-graphs"
@@ -73,10 +86,20 @@ FILE_ROUTE = "/v1/orrery-graphs/{submission_id}/{document_sha256}/{file_name}"
 CONSUMING_RUN = "uk-run-consumer"
 PRODUCING_RUN = "uk-run-producer"
 BUILD = "uk-frs-calibration-attempt-1"
+# The producing run's build, another than the consuming document's.
+PRODUCING_BUILD = "uk-spine-attempt-1"
 ORRERY_VERSION = "0.6.2"
 COLLECTOR_VERSION = "9.8.7"
 DOCUMENT_BYTES = 191_154
 PRIVATE_NO_STORE = "private, no-store"
+# The most bytes of a file the service may hold at once, both while it hashes
+# the file and while it sends it.
+SERVED_PART_BYTES = 1024 * 1024
+# What google-cloud-storage's BlobReader fetches at once when it is opened
+# without a chunk size (fileio.DEFAULT_CHUNK_SIZE).
+BLOB_READER_DEFAULT_CHUNK_BYTES = 40 * 1024 * 1024
+# Nothing listens on port 1, so connecting to this database is refused at once.
+UNREACHABLE_DATABASE_URL = "postgresql://user:password@127.0.0.1:1/none"
 SERVING_ENVIRONMENT = {
     "COLLECTOR_ORRERY_BUCKET": BUCKET,
     "COLLECTOR_ORRERY_READER_SERVICE_ACCOUNT": READER,
@@ -122,13 +145,28 @@ def impostor_signing_key() -> rsa.RSAPrivateKey:
 
 
 @functools.cache
+def rotated_signing_key() -> rsa.RSAPrivateKey:
+    """The key the stand-in for Google signs with after it rotates its keys."""
+
+    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+
+@functools.cache
 def google_certificate() -> str:
     """The signing key's certificate, in PEM, as Google publishes its own."""
 
-    signing_key = google_signing_key()
-    subject = x509.Name(
-        [x509.NameAttribute(NameOID.COMMON_NAME, "google-test-signing-key")]
-    )
+    return self_signed_certificate(google_signing_key(), "google-test-signing-key")
+
+
+@functools.cache
+def rotated_certificate() -> str:
+    """The rotated signing key's certificate, in PEM."""
+
+    return self_signed_certificate(rotated_signing_key(), "google-test-rotated-key")
+
+
+def self_signed_certificate(signing_key: rsa.RSAPrivateKey, common_name: str) -> str:
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
     certificate = (
         x509.CertificateBuilder()
         .subject_name(subject)
@@ -185,21 +223,40 @@ def bearer(token: str) -> dict[str, str]:
 
 
 class CertificateEndpoint:
-    """Stands in for Google's certificate endpoint and counts its fetches."""
+    """Stands in for Google's certificate endpoint and counts its fetches.
+
+    ``published`` is what it answers. After ``hold_fetches``, each fetch
+    waits until ``release_fetches``, as a slow endpoint would, and
+    ``fetch_started`` is set once one is waiting.
+    """
 
     def __init__(self) -> None:
         self.fetches = 0
         self.available = True
         self.lifetime_seconds = 3600.0
+        self.published = {KEY_ID: google_certificate()}
+        self.fetch_started = threading.Event()
+        self._released = threading.Event()
+        self._released.set()
+
+    def hold_fetches(self) -> None:
+        self.fetch_started.clear()
+        self._released.clear()
+
+    def release_fetches(self) -> None:
+        self._released.set()
 
     def __call__(self) -> Any:
         self.fetches += 1
+        self.fetch_started.set()
+        if not self._released.wait(timeout=10):
+            raise AssertionError("A held certificate fetch was never released.")
         if not self.available:
             raise access().GoogleCertificatesUnavailableError(
                 "Google's certificates could not be fetched."
             )
         return access().FetchedCertificates(
-            certificates={KEY_ID: google_certificate()},
+            certificates=dict(self.published),
             lifetime_seconds=self.lifetime_seconds,
         )
 
@@ -224,24 +281,102 @@ class MonotonicClock:
 class BucketObject:
     content: bytes
     metadata: dict[str, str] | None
+    generation: int = 1
+    # Every read raises DataCorruption, as the client does when the bytes it
+    # downloaded don't match the object's checksum.
+    corrupt: bool = False
+
+
+@dataclass
+class ObjectRead:
+    """One read of an object's bytes, as the stand-in client served it."""
+
+    name: str
+    #: The generation the read was pinned to, or None for the newest one.
+    generation: int | None
+    #: The most bytes the read held at once: like the library's BlobReader,
+    #: each part fetches at least the reader's chunk size.
+    largest_held_bytes: int = 0
+    #: Whether the read reached the end of the object.
+    finished: bool = False
+
+
+class StandInBlobReader:
+    """What the stand-in's ``blob.open("rb", chunk_size=...)`` returns."""
+
+    def __init__(
+        self,
+        client: StandInStorageClient,
+        name: str,
+        generation: int | None,
+        chunk_size: int | None,
+    ) -> None:
+        self._client = client
+        self._fetch_bytes = chunk_size or BLOB_READER_DEFAULT_CHUNK_BYTES
+        self._position = 0
+        self._read = ObjectRead(name, generation)
+        client.reads.append(self._read)
+
+    def __enter__(self) -> StandInBlobReader:
+        return self
+
+    def __exit__(self, *exception: object) -> None:
+        return None
+
+    def read(self, size: int = -1) -> bytes:
+        stored = self._client.stored_for_read(self._read.name, self._read.generation)
+        remaining = len(stored.content) - self._position
+        if size < 0:
+            held = remaining
+        else:
+            held = min(remaining, max(size, self._fetch_bytes))
+        part = stored.content[
+            self._position : self._position + (remaining if size < 0 else size)
+        ]
+        self._position += len(part)
+        self._read.largest_held_bytes = max(self._read.largest_held_bytes, held)
+        if not part and not self._read.finished:
+            self._read.finished = True
+            self._client.read_finished(self._read)
+        return part
 
 
 class StandInBlob:
-    """What the stand-in client hands out for a listed or fetched object."""
+    """What the stand-in client hands out: a listed or looked-up object, or
+    one named for a read pinned to ``generation``."""
 
-    def __init__(self, client: StandInStorageClient, name: str, stored: Any) -> None:
+    def __init__(
+        self,
+        client: StandInStorageClient,
+        name: str,
+        *,
+        stored: Any | None = None,
+        generation: int | None = None,
+    ) -> None:
         self._client = client
         self.name = name
-        self.size = len(stored.content)
-        self.generation = 1
-        self.metadata = None if stored.metadata is None else dict(stored.metadata)
+        self.generation = generation if stored is None else stored.generation
+        self.size = None if stored is None else len(stored.content)
+        self.metadata = (
+            None if stored is None or stored.metadata is None else dict(stored.metadata)
+        )
 
-    def download_as_bytes(self) -> bytes:
-        self._client.check_available()
-        stored = self._client.objects.get(self.name)
-        if stored is None:
-            raise NotFound(f"{self.name} is not stored.")
-        self._client.downloads.append(self.name)
+    def open(
+        self, mode: str = "r", chunk_size: int | None = None, **options: Any
+    ) -> StandInBlobReader:
+        assert mode == "rb"
+        return StandInBlobReader(self._client, self.name, self.generation, chunk_size)
+
+    def download_as_bytes(self, **options: Any) -> bytes:
+        stored = self._client.stored_for_read(self.name, self.generation)
+        read = ObjectRead(
+            self.name,
+            self.generation,
+            largest_held_bytes=len(stored.content),
+            finished=True,
+        )
+        self._client.reads.append(read)
+        self._client.read_finished(read)
         return stored.content
 
 
@@ -249,21 +384,40 @@ class StandInBucket:
     def __init__(self, client: StandInStorageClient) -> None:
         self._client = client
 
+    def blob(self, name: str, generation: int | None = None) -> StandInBlob:
+        return StandInBlob(self._client, name, generation=generation)
+
     def get_blob(self, name: str) -> StandInBlob | None:
         self._client.check_available()
         stored = self._client.objects.get(name)
-        return None if stored is None else StandInBlob(self._client, name, stored)
+        if stored is None:
+            return None
+        found = StandInBlob(self._client, name, stored=stored)
+        if self._client.after_lookup is not None:
+            self._client.after_lookup(name)
+        return found
 
 
 class StandInStorageClient:
     """A bucket in memory. ``objects`` may be the worker's stand-in bucket's
-    objects, which have the same ``content`` and ``metadata``."""
+    objects, which have the same ``content``, ``metadata`` and
+    ``generation``.
+
+    ``reads`` records each read of an object's bytes. ``after_lookup`` and
+    ``after_read`` let a test change the bucket after an object is looked up
+    or after a read reaches its end.
+    """
 
     def __init__(self, objects: dict[str, Any] | None = None) -> None:
         self.objects: dict[str, Any] = {} if objects is None else objects
         self.bucket_names: list[str] = []
-        self.downloads: list[str] = []
+        self.reads: list[ObjectRead] = []
         self.available = True
+        self.after_lookup: Callable[[str], None] | None = None
+        self.after_read: Callable[[ObjectRead], None] | None = None
+        self._generation = max(
+            (stored.generation for stored in self.objects.values()), default=0
+        )
 
     def bucket(self, name: str) -> StandInBucket:
         self.bucket_names.append(name)
@@ -272,7 +426,7 @@ class StandInStorageClient:
     def list_blobs(self, bucket_name: str, prefix: str = "") -> list[StandInBlob]:
         self.check_available()
         return [
-            StandInBlob(self, name, stored)
+            StandInBlob(self, name, stored=stored)
             for name, stored in sorted(self.objects.items())
             if name.startswith(prefix)
         ]
@@ -281,12 +435,38 @@ class StandInStorageClient:
         if not self.available:
             raise ServiceUnavailable("Storage is unavailable.")
 
+    def stored_for_read(self, name: str, generation: int | None) -> Any:
+        """The object a read of ``generation`` gets, refusing as Cloud
+        Storage does when that generation is no longer stored."""
+
+        self.check_available()
+        stored = self.objects.get(name)
+        if stored is None or (
+            generation is not None and stored.generation != generation
+        ):
+            raise NotFound(f"{name} generation {generation} is not stored.")
+        if getattr(stored, "corrupt", False):
+            raise DataCorruption(None, f"Checksum mismatch while reading {name}.")
+        return stored
+
+    def read_finished(self, read: ObjectRead) -> None:
+        if self.after_read is not None:
+            self.after_read(read)
+
     def store(
         self, name: str, content: bytes, *, metadata: dict[str, str] | None = None
     ) -> None:
+        """Store an object, as a new generation of any one under ``name``."""
+
+        self._generation += 1
         self.objects[name] = BucketObject(
-            content, {"sha256": sha256_hex(content)} if metadata is None else metadata
+            content,
+            {"sha256": sha256_hex(content)} if metadata is None else metadata,
+            generation=self._generation,
         )
+
+    def generation(self, name: str) -> int:
+        return self.objects[name].generation
 
 
 def graph_reader(storage: StandInStorageClient) -> Any:
@@ -341,11 +521,11 @@ class InMemoryGraphCatalogue:
         record = self.graphs.records.get(key)
         return None if record is None else self._recorded(key, record)
 
-    def producing_run_ids(
+    def producing_submissions(
         self, file_sha256s: Collection[str]
-    ) -> dict[str, frozenset[str]]:
+    ) -> dict[str, frozenset[Any]]:
         wanted = set(file_sha256s)
-        producers: dict[str, set[str]] = {}
+        producers: dict[str, set[Any]] = {}
         for submission in self.submissions.records():
             for submitted_file in submission.files:
                 if (
@@ -353,17 +533,53 @@ class InMemoryGraphCatalogue:
                     and submitted_file["sha256"] in wanted
                 ):
                     producers.setdefault(submitted_file["sha256"], set()).add(
-                        submission.provenance["run_id"]
+                        serving().SubmissionOrigin(
+                            run_id=submission.provenance["run_id"],
+                            build_id=submission.provenance["build_id"],
+                        )
                     )
-        return {sha256: frozenset(runs) for sha256, runs in producers.items()}
+        return {sha256: frozenset(origins) for sha256, origins in producers.items()}
 
-    def licensed_run_ids(self, run_ids: Collection[str]) -> frozenset[str]:
-        wanted = set(run_ids)
-        return frozenset(
-            submission.provenance["run_id"]
+    def licensed_runs_and_builds(
+        self, *, run_ids: Collection[str], build_ids: Collection[str]
+    ) -> Any:
+        licensed = [
+            submission.provenance
             for submission in self.submissions.records()
-            if submission.licensed_data and submission.provenance["run_id"] in wanted
+            if submission.licensed_data
+        ]
+        return serving().LicensedRunsAndBuilds(
+            run_ids=frozenset(
+                provenance["run_id"]
+                for provenance in licensed
+                if provenance["run_id"] in set(run_ids)
+            ),
+            build_ids=frozenset(
+                provenance["build_id"]
+                for provenance in licensed
+                if provenance["build_id"] in set(build_ids)
+            ),
         )
+
+
+class UnavailableDatabaseCatalogue:
+    """A catalogue whose ``failing_method`` raises what SQLAlchemy raises when
+    the database refuses the connection; its other methods answer."""
+
+    def __init__(self, catalogue: Any, failing_method: str) -> None:
+        self._catalogue = catalogue
+        self._failing_method = failing_method
+
+    def __getattr__(self, name: str) -> Any:
+        if name != self._failing_method:
+            return getattr(self._catalogue, name)
+
+        def refuse(*arguments: Any, **keyword_arguments: Any) -> Any:
+            raise OperationalError(
+                "SELECT 1", {}, ConnectionRefusedError("The database refused.")
+            )
+
+        return refuse
 
 
 def submitted_file(name: str, role: str, content: bytes) -> dict[str, Any]:
@@ -522,13 +738,15 @@ class Serving:
         build_id: str = BUILD,
         licensed_data: bool = False,
         upstream: dict[str, bytes] | None = None,
+        content: bytes | None = None,
     ) -> PublishedDocument:
         """Record and store a document as the worker publishes one, with the
         ``upstream`` files it links to."""
 
         variant = len(self.published) + 1
         upstream_files = upstream or {}
-        content = json.dumps({"document": variant, "nodes": []}).encode()
+        if content is None:
+            content = json.dumps({"document": variant, "nodes": []}).encode()
         submission_id = self.submit(
             run_id=run_id,
             build_id=build_id,
@@ -565,9 +783,10 @@ class Serving:
         licensed_data: bool,
         role: str = "schema",
         run_id: str = PRODUCING_RUN,
+        build_id: str = PRODUCING_BUILD,
     ) -> str:
-        """A submission of the run whose file the consuming build copied as
-        its upstream file, holding that file in ``role``."""
+        """A submission of the run and build whose file the consuming build
+        copied as its upstream file, holding that file in ``role``."""
 
         files = orrery_files(f"producer-{run_id}-{role}-{licensed_data}")
         if role == "schema":
@@ -580,7 +799,9 @@ class Serving:
             )
         else:
             files.append(submitted_file(UPSTREAM_NAME, role, UPSTREAM_CONTENT))
-        return self.submit(run_id=run_id, licensed_data=licensed_data, files=files)
+        return self.submit(
+            run_id=run_id, build_id=build_id, licensed_data=licensed_data, files=files
+        )
 
 
 def serving_harness(
@@ -588,7 +809,13 @@ def serving_harness(
     submissions: FakeSubmissionStore | None = None,
     graphs: FakeOrreryGraphStore | None = None,
     storage: StandInStorageClient | None = None,
+    catalogue: Callable[[InMemoryGraphCatalogue], Any] | None = None,
+    maintenance_mode: bool = False,
+    raise_server_exceptions: bool = True,
 ) -> Serving:
+    """The service over the stand-ins. ``catalogue``, when given, wraps the
+    in-memory catalogue the endpoints read."""
+
     clock = SteppingClock()
     if submissions is None:
         submissions = FakeSubmissionStore(clock=clock)
@@ -596,10 +823,13 @@ def serving_harness(
         graphs = FakeOrreryGraphStore(clock=clock)
     if storage is None:
         storage = StandInStorageClient()
+    in_memory_catalogue = InMemoryGraphCatalogue(graphs, submissions)
     certificate_endpoint = CertificateEndpoint()
     certificate_clock = MonotonicClock()
     services = serving().OrreryServingServices(
-        catalogue=InMemoryGraphCatalogue(graphs, submissions),
+        catalogue=in_memory_catalogue
+        if catalogue is None
+        else catalogue(in_memory_catalogue),
         objects=graph_reader(storage),
         verifier=access().GoogleIdentityTokenVerifier(
             certificates=access().GoogleCertificates(
@@ -609,11 +839,14 @@ def serving_harness(
     )
     client = TestClient(
         create_app(
-            settings=collector_settings(orrery_serving=serving_settings()),
+            settings=collector_settings(
+                orrery_serving=serving_settings(), maintenance_mode=maintenance_mode
+            ),
             store=FakeTelemetryStore(),
             huggingface_authenticator=UnusedAuthenticator(),
             orrery_services=services,
-        )
+        ),
+        raise_server_exceptions=raise_server_exceptions,
     )
     return Serving(
         client=client,
@@ -750,7 +983,7 @@ def test_requests_without_a_valid_google_identity_token_are_refused_with_401(
 
     assert_problem(response, 401, code)
     assert response.headers["WWW-Authenticate"] == "Bearer"
-    assert service.storage.downloads == []
+    assert service.storage.reads == []
 
 
 @pytest.mark.parametrize(
@@ -780,7 +1013,7 @@ def test_a_valid_google_token_of_any_other_account_is_refused_with_403(
         response = service.get(path, headers=bearer(identity_token(**claim_changes)))
 
         assert_problem(response, 403, "identity_not_allowed")
-    assert service.storage.downloads == []
+    assert service.storage.reads == []
 
 
 def test_without_google_s_certificates_no_token_is_accepted_and_the_answer_is_503(
@@ -814,6 +1047,173 @@ def test_google_s_certificates_are_fetched_once_for_as_long_as_they_last(
     assert service.certificate_endpoint.fetches == 2
 
 
+def rotated_key_token() -> dict[str, str]:
+    """The reader's token, signed with a key Google published after the
+    collector fetched its certificates."""
+
+    return bearer(
+        identity_token(signing_key=rotated_signing_key(), key_id=ROTATED_KEY_ID)
+    )
+
+
+def test_a_token_signed_with_a_new_key_fetches_the_certificates_again(
+    service: Serving,
+) -> None:
+    service.publish()
+    service.listed()
+    service.certificate_endpoint.published = {
+        KEY_ID: google_certificate(),
+        ROTATED_KEY_ID: rotated_certificate(),
+    }
+    service.certificate_clock.advance(REFETCH_INTERVAL_SECONDS)
+
+    response = service.get(
+        LISTING, params={"run_id": CONSUMING_RUN}, headers=rotated_key_token()
+    )
+
+    assert response.status_code == 200, response.text
+    assert service.certificate_endpoint.fetches == 2
+    # The certificates fetched again serve the old key too, without a fetch.
+    service.listed()
+    assert service.certificate_endpoint.fetches == 2
+
+
+def test_an_unknown_key_fetches_the_certificates_again_at_most_once_a_minute(
+    service: Serving,
+) -> None:
+    service.publish()
+    service.listed()
+
+    def refused_with_fetches() -> int:
+        response = service.get(
+            LISTING, params={"run_id": CONSUMING_RUN}, headers=rotated_key_token()
+        )
+        assert_problem(response, 401, "identity_token_invalid")
+        return service.certificate_endpoint.fetches
+
+    # Within a minute of the fetch, the token is refused without another.
+    assert [refused_with_fetches() for _ in range(3)] == [1, 1, 1]
+    service.certificate_clock.advance(REFETCH_INTERVAL_SECONDS)
+    # Google still doesn't publish the key: one fetch, then none for a minute.
+    assert [refused_with_fetches() for _ in range(3)] == [2, 2, 2]
+    service.certificate_clock.advance(REFETCH_INTERVAL_SECONDS - 1)
+    assert refused_with_fetches() == 2
+    service.certificate_clock.advance(1)
+    assert refused_with_fetches() == 3
+
+
+def test_a_failed_fetch_keeps_the_certificates_for_an_hour_past_their_expiry(
+    service: Serving, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING)
+    service.publish()
+    service.listed()
+    endpoint = service.certificate_endpoint
+    endpoint.available = False
+
+    service.certificate_clock.advance(endpoint.lifetime_seconds)
+    service.listed()
+    assert endpoint.fetches == 2
+    assert [
+        record.levelno for record in caplog.records if record.name == ACCESS_MODULE
+    ] == [logging.WARNING]
+
+    # The failed fetch is tried again at most once a minute.
+    service.certificate_clock.advance(REFETCH_INTERVAL_SECONDS - 1)
+    service.listed()
+    assert endpoint.fetches == 2
+    service.certificate_clock.advance(1)
+    service.listed()
+    assert endpoint.fetches == 3
+
+    # Until an hour past the expiry, and no longer.
+    service.certificate_clock.advance(
+        CERTIFICATE_GRACE_SECONDS - REFETCH_INTERVAL_SECONDS - 1
+    )
+    service.listed()
+    service.certificate_clock.advance(1)
+    response = service.get(LISTING, params={"run_id": CONSUMING_RUN})
+    assert_problem(response, 503, "identity_certificates_unavailable")
+
+    # Once Google answers again, its new certificates are used.
+    endpoint.available = True
+    service.listed()
+
+
+@dataclass
+class VerifierUnderTest:
+    """A verifier over the stand-in certificate endpoint, and what the
+    requests verified in other threads returned."""
+
+    endpoint: CertificateEndpoint = field(default_factory=CertificateEndpoint)
+    clock: MonotonicClock = field(default_factory=MonotonicClock)
+    outcomes: list[object] = field(default_factory=list)
+    verifier: Any = None
+
+    def __post_init__(self) -> None:
+        self.verifier = access().GoogleIdentityTokenVerifier(
+            certificates=access().GoogleCertificates(
+                fetch=self.endpoint, clock=self.clock
+            )
+        )
+
+    def verify_in_thread(self, token: str) -> threading.Thread:
+        def verify() -> None:
+            try:
+                self.outcomes.append(self.verifier.verify(token)["email"])
+            except Exception as error:
+                self.outcomes.append(error)
+
+        thread = threading.Thread(target=verify, daemon=True)
+        thread.start()
+        return thread
+
+
+def test_requests_the_cached_certificates_can_check_do_not_wait_for_a_fetch() -> None:
+    under_test = VerifierUnderTest()
+    token = identity_token()
+    under_test.verifier.verify(token)
+    under_test.clock.advance(under_test.endpoint.lifetime_seconds)
+    under_test.endpoint.hold_fetches()
+
+    fetching = under_test.verify_in_thread(token)
+    try:
+        assert under_test.endpoint.fetch_started.wait(timeout=5)
+        # The certificates have expired but are within their grace period,
+        # so this request uses them instead of waiting for the slow fetch.
+        not_waiting = under_test.verify_in_thread(token)
+        not_waiting.join(timeout=2)
+        assert not not_waiting.is_alive()
+        assert under_test.outcomes == [READER]
+    finally:
+        under_test.endpoint.release_fetches()
+        fetching.join(timeout=5)
+
+    assert under_test.outcomes == [READER, READER]
+    assert under_test.endpoint.fetches == 2
+
+
+def test_requests_without_usable_certificates_wait_for_one_fetch() -> None:
+    under_test = VerifierUnderTest()
+    token = identity_token()
+    under_test.endpoint.hold_fetches()
+
+    fetching = under_test.verify_in_thread(token)
+    assert under_test.endpoint.fetch_started.wait(timeout=5)
+    waiting = under_test.verify_in_thread(token)
+    try:
+        # No certificates are cached yet, so it waits for the fetch running.
+        waiting.join(timeout=0.5)
+        assert waiting.is_alive()
+    finally:
+        under_test.endpoint.release_fetches()
+        fetching.join(timeout=5)
+        waiting.join(timeout=5)
+
+    assert under_test.outcomes == [READER, READER]
+    assert under_test.endpoint.fetches == 1
+
+
 def test_the_token_never_appears_in_answers_or_logs(
     service: Serving, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -831,16 +1231,28 @@ def test_the_token_never_appears_in_answers_or_logs(
     for token in tokens:
         for path in (f"{LISTING}?run_id={CONSUMING_RUN}", published.path()):
             answers.append((token, service.get(path, headers=bearer(token))))
+    # Past the certificates' lifetime, with Google's endpoint down, the
+    # collector warns and keeps using them; an hour later it answers 503.
     service.certificate_endpoint.available = False
-    service.certificate_clock.advance(service.certificate_endpoint.lifetime_seconds)
-    answers.append(
-        (tokens[0], service.get(published.path(), headers=bearer(tokens[0])))
-    )
+    for advance_seconds in (
+        service.certificate_endpoint.lifetime_seconds,
+        CERTIFICATE_GRACE_SECONDS,
+    ):
+        service.certificate_clock.advance(advance_seconds)
+        answers.append(
+            (tokens[0], service.get(published.path(), headers=bearer(tokens[0])))
+        )
 
     assert {answer.status_code for _, answer in answers} == {200, 401, 403, 503}
+    assert [answer.status_code for _, answer in answers[-2:]] == [200, 503]
     for token, answer in answers:
         assert token not in answer.text
         assert all(token not in value for value in answer.headers.values())
+    # The collector's own log records were captured, so their text was checked.
+    assert any(
+        record.name == ACCESS_MODULE and record.levelno == logging.WARNING
+        for record in caplog.records
+    )
     for token in tokens:
         assert token not in caplog.text
 
@@ -1106,12 +1518,34 @@ def test_any_licensed_submission_of_the_producing_run_makes_the_document_private
     service.publish(upstream={UPSTREAM_NAME: UPSTREAM_CONTENT})
     service.submit_producer(licensed_data=False)
     service.submit(
-        run_id=PRODUCING_RUN, licensed_data=True, files=orrery_files("producer-later")
+        run_id=PRODUCING_RUN,
+        build_id="uk-spine-attempt-2",
+        licensed_data=True,
+        files=orrery_files("producer-later"),
     )
 
     [document] = service.listed()
 
     assert document["visibility"] == "private"
+
+
+def test_any_licensed_submission_of_the_producing_build_makes_the_document_private(
+    service: Serving,
+) -> None:
+    published = service.publish(upstream={UPSTREAM_NAME: UPSTREAM_CONTENT})
+    service.submit_producer(licensed_data=False)
+    # The same build, submitted again from another run.
+    service.submit(
+        run_id="uk-run-producer-rerun",
+        build_id=PRODUCING_BUILD,
+        licensed_data=True,
+        files=orrery_files("producer-rerun"),
+    )
+
+    [document] = service.listed()
+
+    assert document["visibility"] == "private"
+    assert service.get(published.path()).headers["X-Orrery-Visibility"] == "private"
 
 
 def test_a_licensed_submission_of_the_document_s_own_run_makes_it_private(
@@ -1119,12 +1553,51 @@ def test_a_licensed_submission_of_the_document_s_own_run_makes_it_private(
 ) -> None:
     service.publish()
     service.submit(
-        run_id=CONSUMING_RUN, licensed_data=True, files=orrery_files("own-run")
+        run_id=CONSUMING_RUN,
+        build_id="uk-build-elsewhere",
+        licensed_data=True,
+        files=orrery_files("own-run"),
     )
 
     [document] = service.listed()
 
     assert document["visibility"] == "private"
+
+
+def test_a_licensed_submission_of_the_document_s_own_build_makes_it_private(
+    service: Serving,
+) -> None:
+    published = service.publish()
+    # The contract defines licensed_data per build, and a build can be
+    # submitted from more than one run.
+    service.submit(
+        run_id="uk-run-rerun",
+        build_id=BUILD,
+        licensed_data=True,
+        files=orrery_files("own-build"),
+    )
+
+    [document] = service.listed()
+
+    assert document["visibility"] == "private"
+    assert service.get(published.path()).headers["X-Orrery-Visibility"] == "private"
+
+
+def test_licensed_submissions_of_other_runs_and_builds_leave_the_document_public(
+    service: Serving,
+) -> None:
+    service.publish(upstream={UPSTREAM_NAME: UPSTREAM_CONTENT})
+    service.submit_producer(licensed_data=False)
+    service.submit(
+        run_id="uk-run-unrelated",
+        build_id="uk-build-unrelated",
+        licensed_data=True,
+        files=orrery_files("unrelated"),
+    )
+
+    [document] = service.listed()
+
+    assert document["visibility"] == "public"
 
 
 def test_a_producing_run_recorded_after_the_document_still_makes_it_private(
@@ -1212,7 +1685,7 @@ def test_a_path_that_names_no_served_file_answers_404(
     response = service.get(UNSERVED_PATHS[case](published))
 
     assert_problem(response, 404, "orrery_graph_not_found")
-    assert service.storage.downloads == []
+    assert service.storage.reads == []
 
 
 @pytest.mark.parametrize(
@@ -1239,7 +1712,7 @@ def test_a_path_with_an_encoded_slash_answers_404(
 
     assert response.status_code == 404, response.text
     assert_private(response)
-    assert service.storage.downloads == []
+    assert service.storage.reads == []
 
 
 @pytest.mark.parametrize("file_name", [GRAPH_FILE_NAME, UPSTREAM_NAME])
@@ -1258,14 +1731,10 @@ CHANGED_CONTENT = b'{"changed":"after publishing"}'
 
 
 def change_document_bytes(storage: StandInStorageClient, published: Any) -> None:
-    storage.objects[published.object_prefix + GRAPH_FILE_NAME] = BucketObject(
-        CHANGED_CONTENT, {"sha256": published.document_sha256}
-    )
-
-
-def change_document_metadata(storage: StandInStorageClient, published: Any) -> None:
-    storage.objects[published.object_prefix + GRAPH_FILE_NAME] = BucketObject(
-        published.content, {"sha256": "f" * 64}
+    storage.store(
+        published.object_prefix + GRAPH_FILE_NAME,
+        CHANGED_CONTENT,
+        metadata={"sha256": published.document_sha256},
     )
 
 
@@ -1277,32 +1746,33 @@ def replace_the_recorded_document(
 
 
 def change_upstream_bytes(storage: StandInStorageClient, published: Any) -> None:
-    storage.objects[published.object_prefix + UPSTREAM_NAME] = BucketObject(
-        CHANGED_CONTENT, {"sha256": UPSTREAM_SHA256}
+    storage.store(
+        published.object_prefix + UPSTREAM_NAME,
+        CHANGED_CONTENT,
+        metadata={"sha256": UPSTREAM_SHA256},
     )
 
 
-def remove_upstream_metadata(storage: StandInStorageClient, published: Any) -> None:
-    storage.objects[published.object_prefix + UPSTREAM_NAME] = BucketObject(
-        UPSTREAM_CONTENT, None
-    )
+def replace_the_named_upstream_file(
+    storage: StandInStorageClient, published: Any
+) -> None:
+    # Bytes and metadata agree, but the name gives another SHA-256.
+    storage.store(published.object_prefix + UPSTREAM_NAME, CHANGED_CONTENT)
 
 
 @pytest.mark.parametrize(
-    ("change", "file_name", "unserved_content"),
+    ("change", "file_name"),
     [
-        (change_document_bytes, GRAPH_FILE_NAME, CHANGED_CONTENT),
-        (change_document_metadata, GRAPH_FILE_NAME, None),
-        (replace_the_recorded_document, GRAPH_FILE_NAME, CHANGED_CONTENT),
-        (change_upstream_bytes, UPSTREAM_NAME, CHANGED_CONTENT),
-        (remove_upstream_metadata, UPSTREAM_NAME, UPSTREAM_CONTENT),
+        (change_document_bytes, GRAPH_FILE_NAME),
+        (replace_the_recorded_document, GRAPH_FILE_NAME),
+        (change_upstream_bytes, UPSTREAM_NAME),
+        (replace_the_named_upstream_file, UPSTREAM_NAME),
     ],
     ids=[
         "document bytes changed",
-        "document metadata of other bytes",
         "document other than the recorded one",
         "upstream bytes changed",
-        "upstream file without its SHA-256",
+        "upstream file other than the one its name gives",
     ],
 )
 def test_a_file_whose_sha256_does_not_match_answers_500_and_is_not_served(
@@ -1310,7 +1780,6 @@ def test_a_file_whose_sha256_does_not_match_answers_500_and_is_not_served(
     caplog: pytest.LogCaptureFixture,
     change: Callable[[StandInStorageClient, Any], None],
     file_name: str,
-    unserved_content: bytes | None,
 ) -> None:
     published = service.publish(upstream={UPSTREAM_NAME: UPSTREAM_CONTENT})
     change(service.storage, published)
@@ -1319,15 +1788,142 @@ def test_a_file_whose_sha256_does_not_match_answers_500_and_is_not_served(
     response = service.get(published.path(file_name))
 
     assert_problem(response, 500, "orrery_graph_digest_mismatch")
-    assert published.content not in response.content
-    if unserved_content is not None:
-        assert unserved_content not in response.content
+    assert CHANGED_CONTENT not in response.content
     assert "X-Orrery-Visibility" not in response.headers
+    assert_error_logged(caplog, published.object_prefix + file_name)
+
+
+def assert_error_logged(caplog: pytest.LogCaptureFixture, object_name: str) -> None:
     assert any(
-        record.levelno == logging.ERROR
-        and published.object_prefix + file_name in record.getMessage()
+        record.levelno == logging.ERROR and object_name in record.getMessage()
         for record in caplog.records
     )
+
+
+def test_files_are_checked_without_their_sha256_metadata(service: Serving) -> None:
+    published = service.publish(upstream={UPSTREAM_NAME: UPSTREAM_CONTENT})
+    for file_name, content in (
+        (GRAPH_FILE_NAME, published.content),
+        (UPSTREAM_NAME, UPSTREAM_CONTENT),
+    ):
+        service.storage.store(published.object_prefix + file_name, content, metadata={})
+    service.submit_producer(licensed_data=True)
+
+    [document] = service.listed()
+    served = {
+        file_name: service.get(published.path(file_name))
+        for file_name in (GRAPH_FILE_NAME, UPSTREAM_NAME)
+    }
+
+    # The upstream file's name gives its SHA-256, which links it to the
+    # licensed producing run.
+    assert document["visibility"] == "private"
+    assert served[GRAPH_FILE_NAME].content == published.content
+    assert served[UPSTREAM_NAME].content == UPSTREAM_CONTENT
+    for response in served.values():
+        assert response.status_code == 200, response.text
+        assert response.headers["X-Orrery-Visibility"] == "private"
+
+
+def large_document(variant: str) -> bytes:
+    """A document of two and a half parts."""
+
+    padding = "x" * (5 * SERVED_PART_BYTES // 2)
+    return json.dumps({"document": variant, "padding": padding}).encode()
+
+
+@pytest.mark.parametrize("file_name", [GRAPH_FILE_NAME, UPSTREAM_NAME])
+def test_a_file_is_hashed_and_then_sent_from_the_same_generation_in_parts(
+    service: Serving, file_name: str
+) -> None:
+    large_upstream_content = large_document("upstream")
+    large_upstream_name = f"upstream-{sha256_hex(large_upstream_content)}.json"
+    published = service.publish(
+        content=large_document("document"),
+        upstream={large_upstream_name: large_upstream_content},
+    )
+    served_name, content = (
+        (GRAPH_FILE_NAME, published.content)
+        if file_name == GRAPH_FILE_NAME
+        else (large_upstream_name, large_upstream_content)
+    )
+    object_name = published.object_prefix + served_name
+    generation = service.storage.generation(object_name)
+
+    response = service.get(published.path(served_name))
+
+    assert response.status_code == 200, response.text
+    assert response.content == content
+    # One read checks the bytes, and a second sends them; both read the
+    # generation that was looked up, to its end, holding at most one part.
+    assert [
+        (read.name, read.generation, read.finished) for read in service.storage.reads
+    ] == [(object_name, generation, True)] * 2
+    assert all(
+        0 < read.largest_held_bytes <= SERVED_PART_BYTES
+        for read in service.storage.reads
+    )
+
+
+@pytest.mark.parametrize("file_name", [GRAPH_FILE_NAME, UPSTREAM_NAME])
+def test_a_file_replaced_after_it_was_looked_up_answers_500_and_is_not_served(
+    service: Serving, caplog: pytest.LogCaptureFixture, file_name: str
+) -> None:
+    published = service.publish(upstream={UPSTREAM_NAME: UPSTREAM_CONTENT})
+    object_name = published.object_prefix + file_name
+    content = service.storage.objects[object_name].content
+
+    def store_a_new_generation(name: str) -> None:
+        # The same bytes, but as another object.
+        if name == object_name:
+            service.storage.store(name, content)
+
+    service.storage.after_lookup = store_a_new_generation
+    caplog.set_level(logging.ERROR)
+
+    response = service.get(published.path(file_name))
+
+    assert_problem(response, 500, "orrery_graph_changed")
+    assert content not in response.content
+    assert "X-Orrery-Visibility" not in response.headers
+    assert_error_logged(caplog, object_name)
+
+
+def test_a_file_replaced_after_its_check_is_not_sent_whole(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    harness = serving_harness(raise_server_exceptions=False)
+    published = harness.publish(content=large_document("document"))
+    object_name = published.object_prefix + GRAPH_FILE_NAME
+
+    def store_a_new_generation_after_the_check(read: ObjectRead) -> None:
+        if read.name == object_name and len(harness.storage.reads) == 1:
+            harness.storage.store(object_name, published.content)
+
+    harness.storage.after_read = store_a_new_generation_after_the_check
+    caplog.set_level(logging.ERROR)
+
+    response = harness.get(published.path())
+
+    # The answer has started, so the collector can only stop it unfinished.
+    assert len(response.content) < len(published.content)
+    assert_error_logged(caplog, object_name)
+
+
+@pytest.mark.parametrize("file_name", [GRAPH_FILE_NAME, UPSTREAM_NAME])
+def test_a_checksum_failure_the_storage_client_reports_answers_500(
+    service: Serving, caplog: pytest.LogCaptureFixture, file_name: str
+) -> None:
+    published = service.publish(upstream={UPSTREAM_NAME: UPSTREAM_CONTENT})
+    object_name = published.object_prefix + file_name
+    service.storage.objects[object_name].corrupt = True
+    caplog.set_level(logging.ERROR)
+
+    response = service.get(published.path(file_name))
+
+    assert_problem(response, 500, "orrery_graph_digest_mismatch")
+    assert "X-Orrery-Visibility" not in response.headers
+    assert_error_logged(caplog, object_name)
 
 
 @pytest.mark.parametrize("endpoint", ["listing", "file"])
@@ -1343,6 +1939,60 @@ def test_an_unavailable_bucket_answers_503(service: Serving, endpoint: str) -> N
     response = service.get(path)
 
     assert_problem(response, 503, "orrery_storage_unavailable")
+    assert int(response.headers["Retry-After"]) > 0
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "failing_method"),
+    [
+        ("listing", "graph_files"),
+        ("listing", "producing_submissions"),
+        ("listing", "licensed_runs_and_builds"),
+        ("file", "graph_file"),
+        ("file", "producing_submissions"),
+        ("file", "licensed_runs_and_builds"),
+    ],
+)
+def test_a_database_that_does_not_answer_gives_503(
+    endpoint: str, failing_method: str
+) -> None:
+    harness = serving_harness(
+        catalogue=lambda in_memory: UnavailableDatabaseCatalogue(
+            in_memory, failing_method
+        )
+    )
+    published = harness.publish(upstream={UPSTREAM_NAME: UPSTREAM_CONTENT})
+    path = (
+        f"{LISTING}?run_id={CONSUMING_RUN}"
+        if endpoint == "listing"
+        else published.path()
+    )
+
+    response = harness.get(path)
+
+    assert_problem(response, 503, "orrery_catalogue_unavailable")
+    assert int(response.headers["Retry-After"]) > 0
+
+
+@pytest.mark.parametrize("endpoint", ["listing", "file"])
+def test_the_postgres_catalogue_s_connection_errors_give_503(endpoint: str) -> None:
+    engine = create_database_engine(UNREACHABLE_DATABASE_URL)
+    try:
+        harness = serving_harness(
+            catalogue=lambda _: serving().PostgresOrreryGraphCatalogue(engine)
+        )
+        published = harness.publish()
+        path = (
+            f"{LISTING}?run_id={CONSUMING_RUN}"
+            if endpoint == "listing"
+            else published.path()
+        )
+
+        response = harness.get(path)
+    finally:
+        engine.dispose()
+
+    assert_problem(response, 503, "orrery_catalogue_unavailable")
     assert int(response.headers["Retry-After"]) > 0
 
 
@@ -1410,6 +2060,25 @@ def test_every_answer_under_the_orrery_graph_path_is_marked_not_to_be_stored(
     for answer in answers:
         assert_private(answer)
     assert "Cache-Control" not in service.client.get("/health").headers
+
+
+def test_maintenance_mode_s_answers_under_the_orrery_graph_path_are_not_to_be_stored() -> (
+    None
+):
+    harness = serving_harness(maintenance_mode=True)
+    published = harness.publish()
+
+    answers = [
+        harness.get(LISTING, params={"run_id": CONSUMING_RUN}),
+        harness.get(published.path()),
+        harness.get(published.path(), headers={}),
+    ]
+
+    assert [answer.status_code for answer in answers] == [503, 503, 503]
+    for answer in answers:
+        assert_private(answer)
+    assert harness.storage.reads == []
+    assert "Cache-Control" not in harness.client.get("/health").headers
 
 
 # Settings.
@@ -1576,11 +2245,19 @@ class RecordStores:
     clock: SteppingClock
 
     def submit(
-        self, *, run_id: str, licensed_data: bool, files: list[dict[str, Any]]
+        self,
+        *,
+        run_id: str,
+        licensed_data: bool,
+        files: list[dict[str, Any]],
+        build_id: str = BUILD,
     ) -> str:
         record, _ = self.submissions.create_submission(
             submission_request(
-                run_id=run_id, build_id=BUILD, licensed_data=licensed_data, files=files
+                run_id=run_id,
+                build_id=build_id,
+                licensed_data=licensed_data,
+                files=files,
             ),
             PRINCIPAL,
         )
@@ -1693,11 +2370,12 @@ def test_the_catalogue_reads_one_document_s_record(
     assert record_stores.catalogue.graph_file(f"sub-{'0' * 32}", "a" * 64) is None
 
 
-def test_the_catalogue_names_the_runs_that_submitted_a_file_other_than_as_upstream(
+def test_the_catalogue_names_the_runs_and_builds_that_submitted_a_file_not_as_upstream(
     record_stores: RecordStores,
 ) -> None:
     record_stores.submit(
         run_id="run-producer",
+        build_id="build-producer",
         licensed_data=False,
         files=[
             submitted_file("graph.schema.json", "schema", UPSTREAM_CONTENT),
@@ -1706,6 +2384,7 @@ def test_the_catalogue_names_the_runs_that_submitted_a_file_other_than_as_upstre
     )
     record_stores.submit(
         run_id="run-second-producer",
+        build_id="build-second-producer",
         licensed_data=True,
         files=[
             *orrery_files("second-producer"),
@@ -1714,6 +2393,7 @@ def test_the_catalogue_names_the_runs_that_submitted_a_file_other_than_as_upstre
     )
     record_stores.submit(
         run_id="run-consumer",
+        build_id="build-consumer",
         licensed_data=True,
         files=[
             *orrery_files("consumer"),
@@ -1721,25 +2401,56 @@ def test_the_catalogue_names_the_runs_that_submitted_a_file_other_than_as_upstre
         ],
     )
 
-    assert record_stores.catalogue.producing_run_ids([UPSTREAM_SHA256, "f" * 64]) == {
-        UPSTREAM_SHA256: frozenset({"run-producer", "run-second-producer"})
+    assert record_stores.catalogue.producing_submissions(
+        [UPSTREAM_SHA256, "f" * 64]
+    ) == {
+        UPSTREAM_SHA256: frozenset(
+            {
+                serving().SubmissionOrigin(
+                    run_id="run-producer", build_id="build-producer"
+                ),
+                serving().SubmissionOrigin(
+                    run_id="run-second-producer", build_id="build-second-producer"
+                ),
+            }
+        )
     }
-    assert record_stores.catalogue.producing_run_ids([]) == {}
+    assert record_stores.catalogue.producing_submissions([]) == {}
 
 
-def test_the_catalogue_names_the_runs_recorded_with_licensed_data(
+def test_the_catalogue_names_the_runs_and_builds_recorded_with_licensed_data(
     record_stores: RecordStores,
 ) -> None:
-    record_stores.submit(
-        run_id="run-licensed", licensed_data=True, files=orrery_files(1)
-    )
-    record_stores.submit(run_id="run-mixed", licensed_data=False, files=orrery_files(2))
-    record_stores.submit(run_id="run-mixed", licensed_data=True, files=orrery_files(3))
-    record_stores.submit(
-        run_id="run-unlicensed", licensed_data=False, files=orrery_files(4)
+    for run_id, build_id, licensed_data, variant in [
+        ("run-licensed", "build-licensed", True, 1),
+        ("run-mixed", "build-mixed", False, 2),
+        ("run-mixed", "build-second", True, 3),
+        ("run-unlicensed", "build-unlicensed", False, 4),
+        # Another run of the mixed build, with licensed data.
+        ("run-rebuilt", "build-mixed", True, 5),
+    ]:
+        record_stores.submit(
+            run_id=run_id,
+            build_id=build_id,
+            licensed_data=licensed_data,
+            files=orrery_files(variant),
+        )
+
+    licensed = record_stores.catalogue.licensed_runs_and_builds(
+        run_ids=["run-licensed", "run-mixed", "run-unlicensed", "run-unknown"],
+        build_ids=["build-mixed", "build-unlicensed", "build-unknown"],
     )
 
-    assert record_stores.catalogue.licensed_run_ids(
-        ["run-licensed", "run-mixed", "run-unlicensed", "run-unknown"]
-    ) == frozenset({"run-licensed", "run-mixed"})
-    assert record_stores.catalogue.licensed_run_ids([]) == frozenset()
+    # Only the run IDs and build IDs asked about come back.
+    assert licensed == serving().LicensedRunsAndBuilds(
+        run_ids=frozenset({"run-licensed", "run-mixed"}),
+        build_ids=frozenset({"build-mixed"}),
+    )
+    assert record_stores.catalogue.licensed_runs_and_builds(
+        run_ids=[], build_ids=[]
+    ) == serving().LicensedRunsAndBuilds(run_ids=frozenset(), build_ids=frozenset())
+    assert record_stores.catalogue.licensed_runs_and_builds(
+        run_ids=[], build_ids=["build-licensed"]
+    ) == serving().LicensedRunsAndBuilds(
+        run_ids=frozenset(), build_ids=frozenset({"build-licensed"})
+    )

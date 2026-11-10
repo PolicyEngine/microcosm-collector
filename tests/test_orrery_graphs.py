@@ -996,6 +996,67 @@ def test_an_upstream_file_named_like_the_graph_file_rejects_the_submission() -> 
     assert publishing.bucket.stored == {}
 
 
+@pytest.mark.parametrize(
+    "upstream_name",
+    [
+        "producing-graph-declaration.json",
+        f"upstream-{UPSTREAM_SHA256[:32]}.json",
+        f"upstream-{UPSTREAM_SHA256.upper()}.json",
+        f"upstream-{UPSTREAM_SHA256}.txt",
+        f"upstream-{UPSTREAM_SHA256}.json.json",
+    ],
+    ids=[
+        "another name",
+        "a short digest",
+        "a digest in capitals",
+        "another extension",
+        "a doubled extension",
+    ],
+)
+def test_an_upstream_file_not_named_upstream_sha256_json_rejects_the_submission(
+    upstream_name: str,
+) -> None:
+    # Microcosm names each upstream file it copies upstream-<its SHA-256>.json
+    # (save_graph_schema), and the service reads the digest from the name.
+    submission = accepted(
+        {
+            **fixture_inputs(EVIDENCE_CASE),
+            upstream_name: ("upstream", UPSTREAM_CONTENT),
+        }
+    )
+    publishing = Publishing()
+
+    submission.run(publishing)
+
+    assert submission.record().status == "rejected"
+    rejection = submission.record().rejection
+    assert rejection["code"] == "orrery_inputs_unusable"
+    assert upstream_name in rejection["message"]
+    assert publishing.bucket.stored == {}
+    assert publishing.records.records == {}
+
+
+def test_an_upstream_file_named_by_another_file_s_sha256_rejects_the_submission() -> (
+    None
+):
+    submission = accepted(
+        {
+            **fixture_inputs(EVIDENCE_CASE),
+            UPSTREAM_NAME: ("upstream", UNLINKED_CONTENT),
+        }
+    )
+    publishing = Publishing()
+
+    submission.run(publishing)
+
+    assert submission.record().status == "rejected"
+    rejection = submission.record().rejection
+    assert rejection["code"] == "orrery_inputs_unusable"
+    assert UPSTREAM_NAME in rejection["message"]
+    assert publishing.bucket.stored == {}
+    assert publishing.records.records == {}
+
+
 def test_objects_are_created_once_in_a_folder_named_by_the_document() -> None:
     submission, publishing, result = published_run(fixture_inputs(LINKLESS_CASE))
 
