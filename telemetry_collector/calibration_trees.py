@@ -19,8 +19,8 @@ country's latest when its release is the country's default release in
 ``DEFAULT_RELEASES``.
 
 The worker registers this handler only where ``COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN``
-is set (``handlers_from_environment``); elsewhere submissions stay in intake
-storage and can be reprocessed once it is.
+is set (``registered_handlers``, which ``telemetry_collector.handlers`` reads);
+elsewhere submissions stay in intake storage and can be reprocessed once it is.
 """
 
 from __future__ import annotations
@@ -42,7 +42,6 @@ import sqlalchemy as sa
 from telemetry_collector.submission_store import SubmissionRecord
 from telemetry_collector.submissions import INTAKE_ONLY_HANDLER
 from telemetry_collector.worker import (
-    DEFAULT_HANDLERS,
     WORKER_TASK_TIMEOUT_SECONDS,
     JobContext,
     JobHandler,
@@ -394,14 +393,14 @@ def calibration_tree_handler(
     return build_tree
 
 
-def handlers_from_environment(
+def registered_handlers(
     *, engine: sa.Engine | None, environ: Mapping[str, str] = os.environ
-) -> Mapping[str, JobHandler]:
-    """The worker's handlers: the tree handler only where its Blob token is set."""
+) -> dict[str, JobHandler]:
+    """The tree handler, only where the worker job has its Blob token."""
 
     blob_token = environ.get(BLOB_TOKEN_SETTING, "").strip()
     if not blob_token:
-        return DEFAULT_HANDLERS
+        return {}
     size_limits = {
         name: environ[name].strip()
         for name in SIZE_LIMIT_SETTINGS
@@ -414,7 +413,6 @@ def handlers_from_environment(
         return postgres_manifest_lock(engine)()
 
     return {
-        **DEFAULT_HANDLERS,
         "calibration-diagnostics": calibration_tree_handler(
             blob_token=blob_token, manifest_lock=manifest_lock, size_limits=size_limits
         ),

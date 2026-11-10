@@ -384,6 +384,7 @@ def test_service_deployment_reads_resource_names_from_environment_variables() ->
         "WORKER_SERVICE_ACCOUNT": "TELEMETRY_WORKER_SERVICE_ACCOUNT",
         "WORKER_INVOKER_SERVICE_ACCOUNT": "TELEMETRY_WORKER_INVOKER_SERVICE_ACCOUNT",
         "RECOVERY_SERVICE_ACCOUNT": "TELEMETRY_RECOVERY_SERVICE_ACCOUNT",
+        "ORRERY_BUCKET": "TELEMETRY_ORRERY_BUCKET",
     }
     for environment_name, github_variable_name in expected_variables.items():
         assert (
@@ -423,6 +424,19 @@ def test_both_deploy_jobs_read_their_calibration_tree_blob_secret_name() -> None
         assert (
             jobs[job_name]["env"].get("CALIBRATION_TREE_BLOB_SECRET_NAME") == mapping
         ), job_name
+    assert PUSH_WORKFLOW.read_text(encoding="utf-8").count(mapping) == 2
+
+
+def test_both_deploy_jobs_read_their_orrery_bucket() -> None:
+    jobs = load_workflow(PUSH_WORKFLOW)["jobs"]
+    mapping = "${{ vars.TELEMETRY_ORRERY_BUCKET }}"
+
+    # Each environment names its own private bucket, which only its worker
+    # job gets; no step passes it anywhere else.
+    for job_name in DEPLOY_JOBS:
+        assert jobs[job_name]["env"].get("ORRERY_BUCKET") == mapping, job_name
+        for step in jobs[job_name]["steps"]:
+            assert "ORRERY_BUCKET" not in step.get("env", {}), (job_name, step)
     assert PUSH_WORKFLOW.read_text(encoding="utf-8").count(mapping) == 2
 
 

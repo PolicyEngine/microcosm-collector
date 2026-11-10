@@ -40,6 +40,8 @@ HUGGINGFACE_SETTINGS = {"HF_READ_SECRET_NAME": "hugging-face-read-token"}
 CALIBRATION_TREE_SETTINGS = {
     "CALIBRATION_TREE_BLOB_SECRET_NAME": "calibration-tree-blob-token"
 }
+# ...and its own private Orrery bucket, which only the worker job gets.
+ORRERY_SETTINGS = {"ORRERY_BUCKET": "orrery-bucket"}
 LOGGING_GCLOUD = (
     "printf 'gcloud' >> \"$COMMAND_LOG\"\n"
     'printf \' <%s>\' "$@" >> "$COMMAND_LOG"\n'
@@ -96,7 +98,7 @@ def test_require_configuration_lists_every_missing_variable() -> None:
         "INTAKE_BUCKET WORKER_QUEUE WORKER_JOB RECOVERY_JOB "
         "WORKER_SERVICE_ACCOUNT WORKER_INVOKER_SERVICE_ACCOUNT "
         "RECOVERY_SERVICE_ACCOUNT HF_READ_SECRET_NAME "
-        "CALIBRATION_TREE_BLOB_SECRET_NAME\n"
+        "CALIBRATION_TREE_BLOB_SECRET_NAME ORRERY_BUCKET\n"
     )
 
 
@@ -122,6 +124,7 @@ def complete_configuration(deployment_environment: str) -> dict[str, str]:
         **DEPLOY_INTAKE_SETTINGS,
         **HUGGINGFACE_SETTINGS,
         **CALIBRATION_TREE_SETTINGS,
+        **ORRERY_SETTINGS,
     }
     return configuration
 
@@ -205,6 +208,35 @@ def test_require_configuration_requires_the_calibration_tree_blob_secret(
     assert result.stderr == (
         "Missing telemetry deployment configuration: "
         "CALIBRATION_TREE_BLOB_SECRET_NAME\n"
+    )
+
+
+@pytest.mark.parametrize("deployment_environment", ["staging", "production"])
+def test_require_configuration_requires_the_orrery_bucket(
+    deployment_environment: str,
+) -> None:
+    configuration = complete_configuration(deployment_environment)
+    del configuration["ORRERY_BUCKET"]
+
+    result = run_deploy("require-configuration", environment=configuration)
+
+    assert result.returncode == 1
+    assert result.stderr == (
+        "Missing telemetry deployment configuration: ORRERY_BUCKET\n"
+    )
+
+
+def test_require_configuration_names_every_malformed_bucket() -> None:
+    configuration = complete_configuration("production")
+    configuration["INTAKE_BUCKET"] = "gs://intake-bucket"
+    configuration["ORRERY_BUCKET"] = "gs://orrery-bucket"
+
+    result = run_deploy("require-configuration", environment=configuration)
+
+    assert result.returncode == 1
+    assert result.stderr == (
+        "INTAKE_BUCKET is not a valid resource name.\n"
+        "ORRERY_BUCKET is not a valid resource name.\n"
     )
 
 
@@ -452,6 +484,8 @@ PROJECT_RESOURCES = "projects/project/locations/region"
 # becomes, and how the deploy turns the name into that setting.
 COLLECTOR_SETTING_SHAPES = {
     "INTAKE_BUCKET": (BUCKET_PATTERN, "{}"),
+    # The worker's COLLECTOR_ORRERY_BUCKET has the intake bucket's pattern.
+    "ORRERY_BUCKET": (BUCKET_PATTERN, "{}"),
     "WORKER_QUEUE": (QUEUE_PATTERN, PROJECT_RESOURCES + "/queues/{}"),
     "WORKER_JOB": (JOB_PATTERN, PROJECT_RESOURCES + "/jobs/{}"),
     "RECOVERY_JOB": (JOB_PATTERN, PROJECT_RESOURCES + "/jobs/{}"),
@@ -467,6 +501,11 @@ COLLECTOR_SETTING_SHAPES = {
         ("INTAKE_BUCKET", "Intake-Bucket"),
         ("INTAKE_BUCKET", "-intake-bucket"),
         ("INTAKE_BUCKET", "gs://intake-bucket"),
+        ("ORRERY_BUCKET", "collector-orrery.example"),
+        ("ORRERY_BUCKET", "Orrery-Bucket"),
+        ("ORRERY_BUCKET", "gs://orrery-bucket"),
+        ("ORRERY_BUCKET", "a" * 63),
+        ("ORRERY_BUCKET", "a" * 64),
         ("WORKER_QUEUE", "Worker-Queue-2"),
         ("WORKER_QUEUE", "projects/project/locations/region/queues/worker-queue"),
         ("WORKER_QUEUE", "worker_queue"),
@@ -566,6 +605,7 @@ def test_deploy_script_patterns_are_the_collectors() -> None:
             "invoker@example.invalid",
         ),
         ("configure-worker-job", "INTAKE_BUCKET", "gs://intake-bucket"),
+        ("configure-worker-job", "ORRERY_BUCKET", "gs://orrery-bucket"),
         ("configure-recovery-job", "WORKER_QUEUE", PROJECT_RESOURCES + "/queues/q"),
         ("configure-recovery-job", "WORKER_JOB", "Worker-Job"),
         (
@@ -894,6 +934,7 @@ def job_deploy_environment(
         **DEPLOY_INTAKE_SETTINGS,
         **HUGGINGFACE_SETTINGS,
         **CALIBRATION_TREE_SETTINGS,
+        **ORRERY_SETTINGS,
     }
 
 
@@ -921,12 +962,55 @@ def test_worker_job_update_mounts_the_read_token_in_both_environments(
         "<--set-secrets> <DATABASE_URL=database-url:latest,"
         "COLLECTOR_HF_READ_TOKEN=hugging-face-read-token:latest,"
         "COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN=calibration-tree-blob-token:latest> "
-        "<--set-env-vars> <COLLECTOR_INTAKE_BUCKET=intake-bucket> "
+        "<--set-env-vars> <COLLECTOR_INTAKE_BUCKET=intake-bucket,"
+        "COLLECTOR_ORRERY_BUCKET=orrery-bucket> "
         "<--command> <uv> "
         "<--args> <run,--no-sync,python,-m,telemetry_collector.worker> "
         "<--tasks> <1> <--max-retries> <2> <--task-timeout> <1h> "
         "<--cpu> <2> <--memory> <8Gi> <--quiet>\n"
     )
+
+
+def test_worker_job_settings_name_a_bucket_the_orrery_handler_accepts(
+    tmp_path: Path,
+) -> None:
+    import importlib
+
+    command_log = tmp_path / "commands.log"
+    install_command_stub(tmp_path, "gcloud", LOGGING_GCLOUD)
+
+    result = run_deploy(
+        "configure-worker-job",
+        environment=job_deploy_environment(tmp_path, command_log, "production"),
+    )
+
+    assert result.returncode == 0, result.stderr
+    settings = logged_setting_values(command_log.read_text())
+    orrery_graphs = importlib.import_module("telemetry_collector.orrery_graphs")
+    assert orrery_graphs.orrery_bucket(settings) == "orrery-bucket"
+
+
+@pytest.mark.parametrize(
+    "deploy_command",
+    ["deploy-maintenance", "deploy-candidate", "configure-recovery-job"],
+)
+def test_only_the_worker_job_gets_the_orrery_bucket(
+    tmp_path: Path, deploy_command: str
+) -> None:
+    command_log = tmp_path / "commands.log"
+    install_command_stub(tmp_path, "gcloud", LOGGING_GCLOUD)
+    if deploy_command.startswith("deploy-"):
+        environment = service_deploy_environment(tmp_path, command_log, "staging")
+    else:
+        environment = job_deploy_environment(tmp_path, command_log, "staging")
+    environment.update(ORRERY_SETTINGS)
+
+    result = run_deploy(deploy_command, environment=environment)
+
+    assert result.returncode == 0, result.stderr
+    command = command_log.read_text()
+    assert "ORRERY" not in command
+    assert "orrery-bucket" not in command
 
 
 def test_worker_job_gives_each_job_the_attempts_and_time_the_worker_counts_on(
@@ -1047,6 +1131,7 @@ def test_recovery_job_update_dispatches_through_the_worker_queue(
     [
         ("configure-worker-job", "WORKER_SERVICE_ACCOUNT"),
         ("configure-worker-job", "INTAKE_BUCKET"),
+        ("configure-worker-job", "ORRERY_BUCKET"),
         ("configure-recovery-job", "RECOVERY_SERVICE_ACCOUNT"),
         ("configure-recovery-job", "WORKER_INVOKER_SERVICE_ACCOUNT"),
     ],

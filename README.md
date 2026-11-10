@@ -345,9 +345,10 @@ worker, a Cloud Run Job running
 `uv run --no-sync python -m telemetry_collector.worker`, recomputes every
 file's SHA-256 and runs the handler registered for the kind. Where the
 worker job has its calibration tree Blob token, `calibration-diagnostics`
-submissions build calibration trees ("Building trees from submissions");
-`orrery-inputs` submissions are only checked and kept until the Orrery worker
-registers its handler.
+submissions build calibration trees ("Building trees from submissions"), and
+where it has its private Orrery bucket, `orrery-inputs` submissions publish
+Orrery graph files ("Publishing Orrery graph files"). Otherwise a kind's
+submissions are only checked and kept in intake storage.
 
 Intake is off unless `COLLECTOR_INTAKE_ENABLED` is exactly `1`. While it is
 off, the collector reads no other intake setting, and the token exchange for
@@ -385,6 +386,7 @@ bucket.
 | `COLLECTOR_WORKER_JOB_ID` | worker | set on each execution by its Cloud Task | not set by the deploy |
 | `DATABASE_URL` | worker, operations | the runtime database secret, as for the service | `TELEMETRY_DATABASE_SECRET_NAME` |
 | `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN` | worker | the read-write token of the environment's own calibration tree Vercel Blob store, a Secret Manager secret; without it, `calibration-diagnostics` submissions stay in intake storage (see "Building trees from submissions") | `TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME`, the secret's name |
+| `COLLECTOR_ORRERY_BUCKET` | worker | the name of the environment's private Orrery bucket, which Orrery graph files are published to; without it, `orrery-inputs` submissions stay in intake storage (see "Publishing Orrery graph files") | `TELEMETRY_ORRERY_BUCKET` |
 
 The `TELEMETRY_*` names are GitHub `staging` and `production` environment
 variables, which `.github/workflows/push.yaml` passes to `scripts/deploy.sh`.
@@ -397,6 +399,7 @@ The deploy also reads these, to update the two jobs:
 | `TELEMETRY_RECOVERY_SERVICE_ACCOUNT` | the recovery job's service account |
 | `TELEMETRY_HF_READ_SECRET_NAME` | the environment's own Hugging Face read token's secret, mounted on the worker job (see "Hugging Face read access") |
 | `TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME` | the secret holding the read-write token of the environment's own calibration tree Blob store, mounted on the worker job only as `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN` (see "Building trees from submissions") |
+| `TELEMETRY_ORRERY_BUCKET` | the name of the environment's private Orrery bucket, set on the worker job only as `COLLECTOR_ORRERY_BUCKET`; the service and the recovery job don't get it (see "Publishing Orrery graph files") |
 
 The two service-account settings accept only user-managed accounts,
 `<name>@<project>.iam.gserviceaccount.com`. The collector refuses to start
@@ -447,7 +450,11 @@ role creates in `public` after they are set.
   is true for each of them and each of the four privileges.
 
 The intake code needs `SELECT`, `INSERT` and `UPDATE`; row locks
-(`SELECT ... FOR UPDATE`) need `UPDATE`. No table uses a sequence. A `serial`
+(`SELECT ... FOR UPDATE`) need `UPDATE`. The Orrery graph handler needs
+`SELECT` and `INSERT` on `orrery_graph_files`, which migration
+`0003_orrery_graph_files` creates: it records each published graph file with
+`INSERT ... ON CONFLICT DO NOTHING RETURNING`, and `RETURNING` needs
+`SELECT`. No table uses a sequence. A `serial`
 column would need `USAGE` on its sequence, which these default privileges
 don't give, so a migration that adds one needs
 `GRANT USAGE, SELECT ON SEQUENCES` added to the default privileges first; an
@@ -490,17 +497,20 @@ and region, these resources, created by hand (both environments have them):
   minutes. The deploy updates both jobs but never creates one, so each must
   exist, with the permissions below, before the release that first deploys
   to its environment.
-- **Database access:** after the migration, the runtime database user has
-  `SELECT`, `INSERT`, `UPDATE` and `DELETE` on `artifact_submissions` and
-  `artifact_jobs`, through the migration user's default privileges, which
-  both environments already have (see "Database access").
+- **Database access:** after the migrations, the runtime database user has
+  `SELECT`, `INSERT`, `UPDATE` and `DELETE` on `artifact_submissions`,
+  `artifact_jobs` and `orrery_graph_files`, through the migration user's
+  default privileges, which both environments already have (see "Database
+  access").
 - **Permissions:** the runtime service account may create and read objects in
   the bucket, sign as itself (`roles/iam.serviceAccountTokenCreator` on
   itself), enqueue on the queue, and act as the invoker account; the invoker
   account may run the worker job with overrides; the worker's service account
-  may read the bucket, connect to Cloud SQL and read the runtime database
-  secret, its environment's Hugging Face read token's secret and its
-  environment's calibration tree Blob token's secret; the recovery
+  may read the bucket, create and read objects in its environment's private
+  Orrery bucket (see "Publishing Orrery graph files"), connect to Cloud SQL
+  and read the runtime database secret, its environment's Hugging Face read
+  token's secret and its environment's calibration tree Blob token's secret;
+  the recovery
   job's service account may connect to Cloud SQL, read the runtime database
   secret, enqueue on the queue and act as the invoker account; Cloud
   Scheduler's account may run the recovery job; and the deployment service
@@ -509,9 +519,10 @@ and region, these resources, created by hand (both environments have them):
 Each release, in each environment, `scripts/deploy.sh`:
 
 1. checks, before it changes anything:
-   - that every intake name has the shape the collector accepts
-     (`require-configuration`, before it authenticates), so a malformed name
-     stops the deploy before a revision or job that reads it fails to start;
+   - that every intake name, and the Orrery bucket's name, has the shape the
+     collector accepts (`require-configuration`, before it authenticates), so
+     a malformed name stops the deploy before a revision or job that reads it
+     fails to start;
    - that each job exists, already runs as the service account the deploy
      gives it, and connects to the environment's own Cloud SQL instance
      (`check-intake-jobs`), so a variable naming the other environment's job
@@ -529,8 +540,10 @@ Each release, in each environment, `scripts/deploy.sh`:
    command, task count, retries, task timeout, CPU and memory. Each update
    sets the job's secrets with `--set-secrets`, which replaces every mount,
    so the worker job's lists `DATABASE_URL`, `COLLECTOR_HF_READ_TOKEN` and
-   `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN` together. The deploy changes
-   neither the schedule nor any job's permissions.
+   `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN` together, and sets the worker
+   job's settings, `COLLECTOR_INTAKE_BUCKET` and `COLLECTOR_ORRERY_BUCKET`,
+   with `--set-env-vars`. The deploy changes neither the schedule nor any
+   job's permissions.
 
 Maintenance mode holds only the service. An execution of either job keeps the
 image it started with, for all its attempts: a worker execution that is
@@ -592,8 +605,8 @@ database.
 projection. `orrery_json_from_schema(schema, execution=overlay)` turns a
 build's saved compiler schema (`graph.schema.json`) and execution overlay
 (`graph.execution.json`) into the Orrery JSON that Microcosm's projection
-writes from them, byte for byte. It needs only the standard library. Nothing
-in the service calls it yet; the collector's Orrery worker will.
+writes from them, byte for byte. It needs only the standard library. The
+worker's Orrery graph handler calls it ("Publishing Orrery graph files").
 
 `provenance.py` records the Microcosm commit the modules were copied from,
 each source file's git blob ID, and what the one changed module,
@@ -647,8 +660,10 @@ stored in PostgreSQL's `jsonb`: shortening keeps whole characters, and an
 unpaired surrogate or a NUL, which a document's JSON can escape and Orrery
 repeats in its issues, becomes U+FFFD. microcosm-runs also
 refuses a graph file over 64 MiB and file names outside its role patterns;
-those are checks on the publication, which the Orrery worker (O4) makes, not
-on the document.
+those are checks on a publication to microcosm-runs, not on the document. The
+collector publishes graph files to its own private bucket instead
+("Publishing Orrery graph files"), and its projection already refuses a
+document over 64 MiB.
 
 `telemetry_collector.orrery.validation.validate_orrery_document(document,
 published_file_names)` runs it and returns the Orrery version, raises
@@ -666,13 +681,126 @@ uv run python -m telemetry_collector.orrery.validation graph.orrery.json NAME...
 The image holds Node 24.21.0, copied from the official image by digest, and the
 validator installed with `npm ci`. npm is not in the image. CI checks the built
 image with `tools/check-worker-image.sh`, which runs the validator inside it on
-a projected document and on one Orrery refuses. Nothing in the service or the
-worker validates documents yet; the collector's Orrery worker will.
+a projected document and on one Orrery refuses. The worker's Orrery graph
+handler validates every document it publishes.
 
 To move to another Orrery version, change the version in
 `orrery-validator/package.json`, run `npm install --prefix orrery-validator
 --package-lock-only --ignore-scripts`, and update `ORRERY_VERSION` in
-`tests/test_orrery_validation.py`.
+`tests/test_orrery_validation.py` and `tests/test_orrery_graphs.py`.
+
+### Publishing Orrery graph files
+
+The worker job publishes an Orrery graph file from each `orrery-inputs`
+submission (`telemetry_collector/orrery_graphs.py`) where it has
+`COLLECTOR_ORRERY_BUCKET`, the name of its environment's private Orrery
+bucket, which the deploy sets on the worker job only, from the GitHub
+environment variable `TELEMETRY_ORRERY_BUCKET`. Without it, submissions stay
+in intake storage and can be reprocessed later (`reprocess --kind
+orrery-inputs --intake-only`). The handler is registered in
+`telemetry_collector/handlers.py`, the worker's one registry, beside the
+calibration tree handler.
+
+- **Inputs.** Each attempt downloads the schema and the execution overlay
+  into a new temporary directory. Upstream files are downloaded only after
+  links are removed, and only those the document still links to: removing
+  links needs only their names, from the submission's file list, and the
+  projection doesn't read them. Evidence files are never downloaded. The
+  handler reads the schema and overlay as Microcosm's own command reads its
+  input (`_read_json` at the projection's source commit): at most 32 MiB,
+  strict JSON in UTF-8, no key repeated within an object, no `NaN` or
+  infinity, and nested no deeper than Python's JSON decoder can parse. The
+  projection, `orrery_json_from_schema(schema, execution=overlay)`, builds
+  the document. These reject the submission with `orrery_inputs_unusable`:
+  - a schema or overlay that fails those reading rules. A schema over
+    32 MiB is rejected here, although intake accepts schemas up to 64 MiB;
+  - a `TypeError`, `ValueError` or `RecursionError` from the projection, with
+    its message shortened to 500 characters. Microcosm's command treats these
+    as input errors, and also `OSError` and `GraphRuntimeError`, which the
+    copied projection never raises;
+  - an upstream file named `graph.orrery.json`, the document's own name.
+
+  The worker records a NUL or an unpaired surrogate in a rejection's message,
+  such as a schema column name the projection repeats, as U+FFFD, as it does
+  for every handler, because PostgreSQL's `jsonb` cannot store them. Any
+  exception from the projection other than a `TypeError`, `ValueError` or
+  `RecursionError`, for example a `KeyError` or an `AttributeError`, fails the
+  attempt and is retried, as Microcosm's own command would crash on it.
+- **Links.** Evidence files stay in private intake storage, so a published
+  document doesn't link to them: each evidence reference keeps its label and
+  SHA-256 but loses its link, whatever the link's scheme, `https://`
+  included. The evidence references are the overlay's phase references
+  (`metadata.execution.phases[].references`) and the document's `artifacts`,
+  which the projection builds only from the overlay: it copies a phase
+  reference's `url` into its artifact's `uri`. There every `url` and `uri` is
+  removed unless it names a submitted upstream file before any `#`.
+  Everywhere else, a `url` or `uri` stays only when it starts with
+  `https://` or names a submitted upstream file before any `#`, as Microcosm
+  writes those links (`upstream-<sha256>.json`), and every other one is
+  removed. The rest of each object stays.
+- **What removal changes.** Each node or edge that lost a link gets a new
+  `revision`: the projection's digest of the record as published, computed as
+  the projection computes it. `metadata.execution` is the submitted overlay
+  with its links removed as above, and `metadata.microcosm.extensions` the
+  schema's extensions likewise. The digests that describe the submitted files
+  are not changed: `metadata.microcosm.schema_sha256` and the document's own
+  `revision` still describe the schema and overlay as submitted. The document
+  is serialised exactly as the projection serialises it, so a document with
+  nothing removed has the projection's bytes.
+- **Checks.** The pinned validator ("Orrery validation") validates the
+  document, with the upstream files it still links to as its published
+  files. A refusal rejects the submission with `orrery_document_refused`,
+  naming the validator's code and its first issue's path; a validator that
+  could not run fails the attempt, so it runs again.
+- **Storage.** The document and each upstream file it links to are written
+  to `graphs/<submission_id>/<document sha256>/` in the bucket, as
+  `graph.orrery.json` and under their own names, upstream files first, with
+  the content type `application/json` and their SHA-256 in the `sha256`
+  metadata, as intake objects carry it. A write only ever creates an object
+  (`if_generation_match=0`). An existing object with the same SHA-256 is
+  kept, so a retry, or a reprocessing with the same code, writes nothing
+  new, and a reprocessing after the projection changes writes a new folder.
+  An existing object with another SHA-256 fails the attempt. Upstream files
+  the document doesn't link to, and evidence files, are not written.
+- **Record.** Each document is recorded in `orrery_graph_files`: its
+  submission and processing round, run, build and country, its folder,
+  SHA-256 and size, how many upstream files it links to, the Orrery version
+  that validated it, the Microcosm commit the projection was copied from
+  (`projection_source`), the collector's version, whether it was
+  reconstructed (false for every document built from a submission's own
+  inputs), and its visibility. A document already recorded for the
+  submission keeps its first row.
+- **Visibility.** A licensed build's graph file is recorded `private`: it
+  stays in the private bucket, to be served only to signed-in members of
+  the PolicyEngine organization (tracker 2b · 5), and no clearance step makes
+  it public. Any other build's is recorded `public`; publishing those
+  publicly is tracker 2b · 5 too. Nothing serves either yet.
+- **Result.** The receipt's result is `{"processed_by": "orrery-graph",
+  "object_prefix", "document_sha256", "document_bytes", "upstream_files",
+  "orrery_version", "visibility", "removed_links"}`, where `removed_links`
+  counts the `url` and `uri` keys removed.
+
+Each environment's bucket, and the worker account's access to it, are set up
+before the first deploy, as the permissions list in "Worker jobs and
+recovery" describes. The deploy neither creates nor checks them. Each
+bucket needs:
+
+- **Private:** uniform bucket-level access, with public access prevention
+  enforced.
+- **Access:** only that environment's worker service account may use its
+  objects, with `roles/storage.objectCreator` and
+  `roles/storage.objectViewer` on the bucket: it creates objects and reads
+  an existing object's SHA-256 back, and can neither replace nor delete one.
+  The service's account gets read access when it serves the files (tracker
+  2b · 5).
+
+Once `0003_orrery_graph_files` is applied, an image without it cannot run
+against the database, as with `0002_artifact_intake` above: its migration job
+cannot find the revision and its `/ready` check fails. To roll back to such
+an image, first run `alembic downgrade 0002_artifact_intake` with this
+release's code, as the migration database user. That drops
+`orrery_graph_files` and every record in it; the graph files stay in the
+bucket, and reprocessing the submissions records them again.
 
 ## Calibration tree package
 
@@ -1075,7 +1203,9 @@ The deployment's access and configuration are provisioned:
   `TELEMETRY_HF_READ_SECRET_NAME` for its own Hugging Face read token's
   secret (see "Artifact intake"), and
   `TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME` for its own calibration tree
-  Blob store's token's secret (see "Building trees from submissions").
+  Blob store's token's secret (see "Building trees from submissions"), and
+  `TELEMETRY_ORRERY_BUCKET` for its own private Orrery bucket (see
+  "Publishing Orrery graph files").
   `scripts/deploy.sh require-configuration` names any that is missing, and
   the deployment stops before it authenticates.
 

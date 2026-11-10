@@ -3,10 +3,11 @@
 Cloud Tasks starts an execution of the worker job with ``COLLECTOR_WORKER_JOB_ID``
 set. The worker leases that job, recomputes the SHA-256 of every file at the
 generation recorded at completion, then calls the handler registered for the
-submission's kind. Where the worker job has a calibration tree Blob token,
-``calibration-diagnostics`` submissions build calibration trees
-(``telemetry_collector.calibration_trees``); otherwise, and for Orrery inputs
-until the Orrery worker registers its handler, they only have their bytes
+submission's kind (``telemetry_collector.handlers``). Where the worker job has
+a calibration tree Blob token, ``calibration-diagnostics`` submissions build
+calibration trees (``telemetry_collector.calibration_trees``), and where it has
+an Orrery bucket, ``orrery-inputs`` submissions publish Orrery graph files
+(``telemetry_collector.orrery_graphs``). Otherwise they only have their bytes
 checked.
 
 Run it with ``python -m telemetry_collector.worker``.
@@ -17,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import uuid
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
@@ -49,6 +51,11 @@ from telemetry_collector.submissions import (
 WORKER_TASK_TIMEOUT_SECONDS = 60 * 60
 JOB_LEASE_SECONDS = WORKER_TASK_TIMEOUT_SECONDS + 5 * 60
 MAX_ERROR_MESSAGE_CHARACTERS = 500
+REPLACEMENT_CHARACTER = "\ufffd"
+# NUL, which PostgreSQL's jsonb cannot store, and the surrogate code points,
+# which UTF-8 cannot encode. Python holds a character above U+FFFF as one code
+# point, never as a surrogate pair, so each surrogate here is unpaired.
+_UNSTORABLE_CHARACTER = re.compile("[\x00\ud800-\udfff]")
 
 
 class SubmissionRejectedError(Exception):
@@ -154,9 +161,35 @@ def verify_stored_bytes(context: JobContext) -> None:
             )
 
 
+def storable_text(text: str) -> str:
+    """``text`` with U+FFFD in place of each character the database can't store.
+
+    These are NUL and unpaired surrogates, which the Orrery validator script's
+    ``shortened`` replaces in the same way. Each becomes exactly one code
+    point, so text shortened to a number of code points keeps that length.
+    """
+
+    return _UNSTORABLE_CHARACTER.sub(REPLACEMENT_CHARACTER, text)
+
+
+def _storable(value: Any) -> Any:
+    """A JSON value with ``storable_text`` applied to every string, keys too."""
+
+    if isinstance(value, str):
+        return storable_text(value)
+    if isinstance(value, Mapping):
+        return {_storable(key): _storable(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_storable(item) for item in value]
+    return value
+
+
 def _error_summary(error: Exception) -> dict[str, str]:
     message = f"{type(error).__name__}: {error}"
-    return {"code": "worker_error", "message": message[:MAX_ERROR_MESSAGE_CHARACTERS]}
+    return {
+        "code": "worker_error",
+        "message": storable_text(message[:MAX_ERROR_MESSAGE_CHARACTERS]),
+    }
 
 
 def run_job(
@@ -168,7 +201,12 @@ def run_job(
     holder: str,
     lease_seconds: float = JOB_LEASE_SECONDS,
 ) -> JobOutcome:
-    """Process one job once; safe to call again for the same job."""
+    """Process one job once; safe to call again for the same job.
+
+    A handler's rejection, an error's message and a handler's result are
+    recorded with ``storable_text`` applied to every string in them, so text
+    the database can't store never stops the job from finishing.
+    """
 
     claimed = submissions.claim_job(job_id, holder=holder, lease_seconds=lease_seconds)
     if claimed is None:
@@ -190,7 +228,7 @@ def run_job(
             holder=holder,
             status="rejected",
             result=None,
-            rejection={"code": rejection.code, "message": rejection.message},
+            rejection=_storable({"code": rejection.code, "message": rejection.message}),
         )
         return JobOutcome.FINISHED
     except Exception as error:
@@ -203,7 +241,11 @@ def run_job(
         submissions.release_job(job_id, holder=holder, error=summary)
         return JobOutcome.RETRY
     submissions.finish_job(
-        job_id, holder=holder, status="succeeded", result=result, rejection=None
+        job_id,
+        holder=holder,
+        status="succeeded",
+        result=_storable(result),
+        rejection=None,
     )
     return JobOutcome.FINISHED
 
@@ -231,8 +273,8 @@ def main() -> int:
     # retry continues its own lease while a duplicate execution cannot.
     holder = os.environ.get("CLOUD_RUN_EXECUTION") or f"local-{uuid.uuid4().hex}"
     engine = create_database_engine(database_url)
-    # Imported here: the calibration tree handler builds on this module.
-    from telemetry_collector.calibration_trees import handlers_from_environment
+    # Imported here: the handlers build on this module.
+    from telemetry_collector.handlers import handlers_from_environment
 
     try:
         outcome = run_job(
