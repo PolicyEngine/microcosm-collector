@@ -56,9 +56,6 @@ from tests.test_submission_store import SteppingClock
 SERVING_MODULE = "telemetry_collector.orrery_serving"
 READ_APP_MODULE = "telemetry_collector.orrery_read_app"
 ROUTES_MODULE = "telemetry_collector.orrery_graph_api"
-# The custom audience the read service accepts, which microcosm-runs requests
-# its identity tokens for.
-AUDIENCE = "microcosm-collector/orrery-graphs"
 READER = "microcosm-runs-reader@example-project.iam.gserviceaccount.com"
 BUCKET = "collector-orrery-test"
 JWT_SECRET = "test-secret-that-is-long-enough-32"
@@ -1553,10 +1550,6 @@ def test_the_read_service_verifies_no_token(service: Serving) -> None:
     for headers in ({}, {"Authorization": "Bearer not-a-token"}):
         assert service.get(published.path(), headers=headers).status_code == 200
     assert importlib.util.find_spec("telemetry_collector.orrery_access") is None
-
-
-def test_the_read_service_documents_the_custom_audience_microcosm_runs_uses() -> None:
-    assert read_app().ORRERY_GRAPHS_AUDIENCE == AUDIENCE
 
 
 @dataclass

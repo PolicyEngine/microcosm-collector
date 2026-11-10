@@ -3,6 +3,7 @@ import json
 import os
 import re
 import subprocess
+import urllib.parse
 from pathlib import Path
 
 import pytest
@@ -55,9 +56,15 @@ LOGGING_GCLOUD = (
 )
 # The Orrery read service: the environment's service name and this suffix.
 READ_SERVICE = "telemetry-service-orrery"
-# The custom audience the read service accepts; microcosm-runs requests its
-# identity tokens for it.
-READ_SERVICE_AUDIENCE = "microcosm-collector/orrery-graphs"
+# The read service's URL, as `gcloud run services describe` gives it
+# (`status.url`). microcosm-runs requests its identity tokens for it.
+READ_SERVICE_URL = "https://telemetry-service-orrery-stand-in.example"
+# The call the deploy makes without a token, once the read service's IAM
+# policy is set: a listing for a run ID in the shape the read service
+# accepts, so that a service that let the call through would answer it.
+UNAUTHENTICATED_CHECK_URL = (
+    f"{READ_SERVICE_URL}/v1/orrery-graphs?run_id=deploy-access-check"
+)
 # Cloud Run refuses a longer service name.
 CLOUD_RUN_SERVICE_NAME_LIMIT = 49
 # What the read service's IAM policy grants, in the policy's `bindings`
@@ -68,7 +75,8 @@ READER_INVOKER_GRANTS = [
 # Logs each call as LOGGING_GCLOUD does. Keeps the policy that `run services
 # set-iam-policy SERVICE FILE` sets in $IAM_POLICY, and answers `run services
 # get-iam-policy` as Cloud Run does, with the kept policy and an etag, or with
-# $IAM_POLICY_ANSWER where a test gives one.
+# $IAM_POLICY_ANSWER where a test gives one. Answers `run services describe`
+# with $READ_SERVICE_URL.
 IAM_POLICY_GCLOUD = (
     LOGGING_GCLOUD
     + '\nif [[ "$1 $2 $3" == "run services set-iam-policy" ]]; then\n'
@@ -80,7 +88,24 @@ IAM_POLICY_GCLOUD = (
     + "  else\n"
     + '    jq \'. + {etag: "BwYexample=", version: 1}\' "$IAM_POLICY"\n'
     + "  fi\n"
+    + "fi\n"
+    + 'if [[ "$1 $2 $3" == "run services describe" ]]; then\n'
+    + "  printf '%s\\n' \"$READ_SERVICE_URL\"\n"
     + "fi"
+)
+# Logs each call as LOGGING_GCLOUD does, and prints the HTTP status code
+# $READ_SERVICE_STATUS, as curl's `--write-out '%{http_code}'` does for the
+# read service's answer. Where $READ_SERVICE_STATUS is "unreachable", it
+# fails as curl does when it cannot connect: code 000 and exit status 7.
+UNAUTHENTICATED_CALL_CURL = (
+    "printf 'curl' >> \"$COMMAND_LOG\"\n"
+    'printf \' <%s>\' "$@" >> "$COMMAND_LOG"\n'
+    "printf '\\n' >> \"$COMMAND_LOG\"\n"
+    'if [[ "$READ_SERVICE_STATUS" == unreachable ]]; then\n'
+    "  printf '000'\n"
+    "  exit 7\n"
+    "fi\n"
+    "printf '%s' \"$READ_SERVICE_STATUS\""
 )
 
 
@@ -1167,11 +1192,18 @@ def test_only_the_read_service_s_iam_policy_names_the_reader_account(
 def read_service_deploy_environment(
     stub_directory: Path, command_log: Path, deployment_environment: str
 ) -> dict[str, str]:
+    """What the read service's deploy runs with, and a stand-in curl in
+    ``stub_directory`` that answers its call without a token as Cloud Run
+    does, with 403, unless a test changes ``READ_SERVICE_STATUS``."""
+
+    install_command_stub(stub_directory, "curl", UNAUTHENTICATED_CALL_CURL)
     return {
         **service_deploy_environment(
             stub_directory, command_log, deployment_environment
         ),
         "IAM_POLICY": str(stub_directory / "iam-policy.json"),
+        "READ_SERVICE_URL": READ_SERVICE_URL,
+        "READ_SERVICE_STATUS": "403",
     }
 
 
@@ -1188,7 +1220,13 @@ def test_the_read_service_is_deployed_and_only_the_reader_account_may_call_it(
     result = run_deploy("deploy-orrery-read-service", environment=environment)
 
     assert result.returncode == 0, result.stderr
-    deploy_line, policy_line, check_line = command_log.read_text().splitlines()
+    (
+        deploy_line,
+        policy_line,
+        policy_check_line,
+        describe_line,
+        unauthenticated_call_line,
+    ) = command_log.read_text().splitlines()
     assert deploy_line == (
         f"gcloud <run> <deploy> <{READ_SERVICE}> "
         "<--project> <project> <--region> <region> <--platform> <managed> "
@@ -1205,7 +1243,7 @@ def test_the_read_service_is_deployed_and_only_the_reader_account_may_call_it(
         "<--min> <0> <--max> <2> <--cpu> <1> <--memory> <512Mi> "
         "<--concurrency> <10> <--timeout> <300> "
         "<--no-allow-unauthenticated> <--invoker-iam-check> "
-        f"<--set-custom-audiences> <{READ_SERVICE_AUDIENCE}> "
+        "<--clear-custom-audiences> "
         "<--default-url> "
         "<--startup-probe> "
         "<tcpSocket.port=8080,timeoutSeconds=10,periodSeconds=10,failureThreshold=12> "
@@ -1222,9 +1260,22 @@ def test_the_read_service_is_deployed_and_only_the_reader_account_may_call_it(
     assert json.loads(Path(environment["IAM_POLICY"]).read_text()) == {
         "bindings": READER_INVOKER_GRANTS
     }
-    assert check_line == (
+    assert policy_check_line == (
         f"gcloud <run> <services> <get-iam-policy> <{READ_SERVICE}> "
         "<--project> <project> <--region> <region> <--format=json>"
+    )
+    # Then the deploy calls the deployed service at its URL without a token.
+    assert describe_line == (
+        f"gcloud <run> <services> <describe> <{READ_SERVICE}> "
+        "<--project> <project> <--region> <region> <--format=value(status.url)>"
+    )
+    assert unauthenticated_call_line == (
+        "curl <--silent> <--output> </dev/null> <--write-out> <%{http_code}> "
+        "<--retry> <12> <--retry-all-errors> <--retry-delay> <5> "
+        f"<{UNAUTHENTICATED_CHECK_URL}>"
+    )
+    assert result.stdout == (
+        "The Orrery read service refused a call without a token with HTTP 403.\n"
     )
 
 
@@ -1260,7 +1311,12 @@ def test_the_read_service_runs_the_read_application_as_it_was_sized(
     assert flag_value("--port") == listening_port
     assert f"tcpSocket.port={listening_port}," in flag_value("--startup-probe")
     assert int(flag_value("--timeout")) == read_app.REQUEST_TIMEOUT_SECONDS
-    assert flag_value("--set-custom-audiences") == read_app.ORRERY_GRAPHS_AUDIENCE
+    # Every deploy leaves the service without a custom audience: microcosm-runs
+    # requests its tokens for the service's URL, which Cloud Run always
+    # accepts.
+    assert "<--clear-custom-audiences>" in deploy_line
+    assert "<--set-custom-audiences>" not in deploy_line
+    assert "<--add-custom-audiences>" not in deploy_line
     assert "<--allow-unauthenticated>" not in deploy_line
     assert "<--no-invoker-iam-check>" not in deploy_line
 
@@ -1328,6 +1384,83 @@ def test_the_read_service_deploy_fails_unless_its_policy_is_the_reader_account_a
         "The Orrery read service's IAM policy is not exactly the Cloud Run "
         "Invoker role for ORRERY_READER_SERVICE_ACCOUNT.\n"
     )
+    # The service is called without a token only once its policy is right.
+    assert not [
+        line
+        for line in command_log.read_text().splitlines()
+        if line.startswith("curl") or "<describe>" in line
+    ]
+
+
+@pytest.mark.parametrize("refusal_status", ["401", "403"])
+def test_the_read_service_deploy_passes_when_the_service_refuses_a_call_without_a_token(
+    tmp_path: Path, refusal_status: str
+) -> None:
+    command_log = tmp_path / "commands.log"
+    install_command_stub(tmp_path, "gcloud", IAM_POLICY_GCLOUD)
+    environment = read_service_deploy_environment(tmp_path, command_log, "staging")
+    environment["READ_SERVICE_STATUS"] = refusal_status
+
+    result = run_deploy("deploy-orrery-read-service", environment=environment)
+
+    assert result.returncode == 0, result.stderr
+    # Only the status code is printed: neither the URL nor the answer.
+    assert result.stdout == (
+        "The Orrery read service refused a call without a token with "
+        f"HTTP {refusal_status}.\n"
+    )
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize("answered_status", ["200", "404", "422", "500", "503"])
+def test_the_read_service_deploy_fails_unless_the_service_refuses_a_call_without_a_token(
+    tmp_path: Path, answered_status: str
+) -> None:
+    command_log = tmp_path / "commands.log"
+    install_command_stub(tmp_path, "gcloud", IAM_POLICY_GCLOUD)
+    environment = read_service_deploy_environment(tmp_path, command_log, "staging")
+    environment["READ_SERVICE_STATUS"] = answered_status
+
+    result = run_deploy("deploy-orrery-read-service", environment=environment)
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert result.stderr == (
+        "The Orrery read service answered a call without a token with "
+        f"HTTP {answered_status}, not 401 or 403.\n"
+    )
+
+
+def test_the_read_service_deploy_fails_when_the_service_does_not_answer(
+    tmp_path: Path,
+) -> None:
+    command_log = tmp_path / "commands.log"
+    install_command_stub(tmp_path, "gcloud", IAM_POLICY_GCLOUD)
+    environment = read_service_deploy_environment(tmp_path, command_log, "staging")
+    environment["READ_SERVICE_STATUS"] = "unreachable"
+
+    result = run_deploy("deploy-orrery-read-service", environment=environment)
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert result.stderr == (
+        "The Orrery read service did not answer the deploy's call without a token.\n"
+    )
+    assert READ_SERVICE_URL not in result.stderr
+
+
+def test_the_call_without_a_token_asks_the_listing_for_a_run_id_it_accepts() -> None:
+    routes = importlib.import_module("telemetry_collector.orrery_graph_api")
+    models = importlib.import_module("telemetry_collector.models")
+    check_url = urllib.parse.urlsplit(UNAUTHENTICATED_CHECK_URL)
+    query = urllib.parse.parse_qs(check_url.query)
+
+    # So a service that let the call through would answer it with a listing,
+    # never with 401 or 403.
+    assert check_url.path == routes.ORRERY_GRAPHS_PATH
+    assert list(query) == ["run_id"]
+    [run_id] = query["run_id"]
+    assert re.fullmatch(models.SAFE_IDENTIFIER, run_id)
 
 
 @pytest.mark.parametrize(
