@@ -42,16 +42,45 @@ CALIBRATION_TREE_SETTINGS = {
     "CALIBRATION_TREE_BLOB_SECRET_NAME": "calibration-tree-blob-token"
 }
 # ...and its own private Orrery bucket, which the worker job publishes Orrery
-# graph files to and the service reads them back from.
+# graph files to and the Orrery read service reads them back from.
 ORRERY_SETTINGS = {"ORRERY_BUCKET": "orrery-bucket"}
 # The Google service account of microcosm-runs' deployments for each
-# environment, the only caller the service serves Orrery graph files to.
+# environment, the only member of the Orrery read service's IAM policy.
 READER_ACCOUNT = "microcosm-runs-reader@example-project.iam.gserviceaccount.com"
 ORRERY_READER_SETTINGS = {"ORRERY_READER_SERVICE_ACCOUNT": READER_ACCOUNT}
 LOGGING_GCLOUD = (
     "printf 'gcloud' >> \"$COMMAND_LOG\"\n"
     'printf \' <%s>\' "$@" >> "$COMMAND_LOG"\n'
     "printf '\\n' >> \"$COMMAND_LOG\""
+)
+# The Orrery read service: the environment's service name and this suffix.
+READ_SERVICE = "telemetry-service-orrery"
+# The custom audience the read service accepts; microcosm-runs requests its
+# identity tokens for it.
+READ_SERVICE_AUDIENCE = "microcosm-collector/orrery-graphs"
+# Cloud Run refuses a longer service name.
+CLOUD_RUN_SERVICE_NAME_LIMIT = 49
+# The read service's IAM policy: the Cloud Run Invoker role for the reader
+# account alone.
+READ_SERVICE_POLICY_BINDINGS = [
+    {"role": "roles/run.invoker", "members": [f"serviceAccount:{READER_ACCOUNT}"]}
+]
+# Logs each call as LOGGING_GCLOUD does. Keeps the policy that `run services
+# set-iam-policy SERVICE FILE` sets in $IAM_POLICY, and answers `run services
+# get-iam-policy` as Cloud Run does, with the kept policy and an etag, or with
+# $IAM_POLICY_ANSWER where a test gives one.
+IAM_POLICY_GCLOUD = (
+    LOGGING_GCLOUD
+    + '\nif [[ "$1 $2 $3" == "run services set-iam-policy" ]]; then\n'
+    + '  cp "$5" "$IAM_POLICY"\n'
+    + "fi\n"
+    + 'if [[ "$1 $2 $3" == "run services get-iam-policy" ]]; then\n'
+    + '  if [[ -f "${IAM_POLICY_ANSWER-}" ]]; then\n'
+    + '    cat "$IAM_POLICY_ANSWER"\n'
+    + "  else\n"
+    + '    jq \'. + {etag: "BwYexample=", version: 1}\' "$IAM_POLICY"\n'
+    + "  fi\n"
+    + "fi"
 )
 
 
@@ -514,7 +543,8 @@ COLLECTOR_SETTING_SHAPES = {
     "RECOVERY_JOB": (JOB_PATTERN, PROJECT_RESOURCES + "/jobs/{}"),
     "RUNTIME_SERVICE_ACCOUNT": (SERVICE_ACCOUNT_PATTERN, "{}"),
     "WORKER_INVOKER_SERVICE_ACCOUNT": (SERVICE_ACCOUNT_PATTERN, "{}"),
-    # The service's COLLECTOR_ORRERY_READER_SERVICE_ACCOUNT.
+    # No setting: the one member of the Orrery read service's IAM policy,
+    # checked as the collector checks its user-managed accounts.
     "ORRERY_READER_SERVICE_ACCOUNT": (SERVICE_ACCOUNT_PATTERN, "{}"),
 }
 
@@ -635,9 +665,9 @@ def test_deploy_script_patterns_are_the_collectors() -> None:
             "WORKER_INVOKER_SERVICE_ACCOUNT",
             "invoker@example.invalid",
         ),
-        ("deploy-maintenance", "ORRERY_BUCKET", "gs://orrery-bucket"),
+        ("deploy-orrery-read-service", "ORRERY_BUCKET", "gs://orrery-bucket"),
         (
-            "deploy-candidate",
+            "deploy-orrery-read-service",
             "ORRERY_READER_SERVICE_ACCOUNT",
             "reader@example.invalid",
         ),
@@ -699,25 +729,43 @@ def test_service_intake_settings_are_ones_the_collector_accepts(
     )
 
 
-def test_service_orrery_settings_are_ones_the_collector_accepts(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def logged_secret_mounts(command: str) -> dict[str, str]:
+    match = re.search(r"<--set-secrets> <([^>]*)>", command)
+    assert match is not None, command
+    return dict(pair.split("=", 1) for pair in match.group(1).split(","))
+
+
+def read_service_deploy_line(command_log: Path) -> str:
+    [deploy_line] = [
+        line
+        for line in command_log.read_text().splitlines()
+        if line.startswith(f"gcloud <run> <deploy> <{READ_SERVICE}> ")
+    ]
+    return deploy_line
+
+
+def test_the_read_service_settings_are_ones_the_read_service_accepts(
+    tmp_path: Path,
 ) -> None:
     serving = importlib.import_module("telemetry_collector.orrery_serving")
     command_log = tmp_path / "commands.log"
-    install_command_stub(tmp_path, "gcloud", LOGGING_GCLOUD)
+    install_command_stub(tmp_path, "gcloud", IAM_POLICY_GCLOUD)
 
     result = run_deploy(
-        "deploy-candidate",
-        environment=service_deploy_environment(tmp_path, command_log, "staging"),
+        "deploy-orrery-read-service",
+        environment=read_service_deploy_environment(tmp_path, command_log, "staging"),
     )
 
     assert result.returncode == 0, result.stderr
-    settings = logged_setting_values(command_log.read_text())
-    assert serving.OrreryServingSettings.from_environment(
-        settings
-    ) == serving.OrreryServingSettings(
-        bucket="orrery-bucket", reader_service_account=READER_ACCOUNT
+    deploy_line = read_service_deploy_line(command_log)
+    settings = logged_setting_values(deploy_line)
+    # DATABASE_URL comes from the runtime database secret, as for the service.
+    assert logged_secret_mounts(deploy_line) == {"DATABASE_URL": "database-url:latest"}
+    assert settings == {"COLLECTOR_ORRERY_BUCKET": "orrery-bucket"}
+    read_service_settings = serving.OrreryServingSettings.from_environment(
+        {**settings, "DATABASE_URL": "postgresql://user@localhost/telemetry"}
     )
+    assert read_service_settings.bucket == "orrery-bucket"
 
 
 def test_recovery_job_settings_are_ones_the_operations_command_accepts(
@@ -942,9 +990,7 @@ def expected_service_settings(maintenance_mode: str) -> str:
         f"COLLECTOR_INTAKE_SIGNING_SERVICE_ACCOUNT={RUNTIME_ACCOUNT},"
         "COLLECTOR_WORKER_QUEUE=projects/project/locations/region/queues/worker-queue,"
         "COLLECTOR_WORKER_JOB=projects/project/locations/region/jobs/worker-job,"
-        f"COLLECTOR_WORKER_INVOKER_SERVICE_ACCOUNT={INVOKER_ACCOUNT},"
-        "COLLECTOR_ORRERY_BUCKET=orrery-bucket,"
-        f"COLLECTOR_ORRERY_READER_SERVICE_ACCOUNT={READER_ACCOUNT}>"
+        f"COLLECTOR_WORKER_INVOKER_SERVICE_ACCOUNT={INVOKER_ACCOUNT}>"
     )
 
 
@@ -1069,10 +1115,8 @@ def test_the_recovery_job_gets_neither_orrery_setting(tmp_path: Path) -> None:
     assert READER_ACCOUNT not in command
 
 
-@pytest.mark.parametrize(
-    "deploy_command", ["configure-worker-job", "configure-recovery-job"]
-)
-def test_neither_job_gets_the_orrery_reader_account(
+@pytest.mark.parametrize("deploy_command", ["deploy-maintenance", "deploy-candidate"])
+def test_service_revisions_get_no_orrery_setting(
     tmp_path: Path, deploy_command: str
 ) -> None:
     command_log = tmp_path / "commands.log"
@@ -1080,28 +1124,265 @@ def test_neither_job_gets_the_orrery_reader_account(
 
     result = run_deploy(
         deploy_command,
-        environment=job_deploy_environment(tmp_path, command_log, "production"),
+        environment=service_deploy_environment(tmp_path, command_log, "production"),
     )
 
+    # The collector's service mounts no Orrery graph route; the read service
+    # serves the files.
     assert result.returncode == 0, result.stderr
     command = command_log.read_text()
-    assert "ORRERY_READER" not in command
+    assert "ORRERY" not in command
+    assert "orrery-bucket" not in command
     assert READER_ACCOUNT not in command
 
 
-@pytest.mark.parametrize("deploy_command", ["deploy-maintenance", "deploy-candidate"])
-@pytest.mark.parametrize(
-    "missing_variable", ["ORRERY_BUCKET", "ORRERY_READER_SERVICE_ACCOUNT"]
-)
-def test_service_revisions_stop_before_gcloud_without_an_orrery_setting(
-    tmp_path: Path, deploy_command: str, missing_variable: str
+def test_only_the_read_service_s_iam_policy_names_the_reader_account(
+    tmp_path: Path,
 ) -> None:
     command_log = tmp_path / "commands.log"
-    install_command_stub(tmp_path, "gcloud", LOGGING_GCLOUD)
-    environment = service_deploy_environment(tmp_path, command_log, "production")
-    del environment[missing_variable]
+    install_command_stub(tmp_path, "gcloud", IAM_POLICY_GCLOUD)
+    environment = {
+        **job_deploy_environment(tmp_path, command_log, "production"),
+        **read_service_deploy_environment(tmp_path, command_log, "production"),
+    }
+
+    for deploy_command in (
+        "deploy-maintenance",
+        "deploy-candidate",
+        "configure-worker-job",
+        "configure-recovery-job",
+        "deploy-orrery-read-service",
+    ):
+        result = run_deploy(deploy_command, environment=environment)
+        assert result.returncode == 0, (deploy_command, result.stderr)
+
+    # No revision, job or container setting gets the address: only the
+    # policy file that sets who may call the read service.
+    assert READER_ACCOUNT not in command_log.read_text()
+    assert json.loads(Path(environment["IAM_POLICY"]).read_text()) == {
+        "bindings": READ_SERVICE_POLICY_BINDINGS
+    }
+
+
+def read_service_deploy_environment(
+    stub_directory: Path, command_log: Path, deployment_environment: str
+) -> dict[str, str]:
+    return {
+        **service_deploy_environment(
+            stub_directory, command_log, deployment_environment
+        ),
+        "IAM_POLICY": str(stub_directory / "iam-policy.json"),
+    }
+
+
+@pytest.mark.parametrize("deployment_environment", ["staging", "production"])
+def test_the_read_service_is_deployed_and_only_the_reader_account_may_call_it(
+    tmp_path: Path, deployment_environment: str
+) -> None:
+    command_log = tmp_path / "commands.log"
+    install_command_stub(tmp_path, "gcloud", IAM_POLICY_GCLOUD)
+    environment = read_service_deploy_environment(
+        tmp_path, command_log, deployment_environment
+    )
+
+    result = run_deploy("deploy-orrery-read-service", environment=environment)
+
+    assert result.returncode == 0, result.stderr
+    deploy_line, policy_line, check_line = command_log.read_text().splitlines()
+    assert deploy_line == (
+        f"gcloud <run> <deploy> <{READ_SERVICE}> "
+        "<--project> <project> <--region> <region> <--platform> <managed> "
+        "<--image> <registry/image:sha> "
+        f"<--service-account> <{RUNTIME_ACCOUNT}> "
+        "<--set-cloudsql-instances> <project:region:database> "
+        "<--set-secrets> <DATABASE_URL=database-url:latest> "
+        "<--set-env-vars> <COLLECTOR_ORRERY_BUCKET=orrery-bucket> "
+        "<--command> <uv> "
+        "<--args> <run,--no-sync,uvicorn,"
+        "telemetry_collector.orrery_read_app:create_orrery_read_app_from_environment,"
+        "--factory,--host,0.0.0.0,--port,8080,--no-access-log> "
+        "<--port> <8080> "
+        "<--min> <0> <--max> <2> <--cpu> <1> <--memory> <512Mi> "
+        "<--concurrency> <10> <--timeout> <300> "
+        "<--no-allow-unauthenticated> <--invoker-iam-check> "
+        f"<--set-custom-audiences> <{READ_SERVICE_AUDIENCE}> "
+        "<--default-url> "
+        "<--startup-probe> "
+        "<tcpSocket.port=8080,timeoutSeconds=10,periodSeconds=10,failureThreshold=12> "
+        "<--quiet>"
+    )
+    policy_call = re.fullmatch(
+        rf"gcloud <run> <services> <set-iam-policy> <{READ_SERVICE}> <([^>]+)> "
+        "<--project> <project> <--region> <region> <--quiet>",
+        policy_line,
+    )
+    assert policy_call is not None, policy_line
+    # The policy file is removed once the policy is set.
+    assert not Path(policy_call.group(1)).exists()
+    assert json.loads(Path(environment["IAM_POLICY"]).read_text()) == {
+        "bindings": READ_SERVICE_POLICY_BINDINGS
+    }
+    assert check_line == (
+        f"gcloud <run> <services> <get-iam-policy> <{READ_SERVICE}> "
+        "<--project> <project> <--region> <region> <--format=json>"
+    )
+
+
+def test_the_read_service_runs_the_read_application_as_it_was_sized(
+    tmp_path: Path,
+) -> None:
+    read_app = importlib.import_module("telemetry_collector.orrery_read_app")
+    command_log = tmp_path / "commands.log"
+    install_command_stub(tmp_path, "gcloud", IAM_POLICY_GCLOUD)
+
+    result = run_deploy(
+        "deploy-orrery-read-service",
+        environment=read_service_deploy_environment(
+            tmp_path, command_log, "production"
+        ),
+    )
+
+    assert result.returncode == 0, result.stderr
+    deploy_line = read_service_deploy_line(command_log)
+
+    def flag_value(flag: str) -> str:
+        match = re.search(rf"<{flag}> <([^>]*)>", deploy_line)
+        assert match is not None, flag
+        return match.group(1)
+
+    arguments = flag_value("--args").split(",")
+    module_name, factory_name = arguments[arguments.index("--factory") - 1].split(":")
+    assert module_name == read_app.__name__
+    assert callable(getattr(read_app, factory_name))
+    # The application listens on the port Cloud Run sends requests to and
+    # probes.
+    listening_port = arguments[arguments.index("--port") + 1]
+    assert flag_value("--port") == listening_port
+    assert f"tcpSocket.port={listening_port}," in flag_value("--startup-probe")
+    assert int(flag_value("--timeout")) == read_app.REQUEST_TIMEOUT_SECONDS
+    assert flag_value("--set-custom-audiences") == read_app.ORRERY_GRAPHS_AUDIENCE
+    assert "<--allow-unauthenticated>" not in deploy_line
+    assert "<--no-invoker-iam-check>" not in deploy_line
+
+
+@pytest.mark.parametrize(
+    "answered_bindings",
+    [
+        [
+            *READ_SERVICE_POLICY_BINDINGS,
+            {"role": "roles/run.invoker", "members": ["allUsers"]},
+        ],
+        [
+            {
+                "role": "roles/run.invoker",
+                "members": [
+                    "allAuthenticatedUsers",
+                    f"serviceAccount:{READER_ACCOUNT}",
+                ],
+            }
+        ],
+        [
+            {
+                "role": "roles/run.invoker",
+                "members": [
+                    f"serviceAccount:{READER_ACCOUNT}",
+                    f"serviceAccount:{RUNTIME_ACCOUNT}",
+                ],
+            }
+        ],
+        [
+            *READ_SERVICE_POLICY_BINDINGS,
+            {
+                "role": "roles/run.developer",
+                "members": ["group:collector-developers@example.com"],
+            },
+        ],
+        [{"role": "roles/run.viewer", "members": [f"serviceAccount:{READER_ACCOUNT}"]}],
+        [],
+    ],
+    ids=[
+        "everyone",
+        "every Google account",
+        "a second invoker",
+        "another role",
+        "no invoker",
+        "no binding",
+    ],
+)
+def test_the_read_service_deploy_fails_unless_its_policy_is_the_reader_account_alone(
+    tmp_path: Path, answered_bindings: list[dict]
+) -> None:
+    command_log = tmp_path / "commands.log"
+    install_command_stub(tmp_path, "gcloud", IAM_POLICY_GCLOUD)
+    environment = read_service_deploy_environment(tmp_path, command_log, "staging")
+    answered_policy = tmp_path / "answered-policy.json"
+    answered_policy.write_text(
+        json.dumps({"bindings": answered_bindings, "etag": "BwYexample=", "version": 1})
+    )
+    environment["IAM_POLICY_ANSWER"] = str(answered_policy)
+
+    result = run_deploy("deploy-orrery-read-service", environment=environment)
+
+    assert result.returncode == 1
+    assert result.stderr == (
+        "The Orrery read service's IAM policy is not exactly the Cloud Run "
+        "Invoker role for ORRERY_READER_SERVICE_ACCOUNT.\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("service_name_length", "accepted"),
+    [(CLOUD_RUN_SERVICE_NAME_LIMIT - len("-orrery"), True), (43, False)],
+)
+@pytest.mark.parametrize(
+    "deploy_command", ["require-configuration", "deploy-orrery-read-service"]
+)
+def test_the_read_service_s_name_must_fit_cloud_run_s_limit(
+    tmp_path: Path, service_name_length: int, accepted: bool, deploy_command: str
+) -> None:
+    command_log = tmp_path / "commands.log"
+    install_command_stub(tmp_path, "gcloud", IAM_POLICY_GCLOUD)
+    service_name = "telemetry-" + "s" * (service_name_length - len("telemetry-"))
+    environment = {
+        **complete_configuration("staging"),
+        **read_service_deploy_environment(tmp_path, command_log, "staging"),
+        "SERVICE": service_name,
+    }
 
     result = run_deploy(deploy_command, environment=environment)
+
+    if accepted:
+        assert result.returncode == 0, result.stderr
+        return
+    assert result.returncode == 1
+    assert result.stderr == (
+        f"The Orrery read service's name, {service_name}-orrery, is longer than "
+        f"Cloud Run's limit of {CLOUD_RUN_SERVICE_NAME_LIMIT} characters.\n"
+    )
+    assert not command_log.exists()
+
+
+@pytest.mark.parametrize(
+    "missing_variable",
+    [
+        "SERVICE",
+        "IMAGE_URI",
+        "RUNTIME_SERVICE_ACCOUNT",
+        "CLOUD_SQL_CONNECTION",
+        "DATABASE_SECRET_NAME",
+        "ORRERY_BUCKET",
+        "ORRERY_READER_SERVICE_ACCOUNT",
+    ],
+)
+def test_the_read_service_deploy_stops_before_gcloud_without_a_setting(
+    tmp_path: Path, missing_variable: str
+) -> None:
+    command_log = tmp_path / "commands.log"
+    install_command_stub(tmp_path, "gcloud", IAM_POLICY_GCLOUD)
+    environment = read_service_deploy_environment(tmp_path, command_log, "production")
+    del environment[missing_variable]
+
+    result = run_deploy("deploy-orrery-read-service", environment=environment)
 
     assert result.returncode == 1
     assert result.stderr == (

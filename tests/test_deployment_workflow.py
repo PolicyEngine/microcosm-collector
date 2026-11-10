@@ -446,7 +446,9 @@ def test_both_deploy_jobs_read_their_orrery_reader_service_account() -> None:
     mapping = "${{ vars.TELEMETRY_ORRERY_READER_SERVICE_ACCOUNT }}"
 
     # Each environment names the service account of its own microcosm-runs
-    # deployments, at job level; no step sets it.
+    # deployments, at job level; no step sets it. The deploy grants it the
+    # Orrery read service's Cloud Run Invoker role and passes it to no
+    # container (tests/test_deploy_script.py).
     for job_name in DEPLOY_JOBS:
         assert jobs[job_name]["env"].get("ORRERY_READER_SERVICE_ACCOUNT") == mapping, (
             job_name
@@ -496,6 +498,30 @@ def test_release_updates_both_intake_jobs_between_migration_and_candidate(
         assert step_position(job, command) < step_position(job, "deploy-candidate")
         assert deploy_step(job, command)["env"] == {"IMAGE_URI": image_source}
     assert deploy_step(job, "deploy-candidate")["env"] == {"IMAGE_URI": image_source}
+
+
+@pytest.mark.parametrize(
+    ("job_name", "image_source"),
+    [
+        ("deploy-staging", "${{ steps.image.outputs.uri }}"),
+        ("deploy-production", "${{ needs.deploy-staging.outputs.image_uri }}"),
+    ],
+)
+def test_release_deploys_the_orrery_read_service_once_the_service_is_released(
+    job_name: str, image_source: str
+) -> None:
+    job = load_workflow(PUSH_WORKFLOW)["jobs"][job_name]
+
+    # The read service reads the migrated database, so it is deployed after
+    # the migration; last, so that a failure leaves the service released and
+    # out of maintenance mode.
+    read_service_step = step_position(job, "deploy-orrery-read-service")
+    assert step_position(job, "apply-migrations") < read_service_step
+    assert step_position(job, "verify-stable-service") < read_service_step
+    assert read_service_step == len(job["steps"]) - 1
+    assert deploy_step(job, "deploy-orrery-read-service")["env"] == {
+        "IMAGE_URI": image_source
+    }
 
 
 def test_collector_uses_store_vocabulary() -> None:
@@ -587,7 +613,7 @@ def test_workflow_shell_logic_lives_in_scripts() -> None:
                     assert "\n" not in step["run"].strip(), (workflow_path.name, step)
 
     workflow = PUSH_WORKFLOW.read_text(encoding="utf-8")
-    assert workflow.count("run: scripts/deploy.sh") == 34
+    assert workflow.count("run: scripts/deploy.sh") == 36
     for command in (
         "require-configuration",
         "validate-environment-target",
@@ -606,6 +632,7 @@ def test_workflow_shell_logic_lives_in_scripts() -> None:
         "route-service-traffic",
         "verify-stable-service",
         "create-database-backup",
+        "deploy-orrery-read-service",
     ):
         assert f"run: scripts/deploy.sh {command}" in workflow
 

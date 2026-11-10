@@ -1,25 +1,24 @@
-"""Orrery graph files are served only to microcosm-runs' own service account.
+"""The Orrery read service serves Orrery graph files, and the collector doesn't.
 
-The collector lists and serves the Orrery graph files its worker published
-(``telemetry_collector.orrery_graph_api``) only to requests that carry a
-Google-signed identity token of the configured reader account, which
-``telemetry_collector.orrery_access`` checks. These tests sign tokens with a
-key generated here and give the check that key's certificate, so they never
-reach Google. They read the bucket through the collector's Google Cloud
-Storage adapter over a stand-in client, and the records through in-memory
-stores, or through PostgreSQL as well where ``TEST_DATABASE_URL`` is set.
+The Orrery read service (``telemetry_collector.orrery_read_app``) is a
+separate Cloud Run service, run from the collector's image, that lists and
+serves the Orrery graph files the worker published
+(``telemetry_collector.orrery_graph_api``). Cloud Run checks each caller's
+Google identity token before a request reaches it, so it verifies no token
+itself, and these tests send none. The collector's main application mounts
+none of its routes. These tests read the bucket through the collector's
+Google Cloud Storage adapter over a stand-in client, and the records through
+in-memory stores, or through PostgreSQL as well where ``TEST_DATABASE_URL``
+is set.
 """
 
 from __future__ import annotations
 
-import functools
 import hashlib
 import importlib
 import importlib.util
 import json
 import logging
-import threading
-import time
 from collections.abc import Callable, Collection, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -27,20 +26,18 @@ from types import ModuleType
 from typing import Any
 
 import httpx
-import jwt
 import pytest
-from cryptography import x509
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.x509.oid import NameOID
 from fastapi.testclient import TestClient
 from google.api_core.exceptions import NotFound, ServiceUnavailable
-from google.auth.exceptions import TransportError
 from google.cloud.storage.exceptions import DataCorruption
 from sqlalchemy.exc import OperationalError
 
 from telemetry_collector import google_cloud
-from telemetry_collector.app import CollectorSettings, create_app
+from telemetry_collector.app import (
+    CollectorSettings,
+    create_app,
+    create_app_from_environment,
+)
 from telemetry_collector.auth import HuggingFacePrincipal
 from telemetry_collector.database import create_database_engine
 from telemetry_collector.migrate import upgrade_database
@@ -51,34 +48,19 @@ from telemetry_collector.orrery_graphs import (
     PostgresOrreryGraphStore,
     orrery_bucket,
 )
-from telemetry_collector.read_api_v2 import openapi_document
 from telemetry_collector.submission_store import PostgresSubmissionStore
 from telemetry_collector.submissions import SubmissionRequest
 from tests.fakes import FakeOrreryGraphStore, FakeSubmissionStore, FakeTelemetryStore
 from tests.test_submission_store import SteppingClock
 
-ACCESS_MODULE = "telemetry_collector.orrery_access"
 SERVING_MODULE = "telemetry_collector.orrery_serving"
-# The audience microcosm-runs requests its identity tokens for.
+READ_APP_MODULE = "telemetry_collector.orrery_read_app"
+ROUTES_MODULE = "telemetry_collector.orrery_graph_api"
+# The custom audience the read service accepts, which microcosm-runs requests
+# its identity tokens for.
 AUDIENCE = "microcosm-collector/orrery-graphs"
-GOOGLE_ISSUER = "https://accounts.google.com"
-GOOGLE_CERTIFICATES_URL = "https://www.googleapis.com/oauth2/v1/certs"
 READER = "microcosm-runs-reader@example-project.iam.gserviceaccount.com"
-ANOTHER_ACCOUNT = "someone-else@example-project.iam.gserviceaccount.com"
-# The reader account's unique ID, which Google puts in `sub` and `azp`.
-READER_ACCOUNT_ID = "112233445566778899000"
 BUCKET = "collector-orrery-test"
-KEY_ID = "google-test-key-1"
-# The key ID of a key Google starts signing with while the collector still
-# holds the certificates it fetched before.
-ROTATED_KEY_ID = "google-test-key-2"
-# A token whose key the cached certificates don't hold, or a fetch that
-# failed while the cached certificates may still be used, fetches them again
-# at most this often.
-REFETCH_INTERVAL_SECONDS = 60
-# How long past their expiry the cached certificates are still used while
-# Google's endpoint can't be reached.
-CERTIFICATE_GRACE_SECONDS = 3600
 JWT_SECRET = "test-secret-that-is-long-enough-32"
 PRINCIPAL = HuggingFacePrincipal("hf-user-1", "builder", ("policyengine",))
 LISTING = "/v1/orrery-graphs"
@@ -100,10 +82,16 @@ SERVED_PART_BYTES = 1024 * 1024
 BLOB_READER_DEFAULT_CHUNK_BYTES = 40 * 1024 * 1024
 # Nothing listens on port 1, so connecting to this database is refused at once.
 UNREACHABLE_DATABASE_URL = "postgresql://user:password@127.0.0.1:1/none"
-SERVING_ENVIRONMENT = {
+# The read service's two settings.
+READ_SERVICE_ENVIRONMENT = {
     "COLLECTOR_ORRERY_BUCKET": BUCKET,
-    "COLLECTOR_ORRERY_READER_SERVICE_ACCOUNT": READER,
+    "DATABASE_URL": UNREACHABLE_DATABASE_URL,
 }
+# The setting the in-code token check read, which nothing reads now.
+RETIRED_READER_SETTING = "COLLECTOR_ORRERY_READER_SERVICE_ACCOUNT"
+# Text a storage error's message could hold, such as a request's access
+# token; the collector's log must never hold it.
+CREDENTIAL_IN_STORAGE_ERROR = "ya29.stand-in-access-token"
 
 
 def sha256_hex(content: bytes) -> str:
@@ -117,161 +105,14 @@ UPSTREAM_SHA256 = sha256_hex(UPSTREAM_CONTENT)
 UPSTREAM_NAME = f"upstream-{UPSTREAM_SHA256}.json"
 
 
-def access() -> ModuleType:
-    assert importlib.util.find_spec(ACCESS_MODULE) is not None
-    return importlib.import_module(ACCESS_MODULE)
-
-
 def serving() -> ModuleType:
     assert importlib.util.find_spec(SERVING_MODULE) is not None
     return importlib.import_module(SERVING_MODULE)
 
 
-# Keys and identity tokens.
-
-
-@functools.cache
-def google_signing_key() -> rsa.RSAPrivateKey:
-    """The key the tests' stand-in for Google signs identity tokens with."""
-
-    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
-
-
-@functools.cache
-def impostor_signing_key() -> rsa.RSAPrivateKey:
-    """A key Google's certificates don't hold."""
-
-    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
-
-
-@functools.cache
-def rotated_signing_key() -> rsa.RSAPrivateKey:
-    """The key the stand-in for Google signs with after it rotates its keys."""
-
-    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
-
-
-@functools.cache
-def google_certificate() -> str:
-    """The signing key's certificate, in PEM, as Google publishes its own."""
-
-    return self_signed_certificate(google_signing_key(), "google-test-signing-key")
-
-
-@functools.cache
-def rotated_certificate() -> str:
-    """The rotated signing key's certificate, in PEM."""
-
-    return self_signed_certificate(rotated_signing_key(), "google-test-rotated-key")
-
-
-def self_signed_certificate(signing_key: rsa.RSAPrivateKey, common_name: str) -> str:
-    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
-    certificate = (
-        x509.CertificateBuilder()
-        .subject_name(subject)
-        .issuer_name(subject)
-        .public_key(signing_key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime(2026, 1, 1, tzinfo=UTC))
-        .not_valid_after(datetime(2036, 1, 1, tzinfo=UTC))
-        .sign(signing_key, hashes.SHA256())
-    )
-    return certificate.public_bytes(serialization.Encoding.PEM).decode("ascii")
-
-
-# Marks a claim that identity_claims leaves out.
-LEFT_OUT = object()
-
-
-def identity_claims(**claim_changes: Any) -> dict[str, Any]:
-    """The claims of an identity token that IAM Credentials' generateIdToken
-    issues for the reader account with ``includeEmail``, with
-    ``claim_changes`` applied; ``LEFT_OUT`` removes a claim."""
-
-    issued_at = int(time.time())
-    claims: dict[str, Any] = {
-        "iss": GOOGLE_ISSUER,
-        "aud": AUDIENCE,
-        "azp": READER_ACCOUNT_ID,
-        "sub": READER_ACCOUNT_ID,
-        "email": READER,
-        "email_verified": True,
-        "iat": issued_at,
-        "exp": issued_at + 3600,
-    }
-    claims.update(claim_changes)
-    return {name: value for name, value in claims.items() if value is not LEFT_OUT}
-
-
-def identity_token(
-    *,
-    signing_key: rsa.RSAPrivateKey | None = None,
-    key_id: str = KEY_ID,
-    **claim_changes: Any,
-) -> str:
-    return jwt.encode(
-        identity_claims(**claim_changes),
-        signing_key or google_signing_key(),
-        algorithm="RS256",
-        headers={"kid": key_id},
-    )
-
-
-def bearer(token: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {token}"}
-
-
-class CertificateEndpoint:
-    """Stands in for Google's certificate endpoint and counts its fetches.
-
-    ``published`` is what it answers. After ``hold_fetches``, each fetch
-    waits until ``release_fetches``, as a slow endpoint would, and
-    ``fetch_started`` is set once one is waiting.
-    """
-
-    def __init__(self) -> None:
-        self.fetches = 0
-        self.available = True
-        self.lifetime_seconds = 3600.0
-        self.published = {KEY_ID: google_certificate()}
-        self.fetch_started = threading.Event()
-        self._released = threading.Event()
-        self._released.set()
-
-    def hold_fetches(self) -> None:
-        self.fetch_started.clear()
-        self._released.clear()
-
-    def release_fetches(self) -> None:
-        self._released.set()
-
-    def __call__(self) -> Any:
-        self.fetches += 1
-        self.fetch_started.set()
-        if not self._released.wait(timeout=10):
-            raise AssertionError("A held certificate fetch was never released.")
-        if not self.available:
-            raise access().GoogleCertificatesUnavailableError(
-                "Google's certificates could not be fetched."
-            )
-        return access().FetchedCertificates(
-            certificates=dict(self.published),
-            lifetime_seconds=self.lifetime_seconds,
-        )
-
-
-class MonotonicClock:
-    """A monotonic clock, in seconds, that the tests move forward."""
-
-    def __init__(self) -> None:
-        self.seconds = 1000.0
-
-    def __call__(self) -> float:
-        return self.seconds
-
-    def advance(self, seconds: float) -> None:
-        self.seconds += seconds
+def read_app() -> ModuleType:
+    assert importlib.util.find_spec(READ_APP_MODULE) is not None
+    return importlib.import_module(READ_APP_MODULE)
 
 
 # The private Orrery bucket, through a stand-in for the Google Cloud client.
@@ -299,6 +140,22 @@ class ObjectRead:
     largest_held_bytes: int = 0
     #: Whether the read reached the end of the object.
     finished: bool = False
+
+
+#: The stand-in client's three kinds of call: listing a folder, looking an
+#: object up, and reading an object's bytes.
+STORAGE_OPERATIONS = ("list", "lookup", "read")
+
+
+@dataclass
+class StorageCall:
+    """One call the collector made to the stand-in client, with the options
+    it passed, such as ``timeout`` and ``retry``."""
+
+    operation: str
+    #: The folder listed, or the object looked up or read.
+    name: str
+    options: dict[str, Any]
 
 
 class StandInBlobReader:
@@ -365,6 +222,8 @@ class StandInBlob:
         self, mode: str = "r", chunk_size: int | None = None, **options: Any
     ) -> StandInBlobReader:
         assert mode == "rb"
+        # The library's BlobReader passes these options to each ranged read.
+        self._client.calls.append(StorageCall("read", self.name, options))
         return StandInBlobReader(self._client, self.name, self.generation, chunk_size)
 
     def download_as_bytes(self, **options: Any) -> bytes:
@@ -387,8 +246,9 @@ class StandInBucket:
     def blob(self, name: str, generation: int | None = None) -> StandInBlob:
         return StandInBlob(self._client, name, generation=generation)
 
-    def get_blob(self, name: str) -> StandInBlob | None:
-        self._client.check_available()
+    def get_blob(self, name: str, **options: Any) -> StandInBlob | None:
+        self._client.calls.append(StorageCall("lookup", name, options))
+        self._client.check_available("lookup")
         stored = self._client.objects.get(name)
         if stored is None:
             return None
@@ -403,7 +263,10 @@ class StandInStorageClient:
     objects, which have the same ``content``, ``metadata`` and
     ``generation``.
 
-    ``reads`` records each read of an object's bytes. ``after_lookup`` and
+    ``reads`` records each read of an object's bytes, and ``calls`` each
+    call with its options. Each operation in ``unavailable`` raises what the
+    client raises when Cloud Storage doesn't answer, with
+    ``CREDENTIAL_IN_STORAGE_ERROR`` in its message. ``after_lookup`` and
     ``after_read`` let a test change the bucket after an object is looked up
     or after a read reaches its end.
     """
@@ -412,7 +275,8 @@ class StandInStorageClient:
         self.objects: dict[str, Any] = {} if objects is None else objects
         self.bucket_names: list[str] = []
         self.reads: list[ObjectRead] = []
-        self.available = True
+        self.calls: list[StorageCall] = []
+        self.unavailable: set[str] = set()
         self.after_lookup: Callable[[str], None] | None = None
         self.after_read: Callable[[ObjectRead], None] | None = None
         self._generation = max(
@@ -423,23 +287,28 @@ class StandInStorageClient:
         self.bucket_names.append(name)
         return StandInBucket(self)
 
-    def list_blobs(self, bucket_name: str, prefix: str = "") -> list[StandInBlob]:
-        self.check_available()
+    def list_blobs(
+        self, bucket_name: str, prefix: str = "", **options: Any
+    ) -> list[StandInBlob]:
+        self.calls.append(StorageCall("list", prefix, options))
+        self.check_available("list")
         return [
             StandInBlob(self, name, stored=stored)
             for name, stored in sorted(self.objects.items())
             if name.startswith(prefix)
         ]
 
-    def check_available(self) -> None:
-        if not self.available:
-            raise ServiceUnavailable("Storage is unavailable.")
+    def check_available(self, operation: str) -> None:
+        if operation in self.unavailable:
+            raise ServiceUnavailable(
+                f"Storage is unavailable to {CREDENTIAL_IN_STORAGE_ERROR}."
+            )
 
     def stored_for_read(self, name: str, generation: int | None) -> Any:
         """The object a read of ``generation`` gets, refusing as Cloud
         Storage does when that generation is no longer stored."""
 
-        self.check_available()
+        self.check_available("read")
         stored = self.objects.get(name)
         if stored is None or (
             generation is not None and stored.generation != generation
@@ -665,22 +534,7 @@ def graph_record(
     )
 
 
-# The service, with the stand-ins above.
-
-
-class UnusedAuthenticator:
-    def authenticate(self, token: str, required_org: str) -> HuggingFacePrincipal:
-        raise AssertionError("These tests exchange no Hugging Face token.")
-
-
-def collector_settings(**changes: Any) -> CollectorSettings:
-    return CollectorSettings(
-        jwt_secret=JWT_SECRET, read_token="dashboard-read-token", **changes
-    )
-
-
-def serving_settings() -> Any:
-    return serving().OrreryServingSettings(bucket=BUCKET, reader_service_account=READER)
+# The read service, with the stand-ins above.
 
 
 @dataclass(frozen=True)
@@ -703,19 +557,14 @@ class Serving:
     submissions: FakeSubmissionStore
     graphs: FakeOrreryGraphStore
     storage: StandInStorageClient
-    certificate_endpoint: CertificateEndpoint
-    certificate_clock: MonotonicClock
     clock: SteppingClock
     published: list[PublishedDocument] = field(default_factory=list)
 
-    def get(
-        self, path: str, *, headers: dict[str, str] | None = None, **request: Any
-    ) -> httpx.Response:
-        """GET ``path``, by default as the reader account."""
+    def get(self, path: str, **request: Any) -> httpx.Response:
+        """GET ``path``, as Cloud Run passes on a request it let through: the
+        read service reads no credential."""
 
-        if headers is None:
-            headers = bearer(identity_token())
-        return self.client.get(path, headers=headers, **request)
+        return self.client.get(path, **request)
 
     def listed(self, **filters: str) -> list[dict[str, Any]]:
         response = self.get(LISTING, params=filters or {"run_id": CONSUMING_RUN})
@@ -826,11 +675,10 @@ def serving_harness(
     graphs: FakeOrreryGraphStore | None = None,
     storage: StandInStorageClient | None = None,
     catalogue: Callable[[InMemoryGraphCatalogue], Any] | None = None,
-    maintenance_mode: bool = False,
     raise_server_exceptions: bool = True,
 ) -> Serving:
-    """The service over the stand-ins. ``catalogue``, when given, wraps the
-    in-memory catalogue the endpoints read."""
+    """The read service over the stand-ins. ``catalogue``, when given, wraps
+    the in-memory catalogue the endpoints read."""
 
     clock = SteppingClock()
     if submissions is None:
@@ -840,28 +688,14 @@ def serving_harness(
     if storage is None:
         storage = StandInStorageClient()
     in_memory_catalogue = InMemoryGraphCatalogue(graphs, submissions)
-    certificate_endpoint = CertificateEndpoint()
-    certificate_clock = MonotonicClock()
     services = serving().OrreryServingServices(
         catalogue=in_memory_catalogue
         if catalogue is None
         else catalogue(in_memory_catalogue),
         objects=graph_reader(storage),
-        verifier=access().GoogleIdentityTokenVerifier(
-            certificates=access().GoogleCertificates(
-                fetch=certificate_endpoint, clock=certificate_clock
-            )
-        ),
     )
     client = TestClient(
-        create_app(
-            settings=collector_settings(
-                orrery_serving=serving_settings(), maintenance_mode=maintenance_mode
-            ),
-            store=FakeTelemetryStore(),
-            huggingface_authenticator=UnusedAuthenticator(),
-            orrery_services=services,
-        ),
+        read_app().create_orrery_read_app(services=services),
         raise_server_exceptions=raise_server_exceptions,
     )
     return Serving(
@@ -869,8 +703,6 @@ def serving_harness(
         submissions=submissions,
         graphs=graphs,
         storage=storage,
-        certificate_endpoint=certificate_endpoint,
-        certificate_clock=certificate_clock,
         clock=clock,
     )
 
@@ -895,527 +727,6 @@ def assert_problem(
     assert isinstance(body["detail"], str) and body["detail"]
     assert_private(response)
     return body
-
-
-# The caller check.
-
-
-def test_microcosm_runs_requests_tokens_for_the_documented_audience() -> None:
-    assert access().ORRERY_GRAPHS_AUDIENCE == AUDIENCE
-
-
-def test_an_identity_token_of_the_reader_account_passes(service: Serving) -> None:
-    published = service.publish()
-
-    listing = service.get(LISTING, params={"run_id": CONSUMING_RUN})
-    document = service.get(published.path())
-
-    assert listing.status_code == 200, listing.text
-    assert [entry["submission_id"] for entry in listing.json()["documents"]] == [
-        published.submission_id
-    ]
-    assert document.status_code == 200, document.text
-    assert_private(listing)
-    assert_private(document)
-
-
-# Each request is refused with 401, and the code the refusal carries.
-UNAUTHENTICATED_REQUESTS: dict[str, tuple[Callable[[], dict[str, str]], str]] = {
-    "no token": (lambda: {}, "identity_token_required"),
-    "another scheme": (
-        lambda: {"Authorization": f"Basic {identity_token()}"},
-        "identity_token_required",
-    ),
-    "an empty bearer token": (
-        lambda: {"Authorization": "Bearer "},
-        "identity_token_required",
-    ),
-    "a malformed token": (lambda: bearer("not-a-token"), "identity_token_invalid"),
-    "a token whose payload is not JSON": (
-        # The header `{}` and the payload `not-json`, unsigned.
-        lambda: bearer("e30.bm90LWpzb24.c2ln"),
-        "identity_token_invalid",
-    ),
-    "a bad signature": (
-        lambda: bearer(identity_token(signing_key=impostor_signing_key())),
-        "identity_token_invalid",
-    ),
-    "a key Google does not publish": (
-        lambda: bearer(identity_token(key_id="google-test-key-2")),
-        "identity_token_invalid",
-    ),
-    # Signed with Google's own key, so only the missing key ID refuses these:
-    # without one, google-auth would try the token against every certificate.
-    "a token without a key ID": (
-        lambda: bearer(
-            jwt.encode(identity_claims(), google_signing_key(), algorithm="RS256")
-        ),
-        "identity_token_invalid",
-    ),
-    "an empty key ID": (
-        lambda: bearer(identity_token(key_id="")),
-        "identity_token_invalid",
-    ),
-    "another algorithm": (
-        lambda: bearer(
-            jwt.encode(
-                identity_claims(),
-                "a-shared-secret-that-is-long-enough-for-hs256-" + "x" * 32,
-                algorithm="HS256",
-                headers={"kid": KEY_ID},
-            )
-        ),
-        "identity_token_invalid",
-    ),
-    "an expired token": (
-        lambda: bearer(
-            identity_token(iat=int(time.time()) - 7200, exp=int(time.time()) - 3600)
-        ),
-        "identity_token_invalid",
-    ),
-    "a token issued for later": (
-        lambda: bearer(
-            identity_token(iat=int(time.time()) + 3600, exp=int(time.time()) + 7200)
-        ),
-        "identity_token_invalid",
-    ),
-    "a token without an expiry": (
-        lambda: bearer(identity_token(exp=LEFT_OUT)),
-        "identity_token_invalid",
-    ),
-    "a wrong audience": (
-        lambda: bearer(identity_token(aud="https://collector.example.test")),
-        "identity_token_invalid",
-    ),
-    "a wrong issuer": (
-        lambda: bearer(identity_token(iss="https://issuer.example.test")),
-        "identity_token_invalid",
-    ),
-}
-
-
-@pytest.mark.parametrize("case", sorted(UNAUTHENTICATED_REQUESTS))
-@pytest.mark.parametrize("endpoint", ["listing", "file"])
-def test_requests_without_a_valid_google_identity_token_are_refused_with_401(
-    service: Serving, case: str, endpoint: str
-) -> None:
-    published = service.publish()
-    headers, code = UNAUTHENTICATED_REQUESTS[case]
-    path = (
-        f"{LISTING}?run_id={CONSUMING_RUN}"
-        if endpoint == "listing"
-        else published.path()
-    )
-
-    response = service.get(path, headers=headers())
-
-    assert_problem(response, 401, code)
-    assert response.headers["WWW-Authenticate"] == "Bearer"
-    assert service.storage.reads == []
-
-
-@pytest.mark.parametrize(
-    "claim_changes",
-    [
-        {"email": ANOTHER_ACCOUNT},
-        {"email": READER.upper()},
-        {"email_verified": False},
-        {"email_verified": "true"},
-        # A token generateIdToken issued without includeEmail.
-        {"email": LEFT_OUT, "email_verified": LEFT_OUT},
-    ],
-    ids=[
-        "another account",
-        "the reader account in capitals",
-        "an unverified address",
-        "a verification flag that is not a boolean",
-        "no address",
-    ],
-)
-def test_a_valid_google_token_of_any_other_account_is_refused_with_403(
-    service: Serving, claim_changes: dict[str, Any]
-) -> None:
-    published = service.publish()
-
-    for path in (f"{LISTING}?run_id={CONSUMING_RUN}", published.path()):
-        response = service.get(path, headers=bearer(identity_token(**claim_changes)))
-
-        assert_problem(response, 403, "identity_not_allowed")
-    assert service.storage.reads == []
-
-
-def test_without_google_s_certificates_no_token_is_accepted_and_the_answer_is_503(
-    service: Serving,
-) -> None:
-    service.publish()
-    service.certificate_endpoint.available = False
-
-    response = service.get(LISTING, params={"run_id": CONSUMING_RUN})
-
-    assert_problem(response, 503, "identity_certificates_unavailable")
-    assert int(response.headers["Retry-After"]) > 0
-    assert "WWW-Authenticate" not in response.headers
-
-
-def test_google_s_certificates_are_fetched_once_for_as_long_as_they_last(
-    service: Serving,
-) -> None:
-    service.publish()
-
-    for _ in range(3):
-        service.listed()
-    assert service.certificate_endpoint.fetches == 1
-
-    service.certificate_clock.advance(service.certificate_endpoint.lifetime_seconds - 1)
-    service.listed()
-    assert service.certificate_endpoint.fetches == 1
-
-    service.certificate_clock.advance(1)
-    service.listed()
-    assert service.certificate_endpoint.fetches == 2
-
-
-def test_certificates_with_a_lifetime_of_0_are_fetched_again_on_the_next_request(
-    service: Serving,
-) -> None:
-    service.publish()
-    service.certificate_endpoint.lifetime_seconds = 0
-    fetches_after_each_request = []
-
-    for _ in range(3):
-        service.listed()
-        fetches_after_each_request.append(service.certificate_endpoint.fetches)
-        service.certificate_clock.advance(5)
-
-    # Google's endpoint answers, so the once-a-minute limit after a failed
-    # fetch doesn't apply: each request after a fetch fetches again.
-    assert fetches_after_each_request == [1, 2, 3]
-
-
-def rotated_key_token() -> dict[str, str]:
-    """The reader's token, signed with a key Google published after the
-    collector fetched its certificates."""
-
-    return bearer(
-        identity_token(signing_key=rotated_signing_key(), key_id=ROTATED_KEY_ID)
-    )
-
-
-def test_a_token_signed_with_a_new_key_fetches_the_certificates_again(
-    service: Serving,
-) -> None:
-    service.publish()
-    service.listed()
-    service.certificate_endpoint.published = {
-        KEY_ID: google_certificate(),
-        ROTATED_KEY_ID: rotated_certificate(),
-    }
-    service.certificate_clock.advance(REFETCH_INTERVAL_SECONDS)
-
-    response = service.get(
-        LISTING, params={"run_id": CONSUMING_RUN}, headers=rotated_key_token()
-    )
-
-    assert response.status_code == 200, response.text
-    assert service.certificate_endpoint.fetches == 2
-    # The certificates fetched again serve the old key too, without a fetch.
-    service.listed()
-    assert service.certificate_endpoint.fetches == 2
-
-
-def test_an_unknown_key_fetches_the_certificates_again_at_most_once_a_minute(
-    service: Serving,
-) -> None:
-    service.publish()
-    service.listed()
-
-    def refused_with_fetches() -> int:
-        response = service.get(
-            LISTING, params={"run_id": CONSUMING_RUN}, headers=rotated_key_token()
-        )
-        assert_problem(response, 401, "identity_token_invalid")
-        return service.certificate_endpoint.fetches
-
-    # Within a minute of the fetch, the token is refused without another.
-    assert [refused_with_fetches() for _ in range(3)] == [1, 1, 1]
-    service.certificate_clock.advance(REFETCH_INTERVAL_SECONDS)
-    # Google still doesn't publish the key: one fetch, then none for a minute.
-    assert [refused_with_fetches() for _ in range(3)] == [2, 2, 2]
-    service.certificate_clock.advance(REFETCH_INTERVAL_SECONDS - 1)
-    assert refused_with_fetches() == 2
-    service.certificate_clock.advance(1)
-    assert refused_with_fetches() == 3
-
-
-def test_a_failed_fetch_keeps_the_certificates_for_an_hour_past_their_expiry(
-    service: Serving, caplog: pytest.LogCaptureFixture
-) -> None:
-    caplog.set_level(logging.WARNING)
-    service.publish()
-    service.listed()
-    endpoint = service.certificate_endpoint
-    endpoint.available = False
-
-    service.certificate_clock.advance(endpoint.lifetime_seconds)
-    service.listed()
-    assert endpoint.fetches == 2
-    assert [
-        record.levelno for record in caplog.records if record.name == ACCESS_MODULE
-    ] == [logging.WARNING]
-
-    # The failed fetch is tried again at most once a minute.
-    service.certificate_clock.advance(REFETCH_INTERVAL_SECONDS - 1)
-    service.listed()
-    assert endpoint.fetches == 2
-    service.certificate_clock.advance(1)
-    service.listed()
-    assert endpoint.fetches == 3
-
-    # Until an hour past the expiry, and no longer.
-    service.certificate_clock.advance(
-        CERTIFICATE_GRACE_SECONDS - REFETCH_INTERVAL_SECONDS - 1
-    )
-    service.listed()
-    service.certificate_clock.advance(1)
-    response = service.get(LISTING, params={"run_id": CONSUMING_RUN})
-    assert_problem(response, 503, "identity_certificates_unavailable")
-
-    # Once Google answers again, its new certificates are used.
-    endpoint.available = True
-    service.listed()
-
-
-@dataclass
-class VerifierUnderTest:
-    """A verifier over the stand-in certificate endpoint, and what the
-    requests verified in other threads returned."""
-
-    endpoint: CertificateEndpoint = field(default_factory=CertificateEndpoint)
-    clock: MonotonicClock = field(default_factory=MonotonicClock)
-    outcomes: list[object] = field(default_factory=list)
-    verifier: Any = None
-
-    def __post_init__(self) -> None:
-        self.verifier = access().GoogleIdentityTokenVerifier(
-            certificates=access().GoogleCertificates(
-                fetch=self.endpoint, clock=self.clock
-            )
-        )
-
-    def verify_in_thread(self, token: str) -> threading.Thread:
-        def verify() -> None:
-            try:
-                self.outcomes.append(self.verifier.verify(token)["email"])
-            except Exception as error:
-                self.outcomes.append(error)
-
-        thread = threading.Thread(target=verify, daemon=True)
-        thread.start()
-        return thread
-
-
-def test_requests_the_cached_certificates_can_check_do_not_wait_for_a_fetch() -> None:
-    under_test = VerifierUnderTest()
-    token = identity_token()
-    under_test.verifier.verify(token)
-    under_test.clock.advance(under_test.endpoint.lifetime_seconds)
-    under_test.endpoint.hold_fetches()
-
-    fetching = under_test.verify_in_thread(token)
-    try:
-        assert under_test.endpoint.fetch_started.wait(timeout=5)
-        # The certificates have expired but are within their grace period,
-        # so this request uses them instead of waiting for the slow fetch.
-        not_waiting = under_test.verify_in_thread(token)
-        not_waiting.join(timeout=2)
-        assert not not_waiting.is_alive()
-        assert under_test.outcomes == [READER]
-    finally:
-        under_test.endpoint.release_fetches()
-        fetching.join(timeout=5)
-
-    assert under_test.outcomes == [READER, READER]
-    assert under_test.endpoint.fetches == 2
-
-
-def test_requests_without_usable_certificates_wait_for_one_fetch() -> None:
-    under_test = VerifierUnderTest()
-    token = identity_token()
-    under_test.endpoint.hold_fetches()
-
-    fetching = under_test.verify_in_thread(token)
-    assert under_test.endpoint.fetch_started.wait(timeout=5)
-    waiting = under_test.verify_in_thread(token)
-    try:
-        # No certificates are cached yet, so it waits for the fetch running.
-        waiting.join(timeout=0.5)
-        assert waiting.is_alive()
-    finally:
-        under_test.endpoint.release_fetches()
-        fetching.join(timeout=5)
-        waiting.join(timeout=5)
-
-    assert under_test.outcomes == [READER, READER]
-    assert under_test.endpoint.fetches == 1
-
-
-def test_the_token_never_appears_in_answers_or_logs(
-    service: Serving, caplog: pytest.LogCaptureFixture
-) -> None:
-    caplog.set_level(logging.DEBUG)
-    published = service.publish()
-    tokens = [
-        identity_token(),
-        identity_token(email=ANOTHER_ACCOUNT),
-        identity_token(aud="https://collector.example.test"),
-        identity_token(signing_key=impostor_signing_key()),
-        "not-a-token-" + "q" * 40,
-    ]
-    answers = []
-
-    for token in tokens:
-        for path in (f"{LISTING}?run_id={CONSUMING_RUN}", published.path()):
-            answers.append((token, service.get(path, headers=bearer(token))))
-    # Past the certificates' lifetime, with Google's endpoint down, the
-    # collector warns and keeps using them; an hour later it answers 503.
-    service.certificate_endpoint.available = False
-    for advance_seconds in (
-        service.certificate_endpoint.lifetime_seconds,
-        CERTIFICATE_GRACE_SECONDS,
-    ):
-        service.certificate_clock.advance(advance_seconds)
-        answers.append(
-            (tokens[0], service.get(published.path(), headers=bearer(tokens[0])))
-        )
-
-    assert {answer.status_code for _, answer in answers} == {200, 401, 403, 503}
-    assert [answer.status_code for _, answer in answers[-2:]] == [200, 503]
-    for token, answer in answers:
-        assert token not in answer.text
-        assert all(token not in value for value in answer.headers.values())
-    # The collector's own log records were captured, so their text was checked.
-    assert any(
-        record.name == ACCESS_MODULE and record.levelno == logging.WARNING
-        for record in caplog.records
-    )
-    for token in tokens:
-        assert token not in caplog.text
-
-
-@pytest.mark.parametrize(
-    ("headers", "lifetime_seconds"),
-    [
-        ({"Cache-Control": "public, max-age=21600, must-revalidate"}, 21600),
-        ({"Cache-Control": "public, max-age=21600", "Age": "600"}, 21000),
-        ({"cache-control": "max-age=60"}, 60),
-        ({"Cache-Control": "max-age=60", "Age": "90"}, 0),
-        ({"Cache-Control": "no-store"}, 0),
-        ({"Cache-Control": "no-cache, max-age=60"}, 0),
-        ({"Cache-Control": "max-age=soon"}, 0),
-        ({}, 0),
-    ],
-)
-def test_certificates_are_kept_only_as_long_as_google_s_cache_control_allows(
-    headers: dict[str, str], lifetime_seconds: float
-) -> None:
-    assert access().certificate_lifetime_seconds(headers) == lifetime_seconds
-
-
-@dataclass
-class CertificateResponse:
-    """What google.auth.transport.requests.Request returns."""
-
-    status: int
-    data: bytes
-    headers: dict[str, str] = field(default_factory=dict)
-
-
-def test_google_s_certificates_are_fetched_from_its_oauth2_certificate_endpoint() -> (
-    None
-):
-    requests_made: list[dict[str, Any]] = []
-
-    def request(**arguments: Any) -> CertificateResponse:
-        requests_made.append(arguments)
-        return CertificateResponse(
-            200,
-            json.dumps({KEY_ID: google_certificate()}).encode(),
-            {"Cache-Control": "public, max-age=21600, must-revalidate"},
-        )
-
-    fetched = access().fetch_google_certificates(request)
-
-    assert dict(fetched.certificates) == {KEY_ID: google_certificate()}
-    assert fetched.lifetime_seconds == 21600
-    assert [(made["url"], made["method"]) for made in requests_made] == [
-        (GOOGLE_CERTIFICATES_URL, "GET")
-    ]
-    assert requests_made[0]["timeout"] > 0
-
-
-def unreachable(**arguments: Any) -> CertificateResponse:
-    raise TransportError("The connection was refused.")
-
-
-@pytest.mark.parametrize(
-    "request_certificates",
-    [
-        unreachable,
-        lambda **arguments: CertificateResponse(503, b"{}"),
-        lambda **arguments: CertificateResponse(200, b"not json"),
-        lambda **arguments: CertificateResponse(200, b"[]"),
-        lambda **arguments: CertificateResponse(200, b"{}"),
-        lambda **arguments: CertificateResponse(200, json.dumps({KEY_ID: 5}).encode()),
-    ],
-    ids=[
-        "unreachable",
-        "an error status",
-        "not JSON",
-        "not an object",
-        "no certificates",
-        "a certificate that is not text",
-    ],
-)
-def test_a_certificate_fetch_that_fails_makes_the_certificates_unavailable(
-    request_certificates: Callable[..., CertificateResponse],
-) -> None:
-    with pytest.raises(access().GoogleCertificatesUnavailableError):
-        access().fetch_google_certificates(request_certificates)
-
-
-@pytest.mark.parametrize(
-    "response_headers",
-    [
-        {"Cache-Control": "no-store"},
-        {"Cache-Control": "no-cache, max-age=3600"},
-        {"Cache-Control": "public"},
-    ],
-    ids=["no-store", "no-cache", "no max-age"],
-)
-def test_certificates_google_forbids_keeping_are_fetched_again_on_the_next_request(
-    response_headers: dict[str, str],
-) -> None:
-    requests_made: list[dict[str, Any]] = []
-
-    def request(**arguments: Any) -> CertificateResponse:
-        requests_made.append(arguments)
-        return CertificateResponse(
-            200, json.dumps({KEY_ID: google_certificate()}).encode(), response_headers
-        )
-
-    clock = MonotonicClock()
-    verifier = access().GoogleIdentityTokenVerifier(
-        certificates=access().GoogleCertificates(
-            fetch=lambda: access().fetch_google_certificates(request), clock=clock
-        )
-    )
-    token = identity_token()
-
-    for _ in range(3):
-        assert verifier.verify(token)["email"] == READER
-        clock.advance(5)
-
-    assert len(requests_made) == 3
 
 
 # Listing a run's or a build's documents.
@@ -2034,10 +1345,24 @@ def test_a_checksum_failure_the_storage_client_reports_answers_500(
     assert_error_logged(caplog, object_name)
 
 
-@pytest.mark.parametrize("endpoint", ["listing", "file"])
-def test_an_unavailable_bucket_answers_503(service: Serving, endpoint: str) -> None:
+# Each storage call that can fail: its operation, and the endpoint whose
+# request makes it.
+STORAGE_FAILURES = {
+    "listing a listed document's folder": ("list", "listing"),
+    "looking the file up": ("lookup", "file"),
+    "reading the file to check it": ("read", "file"),
+    "listing the served document's folder": ("list", "file"),
+}
+
+
+@pytest.mark.parametrize("failure", sorted(STORAGE_FAILURES))
+def test_a_bucket_that_does_not_answer_gives_503_and_is_logged_without_credentials(
+    service: Serving, caplog: pytest.LogCaptureFixture, failure: str
+) -> None:
     published = service.publish(upstream={UPSTREAM_NAME: UPSTREAM_CONTENT})
-    service.storage.available = False
+    operation, endpoint = STORAGE_FAILURES[failure]
+    service.storage.unavailable.add(operation)
+    caplog.set_level(logging.DEBUG)
     path = (
         f"{LISTING}?run_id={CONSUMING_RUN}"
         if endpoint == "listing"
@@ -2048,6 +1373,41 @@ def test_an_unavailable_bucket_answers_503(service: Serving, endpoint: str) -> N
 
     assert_problem(response, 503, "orrery_storage_unavailable")
     assert int(response.headers["Retry-After"]) > 0
+    [failed_call] = [
+        call for call in service.storage.calls if call.operation == operation
+    ]
+    [logged] = [
+        record
+        for record in caplog.records
+        if record.name == ROUTES_MODULE and record.levelno >= logging.WARNING
+    ]
+    # The folder or object the call named, and the error's type, but not its
+    # message, which can hold what the request carried.
+    assert failed_call.name in logged.getMessage()
+    assert "ServiceUnavailable" in logged.getMessage()
+    assert CREDENTIAL_IN_STORAGE_ERROR not in caplog.text
+
+
+def test_every_storage_call_has_a_timeout_and_a_retry_deadline_well_inside_the_request_timeout(
+    service: Serving,
+) -> None:
+    published = service.publish(upstream={UPSTREAM_NAME: UPSTREAM_CONTENT})
+
+    service.listed()
+    for file_name in (GRAPH_FILE_NAME, UPSTREAM_NAME):
+        assert service.get(published.path(file_name)).status_code == 200
+
+    assert {call.operation for call in service.storage.calls} == set(STORAGE_OPERATIONS)
+    request_timeout_seconds = read_app().REQUEST_TIMEOUT_SECONDS
+    for call in service.storage.calls:
+        timeout_seconds = call.options.get("timeout")
+        retry = call.options.get("retry")
+        assert isinstance(timeout_seconds, int | float), call
+        assert timeout_seconds > 0, call
+        assert retry is not None and retry.timeout is not None, call
+        # A fetch makes several storage calls one after another, so one that
+        # is retried until its deadline must leave time for the others.
+        assert retry.timeout + timeout_seconds <= request_timeout_seconds / 4, call
 
 
 @pytest.mark.parametrize(
@@ -2134,10 +1494,10 @@ def test_a_document_the_worker_published_is_listed_and_served() -> None:
     assert served_upstream.content == WORKER_UPSTREAM_CONTENT
 
 
-# Every answer of these endpoints is marked private and not to be stored.
+# Every answer of the read service is marked private and not to be stored.
 
 
-def test_every_answer_under_the_orrery_graph_path_is_marked_not_to_be_stored(
+def test_every_answer_of_the_read_service_is_marked_not_to_be_stored(
     service: Serving,
 ) -> None:
     published = service.publish(upstream={UPSTREAM_NAME: UPSTREAM_CONTENT})
@@ -2146,200 +1506,228 @@ def test_every_answer_under_the_orrery_graph_path_is_marked_not_to_be_stored(
         service.get(LISTING, params={"run_id": CONSUMING_RUN}),
         service.get(published.path()),
         service.get(published.path(UPSTREAM_NAME)),
-        service.get(published.path(), headers={}),
-        service.get(published.path(), headers=bearer(identity_token(email=READER[1:]))),
         service.get(LISTING),
         service.get(published.path("graph.schema.json")),
         service.get(f"{LISTING}/unknown"),
-        service.client.post(LISTING, headers=bearer(identity_token())),
+        service.client.post(LISTING),
+        # Paths outside the Orrery graph routes, which the read service
+        # doesn't have.
+        service.get("/"),
+        service.get("/health"),
+        service.get("/openapi.json"),
     ]
 
     assert [answer.status_code for answer in answers] == [
         200,
         200,
         200,
-        401,
-        403,
         422,
         404,
         404,
         405,
+        404,
+        404,
+        404,
     ]
     for answer in answers:
         assert_private(answer)
-    assert "Cache-Control" not in service.client.get("/health").headers
 
 
-def test_maintenance_mode_s_answers_under_the_orrery_graph_path_are_not_to_be_stored() -> (
-    None
-):
-    harness = serving_harness(maintenance_mode=True)
-    published = harness.publish()
-
-    answers = [
-        harness.get(LISTING, params={"run_id": CONSUMING_RUN}),
-        harness.get(published.path()),
-        harness.get(published.path(), headers={}),
-    ]
-
-    assert [answer.status_code for answer in answers] == [503, 503, 503]
-    for answer in answers:
-        assert_private(answer)
-    assert harness.storage.reads == []
-    assert "Cache-Control" not in harness.client.get("/health").headers
+# The read service and its settings.
 
 
-# Settings.
+def test_the_read_service_mounts_only_the_orrery_graph_routes(
+    service: Serving,
+) -> None:
+    assert {route.path: route.methods for route in service.client.app.routes} == {
+        LISTING: {"GET"},
+        FILE_ROUTE: {"GET"},
+    }
+
+
+def test_the_read_service_verifies_no_token(service: Serving) -> None:
+    published = service.publish()
+
+    # Cloud Run checks the caller before a request reaches the service, so
+    # whatever the request still carries is not read.
+    for headers in ({}, {"Authorization": "Bearer not-a-token"}):
+        assert service.get(published.path(), headers=headers).status_code == 200
+    assert importlib.util.find_spec("telemetry_collector.orrery_access") is None
+
+
+def test_the_read_service_documents_the_custom_audience_microcosm_runs_uses() -> None:
+    assert read_app().ORRERY_GRAPHS_AUDIENCE == AUDIENCE
+
+
+@dataclass
+class ReadServiceEnvironment:
+    """The process environment, and the settings of each Cloud Storage reader
+    the read service built from it."""
+
+    monkeypatch: pytest.MonkeyPatch
+    readers: list[dict[str, Any]]
+
+    def set(self, environment: dict[str, str]) -> None:
+        for name, value in environment.items():
+            self.monkeypatch.setenv(name, value)
 
 
 @pytest.fixture
-def clean_environment(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
-    for name in [
-        *SERVING_ENVIRONMENT,
-        "COLLECTOR_INTAKE_ENABLED",
-        "TELEMETRY_JWT_SIGNING_KEY",
-    ]:
+def read_service_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> ReadServiceEnvironment:
+    for name in [*READ_SERVICE_ENVIRONMENT, RETIRED_READER_SETTING]:
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("TELEMETRY_JWT_SECRET", "x" * 32)
-    monkeypatch.setenv("TELEMETRY_READ_TOKEN", "y" * 24)
-    return monkeypatch
+    readers: list[dict[str, Any]] = []
 
+    def stand_in_reader(**settings: Any) -> dict[str, Any]:
+        readers.append(settings)
+        return settings
 
-def test_without_either_setting_the_endpoints_are_not_enabled(
-    clean_environment: pytest.MonkeyPatch,
-) -> None:
-    assert CollectorSettings.from_environment().orrery_serving is None
-    application = create_app(
-        settings=collector_settings(),
-        store=FakeTelemetryStore(),
-        huggingface_authenticator=UnusedAuthenticator(),
+    monkeypatch.setattr(
+        google_cloud, "GoogleCloudStorageOrreryGraphReader", stand_in_reader
     )
-    client = TestClient(application)
-    document_path = f"{LISTING}/sub-{'0' * 32}/{'0' * 64}/{GRAPH_FILE_NAME}"
-
-    for response in (
-        client.get(LISTING, params={"run_id": CONSUMING_RUN}),
-        client.get(document_path, headers=bearer(identity_token())),
-    ):
-        assert_problem(response, 404, "orrery_graphs_not_enabled")
-    assert not any(path.startswith(LISTING) for path in application.openapi()["paths"])
+    return ReadServiceEnvironment(monkeypatch, readers)
 
 
-@pytest.mark.parametrize(
-    ("present_name", "missing_name"),
-    [
-        ("COLLECTOR_ORRERY_BUCKET", "COLLECTOR_ORRERY_READER_SERVICE_ACCOUNT"),
-        ("COLLECTOR_ORRERY_READER_SERVICE_ACCOUNT", "COLLECTOR_ORRERY_BUCKET"),
-    ],
-)
-def test_the_service_refuses_to_start_with_only_one_setting(
-    clean_environment: pytest.MonkeyPatch, present_name: str, missing_name: str
+def test_the_deployed_read_service_starts_with_its_two_settings(
+    read_service_environment: ReadServiceEnvironment,
 ) -> None:
-    clean_environment.setenv(present_name, SERVING_ENVIRONMENT[present_name])
+    read_service_environment.set(READ_SERVICE_ENVIRONMENT)
+
+    application = read_app().create_orrery_read_app_from_environment()
+
+    assert {route.path for route in application.routes} == {LISTING, FILE_ROUTE}
+    assert read_service_environment.readers == [{"bucket_name": BUCKET}]
+
+
+@pytest.mark.parametrize("missing_name", sorted(READ_SERVICE_ENVIRONMENT))
+def test_the_read_service_refuses_to_start_without_either_setting(
+    read_service_environment: ReadServiceEnvironment, missing_name: str
+) -> None:
+    read_service_environment.set(
+        {
+            name: value
+            for name, value in READ_SERVICE_ENVIRONMENT.items()
+            if name != missing_name
+        }
+    )
 
     with pytest.raises(RuntimeError, match=missing_name):
-        CollectorSettings.from_environment()
-
-
-def test_both_settings_switch_serving_on(
-    clean_environment: pytest.MonkeyPatch,
-) -> None:
-    for name, value in SERVING_ENVIRONMENT.items():
-        clean_environment.setenv(name, value)
-
-    assert CollectorSettings.from_environment().orrery_serving == serving_settings()
+        read_app().create_orrery_read_app_from_environment()
+    assert read_service_environment.readers == []
 
 
 @pytest.mark.parametrize(
-    ("name", "malformed_value"),
-    [
-        ("COLLECTOR_ORRERY_BUCKET", "gs://collector-orrery-test"),
-        ("COLLECTOR_ORRERY_BUCKET", "Collector-Orrery"),
-        ("COLLECTOR_ORRERY_READER_SERVICE_ACCOUNT", "microcosm-runs-reader"),
-        (
-            "COLLECTOR_ORRERY_READER_SERVICE_ACCOUNT",
-            "123456789-compute@developer.gserviceaccount.com",
-        ),
-        ("COLLECTOR_ORRERY_READER_SERVICE_ACCOUNT", "reader@example.invalid"),
-    ],
+    "malformed_bucket", ["gs://collector-orrery-test", "Collector-Orrery"]
 )
-def test_a_malformed_setting_stops_the_service(
-    clean_environment: pytest.MonkeyPatch, name: str, malformed_value: str
+def test_a_malformed_bucket_name_stops_the_read_service(
+    read_service_environment: ReadServiceEnvironment, malformed_bucket: str
 ) -> None:
-    for setting_name, value in SERVING_ENVIRONMENT.items():
-        clean_environment.setenv(setting_name, value)
-    clean_environment.setenv(name, malformed_value)
+    read_service_environment.set(
+        {**READ_SERVICE_ENVIRONMENT, "COLLECTOR_ORRERY_BUCKET": malformed_bucket}
+    )
 
-    with pytest.raises(RuntimeError, match=name):
-        CollectorSettings.from_environment()
+    with pytest.raises(RuntimeError, match="COLLECTOR_ORRERY_BUCKET"):
+        read_app().create_orrery_read_app_from_environment()
+
+
+@pytest.mark.parametrize("reader_setting", [READER, "not-a-service-account"])
+def test_the_read_service_reads_no_reader_account_setting(reader_setting: str) -> None:
+    with_reader_setting = serving().OrreryServingSettings.from_environment(
+        {**READ_SERVICE_ENVIRONMENT, RETIRED_READER_SETTING: reader_setting}
+    )
+
+    assert with_reader_setting == serving().OrreryServingSettings.from_environment(
+        READ_SERVICE_ENVIRONMENT
+    )
+    assert reader_setting not in repr(with_reader_setting)
+
+
+def test_the_read_service_settings_never_show_the_database_url() -> None:
+    settings = serving().OrreryServingSettings.from_environment(
+        READ_SERVICE_ENVIRONMENT
+    )
+
+    assert settings.bucket == BUCKET
+    assert settings.database_url == UNREACHABLE_DATABASE_URL
+    assert UNREACHABLE_DATABASE_URL not in repr(settings)
 
 
 @pytest.mark.parametrize(
     "bucket",
     [BUCKET, "gs://collector-orrery", "Collector-Orrery", "ab", "a" * 63, "a" * 64],
 )
-def test_the_service_checks_the_bucket_name_as_the_worker_does(bucket: str) -> None:
+def test_the_read_service_checks_the_bucket_name_as_the_worker_does(
+    bucket: str,
+) -> None:
     try:
         worker_accepts = orrery_bucket({"COLLECTOR_ORRERY_BUCKET": bucket}) == bucket
     except RuntimeError:
         worker_accepts = False
     try:
         settings = serving().OrreryServingSettings.from_environment(
-            {**SERVING_ENVIRONMENT, "COLLECTOR_ORRERY_BUCKET": bucket}
+            {**READ_SERVICE_ENVIRONMENT, "COLLECTOR_ORRERY_BUCKET": bucket}
         )
-        service_accepts = settings is not None and settings.bucket == bucket
+        read_service_accepts = settings.bucket == bucket
     except RuntimeError:
-        service_accepts = False
+        read_service_accepts = False
 
-    assert service_accepts == worker_accepts
-
-
-class StandInGraphReader:
-    def __init__(self, **settings: Any) -> None:
-        self.settings = settings
+    assert read_service_accepts == worker_accepts
 
 
-@pytest.mark.parametrize("enabled", [True, False])
-def test_the_deployed_app_serves_orrery_graph_files_only_with_both_settings(
-    clean_environment: pytest.MonkeyPatch, enabled: bool
-) -> None:
-    from telemetry_collector.app import create_app_from_environment
-
-    clean_environment.setattr(
-        google_cloud, "GoogleCloudStorageOrreryGraphReader", StandInGraphReader
-    )
-    clean_environment.setenv(
-        "DATABASE_URL", "postgresql://user:password@127.0.0.1:1/none"
-    )
-    if enabled:
-        for name, value in SERVING_ENVIRONMENT.items():
-            clean_environment.setenv(name, value)
-
-    paths = create_app_from_environment().openapi()["paths"]
-
-    assert (LISTING in paths) is enabled
-    assert (FILE_ROUTE in paths) is enabled
+# The collector's main application serves no Orrery graph file.
 
 
-def test_switching_serving_on_without_its_services_is_refused() -> None:
-    with pytest.raises(ValueError, match="Orrery"):
-        create_app(
-            settings=collector_settings(orrery_serving=serving_settings()),
-            store=FakeTelemetryStore(),
-            huggingface_authenticator=UnusedAuthenticator(),
-        )
+class UnusedAuthenticator:
+    def authenticate(self, token: str, required_org: str) -> HuggingFacePrincipal:
+        raise AssertionError("These tests exchange no Hugging Face token.")
 
 
-def test_the_read_api_document_leaves_out_the_orrery_graph_routes(
-    service: Serving,
-) -> None:
-    without_serving = create_app(
-        settings=collector_settings(),
+def test_the_main_application_mounts_no_orrery_graph_route() -> None:
+    application = create_app(
+        settings=CollectorSettings(
+            jwt_secret=JWT_SECRET, read_token="dashboard-read-token"
+        ),
         store=FakeTelemetryStore(),
         huggingface_authenticator=UnusedAuthenticator(),
     )
+    document_path = f"{LISTING}/sub-{'0' * 32}/{'0' * 64}/{GRAPH_FILE_NAME}"
 
-    assert openapi_document(service.client.app) == openapi_document(without_serving)
+    assert not [
+        route.path for route in application.routes if route.path.startswith(LISTING)
+    ]
+    with TestClient(application) as client:
+        for response in (
+            client.get(LISTING, params={"run_id": CONSUMING_RUN}),
+            client.get(document_path),
+        ):
+            assert response.status_code == 404
+            assert response.json() == {"detail": "Not Found"}
+            assert "Cache-Control" not in response.headers
+
+
+def test_the_deployed_main_application_ignores_the_orrery_settings(
+    read_service_environment: ReadServiceEnvironment,
+) -> None:
+    read_service_environment.set(
+        {
+            **READ_SERVICE_ENVIRONMENT,
+            RETIRED_READER_SETTING: READER,
+            "TELEMETRY_JWT_SECRET": "x" * 32,
+            "TELEMETRY_READ_TOKEN": "y" * 24,
+        }
+    )
+    for name in ("COLLECTOR_INTAKE_ENABLED", "TELEMETRY_JWT_SIGNING_KEY"):
+        read_service_environment.monkeypatch.delenv(name, raising=False)
+
+    application = create_app_from_environment()
+
+    assert not hasattr(CollectorSettings.from_environment(), "orrery_serving")
+    assert not [
+        route.path for route in application.routes if route.path.startswith(LISTING)
+    ]
+    assert read_service_environment.readers == []
 
 
 # The catalogue, in memory and in PostgreSQL.
