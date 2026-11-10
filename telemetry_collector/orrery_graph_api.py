@@ -1,11 +1,12 @@
 """HTTP endpoints that serve Orrery graph files to microcosm-runs.
 
-The endpoints are mounted only while serving is on (``OrreryServingSettings``);
-while it is off, every path under ``/v1/orrery-graphs`` answers 404 with the
-code ``orrery_graphs_not_enabled``. Every request must first pass the caller
-check of ``telemetry_collector.orrery_access``: only microcosm-runs' own
-service account may list or fetch any document, public or private, and
-microcosm-runs decides what to show to whom.
+Only the Orrery read service mounts these routes
+(``telemetry_collector.orrery_read_app``), a separate Cloud Run service run
+from the collector's image; the collector's main service doesn't. Cloud Run
+lets only microcosm-runs' own service account call the read service, and
+checks its Google identity token before a request reaches these routes, so
+they read no credential. microcosm-runs may list and fetch any document,
+public or private, and decides what to show to whom.
 
 - ``GET /v1/orrery-graphs?run_id=<run>&build_id=<build>``, with either or
   both, lists the recorded documents of the run, the build ID or both,
@@ -24,17 +25,16 @@ microcosm-runs decides what to show to whom.
   early; microcosm-runs must compare the body's SHA-256 with the ``ETag``
   before it caches or shows the file.
 
-Every answer under ``/v1/orrery-graphs``, refusals and the errors above
-included, carries ``Cache-Control: private, no-store``
-(``PrivateNoStoreMiddleware``). The collector's own errors have the
-service's ``{"detail", "code"}`` shape: a bucket that doesn't answer gives
-503 ``orrery_storage_unavailable`` and a database that doesn't answer 503
-``orrery_catalogue_unavailable``. Three answers have only ``{"detail"}``,
-without a ``code``: maintenance mode's 503, a 405 for a method a route
-doesn't serve, and Starlette's 404 for a path that matches no route. Only
-an unexpected exception, which Starlette's outermost error handler answers
-with a plain-text 500, lacks both the header and a JSON body. The routes
-are outside read API v2, whose OpenAPI document holds only ``/v2`` paths.
+Every answer of the read service, errors included, carries
+``Cache-Control: private, no-store`` (``PrivateNoStoreMiddleware``). The
+routes' own errors have the collector's ``{"detail", "code"}`` shape: a
+bucket that doesn't answer gives 503 ``orrery_storage_unavailable``, logged
+with the object or folder and the storage error's type, and a database that
+doesn't answer 503 ``orrery_catalogue_unavailable``. Two answers have only
+``{"detail"}``, without a ``code``: a 405 for a method a route doesn't
+serve, and Starlette's 404 for a path that matches no route. Only an
+unexpected exception, which Starlette's outermost error handler answers with
+a plain-text 500, lacks both the header and a JSON body.
 """
 
 from __future__ import annotations
@@ -46,16 +46,15 @@ from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from telemetry_collector.disclosure import OutputVisibility
-from telemetry_collector.intake_api import ALL_METHODS, IntakeProblemError
+from telemetry_collector.intake_api import IntakeProblemError
 from telemetry_collector.models import SAFE_IDENTIFIER
-from telemetry_collector.orrery_access import orrery_reader_check
 from telemetry_collector.orrery_serving import (
     DOCUMENT_FILE_NAME,
     OrreryGraphObjectReader,
@@ -84,24 +83,20 @@ VISIBILITY_HEADER = "X-Orrery-Visibility"
 SUBMISSION_ID_PATTERN = r"^sub-[0-9a-f]{32}$"
 STORAGE_RETRY_AFTER_SECONDS = 30
 CATALOGUE_RETRY_AFTER_SECONDS = 30
-NOT_ENABLED_DETAIL = "Serving Orrery graph files is not enabled on this collector."
 
 LOGGER = logging.getLogger(__name__)
 
 
-def is_orrery_graph_path(path: str) -> bool:
-    return path == ORRERY_GRAPHS_PATH or path.startswith(ORRERY_GRAPHS_PATH + "/")
-
-
 class PrivateNoStoreMiddleware:
-    """Mark every answer under ``ORRERY_GRAPHS_PATH`` private and not to be
-    stored, whichever route, refusal or handled error produced it."""
+    """Mark every answer private and not to be stored, whichever route or
+    handled error produced it: the Orrery read service answers nothing
+    else."""
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or not is_orrery_graph_path(scope.get("path", "")):
+        if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
 
@@ -114,19 +109,6 @@ class PrivateNoStoreMiddleware:
         await self.app(scope, receive, send_private)
 
 
-def orrery_graphs_not_enabled_router() -> APIRouter:
-    """Answer every Orrery graph path while serving is off, outside the schema."""
-
-    router = APIRouter()
-
-    def refuse(graph_path: str = "") -> None:
-        raise IntakeProblemError(404, "orrery_graphs_not_enabled", NOT_ENABLED_DETAIL)
-
-    for path in (ORRERY_GRAPHS_PATH, ORRERY_GRAPHS_PATH + "/{graph_path:path}"):
-        router.add_api_route(path, refuse, methods=ALL_METHODS, include_in_schema=False)
-    return router
-
-
 def _query_invalid(detail: str) -> IntakeProblemError:
     return IntakeProblemError(422, "orrery_graph_query_invalid", detail)
 
@@ -137,7 +119,16 @@ def _not_found() -> IntakeProblemError:
     )
 
 
-def _storage_unavailable() -> IntakeProblemError:
+def _storage_unavailable(error: OrreryStorageUnavailableError) -> IntakeProblemError:
+    """Log a bucket that didn't answer, and answer 503."""
+
+    # The object or folder and the storage error's type only: the storage
+    # client's messages can quote the request.
+    LOGGER.warning(
+        "The Orrery bucket did not answer a call for %s (%s); answered 503.",
+        error.object_name,
+        error.error_type,
+    )
     return IntakeProblemError(
         503,
         "orrery_storage_unavailable",
@@ -162,7 +153,7 @@ def _from_storage[**Arguments, Answer](
     try:
         return read(*arguments, **keyword_arguments)
     except OrreryStorageUnavailableError as error:
-        raise _storage_unavailable() from error
+        raise _storage_unavailable(error) from error
 
 
 def _from_catalogue[**Arguments, Answer](
@@ -225,7 +216,7 @@ def check_stored_bytes(
         for part in objects.read_parts(stored):
             digest.update(part)
     except OrreryStorageUnavailableError as error:
-        raise _storage_unavailable() from error
+        raise _storage_unavailable(error) from error
     except OrreryObjectChangedError:
         LOGGER.error(
             "Refused to serve %s: generation %d is no longer stored, so the "
@@ -276,26 +267,24 @@ def sent_parts(
         OrreryObjectChangedError,
         OrreryObjectCorruptError,
     ) as error:
+        cause = (
+            error.error_type
+            if isinstance(error, OrreryStorageUnavailableError)
+            else type(error).__name__
+        )
         LOGGER.error(
-            "Stopped sending %s generation %d before its end: %s",
+            "Stopped sending %s generation %d before its end (%s).",
             stored.name,
             stored.generation,
-            error,
+            cause,
         )
         raise
 
 
-def orrery_graph_router(
-    *, services: OrreryServingServices, reader_service_account: str
-) -> APIRouter:
-    """Create the endpoints over explicit services, for one reader account."""
+def orrery_graph_router(*, services: OrreryServingServices) -> APIRouter:
+    """Create the endpoints over explicit services."""
 
-    require_orrery_reader = orrery_reader_check(
-        services.verifier, reader_service_account
-    )
-    router = APIRouter(
-        prefix=ORRERY_GRAPHS_PATH, dependencies=[Depends(require_orrery_reader)]
-    )
+    router = APIRouter(prefix=ORRERY_GRAPHS_PATH)
     catalogue = services.catalogue
     objects = services.objects
 
@@ -351,11 +340,13 @@ def orrery_graph_router(
         # chosen among all of the build's documents: those with its country
         # code and build ID.
         builds_documents: list[RecordedGraphFile] = []
-        for country_code, build_id in sorted({document.build for document in matching}):
+        for country_code, document_build_id in sorted(
+            {document.build for document in matching}
+        ):
             builds_documents.extend(
                 _from_catalogue(
                     catalogue.graph_files,
-                    build_id=build_id,
+                    build_id=document_build_id,
                     country_code=country_code,
                 )
             )

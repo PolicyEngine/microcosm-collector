@@ -1,15 +1,19 @@
-"""Settings, records and storage the collector serves Orrery graph files from.
+"""Settings, records and storage the Orrery read service serves files from.
 
 The worker publishes each Orrery graph file to the environment's private
 Orrery bucket and records it in ``orrery_graph_files``
-(``telemetry_collector.orrery_graphs``). The service reads both to serve the
-files to microcosm-runs (``telemetry_collector.orrery_graph_api``):
+(``telemetry_collector.orrery_graphs``). The Orrery read service, a separate
+Cloud Run service run from the collector's image
+(``telemetry_collector.orrery_read_app``), reads both to serve the files to
+microcosm-runs (``telemetry_collector.orrery_graph_api``). Cloud Run lets
+only microcosm-runs' service account call it, and checks that account's
+Google identity token before a request reaches this code, so nothing here
+reads a credential. The collector's main service serves none of these
+files.
 
-- **Settings.** Serving is on when the service has both
-  ``COLLECTOR_ORRERY_BUCKET``, the bucket's name, checked as the worker
-  checks it, and ``COLLECTOR_ORRERY_READER_SERVICE_ACCOUNT``, the address of
-  the Google service account microcosm-runs acts as. With neither it is off,
-  and with only one the service refuses to start.
+- **Settings.** The read service needs ``COLLECTOR_ORRERY_BUCKET``, the
+  bucket's name, checked as the worker checks it, and ``DATABASE_URL``, the
+  collector's database; it refuses to start without either.
 - **Current documents.** A build is a country code and a build ID, since
   the contract doesn't require build IDs to differ between countries. Among
   the documents with the same ``country_code`` and ``build_id``, the newest
@@ -41,7 +45,9 @@ files to microcosm-runs (``telemetry_collector.orrery_graph_api``):
   generation it was found at, twice, holding at most ``SERVED_PART_BYTES``
   of it at once: first to hash it and compare the SHA-256 with its row's
   (the document) or its name's (an upstream file), and only then to send
-  it.
+  it. Each call to the bucket has its own timeout and retry deadline
+  (``GoogleCloudStorageOrreryGraphReader``), well inside the read
+  service's request timeout.
 """
 
 from __future__ import annotations
@@ -49,9 +55,9 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Collection, Iterable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import Protocol, cast
 
 import sqlalchemy as sa
 from sqlalchemy import select
@@ -63,16 +69,13 @@ from telemetry_collector.database import (
     create_session_factory,
 )
 from telemetry_collector.disclosure import OutputVisibility
-from telemetry_collector.intake import BUCKET_PATTERN, SERVICE_ACCOUNT_PATTERN
+from telemetry_collector.intake import BUCKET_PATTERN
 from telemetry_collector.submissions import upstream_file_sha256
-
-if TYPE_CHECKING:
-    from telemetry_collector.orrery_access import IdentityTokenVerifier
 
 #: The bucket's name; the worker job reads the same setting to publish to it.
 BUCKET_SETTING = "COLLECTOR_ORRERY_BUCKET"
-#: The address of the service account of microcosm-runs' deployments.
-READER_SETTING = "COLLECTOR_ORRERY_READER_SERVICE_ACCOUNT"
+#: The collector's database, which the read service reads the records from.
+DATABASE_SETTING = "DATABASE_URL"
 #: The document's name in its folder, as the worker writes it.
 DOCUMENT_FILE_NAME = "graph.orrery.json"
 UPSTREAM_ROLE = "upstream"
@@ -83,38 +86,36 @@ SERVED_PART_BYTES = 1024 * 1024
 
 @dataclass(frozen=True)
 class OrreryServingSettings:
-    """The private Orrery bucket and the one account its files are served to."""
+    """What the Orrery read service reads: the private Orrery bucket, for the
+    files, and the collector's database, for their records."""
 
     bucket: str
-    reader_service_account: str
+    #: Holds the database user's password, so the settings' repr leaves it out.
+    database_url: str = field(repr=False)
 
     @classmethod
     def from_environment(
         cls, environ: Mapping[str, str] = os.environ
-    ) -> OrreryServingSettings | None:
-        """Both settings, or ``None`` with neither; refuses only one of them."""
+    ) -> OrreryServingSettings:
+        """Both settings; refuses to give settings without either."""
 
         bucket = environ.get(BUCKET_SETTING, "").strip()
-        reader_service_account = environ.get(READER_SETTING, "").strip()
-        if not bucket and not reader_service_account:
-            return None
-        if not bucket or not reader_service_account:
-            missing, present = (
-                (BUCKET_SETTING, READER_SETTING)
-                if not bucket
-                else (READER_SETTING, BUCKET_SETTING)
+        database_url = environ.get(DATABASE_SETTING, "").strip()
+        missing = [
+            name
+            for name, value in (
+                (BUCKET_SETTING, bucket),
+                (DATABASE_SETTING, database_url),
             )
+            if not value
+        ]
+        if missing:
             raise RuntimeError(
-                f"{missing} is required when {present} is set: the collector "
-                "serves Orrery graph files only with both."
+                f"The Orrery read service needs {' and '.join(missing)}."
             )
         if not re.fullmatch(BUCKET_PATTERN, bucket):
             raise RuntimeError(f"{BUCKET_SETTING} is not a valid resource name.")
-        if not re.fullmatch(SERVICE_ACCOUNT_PATTERN, reader_service_account):
-            raise RuntimeError(
-                f"{READER_SETTING} is not a user-managed service account address."
-            )
-        return cls(bucket=bucket, reader_service_account=reader_service_account)
+        return cls(bucket=bucket, database_url=database_url)
 
 
 @dataclass(frozen=True)
@@ -382,7 +383,17 @@ class UpstreamFile:
 
 
 class OrreryStorageUnavailableError(RuntimeError):
-    """The private Orrery bucket did not answer; the request can be repeated."""
+    """The private Orrery bucket did not answer; the request can be repeated.
+
+    ``object_name`` is the object, or the folder, the call named, and
+    ``error_type`` the class name of what the storage client raised. Only
+    these are logged: the client's message can quote the request.
+    """
+
+    def __init__(self, message: str, *, object_name: str, error_type: str) -> None:
+        super().__init__(message)
+        self.object_name = object_name
+        self.error_type = error_type
 
 
 class OrreryObjectChangedError(RuntimeError):
@@ -416,11 +427,10 @@ class OrreryGraphObjectReader(Protocol):
 
 @dataclass(frozen=True)
 class OrreryServingServices:
-    """What the serving endpoints need while serving is switched on."""
+    """What the serving endpoints read: the records and the bucket."""
 
     catalogue: OrreryGraphCatalogue
     objects: OrreryGraphObjectReader
-    verifier: IdentityTokenVerifier
 
 
 def upstream_files(

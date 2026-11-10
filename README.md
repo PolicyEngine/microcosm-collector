@@ -384,14 +384,14 @@ bucket.
 | `COLLECTOR_WORKER_JOB` | service, operations | `projects/<project>/locations/<region>/jobs/<job>` | `TELEMETRY_WORKER_JOB`, the worker job's name, likewise |
 | `COLLECTOR_WORKER_INVOKER_SERVICE_ACCOUNT` | service, operations | the account whose OAuth token each Cloud Task uses to run the worker job | `TELEMETRY_WORKER_INVOKER_SERVICE_ACCOUNT` |
 | `COLLECTOR_WORKER_JOB_ID` | worker | set on each execution by its Cloud Task | not set by the deploy |
-| `DATABASE_URL` | worker, operations | the runtime database secret, as for the service | `TELEMETRY_DATABASE_SECRET_NAME` |
+| `DATABASE_URL` | worker, operations, Orrery read service | the runtime database secret, as for the service | `TELEMETRY_DATABASE_SECRET_NAME` |
 | `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN` | worker | the read-write token of the environment's own calibration tree Vercel Blob store, a Secret Manager secret; without it, `calibration-diagnostics` submissions stay in intake storage (see "Building trees from submissions") | `TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME`, the secret's name |
-| `COLLECTOR_ORRERY_BUCKET` | service, worker | the name of the environment's private Orrery bucket. For the worker, the bucket it publishes Orrery graph files to; without it, `orrery-inputs` submissions stay in intake storage (see "Publishing Orrery graph files"). For the service, the bucket it serves them from: serving is on only with both this and `COLLECTOR_ORRERY_READER_SERVICE_ACCOUNT`, off with neither, and the service refuses to start with only one (see "Serving Orrery graph files") | `TELEMETRY_ORRERY_BUCKET` |
-| `COLLECTOR_ORRERY_READER_SERVICE_ACCOUNT` | service | the address of the Google service account the environment's microcosm-runs deployments act as, the only caller the service serves Orrery graph files to (see "Serving Orrery graph files") | `TELEMETRY_ORRERY_READER_SERVICE_ACCOUNT` |
+| `COLLECTOR_ORRERY_BUCKET` | worker, Orrery read service | the name of the environment's private Orrery bucket. For the worker, the bucket it publishes Orrery graph files to; without it, `orrery-inputs` submissions stay in intake storage (see "Publishing Orrery graph files"). For the Orrery read service, the bucket it serves them from; it refuses to start without it (see "Serving Orrery graph files"). The service doesn't get it | `TELEMETRY_ORRERY_BUCKET` |
 
 The `TELEMETRY_*` names are GitHub `staging` and `production` environment
 variables, which `.github/workflows/push.yaml` passes to `scripts/deploy.sh`.
-The deploy also reads these, to update the two jobs:
+The deploy also reads these, to update the two jobs and to deploy the Orrery
+read service:
 
 | Variable | Value |
 |---|---|
@@ -400,19 +400,21 @@ The deploy also reads these, to update the two jobs:
 | `TELEMETRY_RECOVERY_SERVICE_ACCOUNT` | the recovery job's service account |
 | `TELEMETRY_HF_READ_SECRET_NAME` | the environment's own Hugging Face read token's secret, mounted on the worker job (see "Hugging Face read access") |
 | `TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME` | the secret holding the read-write token of the environment's own calibration tree Blob store, mounted on the worker job only as `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN` (see "Building trees from submissions") |
-| `TELEMETRY_ORRERY_BUCKET` | the name of the environment's private Orrery bucket, set on the worker job and on both service revisions as `COLLECTOR_ORRERY_BUCKET`; the recovery job doesn't get it (see "Publishing Orrery graph files" and "Serving Orrery graph files") |
-| `TELEMETRY_ORRERY_READER_SERVICE_ACCOUNT` | the address of the Google service account the environment's microcosm-runs deployments act as, set on both service revisions only as `COLLECTOR_ORRERY_READER_SERVICE_ACCOUNT`; neither job gets it (see "Serving Orrery graph files") |
+| `TELEMETRY_ORRERY_BUCKET` | the name of the environment's private Orrery bucket, set on the worker job and on the Orrery read service as `COLLECTOR_ORRERY_BUCKET`; the service revisions and the recovery job don't get it (see "Publishing Orrery graph files" and "Serving Orrery graph files") |
+| `TELEMETRY_ORRERY_READER_SERVICE_ACCOUNT` | the address of the Google service account the environment's microcosm-runs deployments act as: the one member the deploy grants the Cloud Run Invoker role on the Orrery read service. No revision, job or service gets it as a setting (see "Serving Orrery graph files") |
 
-The service-account settings accept only user-managed accounts,
+The two service-account settings accept only user-managed accounts,
 `<name>@<project>.iam.gserviceaccount.com`. The collector refuses to start
 with the default Compute Engine account
 (`<number>-compute@developer.gserviceaccount.com`), so the runtime and invoker
-accounts must be user-managed ones.
+accounts must be user-managed ones. The deploy checks the Orrery reader
+account's address against the same pattern.
 
 ### Database access
 
 The migration job's database user owns the tables it creates; the service,
-the worker and the operator commands connect as the runtime database user.
+the worker, the Orrery read service and the operator commands connect as the
+runtime database user.
 The migrations grant nothing. The runtime user's access to the telemetry
 tables was granted by hand when each database was set up, outside this
 repo. Its access to every table created since then comes from the
@@ -456,8 +458,9 @@ The intake code needs `SELECT`, `INSERT` and `UPDATE`; row locks
 `SELECT` and `INSERT` on `orrery_graph_files`, which migration
 `0003_orrery_graph_files` creates: it records each published graph file with
 `INSERT ... ON CONFLICT DO NOTHING RETURNING`, and `RETURNING` needs
-`SELECT`. Serving Orrery graph files needs `SELECT` on `orrery_graph_files`
-and `artifact_submissions`. No table uses a sequence. A `serial`
+`SELECT`. The Orrery read service, which connects as the runtime user too,
+needs `SELECT` on `orrery_graph_files` and `artifact_submissions`. No table
+uses a sequence. A `serial`
 column would need `USAGE` on its sequence, which these default privileges
 don't give, so a migration that adds one needs
 `GRANT USAGE, SELECT ON SEQUENCES` added to the default privileges first; an
@@ -509,7 +512,8 @@ and region, these resources, created by hand (both environments have them):
   the bucket, sign as itself (`roles/iam.serviceAccountTokenCreator` on
   itself), enqueue on the queue, act as the invoker account, and list and
   read objects in its environment's private Orrery bucket
-  (`roles/storage.objectViewer`; see "Serving Orrery graph files"); the invoker
+  (`roles/storage.objectViewer`), for the Orrery read service, which runs as
+  it (see "Serving Orrery graph files"); the invoker
   account may run the worker job with overrides; the worker's service account
   may read the bucket, create and read objects in its environment's private
   Orrery bucket (see "Publishing Orrery graph files"), connect to Cloud SQL
@@ -519,13 +523,16 @@ and region, these resources, created by hand (both environments have them):
   job's service account may connect to Cloud SQL, read the runtime database
   secret, enqueue on the queue and act as the invoker account; Cloud
   Scheduler's account may run the recovery job; and the deployment service
-  account may update both jobs and act as the worker and recovery accounts.
+  account may update both jobs and act as the worker and recovery accounts,
+  and may deploy the Orrery read service as the runtime account and set its
+  IAM policy (Cloud Run Admin, `roles/run.admin`, on the project).
 
 Each release, in each environment, `scripts/deploy.sh`:
 
 1. checks, before it changes anything:
    - that every intake name, the Orrery bucket's name and the Orrery reader
-     account's address have the shape the collector accepts
+     account's address have the shape the collector accepts, and that the
+     Orrery read service's name fits Cloud Run's 49 characters
      (`require-configuration`, before it authenticates), so
      a malformed name stops the deploy before a revision or job that reads it
      fails to start;
@@ -537,9 +544,8 @@ Each release, in each environment, `scripts/deploy.sh`:
    - that the environment's seven secrets exist, its Hugging Face read
      token's and its calibration tree Blob token's among them
      (`check-secrets-exist`);
-2. passes the intake settings in the first table, `COLLECTOR_ORRERY_BUCKET`
-   and `COLLECTOR_ORRERY_READER_SERVICE_ACCOUNT` among them, to the
-   maintenance and candidate revisions;
+2. passes the intake settings in the first table to the maintenance and
+   candidate revisions;
 3. after the migration and before the candidate revision, updates the worker
    job (`configure-worker-job`) and then the recovery job
    (`configure-recovery-job`) to the released image, with their whole
@@ -550,7 +556,10 @@ Each release, in each environment, `scripts/deploy.sh`:
    `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN` together, and sets the worker
    job's settings, `COLLECTOR_INTAKE_BUCKET` and `COLLECTOR_ORRERY_BUCKET`,
    with `--set-env-vars`. The deploy changes neither the schedule nor any
-   job's permissions.
+   job's permissions;
+4. last, once the service is live, deploys the Orrery read service and sets
+   who may call it (`deploy-orrery-read-service`; see "Serving Orrery graph
+   files").
 
 Maintenance mode holds only the service. An execution of either job keeps the
 image it started with, for all its attempts: a worker execution that is
@@ -701,11 +710,11 @@ To move to another Orrery version, change the version in
 The worker job publishes an Orrery graph file from each `orrery-inputs`
 submission (`telemetry_collector/orrery_graphs.py`) where it has
 `COLLECTOR_ORRERY_BUCKET`, the name of its environment's private Orrery
-bucket, which the deploy sets on the worker job and on the service
-revisions, which serve the files ("Serving Orrery graph files"), from the
-GitHub environment variable `TELEMETRY_ORRERY_BUCKET`. Without it, submissions stay
-in intake storage and can be reprocessed later (`reprocess --kind
-orrery-inputs --intake-only`). The handler is registered in
+bucket, which the deploy sets on the worker job and on the Orrery read
+service, which serves the files ("Serving Orrery graph files"), from the
+GitHub environment variable `TELEMETRY_ORRERY_BUCKET`. Without it,
+submissions stay in intake storage and can be reprocessed later (`reprocess
+--kind orrery-inputs --intake-only`). The handler is registered in
 `telemetry_collector/handlers.py`, the worker's one registry, beside the
 calibration tree handler.
 
@@ -729,10 +738,10 @@ calibration tree handler.
   - an upstream file not named `upstream-<its SHA-256>.json`: `upstream-`,
     64 lowercase hex characters that are the SHA-256 the worker verified for
     the file, and `.json`. Microcosm names each producing run's file it
-    copies that way (`save_graph_schema`), and the service takes a served
-    upstream file's SHA-256 from its name ("Serving Orrery graph files").
-    The rule also keeps an upstream file from taking the document's own
-    name, `graph.orrery.json`.
+    copies that way (`save_graph_schema`), and the Orrery read service takes
+    a served upstream file's SHA-256 from its name ("Serving Orrery graph
+    files"). The rule also keeps an upstream file from taking the document's
+    own name, `graph.orrery.json`.
 
   The worker records a NUL or an unpaired surrogate in a rejection's message,
   such as a schema column name the projection repeats, as U+FFFD, as it does
@@ -786,11 +795,12 @@ calibration tree handler.
   submission keeps its first row.
 - **Visibility.** A licensed build's graph file is recorded `private`: it
   stays in the private bucket, and no clearance step makes it public. Any
-  other build's is recorded `public`. The service serves both only to
-  microcosm-runs, which shows licensed runs' files only to people signed in
-  with policyengine.org Google accounts (tracker 2b · 7 and 4b · 3), and
-  treats a recorded `public` document as private when a run or a build it
-  comes from had licensed data (see "Serving Orrery graph files").
+  other build's is recorded `public`. The Orrery read service serves both
+  only to microcosm-runs, which shows licensed runs' files only to people
+  signed in with policyengine.org Google accounts (tracker 2b · 7 and
+  4b · 3), and treats a recorded `public` document as private when a run or
+  a build it comes from had licensed data (see "Serving Orrery graph
+  files").
 - **Result.** The receipt's result is `{"processed_by": "orrery-graph",
   "object_prefix", "document_sha256", "document_bytes", "upstream_files",
   "orrery_version", "visibility", "removed_links"}`, where `removed_links`
@@ -807,10 +817,10 @@ bucket needs:
   service account may use its objects. The worker's account has
   `roles/storage.objectCreator` and `roles/storage.objectViewer` on the
   bucket: it creates objects and reads an existing object's SHA-256 back,
-  and can neither replace nor delete one. The runtime account has
-  `roles/storage.objectViewer` on the bucket: it lists and reads objects to
-  serve them ("Serving Orrery graph files"), and can neither create,
-  replace nor delete one.
+  and can neither replace nor delete one. The runtime account, which the
+  Orrery read service runs as, has `roles/storage.objectViewer` on the
+  bucket: it lists and reads objects to serve them ("Serving Orrery graph
+  files"), and can neither create, replace nor delete one.
 
 Once `0003_orrery_graph_files` is applied, an image without it cannot run
 against the database, as with `0002_artifact_intake` above: its migration job
@@ -822,67 +832,106 @@ bucket, and reprocessing the submissions records them again.
 
 ### Serving Orrery graph files
 
-The service serves the Orrery graph files the worker published
-(`telemetry_collector/orrery_graph_api.py`) to microcosm-runs alone, for
-every document, public or private. microcosm-runs decides what to show to
-whom: it shows licensed runs' files only to people signed in with
-policyengine.org Google accounts (tracker 4b · 3). Serving is on where the
-service has both settings below, which the deploy sets on every service
-revision. With neither, every path under `/v1/orrery-graphs` answers 404 with
-`orrery_graphs_not_enabled`; with only one, the service refuses to start.
+The Orrery read service serves the Orrery graph files the worker published
+to microcosm-runs alone, for every document, public or private.
+microcosm-runs decides what to show to whom: it shows licensed runs' files
+only to people signed in with policyengine.org Google accounts (tracker
+4b · 3). The read service is a separate Cloud Run service in each
+environment, named `<service>-orrery` after the environment's collector
+service (`TELEMETRY_SERVICE`). It runs the collector's image with an
+application that mounts only the two routes below
+(`telemetry_collector/orrery_read_app.py`; the routes are in
+`telemetry_collector/orrery_graph_api.py`). The collector's own service
+mounts neither route, and gets no Orrery setting.
+
+**Cloud Run's caller check is the read service's only access control.** Its
+code verifies no token and reads no credential, so the service must never
+allow unauthenticated calls, and its Cloud Run invoker check must never be
+switched off: either would serve every file, licensed ones included, to
+anyone. Every deploy sets all of it again:
+
+- `--no-allow-unauthenticated` and `--invoker-iam-check`;
+- `microcosm-collector/orrery-graphs` as the service's only custom audience
+  (`--set-custom-audiences`, which replaces the list);
+- the service's whole IAM policy: the Cloud Run Invoker role
+  (`roles/run.invoker`) for the environment's microcosm-runs account,
+  `TELEMETRY_ORRERY_READER_SERVICE_ACCOUNT`, and nothing else, so `allUsers`,
+  `allAuthenticatedUsers` or another member added by hand is removed. The
+  deploy then reads the policy back and fails unless it is exactly that.
+
+The service's own policy doesn't limit roles granted on the project. Cloud
+Run's documentation lists Cloud Run Admin among the roles that may invoke
+services, and gives project owners and editors that permission by default,
+so those principals, the deployment service account among them, can call
+the read service too. Grant such project roles only to administrators.
 
 | Setting | Value | The deploy sets it from |
 |---|---|---|
 | `COLLECTOR_ORRERY_BUCKET` | the environment's private Orrery bucket's name, checked as the worker checks it | `TELEMETRY_ORRERY_BUCKET` |
-| `COLLECTOR_ORRERY_READER_SERVICE_ACCOUNT` | the address of the Google service account the environment's microcosm-runs deployments act as: a user-managed account, `<name>@<project>.iam.gserviceaccount.com` | `TELEMETRY_ORRERY_READER_SERVICE_ACCOUNT` |
+| `DATABASE_URL` | the collector's database, as for the service | the runtime database secret, `TELEMETRY_DATABASE_SECRET_NAME` |
 
-microcosm-runs' production deployments use the collector's production
-environment, and its preview deployments use staging. Each environment has
-its own reader account, which only the matching Vercel deployments can act
-as, and which has no roles.
+The read service refuses to start without either setting.
 
-- **The caller check** (`telemetry_collector/orrery_access.py`). Every
-  request carries `Authorization: Bearer <token>`, where the token is a
-  Google-signed OpenID Connect identity token of the reader account.
-  microcosm-runs gets one from its Vercel deployment's identity, without a
-  stored key, by calling the IAM Credentials API's `generateIdToken` for the
-  account with the audience `microcosm-collector/orrery-graphs` and
-  `includeEmail: true`. The audience is the same in both environments; the
-  account tells them apart. The collector checks the token with google-auth:
-  its signature against Google's published certificates
-  (`https://www.googleapis.com/oauth2/v1/certs`); its issuer
-  (`accounts.google.com` or `https://accounts.google.com`); its `iat` and
-  `exp`, allowing 10 seconds of clock difference; and its audience. Then its
-  `email` must be the reader account exactly, and `email_verified` the
-  boolean `true`.
-  - **Google's certificates** are fetched and kept for as long as their
-    `Cache-Control` allows: its `max-age` less the response's `Age`, and no
-    time at all with `no-store`, `no-cache` or no `max-age`. Once that time
-    has passed, the next request fetches them again, so with a lifetime of
-    0 the request after each fetch fetches again. A token whose key ID
-    (`kid`) the kept certificates don't hold, while they are within their
-    lifetime, fetches them again before it is refused, at most once a
-    minute, so a key Google starts using before they expire is accepted.
-    When a fetch fails, the certificates fetched before are still used for
-    up to an hour past their expiry, with a warning in the log, and the
-    fetch is tried again at most once a minute.
-  - **Who waits for a fetch.** One request fetches at a time, and the
-    request that starts a fetch waits for it; the fetch gives up after 10
-    seconds without connecting, or without data from Google. Meanwhile, a
-    request the kept certificates can check (they hold its key and are
-    within their lifetime or the hour after it) uses them without waiting.
-    A request they can't check waits for the fetch, then uses its outcome.
-  - 401, with `WWW-Authenticate: Bearer`: no token, or not a Bearer one
-    (`identity_token_required`); a token that is malformed, not signed with
-    RS256, without a key ID, wrongly signed, expired or not yet valid, or for
-    another audience or issuer (`identity_token_invalid`).
-  - 403 (`identity_not_allowed`): a valid Google token of any other account,
-    with an unverified address, or with no address, as `generateIdToken`
-    issues one without `includeEmail`.
-  - 503 (`identity_certificates_unavailable`, with `Retry-After`): Google's
-    certificates could not be fetched, and none fetched before are within
-    their lifetime or the hour after it.
-  - No answer or log message holds the token.
+**The deployed service** (`scripts/deploy.sh deploy-orrery-read-service`).
+Each deploy job runs it last, once the collector's service is live, so that
+a failure leaves the service released and out of maintenance mode. The
+read service reads the migrated database, so it is deployed after the
+migration; it has no maintenance mode, and while a migration runs, its
+previous revision keeps answering.
+
+| What | Value | Why |
+|---|---|---|
+| Name | `<service>-orrery` | needs no variable of its own; `require-configuration` checks it fits Cloud Run's 49 characters before the deploy authenticates |
+| Identity | the runtime service account | it may read the bucket, connect to Cloud SQL and read the runtime database secret, as the service does |
+| Start | `uv run --no-sync uvicorn telemetry_collector.orrery_read_app:create_orrery_read_app_from_environment --factory --host 0.0.0.0 --port 8080 --no-access-log`, with container port 8080 | Cloud Run sends requests to and probes port 8080. The TCP startup probe checks only that the service listens: it has no health route |
+| Request timeout | 300 seconds | a fetch of a 64 MiB file reads it twice, in about 130 ranged reads of 1 MiB one after another, and sends it during the second read. Each Cloud Storage request gives up after 10 seconds without connecting or without data, and each call retries for at most 30 seconds: under a quarter of the timeout together |
+| Memory, CPU, concurrency | 512 MiB, 1 CPU, 10 requests per instance | a request holds about one 1 MiB part of a file at a time, so ten fit beside the Python process with room to spare; hashing and sending are light work for one CPU |
+| Instances | 0 to 2, in both environments | each instance's database pool holds at most five connections, so the read service holds at most ten. microcosm-runs calls it only to show a run's files, and may cache public ones |
+
+The deployment service account deploys it as the runtime account and sets
+its IAM policy with Cloud Run Admin (`roles/run.admin`) on the project; it
+already may act as the runtime account, as it does for the service. The
+runtime service account has `roles/storage.objectViewer` on its
+environment's bucket, so it can list and read objects and can neither
+create, replace nor delete one, and the runtime database user reads
+`orrery_graph_files` and `artifact_submissions` (see "Database access").
+Both were set up before the first release that serves the files; the deploy
+neither creates nor checks them.
+
+**How microcosm-runs calls it.** microcosm-runs gets a Google-signed
+identity token for its environment's reader account from its Vercel
+deployment's identity, without a stored key: it calls the IAM Credentials
+API's `generateIdToken` for that account with
+`"audience": "microcosm-collector/orrery-graphs"` and
+`"includeEmail": true`. It sends the token as `Authorization: Bearer
+<token>` to the read service's address,
+`https://<service>-orrery-<project number>.<region>.run.app`: the deployed
+service's URL, which `gcloud run services describe <service>-orrery
+--region <region> --format 'value(status.url)'` shows. The read service has
+no load balancer or hostname of its own. Cloud Run also accepts a token
+whose audience is that URL. The custom audience is the same in both
+environments: each environment's read service lets only its own reader
+account call it. microcosm-runs'
+production deployments use the collector's production environment, and its
+preview deployments use staging; each environment has its own reader
+account, which only the matching Vercel deployments can act as.
+
+Cloud Run's documentation doesn't say whether it needs the token's `email`
+claim. Its authentication pages name only the audience (`aud`) as the claim
+to set, and its own examples get tokens without `email`: the metadata
+server's identity endpoint without `format=full`, and `gcloud auth
+print-identity-token` without `--include-email`. Asking for the claim costs
+nothing, and the read service reads no claim.
+
+**Answers.**
+
+- **Cloud Run's own refusals,** before a request reaches the read service:
+  401 for an `Authorization` header without a Bearer ID token, a token that
+  isn't a validly signed Google ID token, or one for another audience; 403
+  for a valid token of an account without the Invoker role. Cloud Run's
+  documentation says a request without a token can get 403 too. These are
+  Cloud Run's answers, not the collector's: they have neither its
+  `{"detail", "code"}` shape nor its `Cache-Control` header.
 - **`GET /v1/orrery-graphs?run_id=<run>&build_id=<build>`**, with either or
   both, lists the recorded documents of the run, the build, or both, newest
   first, as `{"documents": [...]}`. Each has `submission_id`,
@@ -913,36 +962,40 @@ as, and which has no roles.
     don't match, or the storage client reports a checksum failure.
   - 500 (`orrery_graph_changed`), logged, nothing served: the generation
     found is no longer stored when the first read asks for it.
-  - 503 (`orrery_storage_unavailable`, with `Retry-After`): the bucket
-    doesn't answer.
-  - **A client must check the body.** If the second read fails (the
-    generation is no longer stored, the bucket stops answering, or the
-    storage client reports a checksum failure), the status 200 and the
-    headers have already been sent. The collector logs the failure and
-    stops sending, so the body ends early. Whether an HTTP client then
+  - **A client must check the body against the `ETag`.** If the second read
+    fails (the generation is no longer stored, the bucket stops answering,
+    or the storage client reports a checksum failure), the status 200 and
+    the headers have already been sent. The read service logs the failure
+    and stops sending, so the body ends early. Whether an HTTP client then
     reports an error depends on the client and on what Cloud Run's front
     end passes on, which is not checked. So before it caches or shows a
     file, microcosm-runs must compare the SHA-256 of the body it received
     with the `ETag`, and with the listed `document_sha256` for a document
     or the SHA-256 in an upstream file's name, and discard the file when
     they differ (tracker 4b · 3).
+- **A bucket that doesn't answer** gives 503 with
+  `orrery_storage_unavailable` and `Retry-After`, on both endpoints, and a
+  warning in the log with the object or folder and the storage error's type,
+  never its message, which can quote the request. Each Cloud Storage
+  request gives up after 10 seconds without connecting or without data,
+  instead of the client's 60, and each call retries for at most 30 seconds,
+  instead of the client's 120.
 - **A database that doesn't answer** gives 503 with
   `orrery_catalogue_unavailable` and `Retry-After`, on both endpoints.
 - **Headers.** A served file has `Content-Type: application/json`, its
   SHA-256 as its `ETag` (`"<sha256>"`), and the document's effective
   visibility as `X-Orrery-Visibility: public` or `private`. It is sent in
   1 MiB parts without `Content-Length`, so that Cloud Run streams a file
-  larger than its 32 MiB limit on a whole response. Every answer under
-  `/v1/orrery-graphs`, refusals, the errors above and maintenance mode's 503
-  included, has `Cache-Control: private, no-store`. The errors with the
-  codes above have the collector's `{"detail", "code"}` shape. Three
-  answers have only `{"detail"}`, without a `code`: maintenance mode's 503,
-  which is the whole service's; a 405 for a method a route doesn't serve,
-  such as `POST`; and the 404 for a path that matches neither route, such
+  larger than its 32 MiB limit on a whole response. Every answer of the
+  read service, the errors above and the 404 for any other path included,
+  has `Cache-Control: private, no-store`. The errors with the codes above
+  have the collector's `{"detail", "code"}` shape. Two answers have only
+  `{"detail"}`, without a `code`: a 405 for a method a route doesn't serve,
+  such as `POST`, and the 404 for a path that matches neither route, such
   as one with an encoded slash or with too few or too many parts. Only an
   unexpected exception, which the server answers with a plain-text 500 from
-  outside the collector's own middleware, lacks both the header and a JSON
-  body.
+  outside the read service's own middleware, lacks both the header and a
+  JSON body.
 - **Current documents.** A build is a country code and a build ID: the
   contract doesn't require build IDs to differ between countries. Among
   all documents with the same `country_code` and `build_id`, whichever run
@@ -971,15 +1024,15 @@ as, and which has no roles.
   own upstream file copied it, so it is no producer. **An upstream file
   whose SHA-256 no recorded submission holds in another role does not
   change the visibility.**
-- **Outside the read API.** The routes are not part of read API v2: its
-  OpenAPI document and the TypeScript client hold only `/v2` paths.
+- **Outside the read API.** The routes are not part of read API v2: the
+  collector's service, which serves read API v2, doesn't mount them, and
+  the read service publishes no OpenAPI document.
 
-The runtime service account has `roles/storage.objectViewer` on its
-environment's bucket, so it can list and read objects and can neither
-create, replace nor delete one, and the runtime database user reads
-`orrery_graph_files` and `artifact_submissions` (see "Database access").
-Both were set up before the first release that serves the files; the deploy
-neither creates nor checks them.
+**Running it locally.** `uv run uvicorn
+telemetry_collector.orrery_read_app:create_orrery_read_app_from_environment
+--factory --host 127.0.0.1 --port 8081`, with `COLLECTOR_ORRERY_BUCKET`,
+`DATABASE_URL` and Google credentials that may read the bucket. Nothing
+checks the caller there, so keep it on `127.0.0.1`.
 
 ## Calibration tree package
 
@@ -1301,8 +1354,9 @@ returns HTTP 503 for data operations, then waits for prior requests to finish.
 Production also creates a completed Cloud SQL backup before its migration. The
 workflow runs the image as a one-task Cloud Run job to apply and verify Alembic
 migrations, deploys a candidate without stable traffic, checks the candidate's
-`/ready` endpoint, and only then directs traffic to the candidate. Once a
-production migration begins, failures leave the maintenance revision serving
+`/ready` endpoint, and only then directs traffic to the candidate. Last, it
+deploys the Orrery read service, a separate Cloud Run service from the same
+image (see "Serving Orrery graph files"). Once a production migration begins, failures leave the maintenance revision serving
 retryable responses; the workflow does not restore schema-incompatible
 application code. To repeat a deployment, re-run the failed jobs of that push.
 
@@ -1314,8 +1368,9 @@ credential has only the data access required by the application. The dashboard r
 address and Secret Manager resource references through non-secret configuration.
 Public ingress lets developer machines reach the service;
 ingestion still requires an expiring collector credential issued after
-Hugging Face authentication, and Orrery graph files a Google identity token
-of microcosm-runs' own service account (see "Serving Orrery graph files").
+Hugging Face authentication. The Orrery read service, a separate service,
+allows no unauthenticated calls: Cloud Run lets only microcosm-runs' own
+service account call it (see "Serving Orrery graph files").
 
 ### Google Cloud access
 
@@ -1387,7 +1442,8 @@ The deployment's access and configuration are provisioned:
   `TELEMETRY_ORRERY_BUCKET` for its own private Orrery bucket (see
   "Publishing Orrery graph files"), and
   `TELEMETRY_ORRERY_READER_SERVICE_ACCOUNT` for the service account of its
-  own microcosm-runs deployments (see "Serving Orrery graph files").
+  own microcosm-runs deployments, the one account that may call its Orrery
+  read service (see "Serving Orrery graph files").
   `scripts/deploy.sh require-configuration` names any that is missing, and
   the deployment stops before it authenticates.
 

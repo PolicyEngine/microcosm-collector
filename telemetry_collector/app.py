@@ -55,17 +55,6 @@ from telemetry_collector.models import (
     TokenExchangeRequest,
     require_telemetry_scope_for_lifetime,
 )
-from telemetry_collector.orrery_access import GoogleIdentityTokenVerifier
-from telemetry_collector.orrery_graph_api import (
-    PrivateNoStoreMiddleware,
-    orrery_graph_router,
-    orrery_graphs_not_enabled_router,
-)
-from telemetry_collector.orrery_serving import (
-    OrreryServingServices,
-    OrreryServingSettings,
-    PostgresOrreryGraphCatalogue,
-)
 from telemetry_collector.read_api_v2 import (
     ErrorMessage,
     RunDetail,
@@ -104,8 +93,6 @@ class CollectorSettings:
     maintenance_mode: bool = False
     # None while artifact intake is switched off (the default).
     intake: IntakeSettings | None = None
-    # None while serving Orrery graph files is switched off (the default).
-    orrery_serving: OrreryServingSettings | None = None
 
     @classmethod
     def from_environment(cls) -> CollectorSettings:
@@ -148,7 +135,6 @@ class CollectorSettings:
             ),
             maintenance_mode=os.environ.get("TELEMETRY_MAINTENANCE_MODE") == "1",
             intake=IntakeSettings.from_environment(),
-            orrery_serving=OrreryServingSettings.from_environment(),
         )
 
     def __post_init__(self) -> None:
@@ -483,21 +469,14 @@ def create_app(
     store: TelemetryStore,
     huggingface_authenticator: HuggingFaceAuthenticator,
     intake_services: IntakeServices | None = None,
-    orrery_services: OrreryServingServices | None = None,
 ) -> FastAPI:
     """Create the collector with explicit dependencies for tests and deployment.
 
-    The submission endpoints exist only when ``settings.intake`` is set, and
-    the Orrery graph endpoints only when ``settings.orrery_serving`` is set.
+    The submission endpoints exist only when ``settings.intake`` is set.
     """
 
     if settings.intake is not None and intake_services is None:
         raise ValueError("Intake is switched on but its services were not provided.")
-    if settings.orrery_serving is not None and orrery_services is None:
-        raise ValueError(
-            "Serving Orrery graph files is switched on but its services were "
-            "not provided."
-        )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> Iterator[None]:
@@ -517,8 +496,6 @@ def create_app(
     application.add_middleware(RequestBodyLimitMiddleware, max_bytes=1_048_576)
     if settings.maintenance_mode:
         application.add_middleware(MaintenanceModeMiddleware)
-    # Outermost, so that maintenance mode's answers are marked too.
-    application.add_middleware(PrivateNoStoreMiddleware)
 
     def require_read_token(
         token: Annotated[str | None, Header(alias="X-Telemetry-Read-Token")] = None,
@@ -559,15 +536,6 @@ def create_app(
         )
     else:
         application.include_router(intake_not_enabled_router())
-    if settings.orrery_serving is not None and orrery_services is not None:
-        application.include_router(
-            orrery_graph_router(
-                services=orrery_services,
-                reader_service_account=settings.orrery_serving.reader_service_account,
-            )
-        )
-    else:
-        application.include_router(orrery_graphs_not_enabled_router())
 
     @application.get("/health")
     def health() -> dict[str, str]:
@@ -783,24 +751,9 @@ def create_app_from_environment() -> FastAPI:
                 ),
             ),
         )
-    orrery_services = None
-    if settings.orrery_serving is not None:
-        # Imported only when serving is on, as for intake above.
-        from telemetry_collector.google_cloud import (
-            GoogleCloudStorageOrreryGraphReader,
-        )
-
-        orrery_services = OrreryServingServices(
-            catalogue=PostgresOrreryGraphCatalogue(store.engine),
-            objects=GoogleCloudStorageOrreryGraphReader(
-                bucket_name=settings.orrery_serving.bucket
-            ),
-            verifier=GoogleIdentityTokenVerifier(),
-        )
     return create_app(
         settings=settings,
         store=store,
         huggingface_authenticator=HuggingFaceAuthenticator(),
         intake_services=intake_services,
-        orrery_services=orrery_services,
     )

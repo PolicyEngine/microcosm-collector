@@ -1213,7 +1213,7 @@ def test_the_read_service_is_deployed_and_only_the_reader_account_may_call_it(
     )
     policy_call = re.fullmatch(
         rf"gcloud <run> <services> <set-iam-policy> <{READ_SERVICE}> <([^>]+)> "
-        "<--project> <project> <--region> <region> <--quiet>",
+        "<--project> <project> <--region> <region> <--format=none> <--quiet>",
         policy_line,
     )
     assert policy_call is not None, policy_line

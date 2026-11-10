@@ -1,8 +1,8 @@
 """Google Cloud Storage and Cloud Tasks implementations of the collector's services.
 
-Only the deployed collector and worker construct these: the intake bucket and
-queue, and the private bucket Orrery graph files are published to and served
-from. Tests use in-memory fakes of the interfaces, or stand-ins for the
+Only the deployed collector, worker and Orrery read service construct these:
+the intake bucket and queue, and the private bucket Orrery graph files are
+published to and served from. Tests use in-memory fakes of the interfaces, or stand-ins for the
 Google Cloud clients, so they never reach Google Cloud.
 """
 
@@ -19,11 +19,17 @@ from urllib.parse import urlsplit
 
 import google.auth
 import requests
-from google.api_core.exceptions import GoogleAPIError, NotFound, PreconditionFailed
+from google.api_core.exceptions import (
+    GoogleAPIError,
+    NotFound,
+    PreconditionFailed,
+    RetryError,
+)
 from google.auth.exceptions import GoogleAuthError
 from google.auth.transport.requests import AuthorizedSession, Request
 from google.cloud import storage
 from google.cloud.storage.exceptions import DataCorruption
+from google.cloud.storage.retry import DEFAULT_RETRY
 
 from telemetry_collector.intake import (
     UPLOAD_CONTENT_TYPE,
@@ -196,28 +202,56 @@ class GoogleCloudStorageOrreryGraphs:
         return True
 
 
-# What the storage client raises when the bucket does not answer as expected.
+# What the storage client raises when the bucket does not answer as expected;
+# RetryError, raised once a call's retry deadline has passed, is a
+# GoogleAPIError.
 STORAGE_ERRORS: tuple[type[Exception], ...] = (
     GoogleAPIError,
     GoogleAuthError,
     requests.RequestException,
 )
+#: How long the Orrery read service waits on each Cloud Storage request, to
+#: connect and for each part of its answer, instead of the client's 60
+#: seconds.
+ORRERY_STORAGE_TIMEOUT_SECONDS = 10.0
+#: How long it retries one call, instead of the client's 120 seconds, before
+#: the call fails and the request answers 503. A fetch makes several calls one
+#: after another, so one call's whole time, this and a last request's
+#: timeout, stays under a quarter of the read service's request timeout
+#: (``telemetry_collector.orrery_read_app.REQUEST_TIMEOUT_SECONDS``).
+ORRERY_STORAGE_RETRY_SECONDS = 30.0
+#: The client's retry rule (which errors to retry, and how long to wait
+#: between attempts) with that deadline.
+ORRERY_STORAGE_RETRY = DEFAULT_RETRY.with_timeout(ORRERY_STORAGE_RETRY_SECONDS)
+
+
+def _storage_error_type(error: Exception) -> str:
+    """The class name of a storage error, and of the last error a retry gave
+    up on, never the message, which can quote the request."""
+
+    if isinstance(error, RetryError) and error.cause is not None:
+        return f"{type(error).__name__} after {type(error.cause).__name__}"
+    return type(error).__name__
 
 
 class GoogleCloudStorageOrreryGraphReader:
-    """The private Orrery bucket, as the collector service reads it to serve
+    """The private Orrery bucket, as the Orrery read service reads it to serve
     Orrery graph files.
 
-    The service's runtime account has ``roles/storage.objectViewer`` on the
-    bucket, so it can list and read objects, and can neither write, replace
-    nor delete one. An object is read at the generation it was found at, in
-    ranged requests of ``part_bytes`` each (the library's ``BlobReader``,
-    opened with that chunk size), so no read holds more than one part. A
-    generation no longer stored raises ``OrreryObjectChangedError``; a
-    checksum failure the client reports (``DataCorruption``) raises
-    ``OrreryObjectCorruptError``, though the client doesn't checksum ranged
-    reads, so the service's own SHA-256 is the check that matters; any other
-    error raises ``OrreryStorageUnavailableError``.
+    The read service runs as the collector's runtime account, which has
+    ``roles/storage.objectViewer`` on the bucket, so it can list and read
+    objects, and can neither write, replace nor delete one. Every call passes
+    ``ORRERY_STORAGE_TIMEOUT_SECONDS`` and ``ORRERY_STORAGE_RETRY``. An object
+    is read at the generation it was found at, in ranged requests of
+    ``part_bytes`` each (the library's ``BlobReader``, opened with that chunk
+    size, which passes the timeout and the retry to each request), so no read
+    holds more than one part. A generation no longer stored raises
+    ``OrreryObjectChangedError``; a checksum failure the client reports
+    (``DataCorruption``) raises ``OrreryObjectCorruptError``, though the
+    client doesn't checksum ranged reads, so the service's own SHA-256 is the
+    check that matters; any other error raises
+    ``OrreryStorageUnavailableError``, naming the object or folder and the
+    error's type.
     """
 
     def __init__(
@@ -235,23 +269,38 @@ class GoogleCloudStorageOrreryGraphReader:
 
     def list_object_names(self, prefix: str) -> list[str]:
         try:
+            # The listing's pages are fetched while it is iterated, each with
+            # the timeout and the retry.
             return [
                 blob.name
-                for blob in self._client.list_blobs(self._bucket_name, prefix=prefix)
+                for blob in self._client.list_blobs(
+                    self._bucket_name,
+                    prefix=prefix,
+                    timeout=ORRERY_STORAGE_TIMEOUT_SECONDS,
+                    retry=ORRERY_STORAGE_RETRY,
+                )
             ]
         except STORAGE_ERRORS as error:
             raise OrreryStorageUnavailableError(
-                "The Orrery bucket could not be listed."
+                f"{prefix} could not be listed in the Orrery bucket.",
+                object_name=prefix,
+                error_type=_storage_error_type(error),
             ) from error
 
     def find_object(self, object_name: str) -> StoredGraphObject | None:
         try:
-            blob = self._bucket.get_blob(object_name)
+            blob = self._bucket.get_blob(
+                object_name,
+                timeout=ORRERY_STORAGE_TIMEOUT_SECONDS,
+                retry=ORRERY_STORAGE_RETRY,
+            )
         except NotFound:
             return None
         except STORAGE_ERRORS as error:
             raise OrreryStorageUnavailableError(
-                f"{object_name} could not be looked up in the Orrery bucket."
+                f"{object_name} could not be looked up in the Orrery bucket.",
+                object_name=object_name,
+                error_type=_storage_error_type(error),
             ) from error
         if blob is None:
             return None
@@ -260,7 +309,12 @@ class GoogleCloudStorageOrreryGraphReader:
     def read_parts(self, stored: StoredGraphObject) -> Iterator[bytes]:
         blob = self._bucket.blob(stored.name, generation=stored.generation)
         try:
-            with blob.open("rb", chunk_size=self._part_bytes) as reader:
+            with blob.open(
+                "rb",
+                chunk_size=self._part_bytes,
+                timeout=ORRERY_STORAGE_TIMEOUT_SECONDS,
+                retry=ORRERY_STORAGE_RETRY,
+            ) as reader:
                 while part := reader.read(self._part_bytes):
                     yield part
         except NotFound as error:
@@ -274,7 +328,9 @@ class GoogleCloudStorageOrreryGraphReader:
             ) from error
         except STORAGE_ERRORS as error:
             raise OrreryStorageUnavailableError(
-                f"{stored.name} could not be read from the Orrery bucket."
+                f"{stored.name} could not be read from the Orrery bucket.",
+                object_name=stored.name,
+                error_type=_storage_error_type(error),
             ) from error
 
 

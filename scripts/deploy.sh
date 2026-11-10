@@ -55,6 +55,7 @@ require_configuration() {
   require_intake_resource_names || failed=1
   require_resource_name ORRERY_BUCKET "$BUCKET_NAME_PATTERN" || failed=1
   require_resource_name ORRERY_READER_SERVICE_ACCOUNT "$SERVICE_ACCOUNT_PATTERN" || failed=1
+  orrery_read_service_name > /dev/null || failed=1
   return "$failed"
 }
 
@@ -65,7 +66,8 @@ require_configuration() {
 # applied to the names the deploy builds them from, so a malformed name stops
 # the deploy before it authenticates rather than when a revision or a job
 # that reads it starts. The Orrery bucket's name has the intake bucket's
-# pattern, and the Orrery reader account's address the service accounts'.
+# pattern, and the Orrery reader account's address, which only the Orrery read
+# service's IAM policy names, the service accounts'.
 # The deploy script's tests compare these patterns and their verdicts with
 # the collector's.
 BUCKET_NAME_PATTERN='^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$'
@@ -155,22 +157,27 @@ service_intake_settings() {
     "COLLECTOR_WORKER_INVOKER_SERVICE_ACCOUNT=${WORKER_INVOKER_SERVICE_ACCOUNT}"
 }
 
-# The settings every service revision gets to serve Orrery graph files: the
-# environment's private Orrery bucket, which the service reads as its runtime
-# account, and the Google service account of the environment's microcosm-runs
-# deployments, the only caller the files are served to. The worker job gets
-# only the bucket (configure_worker_job), and the recovery job neither.
-service_orrery_settings() {
-  require_variables ORRERY_BUCKET ORRERY_READER_SERVICE_ACCOUNT || return 1
+# The Orrery read service (telemetry_collector/orrery_read_app.py) serves
+# Orrery graph files to microcosm-runs: a separate Cloud Run service, named
+# after the environment's service with this suffix, so that each
+# environment's read service differs as its service does. Cloud Run refuses a
+# service name longer than its limit.
+ORRERY_READ_SERVICE_SUFFIX='-orrery'
+CLOUD_RUN_SERVICE_NAME_LIMIT=49
+# The custom audience microcosm-runs requests its identity tokens for
+# (ORRERY_GRAPHS_AUDIENCE in telemetry_collector/orrery_read_app.py).
+ORRERY_READ_SERVICE_AUDIENCE='microcosm-collector/orrery-graphs'
 
-  local failed=0
-  require_resource_name ORRERY_BUCKET "$BUCKET_NAME_PATTERN" || failed=1
-  require_resource_name ORRERY_READER_SERVICE_ACCOUNT "$SERVICE_ACCOUNT_PATTERN" || failed=1
-  (( failed == 0 )) || return 1
+# Prints the Orrery read service's name.
+orrery_read_service_name() {
+  require_variables SERVICE || return 1
 
-  printf '%s,' "COLLECTOR_ORRERY_BUCKET=${ORRERY_BUCKET}"
-  printf '%s\n' \
-    "COLLECTOR_ORRERY_READER_SERVICE_ACCOUNT=${ORRERY_READER_SERVICE_ACCOUNT}"
+  local name="${SERVICE}${ORRERY_READ_SERVICE_SUFFIX}"
+  if (( ${#name} > CLOUD_RUN_SERVICE_NAME_LIMIT )); then
+    echo "The Orrery read service's name, ${name}, is longer than Cloud Run's limit of ${CLOUD_RUN_SERVICE_NAME_LIMIT} characters." >&2
+    return 1
+  fi
+  printf '%s\n' "$name"
 }
 
 validate_environment_target() {
@@ -360,8 +367,9 @@ configure_migration_job() {
 # 2 CPUs. An execution is billed only while it runs. `update` never creates a job: the job and the
 # invoker's permission to run it are created by hand. The worker job gets the
 # private Orrery bucket, which it publishes Orrery graph files to, and not the
-# Orrery reader account, which only the service revisions get; the bucket and
-# the worker account's access to it are created by hand too.
+# Orrery reader account, which only the Orrery read service's IAM policy
+# names; the bucket and the worker account's access to it are created by hand
+# too.
 configure_worker_job() {
   require_variables \
     WORKER_JOB \
@@ -497,10 +505,8 @@ deploy_maintenance() {
     DEPLOYMENT_ENVIRONMENT
 
   local intake_settings
-  local orrery_settings
   local minimum_instance_count
   intake_settings="$(service_intake_settings)"
-  orrery_settings="$(service_orrery_settings)"
   minimum_instance_count="$(minimum_instances)"
 
   # The signing key signs new session tokens with ES256. The HS256 secret stays
@@ -513,7 +519,7 @@ deploy_maintenance() {
     --service-account "$RUNTIME_SERVICE_ACCOUNT" \
     --add-cloudsql-instances "$CLOUD_SQL_CONNECTION" \
     --set-secrets "DATABASE_URL=${DATABASE_SECRET_NAME}:latest,TELEMETRY_JWT_SECRET=${JWT_SECRET_NAME}:latest,TELEMETRY_JWT_SIGNING_KEY=${JWT_SIGNING_KEY_SECRET_NAME}:latest,TELEMETRY_READ_TOKEN=${READ_SECRET_NAME}:latest" \
-    --set-env-vars "TELEMETRY_MAINTENANCE_MODE=1,${intake_settings},${orrery_settings}" \
+    --set-env-vars "TELEMETRY_MAINTENANCE_MODE=1,${intake_settings}" \
     --min "$minimum_instance_count" \
     --max 4 \
     --cpu 1 \
@@ -585,10 +591,8 @@ deploy_candidate() {
     DEPLOYMENT_ENVIRONMENT
 
   local intake_settings
-  local orrery_settings
   local minimum_instance_count
   intake_settings="$(service_intake_settings)"
-  orrery_settings="$(service_orrery_settings)"
   minimum_instance_count="$(minimum_instances)"
 
   # The signing key signs new session tokens with ES256. The HS256 secret stays
@@ -601,7 +605,7 @@ deploy_candidate() {
     --service-account "$RUNTIME_SERVICE_ACCOUNT" \
     --add-cloudsql-instances "$CLOUD_SQL_CONNECTION" \
     --set-secrets "DATABASE_URL=${DATABASE_SECRET_NAME}:latest,TELEMETRY_JWT_SECRET=${JWT_SECRET_NAME}:latest,TELEMETRY_JWT_SIGNING_KEY=${JWT_SIGNING_KEY_SECRET_NAME}:latest,TELEMETRY_READ_TOKEN=${READ_SECRET_NAME}:latest" \
-    --set-env-vars "TELEMETRY_MAINTENANCE_MODE=0,${intake_settings},${orrery_settings}" \
+    --set-env-vars "TELEMETRY_MAINTENANCE_MODE=0,${intake_settings}" \
     --min "$minimum_instance_count" \
     --max 4 \
     --cpu 1 \
@@ -658,6 +662,111 @@ route_service_traffic() {
     --quiet
 }
 
+# Deploys the Orrery read service from the released image, after the
+# migration: it reads the migrated database. Cloud Run's caller check is its
+# only access control (telemetry_collector/orrery_read_app.py), so every
+# deploy sets all of it again: no unauthenticated calls, the invoker check on,
+# the custom audience as the only one, and the IAM policy below.
+#
+# It runs as the runtime account, which may read the environment's private
+# Orrery bucket, connect to Cloud SQL and read the runtime database secret,
+# and gets only the bucket's name and DATABASE_URL. `--set-*` replaces each
+# list, so a setting, secret, Cloud SQL connection or custom audience added
+# by hand is removed. It starts the read application with uvicorn on 8080,
+# the container port Cloud Run sends requests to and probes; the probe checks
+# only that it listens, since the service has no health route. Sizing: a
+# request holds about one 1 MiB part of a file at a time, so 512 MiB fits ten
+# at once beside the process itself. Each instance's database pool holds at
+# most five connections (telemetry_collector/database.py), so two instances
+# keep the read service to ten. The timeout fits two reads of a 64 MiB file
+# (REQUEST_TIMEOUT_SECONDS in telemetry_collector/orrery_read_app.py). It
+# scales to zero in both environments: microcosm-runs calls it only to show a
+# run's files, and may cache public ones.
+deploy_orrery_read_service() {
+  require_variables \
+    SERVICE \
+    PROJECT_ID \
+    REGION \
+    IMAGE_URI \
+    RUNTIME_SERVICE_ACCOUNT \
+    CLOUD_SQL_CONNECTION \
+    DATABASE_SECRET_NAME \
+    ORRERY_BUCKET \
+    ORRERY_READER_SERVICE_ACCOUNT
+
+  local failed=0
+  require_resource_name ORRERY_BUCKET "$BUCKET_NAME_PATTERN" || failed=1
+  require_resource_name ORRERY_READER_SERVICE_ACCOUNT "$SERVICE_ACCOUNT_PATTERN" || failed=1
+  (( failed == 0 )) || return 1
+
+  local service_name
+  service_name="$(orrery_read_service_name)"
+
+  gcloud run deploy "$service_name" \
+    --project "$PROJECT_ID" \
+    --region "$REGION" \
+    --platform managed \
+    --image "$IMAGE_URI" \
+    --service-account "$RUNTIME_SERVICE_ACCOUNT" \
+    --set-cloudsql-instances "$CLOUD_SQL_CONNECTION" \
+    --set-secrets "DATABASE_URL=${DATABASE_SECRET_NAME}:latest" \
+    --set-env-vars "COLLECTOR_ORRERY_BUCKET=${ORRERY_BUCKET}" \
+    --command uv \
+    --args "run,--no-sync,uvicorn,telemetry_collector.orrery_read_app:create_orrery_read_app_from_environment,--factory,--host,0.0.0.0,--port,8080,--no-access-log" \
+    --port 8080 \
+    --min 0 \
+    --max 2 \
+    --cpu 1 \
+    --memory 512Mi \
+    --concurrency 10 \
+    --timeout 300 \
+    --no-allow-unauthenticated \
+    --invoker-iam-check \
+    --set-custom-audiences "$ORRERY_READ_SERVICE_AUDIENCE" \
+    --default-url \
+    --startup-probe "tcpSocket.port=8080,timeoutSeconds=10,periodSeconds=10,failureThreshold=12" \
+    --quiet
+
+  set_orrery_read_service_invokers "$service_name"
+}
+
+# Replaces the read service's whole IAM policy with one binding: the Cloud
+# Run Invoker role for the environment's microcosm-runs account. No etag is
+# sent, so whatever the policy held, such as allUsers or another invoker
+# added by hand, is removed. --format=none keeps the policy, and so the
+# account's address, out of the job's log. Then reads the policy back, and
+# fails unless it is exactly that binding.
+set_orrery_read_service_invokers() {
+  local service_name="$1"
+  local member="serviceAccount:${ORRERY_READER_SERVICE_ACCOUNT}"
+  local policy_file
+  local policy_json
+
+  policy_file="$(mktemp)"
+  jq -n --arg member "$member" \
+    '{bindings: [{role: "roles/run.invoker", members: [$member]}]}' \
+    > "$policy_file"
+  gcloud run services set-iam-policy "$service_name" "$policy_file" \
+    --project "$PROJECT_ID" \
+    --region "$REGION" \
+    --format=none \
+    --quiet
+  rm -f "$policy_file"
+
+  policy_json="$(
+    gcloud run services get-iam-policy "$service_name" \
+      --project "$PROJECT_ID" \
+      --region "$REGION" \
+      --format=json
+  )"
+  if ! jq -e --arg member "$member" \
+    '(.bindings // []) == [{role: "roles/run.invoker", members: [$member]}]' \
+    <<< "$policy_json" > /dev/null 2>&1; then
+    echo "The Orrery read service's IAM policy is not exactly the Cloud Run Invoker role for ORRERY_READER_SERVICE_ACCOUNT." >&2
+    return 1
+  fi
+}
+
 verify_stable_service() {
   require_variables SERVICE PROJECT_ID REGION
 
@@ -695,6 +804,7 @@ Commands:
   resolve-and-verify-candidate
   route-service-traffic
   verify-stable-service
+  deploy-orrery-read-service
 EOF
 }
 
@@ -722,6 +832,7 @@ main() {
     resolve-and-verify-candidate) resolve_and_verify_candidate ;;
     route-service-traffic) route_service_traffic ;;
     verify-stable-service) verify_stable_service ;;
+    deploy-orrery-read-service) deploy_orrery_read_service ;;
     *)
       echo "Unknown deployment command: $1" >&2
       usage

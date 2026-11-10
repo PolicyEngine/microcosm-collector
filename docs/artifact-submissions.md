@@ -421,12 +421,16 @@ latest processing round.
   collector's private Orrery bucket; no clearance step makes it public.
   Graph files from submissions with `licensed_data: false` are recorded
   `public`.
-- **Only microcosm-runs reads Orrery graph files from the collector,**
-  public or private, with a Google identity token of its own service
-  account (the README's "Serving Orrery graph files"). microcosm-runs shows
-  licensed runs' files only to people signed in with policyengine.org Google
-  accounts, and may show public ones to anyone (tracker 2b · 7 and 4b · 3).
-  Each answer gives a document's effective visibility, computed when it is
+- **Only microcosm-runs reads Orrery graph files,** public or private. The
+  collector's Orrery read service serves them: a separate Cloud Run service,
+  run from the collector's image, that allows no unauthenticated calls and
+  that only microcosm-runs' own service account may call. Cloud Run checks
+  that account's Google identity token before a request reaches the read
+  service, which checks no credential itself; the collector's main service
+  doesn't serve the files (the README's "Serving Orrery graph files").
+  microcosm-runs shows licensed runs' files only to people signed in with
+  policyengine.org Google accounts, and may show public ones to anyone
+  (tracker 2b · 7 and 4b · 3). Each answer gives a document's effective visibility, computed when it is
   served: `private` when its row is, or when any recorded submission with
   `licensed_data: true` has the `provenance.run_id` or the
   `provenance.build_id` of the document or of a producing submission of one
@@ -525,7 +529,8 @@ written.
       `<sha256>` is 64 lowercase hex characters and is the file's own
       SHA-256, the one in its `files[]` entry. Microcosm names each
       producing run's file it copies that way (`save_graph_schema`), and the
-      collector takes a served upstream file's SHA-256 from its name. The
+      Orrery read service takes a served upstream file's SHA-256 from its
+      name. The
       rule also keeps an upstream file from being named `graph.orrery.json`.
   - `orrery_document_refused` when the validator refuses the document,
     naming its code and its first issue's path.

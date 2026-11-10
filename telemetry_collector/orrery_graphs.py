@@ -34,8 +34,9 @@ projection changes writes a new folder. Writes only ever create objects; an
 existing object with the same SHA-256 is kept. Each document is recorded in
 ``orrery_graph_files`` with its run and build, the projection's source, the
 collector's and Orrery's versions, and its visibility: ``private`` for a
-licensed build and ``public`` otherwise. The collector serves both only to
-microcosm-runs (``telemetry_collector.orrery_graph_api``), which shows
+licensed build and ``public`` otherwise. The Orrery read service, a separate
+Cloud Run service that only microcosm-runs' service account may call, serves
+both to microcosm-runs (``telemetry_collector.orrery_read_app``), which shows
 licensed runs' files only to people signed in with policyengine.org Google
 accounts (tracker 2b · 7 and 4b · 3).
 
@@ -397,11 +398,10 @@ def check_upstream_file_names(upstream_files: Mapping[str, Mapping[str, Any]]) -
     Microcosm names each producing run's file it copies that way
     (``save_graph_schema``), and its UK Orrery publication gives the upstream
     role only to files so named, after checking that the name's digest is
-    the file's (``uk_runtime/orrery_publication.py``). The service takes a
-    served upstream file's
-    SHA-256 from its name (``telemetry_collector.orrery_serving``), so a file
-    named any other way could be neither served nor linked to its producing
-    run. The rule also keeps an upstream file from taking the document's own
+    the file's (``uk_runtime/orrery_publication.py``). The Orrery read
+    service takes a served upstream file's SHA-256 from its name
+    (``telemetry_collector.orrery_serving``), so a file named any other way
+    could be neither served nor linked to its producing run. The rule also keeps an upstream file from taking the document's own
     name, ``graph.orrery.json``.
     """
 
