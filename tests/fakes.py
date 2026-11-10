@@ -230,6 +230,12 @@ class FakeSubmissionStore:
             record = self._submissions.get(submission_id)
             return None if record is None else self._with_job(record)
 
+    def records(self) -> list[SubmissionRecord]:
+        """Every recorded submission, whatever its status."""
+
+        with self._lock:
+            return [self._with_job(record) for record in self._submissions.values()]
+
     def _add_job(self, record: SubmissionRecord, processing_round: int) -> None:
         values = new_job_values(
             record.submission_id, record.kind, processing_round, self._clock()
@@ -553,10 +559,16 @@ class FakeWorkerQueue:
 
 
 class FakeOrreryGraphStore:
-    """In-memory ``orrery_graph_files``: the first record of each document stays."""
+    """In-memory ``orrery_graph_files``: the first record of each document stays.
 
-    def __init__(self) -> None:
+    ``created_at`` holds when each document was first recorded, as the
+    table's ``created_at`` column does.
+    """
+
+    def __init__(self, *, clock: Callable[[], datetime] | None = None) -> None:
+        self._clock = clock or (lambda: datetime.now(UTC))
         self.records: dict[tuple[str, str], Any] = {}
+        self.created_at: dict[tuple[str, str], datetime] = {}
         self.repeated: list[Any] = []
 
     def record_graph(self, record: Any) -> bool:
@@ -565,4 +577,5 @@ class FakeOrreryGraphStore:
             self.repeated.append(record)
             return False
         self.records[key] = record
+        self.created_at[key] = self._clock()
         return True

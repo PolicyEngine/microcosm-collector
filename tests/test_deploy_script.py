@@ -1,3 +1,4 @@
+import importlib
 import json
 import os
 import re
@@ -40,8 +41,13 @@ HUGGINGFACE_SETTINGS = {"HF_READ_SECRET_NAME": "hugging-face-read-token"}
 CALIBRATION_TREE_SETTINGS = {
     "CALIBRATION_TREE_BLOB_SECRET_NAME": "calibration-tree-blob-token"
 }
-# ...and its own private Orrery bucket, which only the worker job gets.
+# ...and its own private Orrery bucket, which the worker job publishes Orrery
+# graph files to and the service reads them back from.
 ORRERY_SETTINGS = {"ORRERY_BUCKET": "orrery-bucket"}
+# The Google service account of microcosm-runs' deployments for each
+# environment, the only caller the service serves Orrery graph files to.
+READER_ACCOUNT = "microcosm-runs-reader@example-project.iam.gserviceaccount.com"
+ORRERY_READER_SETTINGS = {"ORRERY_READER_SERVICE_ACCOUNT": READER_ACCOUNT}
 LOGGING_GCLOUD = (
     "printf 'gcloud' >> \"$COMMAND_LOG\"\n"
     'printf \' <%s>\' "$@" >> "$COMMAND_LOG"\n'
@@ -98,7 +104,8 @@ def test_require_configuration_lists_every_missing_variable() -> None:
         "INTAKE_BUCKET WORKER_QUEUE WORKER_JOB RECOVERY_JOB "
         "WORKER_SERVICE_ACCOUNT WORKER_INVOKER_SERVICE_ACCOUNT "
         "RECOVERY_SERVICE_ACCOUNT HF_READ_SECRET_NAME "
-        "CALIBRATION_TREE_BLOB_SECRET_NAME ORRERY_BUCKET\n"
+        "CALIBRATION_TREE_BLOB_SECRET_NAME ORRERY_BUCKET "
+        "ORRERY_READER_SERVICE_ACCOUNT\n"
     )
 
 
@@ -125,6 +132,7 @@ def complete_configuration(deployment_environment: str) -> dict[str, str]:
         **HUGGINGFACE_SETTINGS,
         **CALIBRATION_TREE_SETTINGS,
         **ORRERY_SETTINGS,
+        **ORRERY_READER_SETTINGS,
     }
     return configuration
 
@@ -223,6 +231,21 @@ def test_require_configuration_requires_the_orrery_bucket(
     assert result.returncode == 1
     assert result.stderr == (
         "Missing telemetry deployment configuration: ORRERY_BUCKET\n"
+    )
+
+
+@pytest.mark.parametrize("deployment_environment", ["staging", "production"])
+def test_require_configuration_requires_the_orrery_reader_account(
+    deployment_environment: str,
+) -> None:
+    configuration = complete_configuration(deployment_environment)
+    del configuration["ORRERY_READER_SERVICE_ACCOUNT"]
+
+    result = run_deploy("require-configuration", environment=configuration)
+
+    assert result.returncode == 1
+    assert result.stderr == (
+        "Missing telemetry deployment configuration: ORRERY_READER_SERVICE_ACCOUNT\n"
     )
 
 
@@ -491,6 +514,8 @@ COLLECTOR_SETTING_SHAPES = {
     "RECOVERY_JOB": (JOB_PATTERN, PROJECT_RESOURCES + "/jobs/{}"),
     "RUNTIME_SERVICE_ACCOUNT": (SERVICE_ACCOUNT_PATTERN, "{}"),
     "WORKER_INVOKER_SERVICE_ACCOUNT": (SERVICE_ACCOUNT_PATTERN, "{}"),
+    # The service's COLLECTOR_ORRERY_READER_SERVICE_ACCOUNT.
+    "ORRERY_READER_SERVICE_ACCOUNT": (SERVICE_ACCOUNT_PATTERN, "{}"),
 }
 
 
@@ -524,6 +549,12 @@ COLLECTOR_SETTING_SHAPES = {
         (
             "WORKER_INVOKER_SERVICE_ACCOUNT",
             "Invoker-1@example-project.iam.gserviceaccount.com",
+        ),
+        ("ORRERY_READER_SERVICE_ACCOUNT", READER_ACCOUNT),
+        ("ORRERY_READER_SERVICE_ACCOUNT", "microcosm-runs-reader"),
+        (
+            "ORRERY_READER_SERVICE_ACCOUNT",
+            "123456789-compute@developer.gserviceaccount.com",
         ),
         # Each pattern's length bounds, on both sides.
         ("INTAKE_BUCKET", "abc"),
@@ -604,6 +635,12 @@ def test_deploy_script_patterns_are_the_collectors() -> None:
             "WORKER_INVOKER_SERVICE_ACCOUNT",
             "invoker@example.invalid",
         ),
+        ("deploy-maintenance", "ORRERY_BUCKET", "gs://orrery-bucket"),
+        (
+            "deploy-candidate",
+            "ORRERY_READER_SERVICE_ACCOUNT",
+            "reader@example.invalid",
+        ),
         ("configure-worker-job", "INTAKE_BUCKET", "gs://intake-bucket"),
         ("configure-worker-job", "ORRERY_BUCKET", "gs://orrery-bucket"),
         ("configure-recovery-job", "WORKER_QUEUE", PROJECT_RESOURCES + "/queues/q"),
@@ -659,6 +696,27 @@ def test_service_intake_settings_are_ones_the_collector_accepts(
         worker_queue=f"{PROJECT_RESOURCES}/queues/worker-queue",
         worker_job=f"{PROJECT_RESOURCES}/jobs/worker-job",
         worker_invoker_service_account=INVOKER_ACCOUNT,
+    )
+
+
+def test_service_orrery_settings_are_ones_the_collector_accepts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    serving = importlib.import_module("telemetry_collector.orrery_serving")
+    command_log = tmp_path / "commands.log"
+    install_command_stub(tmp_path, "gcloud", LOGGING_GCLOUD)
+
+    result = run_deploy(
+        "deploy-candidate",
+        environment=service_deploy_environment(tmp_path, command_log, "staging"),
+    )
+
+    assert result.returncode == 0, result.stderr
+    settings = logged_setting_values(command_log.read_text())
+    assert serving.OrreryServingSettings.from_environment(
+        settings
+    ) == serving.OrreryServingSettings(
+        bucket="orrery-bucket", reader_service_account=READER_ACCOUNT
     )
 
 
@@ -871,6 +929,8 @@ def service_deploy_environment(
         "READ_SECRET_NAME": "read-token",
         "DEPLOYMENT_ENVIRONMENT": deployment_environment,
         **DEPLOY_INTAKE_SETTINGS,
+        **ORRERY_SETTINGS,
+        **ORRERY_READER_SETTINGS,
     }
 
 
@@ -882,7 +942,9 @@ def expected_service_settings(maintenance_mode: str) -> str:
         f"COLLECTOR_INTAKE_SIGNING_SERVICE_ACCOUNT={RUNTIME_ACCOUNT},"
         "COLLECTOR_WORKER_QUEUE=projects/project/locations/region/queues/worker-queue,"
         "COLLECTOR_WORKER_JOB=projects/project/locations/region/jobs/worker-job,"
-        f"COLLECTOR_WORKER_INVOKER_SERVICE_ACCOUNT={INVOKER_ACCOUNT}>"
+        f"COLLECTOR_WORKER_INVOKER_SERVICE_ACCOUNT={INVOKER_ACCOUNT},"
+        "COLLECTOR_ORRERY_BUCKET=orrery-bucket,"
+        f"COLLECTOR_ORRERY_READER_SERVICE_ACCOUNT={READER_ACCOUNT}>"
     )
 
 
@@ -935,6 +997,7 @@ def job_deploy_environment(
         **HUGGINGFACE_SETTINGS,
         **CALIBRATION_TREE_SETTINGS,
         **ORRERY_SETTINGS,
+        **ORRERY_READER_SETTINGS,
     }
 
 
@@ -990,27 +1053,61 @@ def test_worker_job_settings_name_a_bucket_the_orrery_handler_accepts(
     assert orrery_graphs.orrery_bucket(settings) == "orrery-bucket"
 
 
-@pytest.mark.parametrize(
-    "deploy_command",
-    ["deploy-maintenance", "deploy-candidate", "configure-recovery-job"],
-)
-def test_only_the_worker_job_gets_the_orrery_bucket(
-    tmp_path: Path, deploy_command: str
-) -> None:
+def test_the_recovery_job_gets_neither_orrery_setting(tmp_path: Path) -> None:
     command_log = tmp_path / "commands.log"
     install_command_stub(tmp_path, "gcloud", LOGGING_GCLOUD)
-    if deploy_command.startswith("deploy-"):
-        environment = service_deploy_environment(tmp_path, command_log, "staging")
-    else:
-        environment = job_deploy_environment(tmp_path, command_log, "staging")
-    environment.update(ORRERY_SETTINGS)
 
-    result = run_deploy(deploy_command, environment=environment)
+    result = run_deploy(
+        "configure-recovery-job",
+        environment=job_deploy_environment(tmp_path, command_log, "staging"),
+    )
 
     assert result.returncode == 0, result.stderr
     command = command_log.read_text()
     assert "ORRERY" not in command
     assert "orrery-bucket" not in command
+    assert READER_ACCOUNT not in command
+
+
+@pytest.mark.parametrize(
+    "deploy_command", ["configure-worker-job", "configure-recovery-job"]
+)
+def test_neither_job_gets_the_orrery_reader_account(
+    tmp_path: Path, deploy_command: str
+) -> None:
+    command_log = tmp_path / "commands.log"
+    install_command_stub(tmp_path, "gcloud", LOGGING_GCLOUD)
+
+    result = run_deploy(
+        deploy_command,
+        environment=job_deploy_environment(tmp_path, command_log, "production"),
+    )
+
+    assert result.returncode == 0, result.stderr
+    command = command_log.read_text()
+    assert "ORRERY_READER" not in command
+    assert READER_ACCOUNT not in command
+
+
+@pytest.mark.parametrize("deploy_command", ["deploy-maintenance", "deploy-candidate"])
+@pytest.mark.parametrize(
+    "missing_variable", ["ORRERY_BUCKET", "ORRERY_READER_SERVICE_ACCOUNT"]
+)
+def test_service_revisions_stop_before_gcloud_without_an_orrery_setting(
+    tmp_path: Path, deploy_command: str, missing_variable: str
+) -> None:
+    command_log = tmp_path / "commands.log"
+    install_command_stub(tmp_path, "gcloud", LOGGING_GCLOUD)
+    environment = service_deploy_environment(tmp_path, command_log, "production")
+    del environment[missing_variable]
+
+    result = run_deploy(deploy_command, environment=environment)
+
+    assert result.returncode == 1
+    assert result.stderr == (
+        f"Missing telemetry deployment configuration: {missing_variable}\n"
+    )
+    assert not command_log.exists()
 
 
 def test_worker_job_gives_each_job_the_attempts_and_time_the_worker_counts_on(

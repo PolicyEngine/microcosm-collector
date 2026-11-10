@@ -385,6 +385,7 @@ def test_service_deployment_reads_resource_names_from_environment_variables() ->
         "WORKER_INVOKER_SERVICE_ACCOUNT": "TELEMETRY_WORKER_INVOKER_SERVICE_ACCOUNT",
         "RECOVERY_SERVICE_ACCOUNT": "TELEMETRY_RECOVERY_SERVICE_ACCOUNT",
         "ORRERY_BUCKET": "TELEMETRY_ORRERY_BUCKET",
+        "ORRERY_READER_SERVICE_ACCOUNT": "TELEMETRY_ORRERY_READER_SERVICE_ACCOUNT",
     }
     for environment_name, github_variable_name in expected_variables.items():
         assert (
@@ -431,12 +432,30 @@ def test_both_deploy_jobs_read_their_orrery_bucket() -> None:
     jobs = load_workflow(PUSH_WORKFLOW)["jobs"]
     mapping = "${{ vars.TELEMETRY_ORRERY_BUCKET }}"
 
-    # Each environment names its own private bucket, which only its worker
-    # job gets; no step passes it anywhere else.
+    # Each environment names its own private bucket, which its worker job
+    # publishes to and its service reads from; no step passes it anywhere else.
     for job_name in DEPLOY_JOBS:
         assert jobs[job_name]["env"].get("ORRERY_BUCKET") == mapping, job_name
         for step in jobs[job_name]["steps"]:
             assert "ORRERY_BUCKET" not in step.get("env", {}), (job_name, step)
+    assert PUSH_WORKFLOW.read_text(encoding="utf-8").count(mapping) == 2
+
+
+def test_both_deploy_jobs_read_their_orrery_reader_service_account() -> None:
+    jobs = load_workflow(PUSH_WORKFLOW)["jobs"]
+    mapping = "${{ vars.TELEMETRY_ORRERY_READER_SERVICE_ACCOUNT }}"
+
+    # Each environment names the service account of its own microcosm-runs
+    # deployments, at job level; no step sets it.
+    for job_name in DEPLOY_JOBS:
+        assert jobs[job_name]["env"].get("ORRERY_READER_SERVICE_ACCOUNT") == mapping, (
+            job_name
+        )
+        for step in jobs[job_name]["steps"]:
+            assert "ORRERY_READER_SERVICE_ACCOUNT" not in step.get("env", {}), (
+                job_name,
+                step,
+            )
     assert PUSH_WORKFLOW.read_text(encoding="utf-8").count(mapping) == 2
 
 
