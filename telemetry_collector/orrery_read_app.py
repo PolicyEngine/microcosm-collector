@@ -14,14 +14,17 @@ service allows no unauthenticated calls and has no custom audience, and its
 IAM policy grants the Cloud Run Invoker role to one member, microcosm-runs'
 service account. So Cloud Run checks each request's Google-signed identity
 token, whose audience must be the service's own URL, and refuses the request
-with 401 or 403 before it reaches this code. Principals that hold Owner,
-Editor, Cloud Run Admin, Cloud Run Invoker or Cloud Run Service Invoker on
-the project can call the service too (the README's "Serving Orrery graph
-files"). This code verifies no token and reads no credential. The service
-must therefore never allow unauthenticated calls, and its invoker check must
-never be switched off: either would serve every file, licensed ones
-included, to anyone. Each deploy checks that the deployed service refuses a
-call without a token.
+with 401 or 403 before it reaches this code. Anyone granted, on the
+project, its folder or the organization, any role that includes
+``run.routes.invoke`` can call the service too, and so can anyone who may
+make identity tokens as microcosm-runs' account, which needs
+``iam.serviceAccounts.getOpenIdToken`` on it. The README's "Who else can
+call it", under "Serving Orrery graph files", lists the predefined roles
+that include each permission. This code verifies no token and reads no
+credential. The service must therefore never allow unauthenticated calls,
+and its invoker check must never be switched off: either would serve every
+file, licensed ones included, to anyone. Each deploy checks that the
+deployed service refuses a call without a token.
 
 Its settings are ``COLLECTOR_ORRERY_BUCKET`` and ``DATABASE_URL``
 (``OrreryServingSettings``), and it refuses to start without either. Every

@@ -424,13 +424,16 @@ latest processing round.
 - **Only microcosm-runs reads Orrery graph files,** public or private. The
   collector's Orrery read service serves them: a separate Cloud Run service,
   run from the collector's image, that allows no unauthenticated calls and
-  whose IAM policy lets only microcosm-runs' own service account call it.
-  Principals that hold some project-level roles, such as the project's
-  owners and the deployment service account, can call it too. Cloud Run
-  checks the caller's Google identity token before a request reaches the
-  read service, which checks no credential itself; the collector's main
-  service doesn't serve the files (the README's "Serving Orrery graph
-  files").
+  whose IAM policy grants the Cloud Run Invoker role only to
+  microcosm-runs' own service account. Anyone granted, on the collector's
+  project, its folder or the organization, any role that includes
+  `run.routes.invoke`, such as the project's owners and the deployment
+  service account, can call it too, and so can anyone who may make identity
+  tokens as microcosm-runs' account (the README's "Who else can call it"
+  lists the roles). Cloud Run checks the caller's Google identity token
+  before a request reaches the read service, which checks no credential
+  itself; the collector's main service doesn't serve the files (the
+  README's "Serving Orrery graph files").
   microcosm-runs shows licensed runs' files only to people signed in with
   policyengine.org Google accounts, and may show public ones to anyone
   (tracker 2b · 7 and 4b · 3). Each answer gives a document's effective visibility, computed when it is

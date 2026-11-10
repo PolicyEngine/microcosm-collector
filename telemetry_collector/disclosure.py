@@ -6,8 +6,8 @@ calibration tree handler and the Orrery graph handler apply the same rules:
 - calibration trees may be public, including those built from licensed data;
 - an Orrery graph file of a licensed build is private: it stays in the
   collector's private Orrery bucket, served only to microcosm-runs by the
-  Orrery read service, a separate Cloud Run service whose IAM policy lets
-  only microcosm-runs' service account call it
+  Orrery read service, a separate Cloud Run service whose IAM policy grants
+  the Cloud Run Invoker role only to microcosm-runs' service account
   (``telemetry_collector.orrery_read_app``). microcosm-runs shows licensed
   runs' files only to people signed in with policyengine.org Google
   accounts (tracker 2b · 7 and 4b · 3). There is no clearance step that

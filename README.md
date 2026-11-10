@@ -867,27 +867,75 @@ anyone. Every deploy sets all of it again, and then checks it:
   fail this check even though it has removed the grant; re-running the job
   then shows whether the service refuses the call.
 
-**Who else can call it.** The service's own IAM policy doesn't limit roles
-granted on the project. Cloud Run's access control page lists these roles as
-able to invoke services, so a principal that holds any of them on the
-project can call the read service too, beside the reader account its policy
-names:
+**Who else can call it.** The service's own IAM policy covers only roles
+granted on the service itself. Anyone granted, on the project, its folder or
+the organization, any role that includes the permission to invoke services,
+`run.routes.invoke`, can call the read service too, beside the reader
+account its policy names: IAM passes roles granted on a folder or the
+organization down to the project. That covers custom roles with the
+permission as well as predefined ones. IAM's permissions reference
+(<https://docs.cloud.google.com/iam/docs/roles-permissions/run>, the row for
+`run.routes.invoke`) lists these predefined roles as including it:
 
-| Role | Role ID | What the page says |
-|---|---|---|
-| Owner | `roles/owner` | project owners can invoke Cloud Run resources by default |
-| Editor | `roles/editor` | project editors can invoke Cloud Run resources by default |
-| Cloud Run Admin | `roles/run.admin` | can invoke services and jobs; the deployment service account holds it |
-| Cloud Run Invoker | `roles/run.invoker` | can invoke services and jobs |
-| Cloud Run Service Invoker | `roles/run.servicesInvoker` | can invoke Cloud Run services |
+| Role, as the reference titles it | Role ID |
+|---|---|
+| Admin | `roles/admin` |
+| Writer | `roles/writer` |
+| Owner (Legacy) | `roles/owner` |
+| Editor (Legacy) | `roles/editor` |
+| Cloud Run Admin | `roles/run.admin`, which the deployment service account holds |
+| Cloud Run Developer | `roles/run.developer` |
+| Cloud Run Editor | `roles/run.editor` |
+| Cloud Run Invoker | `roles/run.invoker` |
+| Cloud Run Service Invoker | `roles/run.servicesInvoker` |
+| Cloud Run Source Developer | `roles/run.sourceDeveloper` |
+| Cloud Functions Admin | `roles/cloudfunctions.admin` |
+| Cloud Functions Editor | `roles/cloudfunctions.editor` |
+| Cloud Functions Developer | `roles/cloudfunctions.developer` |
+| Firebase Admin | `roles/firebase.admin` |
+| Firebase Develop Admin | `roles/firebase.developAdmin` |
+| Data Scientist | `roles/iam.dataScientist` |
+| Dev Ops | `roles/iam.devOps` |
+| ML Engineer | `roles/iam.mlEngineer` |
 
-The same roles granted on the project's folder or organization, which IAM
-passes down to the project, and any custom role with the permission to
-invoke services (`run.routes.invoke`), admit their holders too. Grant all of
-these only to administrators. In particular, grant an account that must run
-a job, such as the worker's invoker account or Cloud Scheduler's account,
-its role on that job, not on the project. Whether any account other than an
-administrator holds one of these roles on either project is not checked.
+The same row also lists twelve service agent roles, which the reference says
+to grant only to service agents, the Google-managed accounts that act for a
+Google service: `roles/aiplatform.serviceAgent`, `roles/ces.serviceAgent`,
+`roles/cloudfunctions.serviceAgent`,
+`roles/cloudfunctions.standardServiceAgent`, `roles/dialogflow.serviceAgent`,
+`roles/firebaseapphosting.serviceAgent`,
+`roles/firebasedataconnect.serviceAgent`, `roles/integrations.serviceAgent`,
+`roles/monitoring.notificationServiceAgent`, `roles/run.serviceAgent`,
+`roles/spanner.serviceAgent` and `roles/visionai.serviceAgent`. Cloud Run's
+access control page names only some of these roles, so check the permissions
+reference's row, which changes as Google adds roles.
+
+Anyone who may make identity tokens as the reader account can also call the
+read service, as that account. Making one needs
+`iam.serviceAccounts.getOpenIdToken` on the account. The Workload Identity
+principals of the matching Vercel deployments have it, and so does anyone
+granted, on the account, on the project that holds it, or on that project's
+folder or organization, a role that includes it. IAM's permissions reference
+(<https://docs.cloud.google.com/iam/docs/roles-permissions/iam>, the row for
+`iam.serviceAccounts.getOpenIdToken`) lists these predefined roles, beside
+service agent roles:
+
+| Role, as the reference titles it | Role ID |
+|---|---|
+| Service Account OpenID Connect Identity Token Creator | `roles/iam.serviceAccountOpenIdTokenCreator` |
+| Service Account Token Creator | `roles/iam.serviceAccountTokenCreator` |
+| Workload Identity User | `roles/iam.workloadIdentityUser` |
+
+No basic role includes it, not even Admin or Owner (Legacy), but anyone who
+may change the account's or the project's IAM policy can grant themselves
+one of these roles.
+
+Grant the roles that include `run.routes.invoke` only to administrators, and
+the roles that include `iam.serviceAccounts.getOpenIdToken` on the reader
+account only to the matching Vercel deployments' principals. In particular, grant an account that must run a job, such as the worker's
+invoker account or Cloud Scheduler's account, its role on that job, not on
+the project. Whether any account other than an administrator holds one of
+these roles in either environment is not checked.
 
 | Setting | Value | The deploy sets it from |
 |---|---|---|
@@ -1393,9 +1441,11 @@ address and Secret Manager resource references through non-secret configuration.
 Public ingress lets developer machines reach the service;
 ingestion still requires an expiring collector credential issued after
 Hugging Face authentication. The Orrery read service, a separate service,
-allows no unauthenticated calls: its IAM policy lets only microcosm-runs' own
-service account call it, beside principals with some project-level roles
-(see "Serving Orrery graph files").
+allows no unauthenticated calls: its IAM policy grants the Cloud Run Invoker
+role only to microcosm-runs' own service account. Anyone granted a role that
+includes `run.routes.invoke` on the project, its folder or the organization,
+or who may make identity tokens as that account, can call it too (see "Who
+else can call it" under "Serving Orrery graph files").
 
 ### Google Cloud access
 
@@ -1467,8 +1517,9 @@ The deployment's access and configuration are provisioned:
   `TELEMETRY_ORRERY_BUCKET` for its own private Orrery bucket (see
   "Publishing Orrery graph files"), and
   `TELEMETRY_ORRERY_READER_SERVICE_ACCOUNT` for the service account of its
-  own microcosm-runs deployments, the one account that may call its Orrery
-  read service (see "Serving Orrery graph files").
+  own microcosm-runs deployments, the only account its Orrery read
+  service's IAM policy grants the Cloud Run Invoker role (see "Serving
+  Orrery graph files").
   `scripts/deploy.sh require-configuration` names any that is missing, and
   the deployment stops before it authenticates.
 

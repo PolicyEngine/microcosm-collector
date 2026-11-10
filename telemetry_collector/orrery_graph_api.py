@@ -3,11 +3,13 @@
 Only the Orrery read service mounts these routes
 (``telemetry_collector.orrery_read_app``), a separate Cloud Run service run
 from the collector's image; the collector's main service doesn't. The read
-service's IAM policy lets only microcosm-runs' own service account call it
-(principals with some project-level roles can call it too; see the README's
-"Serving Orrery graph files"), and Cloud Run checks the caller's Google
-identity token before a request reaches these routes, so they read no
-credential. microcosm-runs may list and fetch any document,
+service's IAM policy grants the Cloud Run Invoker role only to
+microcosm-runs' own service account (anyone granted a role that includes
+``run.routes.invoke`` on the project, its folder or the organization, or who
+may make identity tokens as that account, can call it too; see "Who else can
+call it" in the README's "Serving Orrery graph files"), and Cloud Run checks
+the caller's Google identity token before a request reaches these routes, so
+they read no credential. microcosm-runs may list and fetch any document,
 public or private, and decides what to show to whom.
 
 - ``GET /v1/orrery-graphs?run_id=<run>&build_id=<build>``, with either or

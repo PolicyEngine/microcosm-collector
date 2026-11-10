@@ -6,10 +6,10 @@ Orrery bucket and records it in ``orrery_graph_files``
 Cloud Run service run from the collector's image
 (``telemetry_collector.orrery_read_app``), reads both to serve the files to
 microcosm-runs (``telemetry_collector.orrery_graph_api``). Its IAM policy
-lets only microcosm-runs' service account call it, and Cloud Run checks the
-caller's Google identity token before a request reaches this code, so
-nothing here reads a credential. The collector's main service serves none
-of these files.
+grants the Cloud Run Invoker role only to microcosm-runs' service account,
+and Cloud Run checks the caller's Google identity token before a request
+reaches this code, so nothing here reads a credential. The collector's main
+service serves none of these files.
 
 - **Settings.** The read service needs ``COLLECTOR_ORRERY_BUCKET``, the
   bucket's name, checked as the worker checks it, and ``DATABASE_URL``, the

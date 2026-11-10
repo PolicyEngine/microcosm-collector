@@ -35,8 +35,8 @@ existing object with the same SHA-256 is kept. Each document is recorded in
 ``orrery_graph_files`` with its run and build, the projection's source, the
 collector's and Orrery's versions, and its visibility: ``private`` for a
 licensed build and ``public`` otherwise. The Orrery read service, a separate
-Cloud Run service whose IAM policy lets only microcosm-runs' service account
-call it, serves both to microcosm-runs
+Cloud Run service whose IAM policy grants the Cloud Run Invoker role only to
+microcosm-runs' service account, serves both to microcosm-runs
 (``telemetry_collector.orrery_read_app``), which shows
 licensed runs' files only to people signed in with policyengine.org Google
 accounts (tracker 2b · 7 and 4b · 3).
