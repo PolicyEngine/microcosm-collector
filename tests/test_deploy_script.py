@@ -60,9 +60,9 @@ READ_SERVICE = "telemetry-service-orrery"
 READ_SERVICE_AUDIENCE = "microcosm-collector/orrery-graphs"
 # Cloud Run refuses a longer service name.
 CLOUD_RUN_SERVICE_NAME_LIMIT = 49
-# The read service's IAM policy: the Cloud Run Invoker role for the reader
-# account alone.
-READ_SERVICE_POLICY_BINDINGS = [
+# What the read service's IAM policy grants, in the policy's `bindings`
+# field: the Cloud Run Invoker role, to the reader account alone.
+READER_INVOKER_GRANTS = [
     {"role": "roles/run.invoker", "members": [f"serviceAccount:{READER_ACCOUNT}"]}
 ]
 # Logs each call as LOGGING_GCLOUD does. Keeps the policy that `run services
@@ -1160,7 +1160,7 @@ def test_only_the_read_service_s_iam_policy_names_the_reader_account(
     # policy file that sets who may call the read service.
     assert READER_ACCOUNT not in command_log.read_text()
     assert json.loads(Path(environment["IAM_POLICY"]).read_text()) == {
-        "bindings": READ_SERVICE_POLICY_BINDINGS
+        "bindings": READER_INVOKER_GRANTS
     }
 
 
@@ -1220,7 +1220,7 @@ def test_the_read_service_is_deployed_and_only_the_reader_account_may_call_it(
     # The policy file is removed once the policy is set.
     assert not Path(policy_call.group(1)).exists()
     assert json.loads(Path(environment["IAM_POLICY"]).read_text()) == {
-        "bindings": READ_SERVICE_POLICY_BINDINGS
+        "bindings": READER_INVOKER_GRANTS
     }
     assert check_line == (
         f"gcloud <run> <services> <get-iam-policy> <{READ_SERVICE}> "
@@ -1266,10 +1266,10 @@ def test_the_read_service_runs_the_read_application_as_it_was_sized(
 
 
 @pytest.mark.parametrize(
-    "answered_bindings",
+    "answered_grants",
     [
         [
-            *READ_SERVICE_POLICY_BINDINGS,
+            *READER_INVOKER_GRANTS,
             {"role": "roles/run.invoker", "members": ["allUsers"]},
         ],
         [
@@ -1291,7 +1291,7 @@ def test_the_read_service_runs_the_read_application_as_it_was_sized(
             }
         ],
         [
-            *READ_SERVICE_POLICY_BINDINGS,
+            *READER_INVOKER_GRANTS,
             {
                 "role": "roles/run.developer",
                 "members": ["group:collector-developers@example.com"],
@@ -1306,18 +1306,18 @@ def test_the_read_service_runs_the_read_application_as_it_was_sized(
         "a second invoker",
         "another role",
         "no invoker",
-        "no binding",
+        "an empty policy",
     ],
 )
 def test_the_read_service_deploy_fails_unless_its_policy_is_the_reader_account_alone(
-    tmp_path: Path, answered_bindings: list[dict]
+    tmp_path: Path, answered_grants: list[dict]
 ) -> None:
     command_log = tmp_path / "commands.log"
     install_command_stub(tmp_path, "gcloud", IAM_POLICY_GCLOUD)
     environment = read_service_deploy_environment(tmp_path, command_log, "staging")
     answered_policy = tmp_path / "answered-policy.json"
     answered_policy.write_text(
-        json.dumps({"bindings": answered_bindings, "etag": "BwYexample=", "version": 1})
+        json.dumps({"bindings": answered_grants, "etag": "BwYexample=", "version": 1})
     )
     environment["IAM_POLICY_ANSWER"] = str(answered_policy)
 

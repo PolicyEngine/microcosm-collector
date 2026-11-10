@@ -730,12 +730,12 @@ deploy_orrery_read_service() {
   set_orrery_read_service_invokers "$service_name"
 }
 
-# Replaces the read service's whole IAM policy with one binding: the Cloud
-# Run Invoker role for the environment's microcosm-runs account. No etag is
-# sent, so whatever the policy held, such as allUsers or another invoker
-# added by hand, is removed. --format=none keeps the policy, and so the
-# account's address, out of the job's log. Then reads the policy back, and
-# fails unless it is exactly that binding.
+# Replaces the read service's whole IAM policy with one that grants a single
+# role to a single account: the Cloud Run Invoker role to the environment's
+# microcosm-runs account. No etag is sent, so whatever the policy held, such
+# as allUsers or another invoker added by hand, is removed. --format=none
+# keeps the policy, and so the account's address, out of the job's log. Then
+# reads the policy back, and fails unless it grants exactly that.
 set_orrery_read_service_invokers() {
   local service_name="$1"
   local member="serviceAccount:${ORRERY_READER_SERVICE_ACCOUNT}"
