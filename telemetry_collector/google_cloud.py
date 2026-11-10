@@ -1,9 +1,9 @@
-"""Google Cloud Storage and Cloud Tasks implementations of the worker's services.
+"""Google Cloud Storage and Cloud Tasks implementations of the collector's services.
 
 Only the deployed collector and worker construct these: the intake bucket and
-queue, and the private bucket Orrery graph files are published to. Tests use
-in-memory fakes of the interfaces, or stand-ins for the Google Cloud clients,
-so they never reach Google Cloud.
+queue, and the private bucket Orrery graph files are published to and served
+from. Tests use in-memory fakes of the interfaces, or stand-ins for the
+Google Cloud clients, so they never reach Google Cloud.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from urllib.parse import urlsplit
 
 import google.auth
 import requests
-from google.api_core.exceptions import NotFound, PreconditionFailed
+from google.api_core.exceptions import GoogleAPIError, NotFound, PreconditionFailed
 from google.auth.exceptions import GoogleAuthError
 from google.auth.transport.requests import AuthorizedSession, Request
 from google.cloud import storage
@@ -33,6 +33,11 @@ from telemetry_collector.intake import (
     WorkerQueueUnavailableError,
     required_upload_headers,
     upload_instruction_headers,
+)
+from telemetry_collector.orrery_serving import (
+    GraphFolderObject,
+    GraphObjectContent,
+    OrreryStorageUnavailableError,
 )
 
 CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
@@ -186,6 +191,60 @@ class GoogleCloudStorageOrreryGraphs:
                 ) from None
             return False
         return True
+
+
+# What the storage client raises when the bucket does not answer as expected.
+STORAGE_ERRORS: tuple[type[Exception], ...] = (
+    GoogleAPIError,
+    GoogleAuthError,
+    requests.RequestException,
+)
+
+
+class GoogleCloudStorageOrreryGraphReader:
+    """The private Orrery bucket, as the collector service reads it to serve
+    Orrery graph files.
+
+    The service's runtime account has ``roles/storage.objectViewer`` on the
+    bucket, so it can list and read objects, and can neither write, replace
+    nor delete one. Any error but a missing object raises
+    ``OrreryStorageUnavailableError``.
+    """
+
+    def __init__(self, *, bucket_name: str, client: Any | None = None) -> None:
+        self._bucket_name = bucket_name
+        self._client = client or storage.Client()
+        # Names the bucket without reading it, so no bucket permission is needed.
+        self._bucket = self._client.bucket(bucket_name)
+
+    def list_objects(self, prefix: str) -> list[GraphFolderObject]:
+        try:
+            return [
+                GraphFolderObject(
+                    name=blob.name, sha256=(blob.metadata or {}).get("sha256")
+                )
+                for blob in self._client.list_blobs(self._bucket_name, prefix=prefix)
+            ]
+        except STORAGE_ERRORS as error:
+            raise OrreryStorageUnavailableError(
+                "The Orrery bucket could not be listed."
+            ) from error
+
+    def read_object(self, object_name: str) -> GraphObjectContent | None:
+        try:
+            blob = self._bucket.get_blob(object_name)
+            if blob is None:
+                return None
+            content = blob.download_as_bytes()
+        except NotFound:
+            return None
+        except STORAGE_ERRORS as error:
+            raise OrreryStorageUnavailableError(
+                f"{object_name} could not be read from the Orrery bucket."
+            ) from error
+        return GraphObjectContent(
+            content=content, sha256=(blob.metadata or {}).get("sha256")
+        )
 
 
 def cloud_task_id(job_id: str, dispatch_number: int) -> str:

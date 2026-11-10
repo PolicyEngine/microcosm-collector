@@ -20,9 +20,11 @@ permissions:
 # succeeds, the same image to production. Each switches artifact intake on in
 # its environment and updates the environment's intake worker and recovery
 # jobs to that image; the worker job also gets the environment's private
-# Orrery bucket. The staging and production environments accept only
-# main, and Google Cloud's Workload Identity provider accepts this repo's
-# tokens only for refs/heads/main. Both jobs also check for a push to main.
+# Orrery bucket, and the service gets the bucket and the service account of
+# the environment's microcosm-runs deployments, to serve Orrery graph files to
+# it. The staging and production environments accept only main, and Google
+# Cloud's Workload Identity provider accepts this repo's tokens only for
+# refs/heads/main. Both jobs also check for a push to main.
 # This workflow runs only for pushes to main, so that check is always true; it
 # keeps a trigger added later (tags, manual dispatch) from reaching
 # authentication.
@@ -131,9 +133,13 @@ jobs:
       # worker job mounts and only its worker service account may read.
       HF_READ_SECRET_NAME: ${{ vars.TELEMETRY_HF_READ_SECRET_NAME }}
       CALIBRATION_TREE_BLOB_SECRET_NAME: ${{ vars.TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME }}
-      # This environment's private Orrery bucket, which only its worker job
-      # gets, to publish Orrery graph files to.
+      # This environment's private Orrery bucket: its worker job publishes
+      # Orrery graph files to it, and its service reads them from it.
       ORRERY_BUCKET: ${{ vars.TELEMETRY_ORRERY_BUCKET }}
+      # The Google service account this environment's microcosm-runs
+      # deployments act as: the only caller the service serves Orrery graph
+      # files to. Only the service revisions get it.
+      ORRERY_READER_SERVICE_ACCOUNT: ${{ vars.TELEMETRY_ORRERY_READER_SERVICE_ACCOUNT }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -262,9 +268,13 @@ jobs:
       # worker job mounts and only its worker service account may read.
       HF_READ_SECRET_NAME: ${{ vars.TELEMETRY_HF_READ_SECRET_NAME }}
       CALIBRATION_TREE_BLOB_SECRET_NAME: ${{ vars.TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME }}
-      # This environment's private Orrery bucket, which only its worker job
-      # gets, to publish Orrery graph files to.
+      # This environment's private Orrery bucket: its worker job publishes
+      # Orrery graph files to it, and its service reads them from it.
       ORRERY_BUCKET: ${{ vars.TELEMETRY_ORRERY_BUCKET }}
+      # The Google service account this environment's microcosm-runs
+      # deployments act as: the only caller the service serves Orrery graph
+      # files to. Only the service revisions get it.
+      ORRERY_READER_SERVICE_ACCOUNT: ${{ vars.TELEMETRY_ORRERY_READER_SERVICE_ACCOUNT }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:

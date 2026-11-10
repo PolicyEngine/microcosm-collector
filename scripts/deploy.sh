@@ -47,12 +47,14 @@ require_configuration() {
     HF_READ_SECRET_NAME
     CALIBRATION_TREE_BLOB_SECRET_NAME
     ORRERY_BUCKET
+    ORRERY_READER_SERVICE_ACCOUNT
   )
 
   require_variables "${names[@]}"
   local failed=0
   require_intake_resource_names || failed=1
   require_resource_name ORRERY_BUCKET "$BUCKET_NAME_PATTERN" || failed=1
+  require_resource_name ORRERY_READER_SERVICE_ACCOUNT "$SERVICE_ACCOUNT_PATTERN" || failed=1
   return "$failed"
 }
 
@@ -63,8 +65,9 @@ require_configuration() {
 # applied to the names the deploy builds them from, so a malformed name stops
 # the deploy before it authenticates rather than when a revision or a job
 # that reads it starts. The Orrery bucket's name has the intake bucket's
-# pattern. The deploy script's tests compare these patterns and their verdicts
-# with the collector's.
+# pattern, and the Orrery reader account's address the service accounts'.
+# The deploy script's tests compare these patterns and their verdicts with
+# the collector's.
 BUCKET_NAME_PATTERN='^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$'
 QUEUE_NAME_PATTERN='^[A-Za-z0-9-]{1,100}$'
 JOB_NAME_PATTERN='^[a-z][a-z0-9-]{0,62}$'
@@ -150,6 +153,24 @@ service_intake_settings() {
     "COLLECTOR_WORKER_JOB=${worker_job_resource_name}"
   printf '%s\n' \
     "COLLECTOR_WORKER_INVOKER_SERVICE_ACCOUNT=${WORKER_INVOKER_SERVICE_ACCOUNT}"
+}
+
+# The settings every service revision gets to serve Orrery graph files: the
+# environment's private Orrery bucket, which the service reads as its runtime
+# account, and the Google service account of the environment's microcosm-runs
+# deployments, the only caller the files are served to. The worker job gets
+# only the bucket (configure_worker_job), and the recovery job neither.
+service_orrery_settings() {
+  require_variables ORRERY_BUCKET ORRERY_READER_SERVICE_ACCOUNT || return 1
+
+  local failed=0
+  require_resource_name ORRERY_BUCKET "$BUCKET_NAME_PATTERN" || failed=1
+  require_resource_name ORRERY_READER_SERVICE_ACCOUNT "$SERVICE_ACCOUNT_PATTERN" || failed=1
+  (( failed == 0 )) || return 1
+
+  printf '%s,' "COLLECTOR_ORRERY_BUCKET=${ORRERY_BUCKET}"
+  printf '%s\n' \
+    "COLLECTOR_ORRERY_READER_SERVICE_ACCOUNT=${ORRERY_READER_SERVICE_ACCOUNT}"
 }
 
 validate_environment_target() {
@@ -337,9 +358,10 @@ configure_migration_job() {
 # the largest current diagnostics file (128.7 MB) peaked at 3.5 GB, and Cloud
 # Run keeps the job's files in memory too. Above 4 GiB Cloud Run needs at least
 # 2 CPUs. An execution is billed only while it runs. `update` never creates a job: the job and the
-# invoker's permission to run it are created by hand. Only the worker job gets
-# the private Orrery bucket, which it publishes Orrery graph files to; the
-# bucket and the worker account's access to it are created by hand too.
+# invoker's permission to run it are created by hand. The worker job gets the
+# private Orrery bucket, which it publishes Orrery graph files to, and not the
+# Orrery reader account, which only the service revisions get; the bucket and
+# the worker account's access to it are created by hand too.
 configure_worker_job() {
   require_variables \
     WORKER_JOB \
@@ -475,8 +497,10 @@ deploy_maintenance() {
     DEPLOYMENT_ENVIRONMENT
 
   local intake_settings
+  local orrery_settings
   local minimum_instance_count
   intake_settings="$(service_intake_settings)"
+  orrery_settings="$(service_orrery_settings)"
   minimum_instance_count="$(minimum_instances)"
 
   # The signing key signs new session tokens with ES256. The HS256 secret stays
@@ -489,7 +513,7 @@ deploy_maintenance() {
     --service-account "$RUNTIME_SERVICE_ACCOUNT" \
     --add-cloudsql-instances "$CLOUD_SQL_CONNECTION" \
     --set-secrets "DATABASE_URL=${DATABASE_SECRET_NAME}:latest,TELEMETRY_JWT_SECRET=${JWT_SECRET_NAME}:latest,TELEMETRY_JWT_SIGNING_KEY=${JWT_SIGNING_KEY_SECRET_NAME}:latest,TELEMETRY_READ_TOKEN=${READ_SECRET_NAME}:latest" \
-    --set-env-vars "TELEMETRY_MAINTENANCE_MODE=1,${intake_settings}" \
+    --set-env-vars "TELEMETRY_MAINTENANCE_MODE=1,${intake_settings},${orrery_settings}" \
     --min "$minimum_instance_count" \
     --max 4 \
     --cpu 1 \
@@ -561,8 +585,10 @@ deploy_candidate() {
     DEPLOYMENT_ENVIRONMENT
 
   local intake_settings
+  local orrery_settings
   local minimum_instance_count
   intake_settings="$(service_intake_settings)"
+  orrery_settings="$(service_orrery_settings)"
   minimum_instance_count="$(minimum_instances)"
 
   # The signing key signs new session tokens with ES256. The HS256 secret stays
@@ -575,7 +601,7 @@ deploy_candidate() {
     --service-account "$RUNTIME_SERVICE_ACCOUNT" \
     --add-cloudsql-instances "$CLOUD_SQL_CONNECTION" \
     --set-secrets "DATABASE_URL=${DATABASE_SECRET_NAME}:latest,TELEMETRY_JWT_SECRET=${JWT_SECRET_NAME}:latest,TELEMETRY_JWT_SIGNING_KEY=${JWT_SIGNING_KEY_SECRET_NAME}:latest,TELEMETRY_READ_TOKEN=${READ_SECRET_NAME}:latest" \
-    --set-env-vars "TELEMETRY_MAINTENANCE_MODE=0,${intake_settings}" \
+    --set-env-vars "TELEMETRY_MAINTENANCE_MODE=0,${intake_settings},${orrery_settings}" \
     --min "$minimum_instance_count" \
     --max 4 \
     --cpu 1 \

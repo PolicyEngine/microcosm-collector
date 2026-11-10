@@ -418,10 +418,21 @@ latest processing round.
 - **Orrery graph files of licensed builds stay private.** The Orrery graph
   handler records every graph file derived from a submission with
   `licensed_data: true` with visibility `private`. It stays in the
-  collector's private Orrery bucket, to be served only to signed-in members of
-  the PolicyEngine organization; no clearance step makes it public. Graph
-  files from submissions with `licensed_data: false` are recorded `public`
-  and may be published publicly. Serving both is still to come.
+  collector's private Orrery bucket; no clearance step makes it public.
+  Graph files from submissions with `licensed_data: false` are recorded
+  `public`.
+- **Only microcosm-runs reads Orrery graph files from the collector,**
+  public or private, with a Google identity token of its own service
+  account (the README's "Serving Orrery graph files"). microcosm-runs shows
+  licensed runs' files only to people signed in with policyengine.org Google
+  accounts, and may show public ones to anyone (tracker 2b · 7 and 4b · 3).
+  Each answer gives a document's effective visibility, computed when it is
+  served: `private` when its row is, or when any recorded submission of a
+  run it comes from had `licensed_data: true`. Those runs are its own run,
+  and each run that submitted, in any role but `upstream`, a file with the
+  SHA-256 of one of its upstream files, since an upstream file is a byte
+  copy of a producing run's own file. An upstream file that no recorded
+  submission holds in another role doesn't change the visibility.
 - **Calibration data may be public, licensed or not.** Calibration trees built
   from a `calibration-diagnostics` submission may be published publicly,
   including when `licensed_data` is `true`.

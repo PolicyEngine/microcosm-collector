@@ -32,8 +32,10 @@ projection changes writes a new folder. Writes only ever create objects; an
 existing object with the same SHA-256 is kept. Each document is recorded in
 ``orrery_graph_files`` with its run and build, the projection's source, the
 collector's and Orrery's versions, and its visibility: ``private`` for a
-licensed build, served later only to signed-in organization members
-(tracker 2b · 5), and ``public`` otherwise.
+licensed build and ``public`` otherwise. The collector serves both only to
+microcosm-runs (``telemetry_collector.orrery_graph_api``), which shows
+licensed runs' files only to people signed in with policyengine.org Google
+accounts (tracker 2b · 7 and 4b · 3).
 
 The worker registers this handler only where ``COLLECTOR_ORRERY_BUCKET`` is
 set (``registered_handlers``); elsewhere ``orrery-inputs`` submissions stay in
