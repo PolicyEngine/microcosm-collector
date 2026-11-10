@@ -1,3 +1,14 @@
+## [0.16.0] - 2026-11-10
+
+### Added
+
+- Publish Orrery graph files from `orrery-inputs` submissions where the worker job has its environment's private Orrery bucket (`COLLECTOR_ORRERY_BUCKET`, which the deploy sets on the worker job only from `TELEMETRY_ORRERY_BUCKET`): the worker projects the schema and execution overlay, removes every link the published document could not resolve (evidence references keep their label and SHA-256 but lose their link, whatever its scheme; elsewhere `https://` links stay; links to submitted upstream files stay everywhere) and gives each node or edge that lost a link the projection's revision of the record as published, validates the document with the pinned Orrery validator, writes it and the upstream files it links to, the only upstream files it downloads, create-only under `graphs/<submission_id>/<document sha256>/`, and records it in the new `orrery_graph_files` table (migration `0003_orrery_graph_files`) with its run, build, versions and visibility, `private` for licensed builds. The schema and overlay are read as Microcosm's command reads its input (at most 32 MiB, strict JSON in UTF-8, nested no deeper than Python's JSON decoder can parse); an input that fails these rules, or a `TypeError`, `ValueError` or `RecursionError` from the projection, rejects the submission with `orrery_inputs_unusable`, and any other projection error fails the attempt. The worker's handlers now come from one registry, `telemetry_collector.handlers`.
+
+### Fixed
+
+- The worker now records a handler's rejection, an error's message and a handler's result with U+FFFD in place of each NUL and unpaired surrogate, which PostgreSQL's `jsonb` cannot store. Before, such text made the attempt crash while recording it, so a submission that should have been rejected ended `failed` once its attempts ran out.
+
+
 ## [0.15.0] - 2026-11-09
 
 ### Added
