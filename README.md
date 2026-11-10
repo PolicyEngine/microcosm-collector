@@ -855,15 +855,23 @@ as, and which has no roles.
   `exp`, allowing 10 seconds of clock difference; and its audience. Then its
   `email` must be the reader account exactly, and `email_verified` the
   boolean `true`.
-  - **Google's certificates** are fetched once and kept for as long as their
-    `Cache-Control` allows. A token whose key ID (`kid`) the kept
-    certificates don't hold fetches them again before it is refused, at most
-    once a minute, so a key Google starts using before they expire is
-    accepted. When a fetch fails, the certificates fetched before are still
-    used for up to an hour past their expiry, with a warning in the log, and
-    the fetch is tried again at most once a minute. One request fetches at a
-    time; a request the kept certificates can check, within that hour too,
-    never waits for it.
+  - **Google's certificates** are fetched and kept for as long as their
+    `Cache-Control` allows: its `max-age` less the response's `Age`, and no
+    time at all with `no-store`, `no-cache` or no `max-age`. Once that time
+    has passed, the next request fetches them again, so with a lifetime of
+    0 the request after each fetch fetches again. A token whose key ID
+    (`kid`) the kept certificates don't hold, while they are within their
+    lifetime, fetches them again before it is refused, at most once a
+    minute, so a key Google starts using before they expire is accepted.
+    When a fetch fails, the certificates fetched before are still used for
+    up to an hour past their expiry, with a warning in the log, and the
+    fetch is tried again at most once a minute.
+  - **Who waits for a fetch.** One request fetches at a time, and the
+    request that starts a fetch waits for it; the fetch gives up after 10
+    seconds without connecting, or without data from Google. Meanwhile, a
+    request the kept certificates can check (they hold its key and are
+    within their lifetime or the hour after it) uses them without waiting.
+    A request they can't check waits for the fetch, then uses its outcome.
   - 401, with `WWW-Authenticate: Bearer`: no token, or not a Bearer one
     (`identity_token_required`); a token that is malformed, not signed with
     RS256, without a key ID, wrongly signed, expired or not yet valid, or for
@@ -904,11 +912,20 @@ as, and which has no roles.
   - 500 (`orrery_graph_digest_mismatch`), logged, nothing served: the bytes
     don't match, or the storage client reports a checksum failure.
   - 500 (`orrery_graph_changed`), logged, nothing served: the generation
-    found is no longer stored when the first read asks for it. If it stops
-    being stored during the second read, the answer has already started, so
-    the collector logs it and stops the answer unfinished.
+    found is no longer stored when the first read asks for it.
   - 503 (`orrery_storage_unavailable`, with `Retry-After`): the bucket
     doesn't answer.
+  - **A client must check the body.** If the second read fails (the
+    generation is no longer stored, the bucket stops answering, or the
+    storage client reports a checksum failure), the status 200 and the
+    headers have already been sent. The collector logs the failure and
+    stops sending, so the body ends early. Whether an HTTP client then
+    reports an error depends on the client and on what Cloud Run's front
+    end passes on, which is not checked. So before it caches or shows a
+    file, microcosm-runs must compare the SHA-256 of the body it received
+    with the `ETag`, and with the listed `document_sha256` for a document
+    or the SHA-256 in an upstream file's name, and discard the file when
+    they differ (tracker 4b · 3).
 - **A database that doesn't answer** gives 503 with
   `orrery_catalogue_unavailable` and `Retry-After`, on both endpoints.
 - **Headers.** A served file has `Content-Type: application/json`, its
@@ -917,16 +934,23 @@ as, and which has no roles.
   1 MiB parts without `Content-Length`, so that Cloud Run streams a file
   larger than its 32 MiB limit on a whole response. Every answer under
   `/v1/orrery-graphs`, refusals, the errors above and maintenance mode's 503
-  included, has `Cache-Control: private, no-store`, and every error the
-  collector answers has its `{"detail", "code"}` shape, except maintenance
-  mode's, which is the whole service's `{"detail"}`. Only an unexpected
-  exception, which the server answers with a plain-text 500 from outside the
-  collector's own middleware, lacks both.
-- **Current documents.** Among all of a build's documents, whichever run
+  included, has `Cache-Control: private, no-store`. The errors with the
+  codes above have the collector's `{"detail", "code"}` shape. Three
+  answers have only `{"detail"}`, without a `code`: maintenance mode's 503,
+  which is the whole service's; a 405 for a method a route doesn't serve,
+  such as `POST`; and the 404 for a path that matches neither route, such
+  as one with an encoded slash or with too few or too many parts. Only an
+  unexpected exception, which the server answers with a plain-text 500 from
+  outside the collector's own middleware, lacks both the header and a JSON
+  body.
+- **Current documents.** A build is a country code and a build ID: the
+  contract doesn't require build IDs to differ between countries. Among
+  all documents with the same `country_code` and `build_id`, whichever run
   recorded them, the one with the newest `created_at` is `current: true`.
   Documents recorded at the same moment are ordered by `document_sha256`,
   then by `submission_id`, the larger first. The others are listed with
-  their dates.
+  their dates. A listing by `build_id` that holds documents of two
+  countries has a current document for each.
 - **Effective visibility,** computed for every answer, so that a
   submission recorded later still counts. A document is `private` when its
   row is (its submission had licensed data), or when any recorded
@@ -934,17 +958,19 @@ as, and which has no roles.
   document or of a producing submission of one of its upstream files.
   Otherwise it is `public`. Both IDs count because the contract defines
   `licensed_data` per build, and one build can be submitted from more than
-  one run; matching on either can only make a document more private.
-  Upstream references carry no run ID. Microcosm copies a producing run's
-  own file, byte for byte, as `upstream-<sha256>.json` (its graph
-  declaration, run manifest, compiler schema or execution evidence index),
-  so the file's SHA-256 is the link, taken from the file's name: the
-  producing submissions of an upstream file are the recorded submissions,
-  of any kind and status, that hold a file with that SHA-256 in any role but
-  `upstream`. A submission that lists the file only as its own upstream file
-  copied it, so it is no producer. **An upstream file whose SHA-256 no
-  recorded submission holds in another role does not change the
-  visibility.**
+  one run; matching on either can only make a document more private. The
+  build ID is matched alone, whatever the submission's `country_code`,
+  unlike `current`: matching more widely can only make more documents
+  private. Upstream references carry no run ID. Microcosm copies a
+  producing run's own file, byte for byte, as `upstream-<sha256>.json` (its
+  graph declaration, run manifest, compiler schema or execution evidence
+  index), so the file's SHA-256 is the link, taken from the file's name:
+  the producing submissions of an upstream file are the recorded
+  submissions, of any kind and status, that hold a file with that SHA-256
+  in any role but `upstream`. A submission that lists the file only as its
+  own upstream file copied it, so it is no producer. **An upstream file
+  whose SHA-256 no recorded submission holds in another role does not
+  change the visibility.**
 - **Outside the read API.** The routes are not part of read API v2: its
   OpenAPI document and the TypeScript client hold only `/v2` paths.
 

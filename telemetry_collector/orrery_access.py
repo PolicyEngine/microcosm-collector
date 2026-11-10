@@ -17,11 +17,17 @@ The check, in order:
    RS256, or that names no key ID (``kid``), answers 401 with
    ``identity_token_invalid``.
 3. Google's published certificates (``GOOGLE_CERTIFICATES_URL``) are fetched
-   once and kept for as long as Google's ``Cache-Control`` allows
+   and kept for as long as Google's ``Cache-Control`` allows
    (``GoogleCertificates``), not fetched for each request:
 
-   - A token whose key ID the kept certificates don't hold fetches them
-     again before it is refused, at most once a minute
+   - Once that lifetime has passed, the next request fetches them again.
+     With ``no-store``, ``no-cache``, no usable ``max-age``, or an ``Age`` of
+     at least the ``max-age``, the lifetime is 0
+     (``certificate_lifetime_seconds``), so the request after each fetch
+     fetches again.
+   - A token whose key ID the kept certificates don't hold, within their
+     lifetime, fetches them again before it is refused, at most once a
+     minute from the start of the last fetch
      (``CERTIFICATE_REFETCH_INTERVAL_SECONDS``), so a key Google starts
      using before the kept certificates expire is accepted.
    - When a fetch fails, the certificates fetched before are still used, for
@@ -29,9 +35,13 @@ The check, in order:
      warning in the log, and the fetch is tried again at most once a minute.
      Only without such certificates does the request answer 503 with
      ``identity_certificates_unavailable``.
-   - One request fetches at a time. A request the kept certificates can
-     check, within their grace period too, never waits for it; only a
-     request they can't check waits, and then uses that fetch's outcome.
+   - One request fetches at a time, and the request that starts a fetch
+     waits for it: the fetch gives up after
+     ``CERTIFICATE_FETCH_TIMEOUT_SECONDS`` without connecting, or without
+     data from Google. Meanwhile, a request the kept certificates can check
+     (they hold its key and are within their lifetime or the grace hour)
+     uses them without waiting; a request they can't check waits for the
+     fetch and then uses its outcome.
 4. ``google.auth.jwt.decode`` checks the signature against those
    certificates, ``iat`` and ``exp`` (allowing ``CLOCK_SKEW_SECONDS``) and the
    audience; the issuer must then be Google's. Any failure answers 401 with
@@ -81,8 +91,9 @@ CERTIFICATES_RETRY_AFTER_SECONDS = 30
 #: while they cannot be fetched again.
 CERTIFICATE_GRACE_SECONDS = 3600
 #: The shortest time between two fetches, from the start of the last one,
-#: for a key the kept certificates don't hold, or after a failed fetch while
-#: the kept certificates are within their grace period.
+#: for a key the kept certificates don't hold while they are within their
+#: lifetime, and after a failed fetch. Certificates past their lifetime are
+#: otherwise fetched again by the next request.
 CERTIFICATE_REFETCH_INTERVAL_SECONDS = 60
 BEARER_CHALLENGE = "Bearer"
 # What google-auth raises for a token it cannot decode or verify: its own
@@ -201,6 +212,9 @@ class _KeptCertificates:
     #: How many fetches have finished, so that a request that waited for
     #: one can tell that another request fetched meanwhile.
     finished_fetches: int = 0
+    #: Whether the last fetch failed, which keeps the certificates fetched
+    #: before in use, past their lifetime, until a minute after it started.
+    last_fetch_failed: bool = False
 
 
 class GoogleCertificates:
@@ -208,8 +222,9 @@ class GoogleCertificates:
     docstring for when they are fetched again).
 
     One instance serves every request of a collector process. One request
-    fetches at a time, holding ``_fetch_lock``; the kept certificates are
-    replaced whole, never changed, so requests read them without the lock.
+    fetches at a time, holding ``_fetch_lock``, and waits for its fetch; the
+    kept certificates are replaced whole, never changed, so requests read
+    them without the lock.
     """
 
     def __init__(
@@ -239,16 +254,20 @@ class GoogleCertificates:
         now = self._clock()
         certificates = kept.certificates
         if certificates is not None and now < kept.expires_at:
-            if key_id in certificates or not self._refetch_due(kept, now):
+            # Within their lifetime: a key they don't hold fetches them again,
+            # at most once a minute.
+            if key_id in certificates or self._fetch_held_back(kept, now):
                 return certificates
         elif (
             certificates is not None
             and key_id in certificates
             and self._within_grace(kept, now)
         ):
-            # Expired, but within the grace period and holding the key: fetch
-            # again if one is due and none is running, and never wait.
-            if not self._refetch_due(kept, now) or not self._fetch_lock.acquire(
+            # Past their lifetime, but holding the key and within the grace
+            # period: the request that takes the lock fetches again and
+            # waits for it. The others use these meanwhile, as does every
+            # request within a minute of a failed fetch.
+            if self._fetch_held_back(kept, now) or not self._fetch_lock.acquire(
                 blocking=False
             ):
                 return certificates
@@ -269,11 +288,18 @@ class GoogleCertificates:
     def _within_grace(self, kept: _KeptCertificates, now: float) -> bool:
         return now < kept.expires_at + self._grace_seconds
 
-    def _refetch_due(self, kept: _KeptCertificates, now: float) -> bool:
-        return (
+    def _fetch_held_back(self, kept: _KeptCertificates, now: float) -> bool:
+        """Whether the once-a-minute limit holds a fetch back now: within the
+        certificates' lifetime (for a key they don't hold), or after a failed
+        fetch. Past their lifetime, after a successful fetch, nothing holds
+        one back."""
+
+        if (
             kept.fetch_started_at is None
             or now - kept.fetch_started_at >= self._refetch_interval_seconds
-        )
+        ):
+            return False
+        return now < kept.expires_at or kept.last_fetch_failed
 
     def _after_waiting(self, seen: _KeptCertificates) -> Mapping[str, str]:
         """Under the lock: use the outcome of a fetch another request made
@@ -290,9 +316,10 @@ class GoogleCertificates:
         if (
             kept.certificates is not None
             and self._within_grace(kept, now)
-            and not self._refetch_due(kept, now)
+            and self._fetch_held_back(kept, now)
         ):
-            # A key the certificates fetched less than a minute ago don't hold.
+            # A key the certificates fetched less than a minute ago don't
+            # hold, or a fetch failed less than a minute ago.
             return kept.certificates
         return self._fetch_again(kept, now)
 
@@ -309,6 +336,7 @@ class GoogleCertificates:
                 previous,
                 fetch_started_at=now,
                 finished_fetches=previous.finished_fetches + 1,
+                last_fetch_failed=True,
             )
             if previous.certificates is not None and self._within_grace(previous, now):
                 LOGGER.warning(

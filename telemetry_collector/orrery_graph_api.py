@@ -8,8 +8,9 @@ service account may list or fetch any document, public or private, and
 microcosm-runs decides what to show to whom.
 
 - ``GET /v1/orrery-graphs?run_id=<run>&build_id=<build>``, with either or
-  both, lists the recorded documents of the run, the build or both, newest
-  first, with each one's current flag and effective visibility
+  both, lists the recorded documents of the run, the build ID or both,
+  newest first, with each one's current flag, set per country code and
+  build ID, and its effective visibility
   (``telemetry_collector.orrery_serving``).
 - ``GET /v1/orrery-graphs/<submission_id>/<document_sha256>/<file_name>``
   returns ``graph.orrery.json``, or one of its ``upstream-<sha256>.json``
@@ -18,18 +19,22 @@ microcosm-runs decides what to show to whom.
   SHA-256 with the document's row or the upstream file's name, and only on
   a match to send it. A file that doesn't match, that the storage client
   finds corrupt, or whose generation is no longer stored answers 500, is
-  logged, and is never served. Should the generation go while the file is
-  being sent, the answer has started, so it is logged and stopped
-  unfinished.
+  logged, and is never served. Should the second read fail, the status 200
+  and the headers have been sent, so it is logged and the body stops
+  early; microcosm-runs must compare the body's SHA-256 with the ``ETag``
+  before it caches or shows the file.
 
 Every answer under ``/v1/orrery-graphs``, refusals and the errors above
 included, carries ``Cache-Control: private, no-store``
-(``PrivateNoStoreMiddleware``), in the service's error shape when it is an
-error: a bucket that doesn't answer gives 503 ``orrery_storage_unavailable``
-and a database that doesn't answer 503 ``orrery_catalogue_unavailable``. Only
+(``PrivateNoStoreMiddleware``). The collector's own errors have the
+service's ``{"detail", "code"}`` shape: a bucket that doesn't answer gives
+503 ``orrery_storage_unavailable`` and a database that doesn't answer 503
+``orrery_catalogue_unavailable``. Three answers have only ``{"detail"}``,
+without a ``code``: maintenance mode's 503, a 405 for a method a route
+doesn't serve, and Starlette's 404 for a path that matches no route. Only
 an unexpected exception, which Starlette's outermost error handler answers
-with a plain-text 500, lacks both. The routes are outside read API v2, whose
-OpenAPI document holds only ``/v2`` paths.
+with a plain-text 500, lacks both the header and a JSON body. The routes
+are outside read API v2, whose OpenAPI document holds only ``/v2`` paths.
 """
 
 from __future__ import annotations
@@ -343,11 +348,16 @@ def orrery_graph_router(
             reverse=True,
         )
         # A build's current document may belong to another run, so it is
-        # chosen among all of the build's documents.
+        # chosen among all of the build's documents: those with its country
+        # code and build ID.
         builds_documents: list[RecordedGraphFile] = []
-        for build in sorted({document.build_id for document in matching}):
+        for country_code, build_id in sorted({document.build for document in matching}):
             builds_documents.extend(
-                _from_catalogue(catalogue.graph_files, build_id=build)
+                _from_catalogue(
+                    catalogue.graph_files,
+                    build_id=build_id,
+                    country_code=country_code,
+                )
             )
         current = current_documents(builds_documents)
         with_upstreams = [

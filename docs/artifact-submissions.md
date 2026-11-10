@@ -432,11 +432,13 @@ latest processing round.
   `provenance.build_id` of the document or of a producing submission of one
   of its upstream files. `licensed_data` describes the build, and one build
   can be submitted from more than one run, so a licensed submission of the
-  same build counts as well as one of the same run. The producing
-  submissions of an upstream file are those that submitted, in any role but
-  `upstream`, a file with the SHA-256 its name gives, since an upstream file
-  is a byte copy of a producing run's own file. An upstream file that no
-  recorded submission holds in another role doesn't change the visibility.
+  same build counts as well as one of the same run. The build ID is matched
+  alone, whatever the `provenance.country_code`, which can only make more
+  documents private. The producing submissions of an upstream file are
+  those that submitted, in any role but `upstream`, a file with the SHA-256
+  its name gives, since an upstream file is a byte copy of a producing
+  run's own file. An upstream file that no recorded submission holds in
+  another role doesn't change the visibility.
 - **Calibration data may be public, licensed or not.** Calibration trees built
   from a `calibration-diagnostics` submission may be published publicly,
   including when `licensed_data` is `true`.

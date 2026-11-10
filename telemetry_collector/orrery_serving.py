@@ -10,9 +10,12 @@ files to microcosm-runs (``telemetry_collector.orrery_graph_api``):
   checks it, and ``COLLECTOR_ORRERY_READER_SERVICE_ACCOUNT``, the address of
   the Google service account microcosm-runs acts as. With neither it is off,
   and with only one the service refuses to start.
-- **Current documents.** Among a build's documents, the newest ``created_at``
-  is its current one; documents recorded at the same moment are ordered by
-  ``document_sha256``, then by ``submission_id``, the larger first.
+- **Current documents.** A build is a country code and a build ID, since
+  the contract doesn't require build IDs to differ between countries. Among
+  the documents with the same ``country_code`` and ``build_id``, the newest
+  ``created_at`` is the current one; documents recorded at the same moment
+  are ordered by ``document_sha256``, then by ``submission_id``, the larger
+  first.
 - **Effective visibility,** computed for each answer, so that a submission
   recorded later still counts. A document is private when its row says
   ``private`` (its submission had licensed data), or when any recorded
@@ -20,11 +23,13 @@ files to microcosm-runs (``telemetry_collector.orrery_graph_api``):
   document or of a producing submission of one of its upstream files. The
   contract defines ``licensed_data`` per build, and a build can be
   submitted from more than one run, so both IDs count; that can only make a
-  document more private. The producing submissions of an upstream file are
-  the recorded submissions holding a file with the upstream file's SHA-256
-  in any role but ``upstream``. An upstream file Microcosm copies is one of
-  the producing run's own files, byte for byte: its graph declaration, run
-  manifest, compiler schema or execution evidence index
+  document more private. The build ID is matched alone, whatever the
+  country code, which can likewise only make more documents private. The
+  producing submissions of an upstream file are the recorded submissions
+  holding a file with the upstream file's SHA-256 in any role but
+  ``upstream``. An upstream file Microcosm copies is one of the producing
+  run's own files, byte for byte: its graph declaration, run manifest,
+  compiler schema or execution evidence index
   (``checkpoint_references`` at the projection's source commit). Upstream
   references carry no run ID, so the file's SHA-256 is the only link to its
   run. The SHA-256 comes from the file's name, ``upstream-<sha256>.json``,
@@ -139,6 +144,12 @@ class RecordedGraphFile:
     def origin(self) -> SubmissionOrigin:
         return SubmissionOrigin(run_id=self.run_id, build_id=self.build_id)
 
+    @property
+    def build(self) -> tuple[str, str]:
+        """The build the document belongs to: its country code and build ID."""
+
+        return (self.country_code, self.build_id)
+
 
 @dataclass(frozen=True)
 class SubmissionOrigin:
@@ -167,13 +178,14 @@ def newest_first(document: RecordedGraphFile) -> tuple[datetime, str, str]:
 
 
 def current_documents(documents: Iterable[RecordedGraphFile]) -> set[tuple[str, str]]:
-    """The key of each build's current document among ``documents``."""
+    """The key of each build's current document among ``documents``, a build
+    being a country code and a build ID."""
 
-    current: dict[str, RecordedGraphFile] = {}
+    current: dict[tuple[str, str], RecordedGraphFile] = {}
     for document in documents:
-        known = current.get(document.build_id)
+        known = current.get(document.build)
         if known is None or newest_first(document) > newest_first(known):
-            current[document.build_id] = document
+            current[document.build] = document
     return {document.key for document in current.values()}
 
 
@@ -201,9 +213,14 @@ class OrreryGraphCatalogue(Protocol):
     """What the serving endpoints read from the collector's database."""
 
     def graph_files(
-        self, *, run_id: str | None = None, build_id: str | None = None
+        self,
+        *,
+        run_id: str | None = None,
+        build_id: str | None = None,
+        country_code: str | None = None,
     ) -> list[RecordedGraphFile]:
-        """Every recorded document of the run and the build given, in no order."""
+        """Every recorded document with the run ID, build ID and country code
+        given, in no order."""
 
     def graph_file(
         self, submission_id: str, document_sha256: str
@@ -266,13 +283,19 @@ class PostgresOrreryGraphCatalogue:
         self._sessions: sessionmaker[Session] = create_session_factory(engine)
 
     def graph_files(
-        self, *, run_id: str | None = None, build_id: str | None = None
+        self,
+        *,
+        run_id: str | None = None,
+        build_id: str | None = None,
+        country_code: str | None = None,
     ) -> list[RecordedGraphFile]:
         query = select(OrreryGraphFile)
         if run_id is not None:
             query = query.where(OrreryGraphFile.run_id == run_id)
         if build_id is not None:
             query = query.where(OrreryGraphFile.build_id == build_id)
+        if country_code is not None:
+            query = query.where(OrreryGraphFile.country_code == country_code)
         with self._sessions() as session:
             return [_recorded(row) for row in session.scalars(query)]
 
