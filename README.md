@@ -386,7 +386,7 @@ bucket.
 | `COLLECTOR_WORKER_JOB_ID` | worker | set on each execution by its Cloud Task | not set by the deploy |
 | `DATABASE_URL` | worker, operations | the runtime database secret, as for the service | `TELEMETRY_DATABASE_SECRET_NAME` |
 | `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN` | worker | the read-write token of the environment's own calibration tree Vercel Blob store, a Secret Manager secret; without it, `calibration-diagnostics` submissions stay in intake storage (see "Building trees from submissions") | `TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME`, the secret's name |
-| `COLLECTOR_ORRERY_BUCKET` | service, worker | the name of the environment's private Orrery bucket, which the worker publishes Orrery graph files to and the service serves them from; without it, `orrery-inputs` submissions stay in intake storage (see "Publishing Orrery graph files" and "Serving Orrery graph files") | `TELEMETRY_ORRERY_BUCKET` |
+| `COLLECTOR_ORRERY_BUCKET` | service, worker | the name of the environment's private Orrery bucket. For the worker, the bucket it publishes Orrery graph files to; without it, `orrery-inputs` submissions stay in intake storage (see "Publishing Orrery graph files"). For the service, the bucket it serves them from: serving is on only with both this and `COLLECTOR_ORRERY_READER_SERVICE_ACCOUNT`, off with neither, and the service refuses to start with only one (see "Serving Orrery graph files") | `TELEMETRY_ORRERY_BUCKET` |
 | `COLLECTOR_ORRERY_READER_SERVICE_ACCOUNT` | service | the address of the Google service account the environment's microcosm-runs deployments act as, the only caller the service serves Orrery graph files to (see "Serving Orrery graph files") | `TELEMETRY_ORRERY_READER_SERVICE_ACCOUNT` |
 
 The `TELEMETRY_*` names are GitHub `staging` and `production` environment
@@ -726,7 +726,13 @@ calibration tree handler.
     its message shortened to 500 characters. Microcosm's command treats these
     as input errors, and also `OSError` and `GraphRuntimeError`, which the
     copied projection never raises;
-  - an upstream file named `graph.orrery.json`, the document's own name.
+  - an upstream file not named `upstream-<its SHA-256>.json`: `upstream-`,
+    64 lowercase hex characters that are the SHA-256 the worker verified for
+    the file, and `.json`. Microcosm names each producing run's file it
+    copies that way (`save_graph_schema`), and the service takes a served
+    upstream file's SHA-256 from its name ("Serving Orrery graph files").
+    The rule also keeps an upstream file from taking the document's own
+    name, `graph.orrery.json`.
 
   The worker records a NUL or an unpaired surrogate in a rejection's message,
   such as a schema column name the projection repeats, as U+FFFD, as it does
@@ -783,8 +789,8 @@ calibration tree handler.
   other build's is recorded `public`. The service serves both only to
   microcosm-runs, which shows licensed runs' files only to people signed in
   with policyengine.org Google accounts (tracker 2b · 7 and 4b · 3), and
-  treats a recorded `public` document as private when a run it comes from
-  had licensed data (see "Serving Orrery graph files").
+  treats a recorded `public` document as private when a run or a build it
+  comes from had licensed data (see "Serving Orrery graph files").
 - **Result.** The receipt's result is `{"processed_by": "orrery-graph",
   "object_prefix", "document_sha256", "document_bytes", "upstream_files",
   "orrery_version", "visibility", "removed_links"}`, where `removed_links`
@@ -844,21 +850,30 @@ as, and which has no roles.
   `includeEmail: true`. The audience is the same in both environments; the
   account tells them apart. The collector checks the token with google-auth:
   its signature against Google's published certificates
-  (`https://www.googleapis.com/oauth2/v1/certs`), which it fetches once and
-  keeps for as long as their `Cache-Control` allows; its issuer
+  (`https://www.googleapis.com/oauth2/v1/certs`); its issuer
   (`accounts.google.com` or `https://accounts.google.com`); its `iat` and
   `exp`, allowing 10 seconds of clock difference; and its audience. Then its
   `email` must be the reader account exactly, and `email_verified` the
   boolean `true`.
+  - **Google's certificates** are fetched once and kept for as long as their
+    `Cache-Control` allows. A token whose key ID (`kid`) the kept
+    certificates don't hold fetches them again before it is refused, at most
+    once a minute, so a key Google starts using before they expire is
+    accepted. When a fetch fails, the certificates fetched before are still
+    used for up to an hour past their expiry, with a warning in the log, and
+    the fetch is tried again at most once a minute. One request fetches at a
+    time; a request the kept certificates can check, within that hour too,
+    never waits for it.
   - 401, with `WWW-Authenticate: Bearer`: no token, or not a Bearer one
     (`identity_token_required`); a token that is malformed, not signed with
-    RS256, wrongly signed, expired or not yet valid, or for another audience
-    or issuer (`identity_token_invalid`).
+    RS256, without a key ID, wrongly signed, expired or not yet valid, or for
+    another audience or issuer (`identity_token_invalid`).
   - 403 (`identity_not_allowed`): a valid Google token of any other account,
     with an unverified address, or with no address, as `generateIdToken`
     issues one without `includeEmail`.
   - 503 (`identity_certificates_unavailable`, with `Retry-After`): Google's
-    certificates could not be fetched.
+    certificates could not be fetched, and none fetched before are within
+    their lifetime or the hour after it.
   - No answer or log message holds the token.
 - **`GET /v1/orrery-graphs?run_id=<run>&build_id=<build>`**, with either or
   both, lists the recorded documents of the run, the build, or both, newest
@@ -877,39 +892,59 @@ as, and which has no roles.
   as exactly one of those two forms. Any other path, a document without a
   row, and an object that doesn't exist answer 404 with
   `orrery_graph_not_found`; a path holding a parent folder or an encoded
-  slash never names an object. The bytes' SHA-256 must equal the object's
-  `sha256` metadata, and the document's must also equal its row's
-  `document_sha256`. A file that doesn't match answers 500 with
-  `orrery_graph_digest_mismatch`, is logged, and is never served. A bucket
-  that doesn't answer gives 503 with `orrery_storage_unavailable`.
+  slash never names an object.
+  - **The check.** Objects are never replaced, so the service reads the
+    object at the generation it found, twice, in ranged reads of 1 MiB,
+    holding at most one part at once. The first read hashes the bytes,
+    keeping none, and their SHA-256 must equal the document's
+    `document_sha256` in its row, or, for an upstream file, the SHA-256 in
+    its name, which the worker checked is the file's own. The objects'
+    `sha256` metadata is not read. Only on a match does the second read send
+    the bytes, so nothing is sent before the whole file has matched.
+  - 500 (`orrery_graph_digest_mismatch`), logged, nothing served: the bytes
+    don't match, or the storage client reports a checksum failure.
+  - 500 (`orrery_graph_changed`), logged, nothing served: the generation
+    found is no longer stored when the first read asks for it. If it stops
+    being stored during the second read, the answer has already started, so
+    the collector logs it and stops the answer unfinished.
+  - 503 (`orrery_storage_unavailable`, with `Retry-After`): the bucket
+    doesn't answer.
+- **A database that doesn't answer** gives 503 with
+  `orrery_catalogue_unavailable` and `Retry-After`, on both endpoints.
 - **Headers.** A served file has `Content-Type: application/json`, its
   SHA-256 as its `ETag` (`"<sha256>"`), and the document's effective
   visibility as `X-Orrery-Visibility: public` or `private`. It is sent in
   1 MiB parts without `Content-Length`, so that Cloud Run streams a file
   larger than its 32 MiB limit on a whole response. Every answer under
-  `/v1/orrery-graphs`, refusals and the errors above included, has
-  `Cache-Control: private, no-store`. Only an unexpected failure, such as a
-  database outage, which the server answers with a plain-text 500 from
-  outside the collector's own middleware, lacks it.
+  `/v1/orrery-graphs`, refusals, the errors above and maintenance mode's 503
+  included, has `Cache-Control: private, no-store`, and every error the
+  collector answers has its `{"detail", "code"}` shape, except maintenance
+  mode's, which is the whole service's `{"detail"}`. Only an unexpected
+  exception, which the server answers with a plain-text 500 from outside the
+  collector's own middleware, lacks both.
 - **Current documents.** Among all of a build's documents, whichever run
   recorded them, the one with the newest `created_at` is `current: true`.
   Documents recorded at the same moment are ordered by `document_sha256`,
   then by `submission_id`, the larger first. The others are listed with
   their dates.
-- **Effective visibility,** computed for every answer, so that a run
-  recorded later still counts. A document is `private` when its row is (its
-  submission had licensed data), or when any recorded submission of a run it
-  comes from had licensed data: its own run, or a producing run of one of its
-  upstream files. Otherwise it is `public`. Upstream references carry no run
-  ID. Microcosm copies a producing run's own file, byte for byte, as
-  `upstream-<sha256>.json` (its graph declaration, run manifest, compiler
-  schema or execution evidence index), so the file's SHA-256 is the link:
-  the producing runs of an upstream file are the runs of every recorded
-  submission, of any kind and status, that holds a file with that SHA-256 in
-  any role but `upstream`. A submission that lists the file only as its own
-  upstream file copied it, so it is no producer. **An upstream file whose
-  SHA-256 no recorded submission holds in another role, or whose object has
-  no `sha256` metadata, does not change the visibility.**
+- **Effective visibility,** computed for every answer, so that a
+  submission recorded later still counts. A document is `private` when its
+  row is (its submission had licensed data), or when any recorded
+  submission with licensed data has the run ID or the build ID of the
+  document or of a producing submission of one of its upstream files.
+  Otherwise it is `public`. Both IDs count because the contract defines
+  `licensed_data` per build, and one build can be submitted from more than
+  one run; matching on either can only make a document more private.
+  Upstream references carry no run ID. Microcosm copies a producing run's
+  own file, byte for byte, as `upstream-<sha256>.json` (its graph
+  declaration, run manifest, compiler schema or execution evidence index),
+  so the file's SHA-256 is the link, taken from the file's name: the
+  producing submissions of an upstream file are the recorded submissions,
+  of any kind and status, that hold a file with that SHA-256 in any role but
+  `upstream`. A submission that lists the file only as its own upstream file
+  copied it, so it is no producer. **An upstream file whose SHA-256 no
+  recorded submission holds in another role does not change the
+  visibility.**
 - **Outside the read API.** The routes are not part of read API v2: its
   OpenAPI document and the TypeScript client hold only `/v2` paths.
 

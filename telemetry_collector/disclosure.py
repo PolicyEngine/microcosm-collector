@@ -11,7 +11,7 @@ calibration tree handler and the Orrery graph handler apply the same rules:
   that makes it public. One of an unlicensed build may be public: the
   collector serves it only to microcosm-runs too, which may show it to
   anyone. When serving, the collector also treats a document as private when
-  another run it comes from had licensed data
+  a recorded submission of a run or a build it comes from had licensed data
   (``telemetry_collector.orrery_serving``);
 - native evidence is never published, whatever ``licensed_data`` says.
 """

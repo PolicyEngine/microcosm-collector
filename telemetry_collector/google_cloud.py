@@ -23,6 +23,7 @@ from google.api_core.exceptions import GoogleAPIError, NotFound, PreconditionFai
 from google.auth.exceptions import GoogleAuthError
 from google.auth.transport.requests import AuthorizedSession, Request
 from google.cloud import storage
+from google.cloud.storage.exceptions import DataCorruption
 
 from telemetry_collector.intake import (
     UPLOAD_CONTENT_TYPE,
@@ -35,9 +36,11 @@ from telemetry_collector.intake import (
     upload_instruction_headers,
 )
 from telemetry_collector.orrery_serving import (
-    GraphFolderObject,
-    GraphObjectContent,
+    SERVED_PART_BYTES,
+    OrreryObjectChangedError,
+    OrreryObjectCorruptError,
     OrreryStorageUnavailableError,
+    StoredGraphObject,
 )
 
 CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
@@ -207,22 +210,33 @@ class GoogleCloudStorageOrreryGraphReader:
 
     The service's runtime account has ``roles/storage.objectViewer`` on the
     bucket, so it can list and read objects, and can neither write, replace
-    nor delete one. Any error but a missing object raises
-    ``OrreryStorageUnavailableError``.
+    nor delete one. An object is read at the generation it was found at, in
+    ranged requests of ``part_bytes`` each (the library's ``BlobReader``,
+    opened with that chunk size), so no read holds more than one part. A
+    generation no longer stored raises ``OrreryObjectChangedError``; a
+    checksum failure the client reports (``DataCorruption``) raises
+    ``OrreryObjectCorruptError``, though the client doesn't checksum ranged
+    reads, so the service's own SHA-256 is the check that matters; any other
+    error raises ``OrreryStorageUnavailableError``.
     """
 
-    def __init__(self, *, bucket_name: str, client: Any | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        bucket_name: str,
+        client: Any | None = None,
+        part_bytes: int = SERVED_PART_BYTES,
+    ) -> None:
         self._bucket_name = bucket_name
         self._client = client or storage.Client()
         # Names the bucket without reading it, so no bucket permission is needed.
         self._bucket = self._client.bucket(bucket_name)
+        self._part_bytes = part_bytes
 
-    def list_objects(self, prefix: str) -> list[GraphFolderObject]:
+    def list_object_names(self, prefix: str) -> list[str]:
         try:
             return [
-                GraphFolderObject(
-                    name=blob.name, sha256=(blob.metadata or {}).get("sha256")
-                )
+                blob.name
                 for blob in self._client.list_blobs(self._bucket_name, prefix=prefix)
             ]
         except STORAGE_ERRORS as error:
@@ -230,21 +244,38 @@ class GoogleCloudStorageOrreryGraphReader:
                 "The Orrery bucket could not be listed."
             ) from error
 
-    def read_object(self, object_name: str) -> GraphObjectContent | None:
+    def find_object(self, object_name: str) -> StoredGraphObject | None:
         try:
             blob = self._bucket.get_blob(object_name)
-            if blob is None:
-                return None
-            content = blob.download_as_bytes()
         except NotFound:
             return None
         except STORAGE_ERRORS as error:
             raise OrreryStorageUnavailableError(
-                f"{object_name} could not be read from the Orrery bucket."
+                f"{object_name} could not be looked up in the Orrery bucket."
             ) from error
-        return GraphObjectContent(
-            content=content, sha256=(blob.metadata or {}).get("sha256")
-        )
+        if blob is None:
+            return None
+        return StoredGraphObject(name=object_name, generation=int(blob.generation))
+
+    def read_parts(self, stored: StoredGraphObject) -> Iterator[bytes]:
+        blob = self._bucket.blob(stored.name, generation=stored.generation)
+        try:
+            with blob.open("rb", chunk_size=self._part_bytes) as reader:
+                while part := reader.read(self._part_bytes):
+                    yield part
+        except NotFound as error:
+            raise OrreryObjectChangedError(
+                f"{stored.name} generation {stored.generation} is no longer stored."
+            ) from error
+        except DataCorruption as error:
+            raise OrreryObjectCorruptError(
+                f"{stored.name} generation {stored.generation} did not match its "
+                "checksum."
+            ) from error
+        except STORAGE_ERRORS as error:
+            raise OrreryStorageUnavailableError(
+                f"{stored.name} could not be read from the Orrery bucket."
+            ) from error
 
 
 def cloud_task_id(job_id: str, dispatch_number: int) -> str:

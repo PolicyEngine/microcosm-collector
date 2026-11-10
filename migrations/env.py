@@ -12,7 +12,10 @@ from telemetry_collector.database import Base, normalize_database_url
 
 config = context.config
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # Keep every logger the configuration doesn't name: a process that
+    # upgrades the database, such as the test session, also logs with the
+    # collector's own loggers.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 

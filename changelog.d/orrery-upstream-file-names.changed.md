@@ -1,0 +1,1 @@
+The Orrery graph handler rejects an `orrery-inputs` submission with `orrery_inputs_unusable` when an `upstream` file is not named `upstream-<its SHA-256>.json`, with 64 lowercase hex characters, as Microcosm names the files it copies. This replaces the narrower rejection of an upstream file named `graph.orrery.json`.

@@ -13,12 +13,25 @@ The check, in order:
 
 1. A missing ``Authorization`` header, or one that is not ``Bearer <token>``,
    answers 401 with ``identity_token_required``.
-2. A token whose header google-auth cannot decode, or that is not signed with
-   RS256, answers 401 with ``identity_token_invalid``.
+2. A token whose header google-auth cannot decode, that is not signed with
+   RS256, or that names no key ID (``kid``), answers 401 with
+   ``identity_token_invalid``.
 3. Google's published certificates (``GOOGLE_CERTIFICATES_URL``) are fetched
    once and kept for as long as Google's ``Cache-Control`` allows
-   (``GoogleCertificates``), not fetched for each request. A failed fetch
-   answers 503 with ``identity_certificates_unavailable``.
+   (``GoogleCertificates``), not fetched for each request:
+
+   - A token whose key ID the kept certificates don't hold fetches them
+     again before it is refused, at most once a minute
+     (``CERTIFICATE_REFETCH_INTERVAL_SECONDS``), so a key Google starts
+     using before the kept certificates expire is accepted.
+   - When a fetch fails, the certificates fetched before are still used, for
+     up to an hour past their expiry (``CERTIFICATE_GRACE_SECONDS``), with a
+     warning in the log, and the fetch is tried again at most once a minute.
+     Only without such certificates does the request answer 503 with
+     ``identity_certificates_unavailable``.
+   - One request fetches at a time. A request the kept certificates can
+     check, within their grace period too, never waits for it; only a
+     request they can't check waits, and then uses that fetch's outcome.
 4. ``google.auth.jwt.decode`` checks the signature against those
    certificates, ``iat`` and ``exp`` (allowing ``CLOCK_SKEW_SECONDS``) and the
    audience; the issuer must then be Google's. Any failure answers 401 with
@@ -39,10 +52,11 @@ token, is passed on.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Annotated, Any, Protocol
 
 import google.auth.jwt
@@ -63,11 +77,20 @@ SIGNING_ALGORITHM = "RS256"
 CLOCK_SKEW_SECONDS = 10
 CERTIFICATE_FETCH_TIMEOUT_SECONDS = 10
 CERTIFICATES_RETRY_AFTER_SECONDS = 30
+#: How long past their expiry the certificates fetched before are still used
+#: while they cannot be fetched again.
+CERTIFICATE_GRACE_SECONDS = 3600
+#: The shortest time between two fetches, from the start of the last one,
+#: for a key the kept certificates don't hold, or after a failed fetch while
+#: the kept certificates are within their grace period.
+CERTIFICATE_REFETCH_INTERVAL_SECONDS = 60
 BEARER_CHALLENGE = "Bearer"
 # What google-auth raises for a token it cannot decode or verify: its own
 # MalformedError and InvalidValue are ValueErrors, base64 and JSON errors are
 # ValueErrors, and a claim of an unexpected type raises a TypeError.
 TOKEN_ERRORS: tuple[type[Exception], ...] = (ValueError, TypeError, GoogleAuthError)
+
+LOGGER = logging.getLogger(__name__)
 
 
 class IdentityTokenRefusedError(Exception):
@@ -166,11 +189,27 @@ def fetch_google_certificates(
     )
 
 
-class GoogleCertificates:
-    """Google's certificates, fetched again only once their lifetime is over.
+@dataclass(frozen=True)
+class _KeptCertificates:
+    """What ``GoogleCertificates`` keeps, replaced whole after each fetch."""
 
-    One instance serves every request of a collector process; the lock lets
-    one request fetch while the others wait for its answer.
+    certificates: Mapping[str, str] | None = None
+    #: When the certificates' lifetime ends, by the instance's clock.
+    expires_at: float = 0.0
+    #: When the last fetch started, whatever its outcome; None before any.
+    fetch_started_at: float | None = None
+    #: How many fetches have finished, so that a request that waited for
+    #: one can tell that another request fetched meanwhile.
+    finished_fetches: int = 0
+
+
+class GoogleCertificates:
+    """Google's certificates, kept between requests (see the module's
+    docstring for when they are fetched again).
+
+    One instance serves every request of a collector process. One request
+    fetches at a time, holding ``_fetch_lock``; the kept certificates are
+    replaced whole, never changed, so requests read them without the lock.
     """
 
     def __init__(
@@ -178,23 +217,120 @@ class GoogleCertificates:
         *,
         fetch: Callable[[], FetchedCertificates] = fetch_google_certificates,
         clock: Callable[[], float] = time.monotonic,
+        grace_seconds: float = CERTIFICATE_GRACE_SECONDS,
+        refetch_interval_seconds: float = CERTIFICATE_REFETCH_INTERVAL_SECONDS,
     ) -> None:
         self._fetch = fetch
         self._clock = clock
-        self._lock = threading.Lock()
-        self._certificates: Mapping[str, str] | None = None
-        self._expires_at = 0.0
+        self._grace_seconds = grace_seconds
+        self._refetch_interval_seconds = refetch_interval_seconds
+        self._fetch_lock = threading.Lock()
+        self._kept = _KeptCertificates()
 
-    def current(self) -> Mapping[str, str]:
-        """The certificates; raises ``GoogleCertificatesUnavailableError``."""
+    def for_key(self, key_id: str) -> Mapping[str, str]:
+        """Certificates to check a token signed with key ``key_id``: they
+        hold that key unless Google doesn't publish it.
 
-        with self._lock:
-            now = self._clock()
-            if self._certificates is None or now >= self._expires_at:
-                fetched = self._fetch()
-                self._certificates = dict(fetched.certificates)
-                self._expires_at = now + fetched.lifetime_seconds
-            return self._certificates
+        Raises ``GoogleCertificatesUnavailableError`` when no certificates
+        can be used.
+        """
+
+        kept = self._kept
+        now = self._clock()
+        certificates = kept.certificates
+        if certificates is not None and now < kept.expires_at:
+            if key_id in certificates or not self._refetch_due(kept, now):
+                return certificates
+        elif (
+            certificates is not None
+            and key_id in certificates
+            and self._within_grace(kept, now)
+        ):
+            # Expired, but within the grace period and holding the key: fetch
+            # again if one is due and none is running, and never wait.
+            if not self._refetch_due(kept, now) or not self._fetch_lock.acquire(
+                blocking=False
+            ):
+                return certificates
+            try:
+                latest = self._kept
+                if latest.finished_fetches != kept.finished_fetches:
+                    # Another request fetched since this one looked: a failed
+                    # fetch kept the same certificates.
+                    return latest.certificates or certificates
+                return self._fetch_again(kept, now)
+            finally:
+                self._fetch_lock.release()
+        # The kept certificates can't check the token: there are none, they
+        # are past their grace period, or they don't hold its key.
+        with self._fetch_lock:
+            return self._after_waiting(kept)
+
+    def _within_grace(self, kept: _KeptCertificates, now: float) -> bool:
+        return now < kept.expires_at + self._grace_seconds
+
+    def _refetch_due(self, kept: _KeptCertificates, now: float) -> bool:
+        return (
+            kept.fetch_started_at is None
+            or now - kept.fetch_started_at >= self._refetch_interval_seconds
+        )
+
+    def _after_waiting(self, seen: _KeptCertificates) -> Mapping[str, str]:
+        """Under the lock: use the outcome of a fetch another request made
+        while this one waited, or else fetch."""
+
+        kept = self._kept
+        now = self._clock()
+        if kept.finished_fetches != seen.finished_fetches:
+            if kept.certificates is not None and self._within_grace(kept, now):
+                return kept.certificates
+            raise GoogleCertificatesUnavailableError(
+                "Google's certificates could not be fetched."
+            )
+        if (
+            kept.certificates is not None
+            and self._within_grace(kept, now)
+            and not self._refetch_due(kept, now)
+        ):
+            # A key the certificates fetched less than a minute ago don't hold.
+            return kept.certificates
+        return self._fetch_again(kept, now)
+
+    def _fetch_again(
+        self, previous: _KeptCertificates, now: float
+    ) -> Mapping[str, str]:
+        """Under the lock: fetch, keeping ``previous`` within its grace
+        period when the fetch fails."""
+
+        try:
+            fetched = self._fetch()
+        except GoogleCertificatesUnavailableError:
+            self._kept = replace(
+                previous,
+                fetch_started_at=now,
+                finished_fetches=previous.finished_fetches + 1,
+            )
+            if previous.certificates is not None and self._within_grace(previous, now):
+                LOGGER.warning(
+                    "Google's certificates could not be fetched again, so the "
+                    "ones fetched before are still used, for at most %d seconds "
+                    "past their expiry.",
+                    self._grace_seconds,
+                )
+                return previous.certificates
+            LOGGER.warning(
+                "Google's certificates could not be fetched, and none fetched "
+                "before can be used, so identity tokens cannot be checked."
+            )
+            raise
+        certificates = dict(fetched.certificates)
+        self._kept = _KeptCertificates(
+            certificates=certificates,
+            expires_at=now + fetched.lifetime_seconds,
+            fetch_started_at=now,
+            finished_fetches=previous.finished_fetches + 1,
+        )
+        return certificates
 
 
 class IdentityTokenVerifier(Protocol):
@@ -229,7 +365,11 @@ class GoogleIdentityTokenVerifier:
             raise IdentityTokenRefusedError("The token cannot be decoded.") from None
         if header.get("alg") != SIGNING_ALGORITHM:
             raise IdentityTokenRefusedError("The token is not signed with RS256.")
-        certificates = self._certificates.current()
+        key_id = header.get("kid")
+        if not isinstance(key_id, str) or not key_id:
+            # Google's tokens always name their key.
+            raise IdentityTokenRefusedError("The token names no signing key.")
+        certificates = self._certificates.for_key(key_id)
         try:
             claims = google.auth.jwt.decode(
                 token,

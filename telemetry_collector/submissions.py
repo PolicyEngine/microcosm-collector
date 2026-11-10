@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -62,6 +63,19 @@ HUGGINGFACE_REPO_PATTERN = rf"^{HUGGINGFACE_REPO_PART}/{HUGGINGFACE_REPO_PART}$"
 GIT_COMMIT_PATTERN = r"^[0-9a-f]{40}$"
 HUGGINGFACE_FOLDER_PATTERN = rf"^{BUILD_IDENTIFIER}(/{BUILD_IDENTIFIER})*$"
 MAX_HUGGINGFACE_FOLDER_CHARACTERS = 512
+#: An ``upstream`` file's name: ``upstream-<its SHA-256>.json``, as Microcosm
+#: names each producing run's file it copies (``save_graph_schema``). Intake
+#: doesn't check it; the Orrery graph handler requires it, so the service can
+#: take a served upstream file's SHA-256 from its name.
+UPSTREAM_FILE_NAME_PATTERN = r"^upstream-([0-9a-f]{64})\.json$"
+
+
+def upstream_file_sha256(name: str) -> str | None:
+    """The SHA-256 an upstream file's name gives, or ``None`` for a name not
+    of the form ``upstream-<64 lowercase hex characters>.json``."""
+
+    named = re.fullmatch(UPSTREAM_FILE_NAME_PATTERN, name)
+    return None if named is None else named.group(1)
 
 
 @dataclass(frozen=True)

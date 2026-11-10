@@ -161,8 +161,8 @@ build today. The Orrery roles are the inputs the projection needs
 (`orrery_json_from_schema(schema, execution=overlay)`), plus the native evidence
 files that stay in private intake storage. Intake checks each file's role,
 count and size, not its name; the Orrery graph handler rejects a submission
-whose files it cannot use, including a schema over 32 MiB (see "Orrery graph
-files").
+whose files it cannot use, including a schema over 32 MiB and an `upstream`
+file not named `upstream-<its SHA-256>.json` (see "Orrery graph files").
 
 ### The roles the emitter sends
 
@@ -427,12 +427,16 @@ latest processing round.
   licensed runs' files only to people signed in with policyengine.org Google
   accounts, and may show public ones to anyone (tracker 2b · 7 and 4b · 3).
   Each answer gives a document's effective visibility, computed when it is
-  served: `private` when its row is, or when any recorded submission of a
-  run it comes from had `licensed_data: true`. Those runs are its own run,
-  and each run that submitted, in any role but `upstream`, a file with the
-  SHA-256 of one of its upstream files, since an upstream file is a byte
-  copy of a producing run's own file. An upstream file that no recorded
-  submission holds in another role doesn't change the visibility.
+  served: `private` when its row is, or when any recorded submission with
+  `licensed_data: true` has the `provenance.run_id` or the
+  `provenance.build_id` of the document or of a producing submission of one
+  of its upstream files. `licensed_data` describes the build, and one build
+  can be submitted from more than one run, so a licensed submission of the
+  same build counts as well as one of the same run. The producing
+  submissions of an upstream file are those that submitted, in any role but
+  `upstream`, a file with the SHA-256 its name gives, since an upstream file
+  is a byte copy of a producing run's own file. An upstream file that no
+  recorded submission holds in another role doesn't change the visibility.
 - **Calibration data may be public, licensed or not.** Calibration trees built
   from a `calibration-diagnostics` submission may be published publicly,
   including when `licensed_data` is `true`.
@@ -515,7 +519,12 @@ written.
     - it is nested too deeply for Python's JSON decoder to parse;
     - the projection raises a `TypeError`, `ValueError` or `RecursionError`
       for it (its message, shortened to 500 characters);
-    - or an upstream file is named `graph.orrery.json`.
+    - or an `upstream` file's name is not `upstream-<sha256>.json`, where
+      `<sha256>` is 64 lowercase hex characters and is the file's own
+      SHA-256, the one in its `files[]` entry. Microcosm names each
+      producing run's file it copies that way (`save_graph_schema`), and the
+      collector takes a served upstream file's SHA-256 from its name. The
+      rule also keeps an upstream file from being named `graph.orrery.json`.
   - `orrery_document_refused` when the validator refuses the document,
     naming its code and its first issue's path.
 
