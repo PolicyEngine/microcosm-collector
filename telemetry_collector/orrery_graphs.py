@@ -1,7 +1,9 @@
 """Build, check and publish Orrery graph files from ``orrery-inputs`` submissions.
 
-Each attempt downloads the submission's schema and execution overlay into a
-new temporary directory. It projects them with the collector's copy of
+Each attempt first checks that every upstream file is named
+``upstream-<its SHA-256>.json``, as Microcosm names the producing run's files
+it copies, and then downloads the submission's schema and execution overlay
+into a new temporary directory. It projects them with the collector's copy of
 Microcosm's projection (``orrery_json_from_schema(schema, execution=overlay)``)
 and then removes every link the published document could not resolve, which
 needs only the upstream files' names, from the submission's file list:
@@ -32,8 +34,12 @@ projection changes writes a new folder. Writes only ever create objects; an
 existing object with the same SHA-256 is kept. Each document is recorded in
 ``orrery_graph_files`` with its run and build, the projection's source, the
 collector's and Orrery's versions, and its visibility: ``private`` for a
-licensed build, served later only to signed-in organization members
-(tracker 2b · 5), and ``public`` otherwise.
+licensed build and ``public`` otherwise. The Orrery read service, a separate
+Cloud Run service whose IAM policy grants the Cloud Run Invoker role only to
+microcosm-runs' service account, serves both to microcosm-runs
+(``telemetry_collector.orrery_read_app``), which shows
+licensed runs' files only to people signed in with policyengine.org Google
+accounts (tracker 2b · 7 and 4b · 3).
 
 The worker registers this handler only where ``COLLECTOR_ORRERY_BUCKET`` is
 set (``registered_handlers``); elsewhere ``orrery-inputs`` submissions stay in
@@ -75,6 +81,7 @@ from telemetry_collector.orrery.validation import (
     OrreryValidation,
     validate_orrery_document,
 )
+from telemetry_collector.submissions import upstream_file_sha256
 from telemetry_collector.worker import (
     JobContext,
     JobHandler,
@@ -385,6 +392,41 @@ def _refusal_message(refusal: OrreryDocumentRefusedError) -> str:
     return _shortened(message)
 
 
+def check_upstream_file_names(upstream_files: Mapping[str, Mapping[str, Any]]) -> None:
+    """Reject the submission unless each upstream file, by name, is named
+    ``upstream-<its SHA-256>.json``, with the SHA-256 the worker verified.
+
+    Microcosm names each producing run's file it copies that way
+    (``save_graph_schema``), and its UK Orrery publication gives the upstream
+    role only to files so named, after checking that the name's digest is
+    the file's (``uk_runtime/orrery_publication.py``). The Orrery read
+    service takes a served upstream file's SHA-256 from its name
+    (``telemetry_collector.orrery_serving``), so a file named any other way
+    could be neither served nor linked to its producing run. The rule also keeps an upstream file from taking the document's own
+    name, ``graph.orrery.json``.
+    """
+
+    for name in sorted(upstream_files):
+        named_sha256 = upstream_file_sha256(name)
+        if named_sha256 is None:
+            raise SubmissionRejectedError(
+                UNUSABLE_INPUTS,
+                _shortened(
+                    f"The upstream file {name} is not named upstream-<its "
+                    "SHA-256>.json, with 64 lowercase hexadecimal characters."
+                ),
+            )
+        file_sha256 = upstream_files[name]["sha256"]
+        if named_sha256 != file_sha256:
+            raise SubmissionRejectedError(
+                UNUSABLE_INPUTS,
+                _shortened(
+                    f"The upstream file {name} is not named by its own "
+                    f"SHA-256, {file_sha256}."
+                ),
+            )
+
+
 def installed_collector_version() -> str:
     """The installed collector package's version."""
 
@@ -414,11 +456,7 @@ def orrery_graph_handler(
         [schema_file] = context.files("schema")
         [overlay_file] = context.files("execution_overlay")
         upstream_files = {file["name"]: file for file in context.files("upstream")}
-        if GRAPH_FILE_NAME in upstream_files:
-            raise SubmissionRejectedError(
-                UNUSABLE_INPUTS,
-                f"An upstream file is named {GRAPH_FILE_NAME}, the graph file's name.",
-            )
+        check_upstream_file_names(upstream_files)
         with tempfile.TemporaryDirectory(prefix="orrery-graph-") as directory:
             attempt_directory = Path(directory)
             inputs = attempt_directory / "inputs"

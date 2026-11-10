@@ -161,8 +161,8 @@ build today. The Orrery roles are the inputs the projection needs
 (`orrery_json_from_schema(schema, execution=overlay)`), plus the native evidence
 files that stay in private intake storage. Intake checks each file's role,
 count and size, not its name; the Orrery graph handler rejects a submission
-whose files it cannot use, including a schema over 32 MiB (see "Orrery graph
-files").
+whose files it cannot use, including a schema over 32 MiB and an `upstream`
+file not named `upstream-<its SHA-256>.json` (see "Orrery graph files").
 
 ### The roles the emitter sends
 
@@ -418,10 +418,37 @@ latest processing round.
 - **Orrery graph files of licensed builds stay private.** The Orrery graph
   handler records every graph file derived from a submission with
   `licensed_data: true` with visibility `private`. It stays in the
-  collector's private Orrery bucket, to be served only to signed-in members of
-  the PolicyEngine organization; no clearance step makes it public. Graph
-  files from submissions with `licensed_data: false` are recorded `public`
-  and may be published publicly. Serving both is still to come.
+  collector's private Orrery bucket; no clearance step makes it public.
+  Graph files from submissions with `licensed_data: false` are recorded
+  `public`.
+- **Only microcosm-runs reads Orrery graph files,** public or private. The
+  collector's Orrery read service serves them: a separate Cloud Run service,
+  run from the collector's image, that allows no unauthenticated calls and
+  whose IAM policy grants the Cloud Run Invoker role only to
+  microcosm-runs' own service account. Anyone granted, on the collector's
+  project, its folder or the organization, any role that includes
+  `run.routes.invoke`, such as the project's owners and the deployment
+  service account, can call it too, and so can anyone who may make identity
+  tokens as microcosm-runs' account (the README's "Who else can call it"
+  lists the roles). Cloud Run checks the caller's Google identity token
+  before a request reaches the read service, which checks no credential
+  itself; the collector's main service doesn't serve the files (the
+  README's "Serving Orrery graph files").
+  microcosm-runs shows licensed runs' files only to people signed in with
+  policyengine.org Google accounts, and may show public ones to anyone
+  (tracker 2b · 7 and 4b · 3). Each answer gives a document's effective visibility, computed when it is
+  served: `private` when its row is, or when any recorded submission with
+  `licensed_data: true` has the `provenance.run_id` or the
+  `provenance.build_id` of the document or of a producing submission of one
+  of its upstream files. `licensed_data` describes the build, and one build
+  can be submitted from more than one run, so a licensed submission of the
+  same build counts as well as one of the same run. The build ID is matched
+  alone, whatever the `provenance.country_code`, which can only make more
+  documents private. The producing submissions of an upstream file are
+  those that submitted, in any role but `upstream`, a file with the SHA-256
+  its name gives, since an upstream file is a byte copy of a producing
+  run's own file. An upstream file that no recorded submission holds in
+  another role doesn't change the visibility.
 - **Calibration data may be public, licensed or not.** Calibration trees built
   from a `calibration-diagnostics` submission may be published publicly,
   including when `licensed_data` is `true`.
@@ -504,7 +531,13 @@ written.
     - it is nested too deeply for Python's JSON decoder to parse;
     - the projection raises a `TypeError`, `ValueError` or `RecursionError`
       for it (its message, shortened to 500 characters);
-    - or an upstream file is named `graph.orrery.json`.
+    - or an `upstream` file's name is not `upstream-<sha256>.json`, where
+      `<sha256>` is 64 lowercase hex characters and is the file's own
+      SHA-256, the one in its `files[]` entry. Microcosm names each
+      producing run's file it copies that way (`save_graph_schema`), and the
+      Orrery read service takes a served upstream file's SHA-256 from its
+      name. The
+      rule also keeps an upstream file from being named `graph.orrery.json`.
   - `orrery_document_refused` when the validator refuses the document,
     naming its code and its first issue's path.
 
