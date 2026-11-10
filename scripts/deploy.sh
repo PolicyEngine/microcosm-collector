@@ -164,9 +164,12 @@ service_intake_settings() {
 # service name longer than its limit.
 ORRERY_READ_SERVICE_SUFFIX='-orrery'
 CLOUD_RUN_SERVICE_NAME_LIMIT=49
-# The custom audience microcosm-runs requests its identity tokens for
-# (ORRERY_GRAPHS_AUDIENCE in telemetry_collector/orrery_read_app.py).
-ORRERY_READ_SERVICE_AUDIENCE='microcosm-collector/orrery-graphs'
+# What the deploy asks the read service for without a token, to check that
+# Cloud Run refuses the call: the listing (ORRERY_GRAPHS_PATH in
+# telemetry_collector/orrery_graph_api.py) for a run ID in the shape the
+# service accepts, so that a service that let the call through would answer
+# it with a listing.
+ORRERY_READ_SERVICE_CHECK_PATH='/v1/orrery-graphs?run_id=deploy-access-check'
 
 # Prints the Orrery read service's name.
 orrery_read_service_name() {
@@ -666,13 +669,16 @@ route_service_traffic() {
 # migration: it reads the migrated database. Cloud Run's caller check is its
 # only access control (telemetry_collector/orrery_read_app.py), so every
 # deploy sets all of it again: no unauthenticated calls, the invoker check on,
-# the custom audience as the only one, and the IAM policy below.
+# no custom audience, so that a token must be for the service's own URL, and
+# the IAM policy below. Then it checks that the service refuses a call
+# without a token.
 #
 # It runs as the runtime account, which may read the environment's private
 # Orrery bucket, connect to Cloud SQL and read the runtime database secret,
 # and gets only the bucket's name and DATABASE_URL. `--set-*` replaces each
-# list, so a setting, secret, Cloud SQL connection or custom audience added
-# by hand is removed. It starts the read application with uvicorn on 8080,
+# list, so a setting, secret or Cloud SQL connection added by hand is
+# removed, and `--clear-custom-audiences` removes any custom audience. It
+# starts the read application with uvicorn on 8080,
 # the container port Cloud Run sends requests to and probes; the probe checks
 # only that it listens, since the service has no health route. Sizing: a
 # request holds about one 1 MiB part of a file at a time, so 512 MiB fits ten
@@ -722,20 +728,23 @@ deploy_orrery_read_service() {
     --timeout 300 \
     --no-allow-unauthenticated \
     --invoker-iam-check \
-    --set-custom-audiences "$ORRERY_READ_SERVICE_AUDIENCE" \
+    --clear-custom-audiences \
     --default-url \
     --startup-probe "tcpSocket.port=8080,timeoutSeconds=10,periodSeconds=10,failureThreshold=12" \
     --quiet
 
   set_orrery_read_service_invokers "$service_name"
+  check_orrery_read_service_refuses_unauthenticated_calls "$service_name"
 }
 
 # Replaces the read service's whole IAM policy with one that grants a single
 # role to a single account: the Cloud Run Invoker role to the environment's
 # microcosm-runs account. No etag is sent, so whatever the policy held, such
 # as allUsers or another invoker added by hand, is removed. --format=none
-# keeps the policy, and so the account's address, out of the job's log. Then
-# reads the policy back, and fails unless it grants exactly that.
+# keeps gcloud from printing the policy it set. The account's address is in
+# the job's log all the same, since GitHub lists each job-level `env:` value
+# in every step's log; it is not a secret. Then reads the policy back, and
+# fails unless it grants exactly that.
 set_orrery_read_service_invokers() {
   local service_name="$1"
   local member="serviceAccount:${ORRERY_READER_SERVICE_ACCOUNT}"
@@ -765,6 +774,45 @@ set_orrery_read_service_invokers() {
     echo "The Orrery read service's IAM policy is not exactly the Cloud Run Invoker role for ORRERY_READER_SERVICE_ACCOUNT." >&2
     return 1
   fi
+}
+
+# Calls the deployed read service at its URL without a token, and fails
+# unless the answer is 401 or 403, Cloud Run's refusals: that shows on the
+# service itself that Cloud Run lets no unauthenticated call through. Prints
+# only the answer's status code: neither the URL nor the answer's body.
+# curl retries a call that doesn't connect or gets a transient error (such
+# as 503), and never retries a 401 or 403.
+check_orrery_read_service_refuses_unauthenticated_calls() {
+  local service_name="$1"
+  local service_url
+  local status_code
+
+  service_url="$(
+    gcloud run services describe "$service_name" \
+      --project "$PROJECT_ID" \
+      --region "$REGION" \
+      --format='value(status.url)'
+  )"
+  if ! status_code="$(
+    curl --silent \
+      --output /dev/null \
+      --write-out '%{http_code}' \
+      --retry 12 --retry-all-errors --retry-delay 5 \
+      "${service_url}${ORRERY_READ_SERVICE_CHECK_PATH}"
+  )"; then
+    echo "The Orrery read service did not answer the deploy's call without a token." >&2
+    return 1
+  fi
+
+  case "$status_code" in
+    401 | 403)
+      echo "The Orrery read service refused a call without a token with HTTP ${status_code}."
+      ;;
+    *)
+      echo "The Orrery read service answered a call without a token with HTTP ${status_code}, not 401 or 403." >&2
+      return 1
+      ;;
+  esac
 }
 
 verify_stable_service() {

@@ -21,9 +21,10 @@ permissions:
 # its environment and updates the environment's intake worker and recovery
 # jobs to that image; the worker job also gets the environment's private
 # Orrery bucket. Last, each deploys the environment's Orrery read service from
-# the same image, which serves Orrery graph files from that bucket, and lets
+# the same image, which serves Orrery graph files from that bucket, grants
 # only the service account of the environment's microcosm-runs deployments
-# call it. The staging and production environments accept only main, and Google
+# the Cloud Run Invoker role on it, and checks that it refuses a call without
+# a token. The staging and production environments accept only main, and Google
 # Cloud's Workload Identity provider accepts this repo's tokens only for
 # refs/heads/main. Both jobs also check for a push to main.
 # This workflow runs only for pushes to main, so that check is always true; it

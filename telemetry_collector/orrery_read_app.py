@@ -10,20 +10,24 @@ collector's runtime account. The collector's main service mounts neither
 route.
 
 **Cloud Run's caller check is the read service's only access control.** The
-service allows no unauthenticated calls, and its IAM policy grants the Cloud
-Run Invoker role to one member, microcosm-runs' service account, so Cloud Run
-checks each request's Google-signed identity token, for the service's
-address or the custom audience ``ORRERY_GRAPHS_AUDIENCE``, and refuses the
-request with 401 or 403 before it reaches this code. This code verifies no
-token and reads no credential. The service must therefore never allow
-unauthenticated calls, and its invoker check must never be switched off:
-either would serve every file, licensed ones included, to anyone.
+service allows no unauthenticated calls and has no custom audience, and its
+IAM policy grants the Cloud Run Invoker role to one member, microcosm-runs'
+service account. So Cloud Run checks each request's Google-signed identity
+token, whose audience must be the service's own URL, and refuses the request
+with 401 or 403 before it reaches this code. Principals that hold Owner,
+Editor, Cloud Run Admin, Cloud Run Invoker or Cloud Run Service Invoker on
+the project can call the service too (the README's "Serving Orrery graph
+files"). This code verifies no token and reads no credential. The service
+must therefore never allow unauthenticated calls, and its invoker check must
+never be switched off: either would serve every file, licensed ones
+included, to anyone. Each deploy checks that the deployed service refuses a
+call without a token.
 
 Its settings are ``COLLECTOR_ORRERY_BUCKET`` and ``DATABASE_URL``
 (``OrreryServingSettings``), and it refuses to start without either. Every
-answer has ``Cache-Control: private, no-store``. It has no other route, no
-OpenAPI document and no health route: Cloud Run's startup probe checks that
-it listens on its port.
+answer its routes and middleware give has ``Cache-Control: private,
+no-store``. It has no other route, no OpenAPI document and no health route:
+Cloud Run's startup probe checks that it listens on its port.
 """
 
 from __future__ import annotations
@@ -46,10 +50,6 @@ from telemetry_collector.orrery_serving import (
     PostgresOrreryGraphCatalogue,
 )
 
-#: The custom audience the read service accepts identity tokens for, beside
-#: its own address. microcosm-runs requests its tokens for it; the deploy
-#: sets it as the service's only custom audience.
-ORRERY_GRAPHS_AUDIENCE = "microcosm-collector/orrery-graphs"
 #: The read service's request timeout, which the deploy sets (``--timeout``).
 #: A fetch of a 64 MiB file, the largest a document or an upstream file may
 #: be, reads it twice, in about 130 ranged reads of 1 MiB one after another,

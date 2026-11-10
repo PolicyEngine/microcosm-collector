@@ -27,6 +27,7 @@ from typing import Any
 
 import httpx
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from google.api_core.exceptions import NotFound, ServiceUnavailable
 from google.cloud.storage.exceptions import DataCorruption
@@ -40,6 +41,7 @@ from telemetry_collector.app import (
 )
 from telemetry_collector.auth import HuggingFacePrincipal
 from telemetry_collector.database import create_database_engine
+from telemetry_collector.intake_api import SUBMISSION_PATHS
 from telemetry_collector.migrate import upgrade_database
 from telemetry_collector.orrery.projection.provenance import MICROCOSM_COMMIT
 from telemetry_collector.orrery_graphs import (
@@ -1533,10 +1535,30 @@ def test_every_answer_of_the_read_service_is_marked_not_to_be_stored(
 # The read service and its settings.
 
 
+def mounted_routes(application: FastAPI) -> dict[str, set[str]]:
+    """Each path the application routes, with its methods.
+
+    FastAPI keeps an included router in ``application.routes`` as one entry
+    with no path of its own, and lists that router's routes, with its prefix
+    applied, through the entry's ``effective_route_contexts()``. This expands
+    such entries, so that every route is listed.
+    """
+
+    methods_by_path: dict[str, set[str]] = {}
+    for entry in application.routes:
+        included_routes = getattr(entry, "effective_route_contexts", None)
+        routes = included_routes() if included_routes is not None else [entry]
+        for route in routes:
+            methods_by_path.setdefault(route.path, set()).update(
+                getattr(route, "methods", None) or set()
+            )
+    return methods_by_path
+
+
 def test_the_read_service_mounts_only_the_orrery_graph_routes(
     service: Serving,
 ) -> None:
-    assert {route.path: route.methods for route in service.client.app.routes} == {
+    assert mounted_routes(service.client.app) == {
         LISTING: {"GET"},
         FILE_ROUTE: {"GET"},
     }
@@ -1590,7 +1612,7 @@ def test_the_deployed_read_service_starts_with_its_two_settings(
 
     application = read_app().create_orrery_read_app_from_environment()
 
-    assert {route.path for route in application.routes} == {LISTING, FILE_ROUTE}
+    assert set(mounted_routes(application)) == {LISTING, FILE_ROUTE}
     assert read_service_environment.readers == [{"bucket_name": BUCKET}]
 
 
@@ -1686,10 +1708,12 @@ def test_the_main_application_mounts_no_orrery_graph_route() -> None:
         huggingface_authenticator=UnusedAuthenticator(),
     )
     document_path = f"{LISTING}/sub-{'0' * 32}/{'0' * 64}/{GRAPH_FILE_NAME}"
+    main_routes = mounted_routes(application)
 
-    assert not [
-        route.path for route in application.routes if route.path.startswith(LISTING)
-    ]
+    # The routes of the included intake router are listed too, so the check
+    # below covers every route.
+    assert set(SUBMISSION_PATHS) <= set(main_routes)
+    assert not [path for path in main_routes if path.startswith(LISTING)]
     with TestClient(application) as client:
         for response in (
             client.get(LISTING, params={"run_id": CONSUMING_RUN}),
@@ -1717,9 +1741,9 @@ def test_the_deployed_main_application_ignores_the_orrery_settings(
     application = create_app_from_environment()
 
     assert not hasattr(CollectorSettings.from_environment(), "orrery_serving")
-    assert not [
-        route.path for route in application.routes if route.path.startswith(LISTING)
-    ]
+    main_routes = mounted_routes(application)
+    assert set(SUBMISSION_PATHS) <= set(main_routes)
+    assert not [path for path in main_routes if path.startswith(LISTING)]
     assert read_service_environment.readers == []
 
 

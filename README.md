@@ -557,9 +557,9 @@ Each release, in each environment, `scripts/deploy.sh`:
    job's settings, `COLLECTOR_INTAKE_BUCKET` and `COLLECTOR_ORRERY_BUCKET`,
    with `--set-env-vars`. The deploy changes neither the schedule nor any
    job's permissions;
-4. last, once the service is live, deploys the Orrery read service and sets
-   who may call it (`deploy-orrery-read-service`; see "Serving Orrery graph
-   files").
+4. last, once the service is live, deploys the Orrery read service, sets
+   who may call it and checks that it refuses a call without a token
+   (`deploy-orrery-read-service`; see "Serving Orrery graph files").
 
 Maintenance mode holds only the service. An execution of either job keeps the
 image it started with, for all its attempts: a worker execution that is
@@ -848,22 +848,46 @@ mounts neither route, and gets no Orrery setting.
 code verifies no token and reads no credential, so the service must never
 allow unauthenticated calls, and its Cloud Run invoker check must never be
 switched off: either would serve every file, licensed ones included, to
-anyone. Every deploy sets all of it again:
+anyone. Every deploy sets all of it again, and then checks it:
 
 - `--no-allow-unauthenticated` and `--invoker-iam-check`;
-- `microcosm-collector/orrery-graphs` as the service's only custom audience
-  (`--set-custom-audiences`, which replaces the list);
+- no custom audience (`--clear-custom-audiences`), so a token must be for
+  the service's own URL, which Cloud Run always accepts;
 - the service's whole IAM policy: the Cloud Run Invoker role
   (`roles/run.invoker`) for the environment's microcosm-runs account,
   `TELEMETRY_ORRERY_READER_SERVICE_ACCOUNT`, and nothing else, so `allUsers`,
   `allAuthenticatedUsers` or another member added by hand is removed. The
-  deploy then reads the policy back and fails unless it is exactly that.
+  deploy then reads the policy back and fails unless it is exactly that;
+- a call without a token: the deploy reads the service's URL (`gcloud run
+  services describe <service>-orrery --format 'value(status.url)'`), sends
+  `GET <URL>/v1/orrery-graphs?run_id=deploy-access-check` with no
+  `Authorization` header, and fails unless the answer is 401 or 403. It
+  prints only the status code. IAM can take a few minutes to apply a policy
+  change, so the first deploy after someone grants `allUsers` by hand can
+  fail this check even though it has removed the grant; re-running the job
+  then shows whether the service refuses the call.
 
-The service's own policy doesn't limit roles granted on the project. Cloud
-Run's documentation lists Cloud Run Admin among the roles that may invoke
-services, and gives project owners and editors that permission by default,
-so those principals, the deployment service account among them, can call
-the read service too. Grant such project roles only to administrators.
+**Who else can call it.** The service's own IAM policy doesn't limit roles
+granted on the project. Cloud Run's access control page lists these roles as
+able to invoke services, so a principal that holds any of them on the
+project can call the read service too, beside the reader account its policy
+names:
+
+| Role | Role ID | What the page says |
+|---|---|---|
+| Owner | `roles/owner` | project owners can invoke Cloud Run resources by default |
+| Editor | `roles/editor` | project editors can invoke Cloud Run resources by default |
+| Cloud Run Admin | `roles/run.admin` | can invoke services and jobs; the deployment service account holds it |
+| Cloud Run Invoker | `roles/run.invoker` | can invoke services and jobs |
+| Cloud Run Service Invoker | `roles/run.servicesInvoker` | can invoke Cloud Run services |
+
+The same roles granted on the project's folder or organization, which IAM
+passes down to the project, and any custom role with the permission to
+invoke services (`run.routes.invoke`), admit their holders too. Grant all of
+these only to administrators. In particular, grant an account that must run
+a job, such as the worker's invoker account or Cloud Scheduler's account,
+its role on that job, not on the project. Whether any account other than an
+administrator holds one of these roles on either project is not checked.
 
 | Setting | Value | The deploy sets it from |
 |---|---|---|
@@ -901,20 +925,20 @@ neither creates nor checks them.
 **How microcosm-runs calls it.** microcosm-runs gets a Google-signed
 identity token for its environment's reader account from its Vercel
 deployment's identity, without a stored key: it calls the IAM Credentials
-API's `generateIdToken` for that account with
-`"audience": "microcosm-collector/orrery-graphs"` and
-`"includeEmail": true`. It sends the token as `Authorization: Bearer
-<token>` to the read service's address,
-`https://<service>-orrery-<project number>.<region>.run.app`: the deployed
-service's URL, which `gcloud run services describe <service>-orrery
---region <region> --format 'value(status.url)'` shows. The read service has
-no load balancer or hostname of its own. Cloud Run also accepts a token
-whose audience is that URL. The custom audience is the same in both
-environments: each environment's read service lets only its own reader
-account call it. microcosm-runs'
-production deployments use the collector's production environment, and its
-preview deployments use staging; each environment has its own reader
-account, which only the matching Vercel deployments can act as.
+API's `generateIdToken` for that account with the read service's URL as the
+audience, `"audience": "<read service URL>"`, and `"includeEmail": true`. It
+sends the token as `Authorization: Bearer <token>` to that same URL. The URL
+is the deployed service's `run.app` URL, a scheme and a host with no path,
+exactly as `gcloud run services describe <service>-orrery --region <region>
+--format 'value(status.url)'` shows it; the `Service URL:` that `gcloud run
+deploy` prints in the deploy job's log is the same. Cloud Run
+always accepts a token whose audience is the service's URL, and the service
+has no custom audience. The read service has no load balancer or hostname of
+its own. Each environment's read service has its own URL, so the audience
+differs between environments. microcosm-runs' production deployments use
+the collector's production environment, and its preview deployments use
+staging; each environment has its own reader account, which only the
+matching Vercel deployments can act as.
 
 Cloud Run's documentation doesn't say whether it needs the token's `email`
 claim. Its authentication pages name only the audience (`aud`) as the claim
@@ -1369,8 +1393,9 @@ address and Secret Manager resource references through non-secret configuration.
 Public ingress lets developer machines reach the service;
 ingestion still requires an expiring collector credential issued after
 Hugging Face authentication. The Orrery read service, a separate service,
-allows no unauthenticated calls: Cloud Run lets only microcosm-runs' own
-service account call it (see "Serving Orrery graph files").
+allows no unauthenticated calls: its IAM policy lets only microcosm-runs' own
+service account call it, beside principals with some project-level roles
+(see "Serving Orrery graph files").
 
 ### Google Cloud access
 
