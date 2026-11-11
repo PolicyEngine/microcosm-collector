@@ -1,6 +1,6 @@
 {
   "name": "@policyengine/microcosm-collector-client",
-  "version": "0.18.0",
+  "version": "0.19.0",
   "description": "Typed client for version 2 of the Microcosm collector's read API",
   "license": "MIT",
   "repository": {
