@@ -358,7 +358,7 @@ def test_a_dry_run_lists_what_it_would_project_and_writes_nothing() -> None:
 
     assert outcome.outcome == "would_reproject"
     assert outcome.submission_id is None
-    assert hugging_face.requests == []
+    assert downloads(hugging_face) == []
     assert intake.objects == {}
     assert handled == []
 
@@ -440,6 +440,7 @@ def test_a_folder_the_submission_rules_refuse_is_reported_without_a_submission()
     assert "256" in outcome.reason
     assert outcome.submission_id is None
     assert intake.objects == {}
+    assert downloads(hugging_face) == []
 
 
 def test_the_intake_bucket_creates_each_object_once_with_its_sha256(
@@ -511,10 +512,14 @@ def test_the_dry_run_command_prints_one_document_for_each_build(
 
     assert operations.main(["reproject-past-builds", "--dry-run"]) == 0
 
-    (printed_line,) = capsys.readouterr().out.splitlines()
-    printed = json.loads(printed_line)
+    printed_lines = capsys.readouterr().out.splitlines()
+    assert len(printed_lines) == 2
+    printed = json.loads(printed_lines[0])
     assert printed["run_id"] == "uk-run-1"
     assert printed["outcome"] == "would_reproject"
+    assert json.loads(printed_lines[1]) == {
+        "summary": {"outcomes": {"would_reproject": 1}, "incomplete_run_ids": []}
+    }
     assert downloads(hugging_face) == []
 
 
@@ -761,24 +766,33 @@ def test_a_submission_an_interrupted_run_left_awaiting_upload_is_completed() -> 
     submissions = FakeSubmissionStore()
 
     class InterruptedIntake(FakeIntakeObjectStore):
-        def create_object(self, object_name: str, source: Path, *, sha256: str) -> bool:
-            raise KeyboardInterrupt
+        """Stops the run after storing one file, until told not to."""
 
+        interrupting = True
+
+        def create_object(self, object_name: str, source: Path, *, sha256: str) -> bool:
+            if self.interrupting and self.objects:
+                raise KeyboardInterrupt
+            return super().create_object(object_name, source, sha256=sha256)
+
+    intake = InterruptedIntake()
     with pytest.raises(KeyboardInterrupt):
         reproject(
             inventory,
             hugging_face,
             submissions=submissions,
-            intake=InterruptedIntake(),
+            intake=intake,
             handlers={"orrery-inputs": stand_in_handler([])},
         )
+    assert len(intake.objects) == 1
+    intake.interrupting = False
     handled: list[Any] = []
 
     (outcome,) = reproject(
         inventory,
         hugging_face,
         submissions=submissions,
-        intake=FakeIntakeObjectStore(),
+        intake=intake,
         handlers={"orrery-inputs": stand_in_handler(handled)},
     )
 
@@ -821,7 +835,197 @@ def test_the_command_prints_every_outcome_and_exits_non_zero_after_an_error(
     assert operations.main(["reproject-past-builds"]) == 1
 
     printed = [json.loads(text) for text in capsys.readouterr().out.splitlines()]
-    assert [(document["run_id"], document["outcome"]) for document in printed] == [
-        ("uk-run-1", "error"),
-        ("uk-run-2", "succeeded"),
-    ]
+    assert [
+        (document["run_id"], document["outcome"])
+        for document in printed
+        if "summary" not in document
+    ] == [("uk-run-1", "error"), ("uk-run-2", "succeeded")]
+    assert printed[-1]["summary"]["incomplete_run_ids"] == ["uk-run-1"]
+
+
+def test_a_build_github_stopped_classing_is_incomplete_and_fails_the_command(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    files = {**staged_files("uk-run-1"), **staged_files("uk-run-2")}
+    hugging_face = hugging_face_with(UK_RELEASES, files)
+    unclassed = replace(
+        past_build(
+            "uk-run-1",
+            hugging_face,
+            commit_class="unknown",
+            class_reason="GitHub's rate limit for requests without a token was reached",
+        ),
+        class_retry_later=True,
+    )
+    inventory = inventory_of(unclassed, past_build("uk-run-2", hugging_face))
+    stand_in_command_services(monkeypatch)
+    handlers_module = importlib.import_module("telemetry_collector.handlers")
+
+    class StandInReader:
+        @staticmethod
+        def from_environment() -> HuggingFaceReader:
+            return reader_for(hugging_face)
+
+    monkeypatch.setattr(operations, "HuggingFaceReader", StandInReader)
+    monkeypatch.setattr(
+        operations, "_past_build_inventory", lambda reader, engine: inventory
+    )
+    monkeypatch.setattr(
+        operations,
+        "GoogleCloudStorageIntake",
+        lambda bucket_name: FakeIntakeObjectStore(),
+    )
+    monkeypatch.setattr(
+        handlers_module,
+        "handlers_from_environment",
+        lambda engine: {"orrery-inputs": stand_in_handler([])},
+    )
+
+    assert operations.main(["reproject-past-builds"]) == 1
+
+    printed = [json.loads(text) for text in capsys.readouterr().out.splitlines()]
+    first, second, summary = printed
+    assert (first["run_id"], first["outcome"], first["incomplete"]) == (
+        "uk-run-1",
+        "left_out",
+        True,
+    )
+    assert (second["outcome"], second["incomplete"]) == ("succeeded", False)
+    assert summary == {
+        "summary": {
+            "outcomes": {"left_out": 1, "succeeded": 1},
+            "incomplete_run_ids": ["uk-run-1"],
+        }
+    }
+
+
+def test_a_schema_over_the_handlers_input_limit_is_refused_before_download() -> None:
+    files = staged_files("uk-run-1")
+    files[f"staged/uk-run-1/{SCHEMA}"] = b" " * (32 * 1024 * 1024 + 1)
+    hugging_face = hugging_face_with(UK_RELEASES, files)
+
+    (outcome,) = reproject(
+        inventory_of(past_build("uk-run-1", hugging_face)),
+        hugging_face,
+        submissions=FakeSubmissionStore(),
+        intake=FakeIntakeObjectStore(),
+        handlers={"orrery-inputs": stand_in_handler([])},
+    )
+
+    assert outcome.outcome == "refused"
+    assert SCHEMA in outcome.reason
+    assert "input limit" in outcome.reason
+    assert downloads(hugging_face) == []
+
+
+def test_a_dry_run_reports_a_build_a_real_run_would_refuse() -> None:
+    files = staged_files("uk-run-1")
+    files[f"staged/uk-run-1/{OVERLAY}"] = b" " * (32 * 1024 * 1024 + 1)
+    hugging_face = hugging_face_with(UK_RELEASES, files)
+    intake = FakeIntakeObjectStore()
+
+    (outcome,) = reproject(
+        inventory_of(past_build("uk-run-1", hugging_face)),
+        hugging_face,
+        submissions=FakeSubmissionStore(),
+        intake=intake,
+        handlers={"orrery-inputs": stand_in_handler([])},
+        dry_run=True,
+    )
+
+    assert outcome.outcome == "refused"
+    assert OVERLAY in outcome.reason
+    assert downloads(hugging_face) == []
+    assert intake.objects == {}
+
+
+def test_a_download_that_differs_from_its_listing_is_an_error() -> None:
+    hugging_face = hugging_face_with(UK_RELEASES, staged_files("uk-run-1"))
+    upstream_path = f"staged/uk-run-1/{UPSTREAM_NAME}"
+
+    class AlteringReader(HuggingFaceReader):
+        def read_file(self, dataset: str, path: str, revision: str) -> bytes:
+            content = super().read_file(dataset, path, revision)
+            # Same size, other bytes: only a hash shows the difference.
+            return (
+                content.replace(b"true", b"True") if path == upstream_path else content
+            )
+
+    (outcome,) = reproject(
+        inventory_of(past_build("uk-run-1", hugging_face)),
+        hugging_face,
+        submissions=FakeSubmissionStore(),
+        intake=FakeIntakeObjectStore(),
+        handlers={"orrery-inputs": stand_in_handler([])},
+        reader=AlteringReader.from_environment(
+            {TOKEN_VARIABLE: READ_TOKEN}, client=hugging_face.client()
+        ),
+    )
+
+    assert outcome.outcome == "error"
+    assert "differs from Hugging Face's listing" in outcome.reason
+
+
+def test_a_failed_dataset_listing_makes_each_of_its_builds_an_error() -> None:
+    files = {**staged_files("uk-run-1"), **staged_files("uk-run-2")}
+    hugging_face = hugging_face_with(UK_RELEASES, files)
+
+    class FailingListingReader(HuggingFaceReader):
+        def list_files(self, dataset: str, revision: str) -> list[Any]:
+            raise HuggingFaceReadError(dataset, 502, "Hugging Face answered HTTP 502.")
+
+    outcomes = reproject(
+        inventory_of(
+            past_build("uk-run-1", hugging_face), past_build("uk-run-2", hugging_face)
+        ),
+        hugging_face,
+        submissions=FakeSubmissionStore(),
+        intake=FakeIntakeObjectStore(),
+        handlers={"orrery-inputs": stand_in_handler([])},
+        reader=FailingListingReader.from_environment(
+            {TOKEN_VARIABLE: READ_TOKEN}, client=hugging_face.client()
+        ),
+    )
+
+    assert [outcome.outcome for outcome in outcomes] == ["error", "error"]
+    assert all("HTTP 502" in outcome.reason for outcome in outcomes)
+
+
+def test_an_unusable_last_commit_is_an_error() -> None:
+    hugging_face = hugging_face_with(UK_RELEASES, staged_files("uk-run-1"))
+    hugging_face.datasets[UK_RELEASES].last_commits[f"staged/uk-run-1/{SCHEMA}"] = (
+        "not-a-commit",
+        DEFAULT_COMMIT_DATE,
+    )
+
+    (outcome,) = reproject(
+        inventory_of(past_build("uk-run-1", hugging_face)),
+        hugging_face,
+        submissions=FakeSubmissionStore(),
+        intake=FakeIntakeObjectStore(),
+        handlers={"orrery-inputs": stand_in_handler([])},
+    )
+
+    assert outcome.outcome == "error"
+    assert "folder list" in outcome.reason
+
+
+def test_an_error_after_the_submission_is_made_keeps_its_id() -> None:
+    hugging_face = hugging_face_with(UK_RELEASES, staged_files("uk-run-1"))
+
+    class UnlistableIntake(FakeIntakeObjectStore):
+        def list_objects(self, prefix: str) -> Any:
+            raise OSError("Cloud Storage is unavailable.")
+
+    (outcome,) = reproject(
+        inventory_of(past_build("uk-run-1", hugging_face)),
+        hugging_face,
+        submissions=FakeSubmissionStore(),
+        intake=UnlistableIntake(),
+        handlers={"orrery-inputs": stand_in_handler([])},
+    )
+
+    assert outcome.outcome == "error"
+    assert outcome.submission_id is not None
+    assert outcome.new_submission is True
+    assert outcome.incomplete is True
