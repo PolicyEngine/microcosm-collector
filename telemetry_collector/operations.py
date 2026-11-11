@@ -53,7 +53,7 @@ from telemetry_collector.submissions import (
     SubmissionKind,
 )
 
-OPERATIONS_REQUIREMENT = "running artifact job operations"
+OPERATIONS_REQUIREMENT = "running operator commands"
 
 
 def recover_stalled_jobs(

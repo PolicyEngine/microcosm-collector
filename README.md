@@ -1153,7 +1153,7 @@ where the build ran, read from one of two places:
 | `commit_source` | Where |
 |---|---|
 | `staged_manifest` | `summary.git_commit` in the folder's `staged_manifest.json`, which Microcosm copies from the build manifest's `git_commit` |
-| `telemetry` | when no staged manifest records one: `details.identity.git_commit` in the run's `run` events, which Microcosm's emitter sends from `runtime_identity()`; the first non-null one, in the order the events were emitted |
+| `telemetry` | when no staged manifest records one: `details.identity.git_commit` in the run's `run` events, which the build's emitter (the microcosm-emitter package) sends from Microcosm's `runtime_identity()`; the first non-null one, in the order the events were emitted |
 
 GitHub's compare API then says, for each distinct commit, whether it has the
 merge commit of microcosm#1151 as an ancestor, and if not, whether it has
@@ -1185,6 +1185,18 @@ that commit and every later one are `unknown` with the reason, and the
 command sends no more requests; nothing is guessed. Cloud Run jobs reach
 GitHub from addresses that other Google Cloud users share, so part of the
 hour's allowance may already be used.
+
+So that the builds that can be rebuilt are the ones classed when the
+allowance runs out, commits are checked in this order, while the inventory
+stays in run-ID order:
+
+1. staged builds whose `rebuild` is `full` or `declaration_only`;
+2. other staged builds;
+3. recorded runs without a staged folder.
+
+Within each group they are checked in descending run-ID order. That puts
+newer builds first among run IDs that share a prefix, such as
+`uk-frs-calibration-attempt-<UTC time>-<suffix>`.
 
 **Running it.** It needs `DATABASE_URL` and `COLLECTOR_HF_READ_TOKEN`, which
 only the worker job mounts, and stops with a message naming either variable

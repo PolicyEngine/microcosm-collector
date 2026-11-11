@@ -5,16 +5,19 @@ in each country's Hugging Face release dataset (``RELEASE_REPOS``), and the
 collector's recorded runs (``telemetry_runs``). Each build is classed by the
 Microcosm commit that made it. Its folder's ``staged_manifest.json`` records it
 as ``summary.git_commit``, which Microcosm copies from the build manifest's
-``git rev-parse HEAD``. A recorded run's emitter sends the same value in the
-run's ``run`` event as ``details.identity.git_commit`` (Microcosm's
-``runtime_identity``), which is used when no staged manifest records one.
+``git rev-parse HEAD``. The build's emitter (the microcosm-emitter package)
+sends the same value, from Microcosm's ``runtime_identity()``, in the run's
+``run`` event as ``details.identity.git_commit``, which is used when no staged
+manifest records one.
 
 GitHub's compare API says whether that commit contains the merge commits of
 microcosm#1144, which made builds record execution evidence, and of
 microcosm#1151. Each build also says which graph files its folder holds, and so
 what its Orrery graph document can be rebuilt from on Hugging Face. Builds made
 before #1144, and builds made before #1151 with nothing on Hugging Face to
-rebuild from, are listed but marked skipped.
+rebuild from, are listed but marked skipped. GitHub allows few requests
+without a token, so the builds that can be rebuilt from Hugging Face are classed
+first.
 
 ``list_past_builds`` returns the inventory; the ``past-builds`` operator
 command prints it as JSON.
@@ -135,6 +138,10 @@ class GitHubUnavailableError(RuntimeError):
     """GitHub gave no usable answer; later commits are not checked either."""
 
 
+class CommitNotFoundError(Exception):
+    """GitHub has no such commit in Microcosm's repo; other commits are checked."""
+
+
 class GitHubCommitClassifier:
     """Classes Microcosm commits with GitHub's compare API, without a token.
 
@@ -181,7 +188,7 @@ class GitHubCommitClassifier:
                 classification = CommitClassification("between_1144_and_1151")
             else:
                 classification = CommitClassification("before_1144")
-        except LookupError:
+        except CommitNotFoundError:
             classification = CommitClassification(
                 "unknown", f"GitHub has no commit {commit} in {MICROCOSM_REPO}"
             )
@@ -213,7 +220,7 @@ class GitHubCommitClassifier:
                 "GitHub could not be reached to class the commit"
             ) from error
         if response.status_code == 404:
-            raise LookupError(commit)
+            raise CommitNotFoundError(commit)
         if response.status_code in {403, 429} and (
             response.headers.get("x-ratelimit-remaining") == "0"
             or "retry-after" in response.headers
@@ -322,6 +329,92 @@ def _staged_commit(
     return commit, None
 
 
+@dataclass(frozen=True)
+class _FoundBuild:
+    """A build's staged folder or recorded run, or both, before it is classed."""
+
+    run_id: str
+    country_code: str
+    folder: _StagedFolder | None
+    recorded_run: bool
+    commit: str | None
+    commit_source: CommitSource | None
+    #: Why there is no commit; ``None`` when there is one.
+    commit_reason: str | None
+    file_names: frozenset[str]
+    rebuild: Rebuild
+
+
+def _found_build(
+    reader: HuggingFaceReader,
+    run_id: str,
+    folder: _StagedFolder | None,
+    recorded_run: RecordedRun | None,
+) -> _FoundBuild:
+    commit: str | None = None
+    commit_reason: str | None = "the build has no staged folder to read its commit from"
+    file_names: frozenset[str] = frozenset()
+    if folder is not None:
+        commit, commit_reason = _staged_commit(reader, folder)
+        file_names = folder.file_names
+    commit_source: CommitSource | None = (
+        "staged_manifest" if commit is not None else None
+    )
+    if commit is None and recorded_run is not None:
+        if recorded_run.microcosm_commit is not None:
+            commit = recorded_run.microcosm_commit
+            commit_source = "telemetry"
+            commit_reason = None
+        else:
+            commit_reason = f"{commit_reason}, and its telemetry records none"
+    if folder is not None:
+        country_code = folder.country_code
+    else:
+        assert recorded_run is not None
+        country_code = recorded_run.country_code
+    return _FoundBuild(
+        run_id=run_id,
+        country_code=country_code,
+        folder=folder,
+        recorded_run=recorded_run is not None,
+        commit=commit,
+        commit_source=commit_source,
+        commit_reason=commit_reason,
+        file_names=file_names,
+        rebuild=_rebuild(file_names),
+    )
+
+
+def _classing_order(found: _FoundBuild) -> int:
+    """Staged builds that can be rebuilt, then other staged builds, then
+    recorded runs without a staged folder."""
+
+    if found.folder is None:
+        return 2
+    return 0 if found.rebuild != "none" else 1
+
+
+def _classify(
+    found_builds: Iterable[_FoundBuild],
+    classifier: Callable[[str], CommitClassification],
+) -> dict[str, CommitClassification]:
+    """Class each distinct commit, the builds that can be rebuilt first.
+
+    GitHub's hourly allowance for requests without a token may run out, and
+    every commit after that is ``unknown``. So commits are checked in
+    ``_classing_order``, and within each group in descending run-ID order,
+    which puts newer builds first among run IDs that share a prefix, such as
+    ``uk-frs-calibration-attempt-<UTC time>-<suffix>``.
+    """
+
+    newest_first = sorted(found_builds, key=lambda found: found.run_id, reverse=True)
+    classifications: dict[str, CommitClassification] = {}
+    for found in sorted(newest_first, key=_classing_order):
+        if found.commit is not None and found.commit not in classifications:
+            classifications[found.commit] = classifier(found.commit)
+    return classifications
+
+
 def _rebuild(file_names: frozenset[str]) -> Rebuild:
     if GRAPH_SCHEMA not in file_names:
         return "none"
@@ -356,53 +449,39 @@ def list_past_builds(
             folders.setdefault(folder.run_id, folder)
     recorded = {run.run_id: run for run in runs}
 
+    found_builds = [
+        _found_build(reader, run_id, folders.get(run_id), recorded.get(run_id))
+        for run_id in sorted(folders.keys() | recorded.keys())
+    ]
+    classifications = _classify(found_builds, classifier)
+
     builds: list[PastBuild] = []
-    for run_id in sorted(folders.keys() | recorded.keys()):
-        folder = folders.get(run_id)
-        recorded_run = recorded.get(run_id)
-        if folder is None:
-            commit = None
-            commit_reason = "the build has no staged folder to read its commit from"
-            file_names: frozenset[str] = frozenset()
-        else:
-            commit, commit_reason = _staged_commit(reader, folder)
-            file_names = folder.file_names
-        commit_source: CommitSource | None = (
-            "staged_manifest" if commit is not None else None
-        )
-        if commit is None and recorded_run is not None:
-            if recorded_run.microcosm_commit is not None:
-                commit = recorded_run.microcosm_commit
-                commit_source = "telemetry"
-            else:
-                commit_reason = f"{commit_reason}, and its telemetry records none"
+    for found in found_builds:
         classification = (
-            CommitClassification("unknown", commit_reason)
-            if commit is None
-            else classifier(commit)
+            classifications[found.commit]
+            if found.commit is not None
+            else CommitClassification("unknown", found.commit_reason)
         )
-        rebuild = _rebuild(file_names)
-        skip_reason = _skip_reason(classification.commit_class, rebuild)
+        skip_reason = _skip_reason(classification.commit_class, found.rebuild)
+        folder = found.folder
         builds.append(
             PastBuild(
-                run_id=run_id,
-                country_code=(
-                    folder.country_code
-                    if folder is not None
-                    else recorded[run_id].country_code
-                ),
+                run_id=found.run_id,
+                country_code=found.country_code,
                 dataset=folder.dataset if folder is not None else None,
                 revision=folder.revision if folder is not None else None,
                 staged_folder=(
-                    f"{STAGED_PREFIX}/{run_id}" if folder is not None else None
+                    f"{STAGED_PREFIX}/{found.run_id}" if folder is not None else None
                 ),
-                recorded_run=recorded_run is not None,
-                microcosm_commit=commit,
-                commit_source=commit_source,
+                recorded_run=found.recorded_run,
+                microcosm_commit=found.commit,
+                commit_source=found.commit_source,
                 commit_class=classification.commit_class,
                 class_reason=classification.reason,
-                graph_files=tuple(name for name in GRAPH_FILES if name in file_names),
-                rebuild=rebuild,
+                graph_files=tuple(
+                    name for name in GRAPH_FILES if name in found.file_names
+                ),
+                rebuild=found.rebuild,
                 skipped=skip_reason is not None,
                 skip_reason=skip_reason,
             )
