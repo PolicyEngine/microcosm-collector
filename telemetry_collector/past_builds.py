@@ -3,9 +3,11 @@
 Past builds come from two places: the folders staged under ``staged/<run_id>/``
 in each country's Hugging Face release dataset (``RELEASE_REPOS``), and the
 collector's recorded runs (``telemetry_runs``). Each build is classed by the
-Microcosm commit that made it, which its folder's ``staged_manifest.json``
-records as ``summary.git_commit`` (Microcosm copies it there from the build
-manifest's ``git rev-parse HEAD``). Recorded runs record no commit.
+Microcosm commit that made it. Its folder's ``staged_manifest.json`` records it
+as ``summary.git_commit``, which Microcosm copies from the build manifest's
+``git rev-parse HEAD``. A recorded run's emitter sends the same value in the
+run's ``run`` event as ``details.identity.git_commit`` (Microcosm's
+``runtime_identity``), which is used when no staged manifest records one.
 
 GitHub's compare API says whether that commit contains the merge commits of
 microcosm#1144, which made builds record execution evidence, and of
@@ -29,15 +31,16 @@ from types import TracebackType
 from typing import Any, Final, Literal
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import and_, select
 from sqlalchemy.engine import Engine
 
 from telemetry_collector.calibration_trees import RELEASE_REPOS
-from telemetry_collector.database import TelemetryRun
+from telemetry_collector.database import TelemetryEvent, TelemetryRun
 from telemetry_collector.huggingface_read import HuggingFaceReader
 
 CommitClass = Literal["before_1144", "between_1144_and_1151", "after_1151", "unknown"]
 Rebuild = Literal["full", "declaration_only", "none"]
+CommitSource = Literal["staged_manifest", "telemetry"]
 
 COMMIT_CLASSES: Final[tuple[CommitClass, ...]] = (
     "after_1151",
@@ -47,7 +50,7 @@ COMMIT_CLASSES: Final[tuple[CommitClass, ...]] = (
 )
 REBUILDS: Final[tuple[Rebuild, ...]] = ("full", "declaration_only", "none")
 
-MICROCOSM_REPOSITORY: Final = "PolicyEngine/microcosm"
+MICROCOSM_REPO: Final = "PolicyEngine/microcosm"
 #: The merge commit of microcosm#1144, from which builds record execution evidence.
 EXECUTION_EVIDENCE_MERGE: Final = "58b4c46175731cac940b897a42d85cd893cb3381"
 #: The merge commit of microcosm#1151.
@@ -77,6 +80,8 @@ SKIPPED_BEFORE_1151: Final = (
     "made before microcosm#1151 with nothing on Hugging Face to rebuild from"
 )
 _COMMIT: Final = re.compile(r"^[0-9a-f]{40}$")
+#: Microcosm registers UK runs as GB; the release datasets call the country uk.
+_RELEASE_COUNTRY_BY_RECORDED_CODE: Final = {"GB": "uk"}
 
 
 @dataclass(frozen=True)
@@ -85,6 +90,8 @@ class RecordedRun:
 
     run_id: str
     country_code: str
+    #: The first non-null ``details.identity.git_commit`` of the run's ``run`` events.
+    microcosm_commit: str | None
 
 
 @dataclass(frozen=True)
@@ -104,6 +111,7 @@ class PastBuild:
     staged_folder: str | None
     recorded_run: bool
     microcosm_commit: str | None
+    commit_source: CommitSource | None
     commit_class: CommitClass
     class_reason: str | None
     graph_files: tuple[str, ...]
@@ -167,15 +175,15 @@ class GitHubCommitClassifier:
         if self._stopped_reason is not None:
             return CommitClassification("unknown", self._stopped_reason)
         try:
-            if self._contains(GRAPH_SCHEMA_MERGE, commit):
+            if self._contains(commit, GRAPH_SCHEMA_MERGE):
                 classification = CommitClassification("after_1151")
-            elif self._contains(EXECUTION_EVIDENCE_MERGE, commit):
+            elif self._contains(commit, EXECUTION_EVIDENCE_MERGE):
                 classification = CommitClassification("between_1144_and_1151")
             else:
                 classification = CommitClassification("before_1144")
         except LookupError:
             classification = CommitClassification(
-                "unknown", f"GitHub has no commit {commit} in {MICROCOSM_REPOSITORY}"
+                "unknown", f"GitHub has no commit {commit} in {MICROCOSM_REPO}"
             )
         except GitHubUnavailableError as error:
             self._stopped_reason = str(error)
@@ -183,10 +191,15 @@ class GitHubCommitClassifier:
         self._classifications[commit] = classification
         return classification
 
-    def _contains(self, base: str, head: str) -> bool:
-        """Whether ``head`` has ``base`` as an ancestor (or is it)."""
+    def _contains(self, commit: str, merge_commit: str) -> bool:
+        """Whether ``commit`` has ``merge_commit`` as an ancestor (or is it).
 
-        url = f"{GITHUB_API}/repos/{MICROCOSM_REPOSITORY}/compare/{base}...{head}"
+        It compares ``<commit>...<merge_commit>``: when the commit contains the
+        merge commit, the merge commit is ``behind`` (or ``identical``), and
+        GitHub's answer lists no commits or files.
+        """
+
+        url = f"{GITHUB_API}/repos/{MICROCOSM_REPO}/compare/{commit}...{merge_commit}"
         try:
             response = self._client.get(
                 url,
@@ -200,7 +213,7 @@ class GitHubCommitClassifier:
                 "GitHub could not be reached to class the commit"
             ) from error
         if response.status_code == 404:
-            raise LookupError(head)
+            raise LookupError(commit)
         if response.status_code in {403, 429} and (
             response.headers.get("x-ratelimit-remaining") == "0"
             or "retry-after" in response.headers
@@ -216,26 +229,49 @@ class GitHubCommitClassifier:
             comparison = response.json()["status"]
         except (ValueError, KeyError, TypeError):
             comparison = None
-        if comparison in {"ahead", "identical"}:
+        if comparison in {"behind", "identical"}:
             return True
-        if comparison in {"behind", "diverged"}:
+        if comparison in {"ahead", "diverged"}:
             return False
         raise GitHubUnavailableError("GitHub returned an unusable commit comparison")
 
 
 def recorded_runs(engine: Engine) -> list[RecordedRun]:
-    """Every run in ``telemetry_runs``, with its country in lower case."""
+    """Every run in ``telemetry_runs``, with the commit its ``run`` events record.
 
-    with engine.connect() as connection:
-        rows = connection.execute(
-            select(TelemetryRun.run_id, TelemetryRun.country_code).order_by(
-                TelemetryRun.run_id
-            )
+    The commit is the first non-null ``details.identity.git_commit`` among the
+    run's ``run`` events, in the order they were emitted. The country is the
+    release datasets' code (``GB`` becomes ``uk``).
+    """
+
+    commit_column = TelemetryEvent.details[("identity", "git_commit")].astext
+    query = (
+        select(TelemetryRun.run_id, TelemetryRun.country_code, commit_column)
+        .outerjoin(
+            TelemetryEvent,
+            and_(
+                TelemetryEvent.run_id == TelemetryRun.run_id,
+                TelemetryEvent.event_type == "run",
+            ),
         )
-        return [
-            RecordedRun(run_id=run_id, country_code=country_code.lower())
-            for run_id, country_code in rows
-        ]
+        .order_by(
+            TelemetryRun.run_id, TelemetryEvent.emitted_at, TelemetryEvent.sequence
+        )
+    )
+    runs: dict[str, RecordedRun] = {}
+    with engine.connect() as connection:
+        for run_id, country_code, commit in connection.execute(query):
+            known = runs.get(run_id)
+            if known is not None and known.microcosm_commit is not None:
+                continue
+            runs[run_id] = RecordedRun(
+                run_id=run_id,
+                country_code=_RELEASE_COUNTRY_BY_RECORDED_CODE.get(
+                    country_code, country_code.lower()
+                ),
+                microcosm_commit=commit,
+            )
+    return list(runs.values())
 
 
 @dataclass(frozen=True)
@@ -274,8 +310,12 @@ def _staged_commit(
         folder.revision,
     )
     try:
-        commit = json.loads(content)["summary"]["git_commit"]
-    except (ValueError, KeyError, TypeError):
+        manifest = json.loads(content)
+    except ValueError:
+        return None, f"{STAGED_MANIFEST} is not JSON"
+    try:
+        commit = manifest["summary"]["git_commit"]
+    except (KeyError, TypeError):
         commit = None
     if not isinstance(commit, str):
         return None, f"{STAGED_MANIFEST} records no summary.git_commit"
@@ -319,6 +359,7 @@ def list_past_builds(
     builds: list[PastBuild] = []
     for run_id in sorted(folders.keys() | recorded.keys()):
         folder = folders.get(run_id)
+        recorded_run = recorded.get(run_id)
         if folder is None:
             commit = None
             commit_reason = "the build has no staged folder to read its commit from"
@@ -326,6 +367,15 @@ def list_past_builds(
         else:
             commit, commit_reason = _staged_commit(reader, folder)
             file_names = folder.file_names
+        commit_source: CommitSource | None = (
+            "staged_manifest" if commit is not None else None
+        )
+        if commit is None and recorded_run is not None:
+            if recorded_run.microcosm_commit is not None:
+                commit = recorded_run.microcosm_commit
+                commit_source = "telemetry"
+            else:
+                commit_reason = f"{commit_reason}, and its telemetry records none"
         classification = (
             CommitClassification("unknown", commit_reason)
             if commit is None
@@ -346,8 +396,9 @@ def list_past_builds(
                 staged_folder=(
                     f"{STAGED_PREFIX}/{run_id}" if folder is not None else None
                 ),
-                recorded_run=run_id in recorded,
+                recorded_run=recorded_run is not None,
                 microcosm_commit=commit,
+                commit_source=commit_source,
                 commit_class=classification.commit_class,
                 class_reason=classification.reason,
                 graph_files=tuple(name for name in GRAPH_FILES if name in file_names),

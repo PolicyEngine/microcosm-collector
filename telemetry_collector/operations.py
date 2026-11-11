@@ -10,7 +10,8 @@ dispatches it: after the calibration-tree or Orrery worker registers its
 handler, or when the projection or Orrery changes.
 
 ``past-builds`` prints the inventory of past Microcosm builds
-(``telemetry_collector.past_builds``) as JSON and changes nothing. It reads
+(``telemetry_collector.past_builds``) as JSON documents, the inventory's
+totals first and then one for each build, and changes nothing. It reads
 Hugging Face, so it runs as an execution of the worker job, the only job with
 ``COLLECTOR_HF_READ_TOKEN``.
 
@@ -179,7 +180,13 @@ def _print_past_builds(database_url: str) -> int:
             engine.dispose()
         with past_builds.GitHubCommitClassifier() as classifier:
             inventory = past_builds.list_past_builds(reader, runs, classifier)
-    _print_json(inventory.to_json())
+    # One document for the inventory and then one for each build, so that no
+    # log entry grows with the number of builds.
+    document = inventory.to_json()
+    builds = document.pop("builds")
+    _print_json(document)
+    for build in builds:
+        _print_json(build)
     return 0
 
 
