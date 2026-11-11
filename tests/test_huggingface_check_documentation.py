@@ -27,15 +27,21 @@ def production_only_variables() -> set[str]:
     )
 
 
-def test_the_readme_names_every_variable_only_production_reads() -> None:
+#: The variables the check job's production deploy reads. Each environment
+#: has its own read token and worker service account, so staging reads the
+#: last two as well; only the job's name is production's alone.
+CHECK_JOB_VARIABLES = {
+    "TELEMETRY_HF_CHECK_JOB",
+    "TELEMETRY_WORKER_SERVICE_ACCOUNT",
+    "TELEMETRY_HF_READ_SECRET_NAME",
+}
+
+
+def test_the_readme_names_every_variable_the_check_job_reads() -> None:
     section = readme_section()
 
-    assert production_only_variables() == {
-        "TELEMETRY_HF_CHECK_JOB",
-        "TELEMETRY_WORKER_SERVICE_ACCOUNT",
-        "TELEMETRY_HF_READ_SECRET_NAME",
-    }
-    for variable_name in production_only_variables():
+    assert production_only_variables() == {"TELEMETRY_HF_CHECK_JOB"}
+    for variable_name in CHECK_JOB_VARIABLES:
         assert f"`{variable_name}`" in section
 
 

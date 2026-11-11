@@ -1200,7 +1200,8 @@ newer builds first among run IDs that share a prefix, such as
 `uk-frs-calibration-attempt-<UTC time>-<suffix>`.
 
 **Running it.** It needs `DATABASE_URL` and `COLLECTOR_HF_READ_TOKEN`, which
-only the worker job mounts, and stops with a message naming either variable
+only the worker job mounts together (production's daily Hugging Face check job
+mounts the token but not the database), and stops with a message naming either variable
 when it is missing. Run it as an execution of the worker job with its
 arguments overridden:
 
@@ -1477,8 +1478,8 @@ dataset is added here:
 
 `python -m telemetry_collector.huggingface_check` runs in production as a
 Cloud Run job, started by Cloud Scheduler at 06:00 and 18:00 UTC
-(`0 6,18 * * *`). It reads Hugging Face with the collector's read token and
-runs two checks:
+(`0 6,18 * * *`). It reads Hugging Face with production's read token, the one
+production's worker job mounts, and runs two checks:
 
 1. **Token check.** It requests every dataset in `HUGGINGFACE_DATASETS` once.
    Any answer but HTTP 200 is a problem, including a redirect or no answer.
@@ -1537,7 +1538,9 @@ production environment variables:
 | `TELEMETRY_WORKER_SERVICE_ACCOUNT` | the worker service account, the only identity that may read the token |
 | `TELEMETRY_HF_READ_SECRET_NAME` | the read token's Secret Manager secret |
 
-Staging has no check job: there is one token and one schedule. The deployment
+Staging has no check job, so staging's own read token, which only staging's
+worker job mounts, is not checked on a schedule; production's job checks
+production's token, with one schedule and one set of alerts. The deployment
 service account needs metadata read access to the secret and permission to
 act as the worker service account. The schedule, the account it starts the
 job with, and the alert policies are created once by hand; the deploy does not

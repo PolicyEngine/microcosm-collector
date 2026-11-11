@@ -667,7 +667,10 @@ def test_huggingface_check_job_reads_its_names_from_production_variables() -> No
     }.items():
         mapping = f"{environment_name}: ${{{{ vars.{github_variable_name} }}}}"
         assert production_job.count(mapping) == 1
-        assert github_variable_name not in staging_job
+    # Each environment has its own worker service account and read token, so
+    # staging reads those two as well; only the check job's name is
+    # production's alone.
+    assert "TELEMETRY_HF_CHECK_JOB" not in staging_job
 
 
 def test_service_image_contains_alembic_runtime_files() -> None:
