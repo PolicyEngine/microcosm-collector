@@ -40,7 +40,8 @@ Outcomes are produced one build at a time. An error in one build is that
 build's ``error`` outcome, and the next build is still projected. Builds that
 can't be projected are ``left_out`` with the reason. An outcome is
 ``incomplete`` when a later run should try the build again: an ``error``, or
-a build left out because GitHub stopped answering before it was classed.
+a build that would be projected but GitHub stopped answering before it was
+classed (``left_out_incomplete``).
 """
 
 from __future__ import annotations
@@ -49,7 +50,7 @@ import hashlib
 import re
 import tempfile
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Final, Literal, Protocol
@@ -162,14 +163,14 @@ class ProjectionOutcome:
 
 
 def left_out_reason(build: PastBuild) -> str | None:
-    """Why a past build isn't projected, or ``None`` when it is."""
+    """Why a past build isn't projected, or ``None`` when it is.
+
+    What the staged folder holds is checked before the commit's class, so a
+    build that could never be projected gives that reason, whatever its class.
+    """
 
     if build.skipped:
         return build.skip_reason
-    if build.commit_class != "after_1151":
-        return build.class_reason or (
-            f"its Microcosm commit is classed {build.commit_class}"
-        )
     if build.rebuild == "declaration_only":
         return _LEFT_OUT_WITHOUT_OVERLAY
     if (
@@ -179,7 +180,27 @@ def left_out_reason(build: PastBuild) -> str | None:
         or build.revision is None
     ):
         return _LEFT_OUT_WITHOUT_INPUTS
+    if build.commit_class != "after_1151":
+        return build.class_reason or (
+            f"its Microcosm commit is classed {build.commit_class}"
+        )
     return None
+
+
+def left_out_incomplete(build: PastBuild) -> bool:
+    """Whether a left-out build is kept from projection only by GitHub stopping.
+
+    Only such a build should be tried again: a later run may class it.
+    """
+
+    return (
+        build.commit_class == "unknown"
+        and build.class_retry_later
+        and left_out_reason(
+            replace(build, commit_class="after_1151", class_reason=None)
+        )
+        is None
+    )
 
 
 @dataclass(frozen=True)
@@ -524,7 +545,7 @@ def reproject_past_builds(
                 run_id=build.run_id,
                 outcome="left_out",
                 reason=reason,
-                incomplete=build.commit_class == "unknown" and build.class_retry_later,
+                incomplete=left_out_incomplete(build),
             )
             continue
         assert build.dataset is not None and build.revision is not None

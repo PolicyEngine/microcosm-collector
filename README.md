@@ -1233,12 +1233,18 @@ new build does. It uses the inventory of past builds (see "Past builds") and
 
 **Which builds.** A build is projected when the inventory classes it
 `after_1151`, its `rebuild` is `full`, and it isn't skipped. Every other build
-is listed as `left_out`, with the reason. A build left out only because GitHub stopped answering before
-it was classed (`class_retry_later` in the inventory) is also marked
-`incomplete`. Left out are: skipped builds, builds classed
-`before_1144`, `between_1144_and_1151` or `unknown`, builds whose staged
-folder holds the schema without the execution overlay, or no schema, and
-builds one of whose submitted files Hugging Face lists without a last commit.
+is listed as `left_out`, with the reason, checked in this order:
+1. skipped builds;
+2. builds whose staged folder holds the schema without the execution
+   overlay, or no schema, or that have no staged folder;
+3. builds classed `before_1144`, `between_1144_and_1151` or `unknown`;
+4. builds one of whose submitted files Hugging Face lists without a last
+   commit.
+
+A build left out only because GitHub stopped answering before it was classed
+(`class_retry_later` in the inventory), with nothing else keeping it from
+being projected, is also marked `incomplete`. A build that could never be
+projected, such as a recorded run without a staged folder, never is.
 
 **The submission.** For each build the command makes the `orrery-inputs`
 submission the build would have sent:
@@ -1269,8 +1275,9 @@ Face's listings alone, in a dry run too, and is `refused` or `left_out` when:
    submission's ID, create-only and with its SHA-256 in its metadata, as an
    upload does.
 2. It accepts the submission as completion accepts one: each stored object
-   must have the inventory's size and SHA-256, and a stored object that
-   differs rejects the submission with `stored_object_mismatch`.
+   must have the size and SHA-256 the submission's file list gives, and a
+   stored object that differs rejects the submission with
+   `stored_object_mismatch`.
 3. It runs the submission's job at once, through the worker's `run_job` and
    the registered handlers. The worker hashes every stored file, and the
    Orrery handler projects, validates, publishes and records the document (see
@@ -1296,9 +1303,14 @@ run created the submission, the handler's result, and whether it is
 
 It then prints a summary, `{"summary": {"outcomes": …, "incomplete_run_ids":
 […]}}`, and exits non-zero when any build is incomplete: it ended in `error`,
-or GitHub stopped answering before it was classed. A run is complete only
-when its summary lists no incomplete builds. Judge the rebuild by the last
-attempt's summary, not by whether the execution succeeded.
+or it would be projected but GitHub stopped answering before it was classed.
+The rebuild is complete when a run's summary lists no incomplete builds.
+Every attempt's output stays in the execution's log. A build an earlier
+attempt reported `succeeded` stays done even if a later attempt, short of
+GitHub requests, lists it as incomplete. Judge the rebuild by these
+summaries, not by whether the execution succeeded. An attempt whose
+inventory itself fails prints no summary, and the execution's log shows the
+error.
 
 **Running it.** It needs `DATABASE_URL`, `COLLECTOR_HF_READ_TOKEN`,
 `COLLECTOR_INTAKE_BUCKET` and `COLLECTOR_ORRERY_BUCKET`, which the worker job
@@ -1319,8 +1331,10 @@ or is stopped by the timeout, Cloud Run runs the task again, up to twice, like
 any worker execution. A rerun builds the inventory again, makes the same
 submissions, completes any left awaiting upload, and runs each queued job
 again. Each run of a job is one more of its three attempts, so a job that
-fails three times ends `failed`. When GitHub's hourly allowance runs out,
-later builds stay incomplete; run the command again an hour later.
+fails three times ends `failed`. Every run, a dry run included, uses GitHub
+requests from the same hourly allowance. When the allowance runs out, the
+task's retries in the same hour can't class more builds, so run the command
+again an hour later, after a dry run's or another environment's run too.
 
 First list what a run would do. A dry run makes the checks above, downloads
 no build's graph inputs and writes nothing. It still reads what the inventory

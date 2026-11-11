@@ -288,7 +288,11 @@ def _reproject_past_builds(database_url: str, *, dry_run: bool) -> int:
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
-    """Run one operator command; non-zero when a reprocessing was refused."""
+    """Run one operator command.
+
+    Non-zero when a reprocessing was refused, or when projecting past builds
+    left any build incomplete.
+    """
 
     options = _argument_parser().parse_args(arguments)
     if options.command == "reprocess" and bool(options.submission_ids) == bool(
