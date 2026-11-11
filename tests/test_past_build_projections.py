@@ -1029,3 +1029,73 @@ def test_an_error_after_the_submission_is_made_keeps_its_id() -> None:
     assert outcome.submission_id is not None
     assert outcome.new_submission is True
     assert outcome.incomplete is True
+
+
+def test_only_a_build_github_alone_kept_from_projection_is_incomplete() -> None:
+    files = {**staged_files("uk-run-1"), **staged_files("uk-run-3")}
+    hugging_face = hugging_face_with(UK_RELEASES, files)
+    unclassed = {
+        "commit_class": "unknown",
+        "class_reason": "GitHub's rate limit for requests without a token was reached",
+    }
+    schema_only = replace(
+        past_build("uk-run-1", hugging_face, rebuild="declaration_only", **unclassed),
+        class_retry_later=True,
+    )
+    recorded_only = replace(
+        past_build("uk-run-2", hugging_face, rebuild="none", **unclassed),
+        dataset=None,
+        revision=None,
+        staged_folder=None,
+        graph_files=(),
+        recorded_run=True,
+        class_retry_later=True,
+    )
+    projectable = replace(
+        past_build("uk-run-3", hugging_face, **unclassed), class_retry_later=True
+    )
+
+    outcomes = reproject(
+        inventory_of(schema_only, recorded_only, projectable),
+        hugging_face,
+        submissions=FakeSubmissionStore(),
+        intake=FakeIntakeObjectStore(),
+        handlers={"orrery-inputs": stand_in_handler([])},
+    )
+
+    assert [(outcome.outcome, outcome.incomplete) for outcome in outcomes] == [
+        ("left_out", False),
+        ("left_out", False),
+        ("left_out", True),
+    ]
+    assert "without the execution overlay" in outcomes[0].reason
+    assert "nothing on Hugging Face" in outcomes[1].reason
+    assert "rate limit" in outcomes[2].reason
+
+
+def test_a_download_whose_lfs_sha256_differs_from_its_listing_is_an_error() -> None:
+    hugging_face = hugging_face_with(UK_RELEASES, staged_files("uk-run-1"))
+    schema_path = f"staged/uk-run-1/{SCHEMA}"
+    hugging_face.datasets[UK_RELEASES].lfs_paths = {schema_path}
+
+    class AlteringReader(HuggingFaceReader):
+        def read_file(self, dataset: str, path: str, revision: str) -> bytes:
+            content = super().read_file(dataset, path, revision)
+            if path != schema_path:
+                return content
+            # Same size, other bytes: only the LFS SHA-256 shows the difference.
+            return bytes([content[0] ^ 1]) + content[1:]
+
+    (outcome,) = reproject(
+        inventory_of(past_build("uk-run-1", hugging_face)),
+        hugging_face,
+        submissions=FakeSubmissionStore(),
+        intake=FakeIntakeObjectStore(),
+        handlers={"orrery-inputs": stand_in_handler([])},
+        reader=AlteringReader.from_environment(
+            {TOKEN_VARIABLE: READ_TOKEN}, client=hugging_face.client()
+        ),
+    )
+
+    assert outcome.outcome == "error"
+    assert "differs from Hugging Face's listing" in outcome.reason
