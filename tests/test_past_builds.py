@@ -23,6 +23,8 @@ import pytest
 from telemetry_collector import operations
 from telemetry_collector.calibration_trees import RELEASE_REPOS
 from telemetry_collector.database import (
+    TelemetryEvent,
+    TelemetryProducer,
     TelemetryRun,
     create_database_engine,
     create_session_factory,
@@ -46,6 +48,7 @@ GRAPH_SCHEMA_MERGE = "852ec44e6bc75db8399ebe3f649b2987c3d77424"
 COMMIT_AFTER_1151 = "a" * 40
 COMMIT_BETWEEN_1144_AND_1151 = "b" * 40
 COMMIT_BEFORE_1144 = "c" * 40
+COMMIT_UNKNOWN_TO_GITHUB = "e" * 40
 MERGES_CONTAINED = {
     COMMIT_AFTER_1151: {EXECUTION_EVIDENCE_MERGE, GRAPH_SCHEMA_MERGE},
     COMMIT_BETWEEN_1144_AND_1151: {EXECUTION_EVIDENCE_MERGE},
@@ -70,7 +73,10 @@ def past_builds_module() -> ModuleType:
 class FakeGitHub:
     """Answers GitHub's compare API for PolicyEngine/microcosm.
 
-    A head contains a base when the base is in ``MERGES_CONTAINED[head]``. After
+    A comparison ``<base>...<head>`` answers as GitHub does for commits on one
+    history: ``behind`` when the head is an ancestor of the base, that is when
+    the base commit contains the head merge commit (``MERGES_CONTAINED``), and
+    ``ahead`` otherwise. A base commit it doesn't know gets 404. After
     ``requests_answered`` requests, every later one gets GitHub's rate-limit
     answer.
     """
@@ -83,6 +89,8 @@ class FakeGitHub:
         return httpx.Client(transport=httpx.MockTransport(self.handle))
 
     def comparisons(self) -> list[tuple[str, str]]:
+        """Each request's ``(base, head)``."""
+
         prefix = "/repos/PolicyEngine/microcosm/compare/"
         compared = []
         for request in self.requests:
@@ -103,12 +111,12 @@ class FakeGitHub:
                 headers={"x-ratelimit-remaining": "0", "x-ratelimit-reset": "1"},
                 json={"message": "API rate limit exceeded"},
             )
-        base, head = self.comparisons()[-1]
-        if head not in MERGES_CONTAINED:
+        commit, merge = self.comparisons()[-1]
+        if commit not in MERGES_CONTAINED:
             return httpx.Response(404, json={"message": "Not Found"})
-        contains_base = base in MERGES_CONTAINED[head]
+        contains_merge = merge in MERGES_CONTAINED[commit]
         return httpx.Response(
-            200, json={"status": "ahead" if contains_base else "diverged"}
+            200, json={"status": "behind" if contains_merge else "ahead"}
         )
 
 
@@ -201,9 +209,10 @@ def test_a_commit_containing_1151_is_after_1151_after_one_call() -> None:
     build = builds_by_run_id(inventory)["uk-run-1"]
     assert build.microcosm_commit == COMMIT_AFTER_1151
     assert build.commit_class == "after_1151"
+    assert build.commit_source == "staged_manifest"
     assert build.class_reason is None
     assert build.skipped is False
-    assert github.comparisons() == [(GRAPH_SCHEMA_MERGE, COMMIT_AFTER_1151)]
+    assert github.comparisons() == [(COMMIT_AFTER_1151, GRAPH_SCHEMA_MERGE)]
     (request,) = github.requests
     assert "Authorization" not in request.headers
     assert request.headers["User-Agent"].startswith("microcosm-collector")
@@ -221,8 +230,8 @@ def test_a_commit_containing_1144_but_not_1151_is_between_after_two_calls() -> N
         "between_1144_and_1151"
     )
     assert github.comparisons() == [
-        (GRAPH_SCHEMA_MERGE, COMMIT_BETWEEN_1144_AND_1151),
-        (EXECUTION_EVIDENCE_MERGE, COMMIT_BETWEEN_1144_AND_1151),
+        (COMMIT_BETWEEN_1144_AND_1151, GRAPH_SCHEMA_MERGE),
+        (COMMIT_BETWEEN_1144_AND_1151, EXECUTION_EVIDENCE_MERGE),
     ]
 
 
@@ -272,6 +281,22 @@ def test_a_malformed_commit_is_unknown_without_a_call() -> None:
     assert github.requests == []
 
 
+def test_a_commit_github_does_not_have_is_unknown_and_checking_goes_on() -> None:
+    github = FakeGitHub()
+    staged_files = {
+        **staged_folder("uk-run-1", COMMIT_UNKNOWN_TO_GITHUB, ALL_GRAPH_FILES),
+        **staged_folder("uk-run-2", COMMIT_AFTER_1151, ALL_GRAPH_FILES),
+    }
+
+    inventory, _ = list_builds(staged_files, github)
+
+    builds = builds_by_run_id(inventory)
+    assert builds["uk-run-1"].commit_class == "unknown"
+    assert "GitHub has no commit" in builds["uk-run-1"].class_reason
+    assert builds["uk-run-2"].commit_class == "after_1151"
+    assert len(github.requests) == 2
+
+
 def test_builds_sharing_a_commit_make_one_set_of_calls() -> None:
     github = FakeGitHub()
     staged_files = {
@@ -306,26 +331,45 @@ def test_a_rate_limit_answer_makes_that_commit_and_later_ones_unknown() -> None:
     assert len(github.requests) == 2
 
 
-def test_a_staged_folder_without_a_manifest_has_no_commit() -> None:
+def test_a_staged_folder_without_a_usable_manifest_has_no_commit() -> None:
     github = FakeGitHub()
+    staged_files = {
+        **staged_folder("uk-run-1", None, ALL_GRAPH_FILES, with_manifest=False),
+        **staged_folder("uk-run-2", None, ALL_GRAPH_FILES, with_manifest=False),
+        "staged/uk-run-2/staged_manifest.json": b"not JSON",
+    }
 
-    inventory, _ = list_builds(
-        staged_folder("uk-run-1", None, ALL_GRAPH_FILES, with_manifest=False), github
-    )
+    inventory, _ = list_builds(staged_files, github)
 
-    build = builds_by_run_id(inventory)["uk-run-1"]
-    assert build.staged_folder == "staged/uk-run-1"
-    assert build.microcosm_commit is None
-    assert build.commit_class == "unknown"
-    assert "staged_manifest.json" in build.class_reason
+    builds = builds_by_run_id(inventory)
+    without_manifest = builds["uk-run-1"]
+    assert without_manifest.staged_folder == "staged/uk-run-1"
+    assert without_manifest.microcosm_commit is None
+    assert without_manifest.commit_class == "unknown"
+    assert "has no staged_manifest.json" in without_manifest.class_reason
+    assert builds["uk-run-2"].commit_class == "unknown"
+    assert "is not JSON" in builds["uk-run-2"].class_reason
     assert github.requests == []
 
 
 def test_recorded_runs_join_staged_folders_by_run_id() -> None:
     module = past_builds_module()
     recorded_runs = [
-        module.RecordedRun(run_id="uk-run-staged", country_code="uk"),
-        module.RecordedRun(run_id="uk-run-only-recorded", country_code="uk"),
+        module.RecordedRun(
+            run_id="uk-run-staged",
+            country_code="uk",
+            microcosm_commit=COMMIT_BEFORE_1144,
+        ),
+        module.RecordedRun(
+            run_id="uk-run-recorded-old",
+            country_code="uk",
+            microcosm_commit=COMMIT_BEFORE_1144,
+        ),
+        module.RecordedRun(
+            run_id="uk-run-recorded-without-commit",
+            country_code="uk",
+            microcosm_commit=None,
+        ),
     ]
 
     inventory, _ = list_builds(
@@ -334,21 +378,29 @@ def test_recorded_runs_join_staged_folders_by_run_id() -> None:
         recorded_runs,
     )
 
-    assert len(inventory.builds) == 2
+    assert len(inventory.builds) == 3
     builds = builds_by_run_id(inventory)
     staged = builds["uk-run-staged"]
     assert staged.recorded_run is True
     assert staged.staged_folder == "staged/uk-run-staged"
     assert staged.rebuild == "full"
-    only_recorded = builds["uk-run-only-recorded"]
-    assert only_recorded.recorded_run is True
-    assert only_recorded.country_code == "uk"
-    assert only_recorded.staged_folder is None
-    assert only_recorded.dataset is None
-    assert only_recorded.microcosm_commit is None
-    assert only_recorded.commit_class == "unknown"
-    assert only_recorded.rebuild == "none"
-    assert only_recorded.skipped is False
+    assert staged.microcosm_commit == COMMIT_AFTER_1151
+    assert staged.commit_source == "staged_manifest"
+    recorded_old = builds["uk-run-recorded-old"]
+    assert recorded_old.recorded_run is True
+    assert recorded_old.country_code == "uk"
+    assert recorded_old.staged_folder is None
+    assert recorded_old.dataset is None
+    assert recorded_old.microcosm_commit == COMMIT_BEFORE_1144
+    assert recorded_old.commit_source == "telemetry"
+    assert recorded_old.commit_class == "before_1144"
+    assert recorded_old.rebuild == "none"
+    assert recorded_old.skipped is True
+    without_commit = builds["uk-run-recorded-without-commit"]
+    assert without_commit.microcosm_commit is None
+    assert without_commit.commit_source is None
+    assert without_commit.commit_class == "unknown"
+    assert without_commit.skipped is False
 
 
 def test_every_read_is_pinned_to_the_dataset_head_commit() -> None:
@@ -376,25 +428,75 @@ def test_recorded_runs_are_read_from_the_telemetry_runs_table(
     module = past_builds_module()
     upgrade_database(postgres_url)
     engine = create_database_engine(postgres_url)
+
+    def recorded_run(run_id: str, country_code: str) -> TelemetryRun:
+        return TelemetryRun(
+            run_id=run_id,
+            country_code=country_code,
+            pipeline="uk-frs-calibration",
+            run_kind="build",
+            owner_hf_id="hf-user-1",
+            owner_hf_username="builder",
+            status="succeeded",
+            current_stage="finished",
+            started_at=INVENTORY_TIME,
+            updated_at=INVENTORY_TIME,
+        )
+
+    def run_event(
+        run_id: str, sequence: int, event_type: str, details: dict[str, Any]
+    ) -> TelemetryEvent:
+        return TelemetryEvent(
+            event_id=f"{run_id}-event-{sequence}",
+            run_id=run_id,
+            producer_id="producer-1",
+            sequence=sequence,
+            emitted_at=INVENTORY_TIME,
+            event_type=event_type,
+            status="started",
+            details=details,
+        )
+
     try:
         with create_session_factory(engine)() as session, session.begin():
-            session.add(
-                TelemetryRun(
-                    run_id="uk-run-1",
-                    country_code="UK",
-                    pipeline="uk-frs-calibration",
-                    run_kind="build",
-                    owner_hf_id="hf-user-1",
-                    owner_hf_username="builder",
-                    status="succeeded",
-                    current_stage="finished",
-                    started_at=INVENTORY_TIME,
-                    updated_at=INVENTORY_TIME,
-                )
+            session.add_all(
+                [
+                    recorded_run("uk-run-1", "GB"),
+                    recorded_run("us-run-2", "US"),
+                ]
+            )
+            session.flush()
+            session.add_all(
+                [
+                    TelemetryProducer(run_id="uk-run-1", producer_id="producer-1"),
+                    TelemetryProducer(run_id="us-run-2", producer_id="producer-1"),
+                ]
+            )
+            session.flush()
+            session.add_all(
+                [
+                    run_event(
+                        "uk-run-1",
+                        1,
+                        "run",
+                        {"identity": {"git_commit": COMMIT_BEFORE_1144}},
+                    ),
+                    run_event(
+                        "uk-run-1", 2, "stage", {"identity": {"git_commit": "d" * 40}}
+                    ),
+                    run_event("us-run-2", 1, "run", {"identity": {"git_commit": None}}),
+                ]
             )
 
         assert module.recorded_runs(engine) == [
-            module.RecordedRun(run_id="uk-run-1", country_code="uk")
+            module.RecordedRun(
+                run_id="uk-run-1",
+                country_code="uk",
+                microcosm_commit=COMMIT_BEFORE_1144,
+            ),
+            module.RecordedRun(
+                run_id="us-run-2", country_code="us", microcosm_commit=None
+            ),
         ]
     finally:
         engine.dispose()
@@ -437,7 +539,11 @@ def stand_in_past_builds_services(monkeypatch: pytest.MonkeyPatch) -> dict[str, 
     monkeypatch.setattr(
         module,
         "recorded_runs",
-        lambda engine: [module.RecordedRun(run_id="uk-run-1", country_code="uk")],
+        lambda engine: [
+            module.RecordedRun(
+                run_id="uk-run-1", country_code="uk", microcosm_commit=None
+            )
+        ],
     )
     for name in GENERIC_TOKEN_VARIABLES:
         monkeypatch.delenv(name, raising=False)
@@ -453,15 +559,18 @@ def test_the_past_builds_command_prints_the_inventory(
 
     assert operations.main(["past-builds"]) == 0
 
-    (printed_line,) = capsys.readouterr().out.splitlines()
-    printed = json.loads(printed_line)
-    assert set(printed["dataset_revisions"]) == set(RELEASE_REPOS.values())
-    (build,) = printed["builds"]
+    # One document for the inventory, then one for each build, so that no
+    # single log entry grows with the number of builds.
+    summary_line, *build_lines = capsys.readouterr().out.splitlines()
+    summary = json.loads(summary_line)
+    assert set(summary) == {"created_at", "dataset_revisions", "counts"}
+    assert set(summary["dataset_revisions"]) == set(RELEASE_REPOS.values())
+    assert summary["counts"]["rebuild"]["full"] == 1
+    (build,) = [json.loads(build_line) for build_line in build_lines]
     assert build["run_id"] == "uk-run-1"
     assert build["recorded_run"] is True
     assert build["commit_class"] == "after_1151"
     assert build["rebuild"] == "full"
-    assert printed["counts"]["rebuild"]["full"] == 1
     assert constructed["disposed"] is True
 
 
