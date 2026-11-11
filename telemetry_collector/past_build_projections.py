@@ -79,6 +79,7 @@ from telemetry_collector.past_builds import (
 )
 from telemetry_collector.submission_store import SubmissionRecord, SubmissionStore
 from telemetry_collector.submissions import (
+    COLLECTOR_OWNER_HF_ID,
     CONTRACT_VERSION,
     UPSTREAM_FILE_NAME_PATTERN,
     SubmissionRequest,
@@ -102,7 +103,9 @@ ProjectionOutcomeKind = Literal[
 #: The owner of the submissions the collector makes for past builds. No
 #: Hugging Face user has this ID, so no build can complete or read them.
 COLLECTOR_OWNER: Final = HuggingFacePrincipal(
-    user_id="microcosm-collector", username="microcosm-collector", organizations=()
+    user_id=COLLECTOR_OWNER_HF_ID,
+    username=COLLECTOR_OWNER_HF_ID,
+    organizations=(),
 )
 SUBMISSION_KIND: Final = "orrery-inputs"
 #: The Orrery handler reads the schema and the overlay only up to this size.

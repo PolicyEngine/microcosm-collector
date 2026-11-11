@@ -801,9 +801,10 @@ calibration tree handler.
   SHA-256 and size, how many upstream files it links to, the Orrery version
   that validated it, the Microcosm commit the projection was copied from
   (`projection_source`), the collector's version, whether it was
-  reconstructed (false for every document built from a submission's own
-  inputs), and its visibility. A document already recorded for the
-  submission keeps its first row.
+  reconstructed (true only for a document the collector rebuilt from a past
+  build's staged inputs, whose submission `microcosm-collector` owns; see
+  "Projecting past builds again"), and its visibility. A document already
+  recorded for the submission keeps its first row.
 - **Visibility.** A licensed build's graph file is recorded `private`: it
   stays in the private bucket, and no clearance step makes it public. Any
   other build's is recorded `public`. The Orrery read service serves both
@@ -1239,7 +1240,8 @@ is listed as `left_out`, with the reason, checked in this order:
    overlay, or no schema, or that have no staged folder;
 3. builds classed `before_1144`, `between_1144_and_1151` or `unknown`;
 4. builds one of whose submitted files Hugging Face lists without a last
-   commit.
+   commit, after the checks that make a build `refused` (see "Checks before
+   downloading").
 
 A build left out only because GitHub stopped answering before it was classed
 (`class_retry_later` in the inventory), with nothing else keeping it from
@@ -1301,16 +1303,46 @@ run created the submission, the handler's result, and whether it is
 - the submission's status: `succeeded`, `rejected`, `failed`, `queued` or
   `processing`.
 
-It then prints a summary, `{"summary": {"outcomes": …, "incomplete_run_ids":
-[…]}}`, and exits non-zero when any build is incomplete: it ended in `error`,
-or it would be projected but GitHub stopped answering before it was classed.
-The rebuild is complete when a run's summary lists no incomplete builds.
-Every attempt's output stays in the execution's log. A build an earlier
-attempt reported `succeeded` stays done even if a later attempt, short of
-GitHub requests, lists it as incomplete. Judge the rebuild by these
-summaries, not by whether the execution succeeded. An attempt whose
-inventory itself fails prints no summary, and the execution's log shows the
-error.
+It then prints a summary:
+
+```json
+{"summary": {"outcomes": {}, "incomplete_run_ids": [], "unpublished_run_ids": []}}
+```
+
+- `incomplete_run_ids`: builds a later run should try again, because they
+  ended in `error` or would be projected but GitHub stopped answering before
+  they were classed. The command exits non-zero while there are any.
+- `unpublished_run_ids`: projected builds whose document isn't published,
+  because their job is `queued` or `processing` for the scheduled recovery,
+  or ended `failed` or `rejected`. They don't change the exit code.
+
+Every document a run publishes is recorded with `reconstructed: true` in
+`orrery_graph_files`, so microcosm-runs can mark it as rebuilt from a past
+build.
+
+**When it is done.** Every attempt's output stays in the execution's log:
+each printed document is one structured entry, which the Cloud Run console
+shows for the execution, or this selects:
+
+```bash
+gcloud logging read 'labels."run.googleapis.com/execution_name"="<execution>" AND jsonPayload.summary:*' \
+  --project <project> --format=json
+```
+
+The rebuild is complete when a summary lists no incomplete and no
+unpublished builds. A build an earlier attempt reported `succeeded` stays
+done even if a later attempt, short of GitHub requests, lists it as
+incomplete. Judge the rebuild by these summaries, not by whether the
+execution succeeded. An attempt whose inventory itself fails prints no
+summary, and the log shows the error. For unpublished builds:
+- `queued` or `processing`: wait for recovery (it runs every 10 minutes, and
+  a job another holder leased waits up to 65 minutes), then run the command
+  again. A rerun reports each build's current status and changes nothing
+  already finished.
+- `failed`: after fixing the cause, process it again with `reprocess
+  <submission ID>`, run as the recovery job (see "Worker jobs and recovery").
+- `rejected`: the handler refused its inputs, and rerunning won't change
+  that; the outcome's reason says why.
 
 **Running it.** It needs `DATABASE_URL`, `COLLECTOR_HF_READ_TOKEN`,
 `COLLECTOR_INTAKE_BUCKET` and `COLLECTOR_ORRERY_BUCKET`, which the worker job
@@ -1319,7 +1351,9 @@ account may only read the intake bucket. A run therefore also needs, for its
 duration only, permission for that account to create objects in its own
 environment's intake bucket (`roles/storage.objectCreator` on the bucket).
 That permission is a manual step before the run, and it is removed after it.
-Creating can't overwrite or delete an object. While the permission exists, a
+It is needed only until each build's submission is accepted: an accepted
+submission's job, its retries and recovery read intake storage and never
+create in it. Creating can't overwrite or delete an object. While the permission exists, a
 compromised worker could create a file where a pending upload is about to
 go. The worker's hash check would then reject that submission with
 `content_mismatch`; the file could not replace the upload's content.
@@ -1334,7 +1368,9 @@ again. Each run of a job is one more of its three attempts, so a job that
 fails three times ends `failed`. Every run, a dry run included, uses GitHub
 requests from the same hourly allowance. When the allowance runs out, the
 task's retries in the same hour can't class more builds, so run the command
-again an hour later, after a dry run's or another environment's run too.
+again an hour later. A dry run and the real run each use up to two requests
+for every distinct commit, so leave an hour between them, and between the
+two environments' runs, unless there are only a few builds to class.
 
 First list what a run would do. A dry run makes the checks above, downloads
 no build's graph inputs and writes nothing. It still reads what the inventory
@@ -1347,8 +1383,34 @@ gcloud run jobs execute <worker job> --project <project> --region <region> \
   --wait
 ```
 
-Then run it without `--dry-run`, in staging first. The three values are the
-environment's GitHub variables, as for "Past builds".
+Then, an hour later, run it, in staging first:
+
+```bash
+gcloud run jobs execute <worker job> --project <project> --region <region> \
+  --args=run,--no-sync,python,-m,telemetry_collector.operations,reproject-past-builds \
+  --wait
+```
+
+The three values are the environment's GitHub variables, as for "Past
+builds". Once the rebuild is complete, remove the worker's permission and
+check that it is gone:
+
+```bash
+gcloud storage buckets remove-iam-policy-binding gs://<intake bucket> --project <project> \
+  --member=serviceAccount:<worker service account> --role=roles/storage.objectCreator
+gcloud storage buckets get-iam-policy gs://<intake bucket> --project <project> --format=json
+```
+
+The bucket and the account are the environment's `TELEMETRY_INTAKE_BUCKET`
+and `TELEMETRY_WORKER_SERVICE_ACCOUNT`; the policy must list no
+`roles/storage.objectCreator` for the worker's account.
+
+**Undoing it.** No command undoes a run, and the worker can't delete
+anything. To remove a rebuilt document by hand, delete its submission's
+`artifact_submissions` row, which also deletes its job and its
+`orrery_graph_files` rows, so the Orrery read service no longer lists or
+serves it. Its objects stay in the intake and Orrery buckets until they are
+deleted too.
 
 ## Calibration tree package
 

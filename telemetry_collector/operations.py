@@ -73,6 +73,10 @@ from telemetry_collector.submissions import (
 
 OPERATIONS_REQUIREMENT = "running operator commands"
 REPROJECTION_REQUIREMENT = "projecting past builds again"
+#: Projected builds whose document isn't published: their jobs wait for the
+#: scheduled recovery (queued, processing) or ended without one (failed,
+#: rejected). They don't make the command exit non-zero.
+UNPUBLISHED_OUTCOMES = frozenset({"queued", "processing", "failed", "rejected"})
 
 
 def recover_stalled_jobs(
@@ -248,6 +252,7 @@ def _reproject_past_builds(database_url: str, *, dry_run: bool) -> int:
     holder = f"reprojection-{os.environ.get('CLOUD_RUN_EXECUTION') or uuid.uuid4().hex}"
     outcome_counts: Counter[str] = Counter()
     incomplete_run_ids: list[str] = []
+    unpublished_run_ids: list[str] = []
     with HuggingFaceReader.from_environment() as reader:
         engine = create_database_engine(database_url)
         try:
@@ -272,6 +277,8 @@ def _reproject_past_builds(database_url: str, *, dry_run: bool) -> int:
                 outcome_counts[outcome.outcome] += 1
                 if outcome.incomplete:
                     incomplete_run_ids.append(outcome.run_id)
+                if outcome.outcome in UNPUBLISHED_OUTCOMES:
+                    unpublished_run_ids.append(outcome.run_id)
         finally:
             engine.dispose()
     # The summary says whether the run is complete; a task retry starts the
@@ -281,6 +288,7 @@ def _reproject_past_builds(database_url: str, *, dry_run: bool) -> int:
             "summary": {
                 "outcomes": dict(outcome_counts),
                 "incomplete_run_ids": incomplete_run_ids,
+                "unpublished_run_ids": unpublished_run_ids,
             }
         }
     )
