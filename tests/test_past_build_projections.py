@@ -520,7 +520,11 @@ def test_the_dry_run_command_prints_one_document_for_each_build(
     assert printed["run_id"] == "uk-run-1"
     assert printed["outcome"] == "would_reproject"
     assert json.loads(printed_lines[1]) == {
-        "summary": {"outcomes": {"would_reproject": 1}, "incomplete_run_ids": []}
+        "summary": {
+            "outcomes": {"would_reproject": 1},
+            "incomplete_run_ids": [],
+            "unpublished_run_ids": [],
+        }
     }
     assert downloads(hugging_face) == []
 
@@ -897,6 +901,7 @@ def test_a_build_github_stopped_classing_is_incomplete_and_fails_the_command(
         "summary": {
             "outcomes": {"left_out": 1, "succeeded": 1},
             "incomplete_run_ids": ["uk-run-1"],
+            "unpublished_run_ids": [],
         }
     }
 
