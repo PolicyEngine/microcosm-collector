@@ -15,9 +15,17 @@ totals first and then one for each build, and changes nothing. It reads
 Hugging Face, so it runs as an execution of the worker job, the only job with
 ``COLLECTOR_HF_READ_TOKEN``.
 
+``reproject-past-builds`` makes an ``orrery-inputs`` submission for each past
+build that can be projected again and processes it at once
+(``telemetry_collector.past_build_projections``). Besides the Hugging Face
+token it needs the worker job's intake and Orrery buckets, and permission for
+the worker's account to create objects in the intake bucket. With
+``--dry-run`` it only lists what it would project.
+
 Run them with ``python -m telemetry_collector.operations recover``,
-``python -m telemetry_collector.operations reprocess`` and
-``python -m telemetry_collector.operations past-builds``.
+``python -m telemetry_collector.operations reprocess``,
+``python -m telemetry_collector.operations past-builds`` and
+``python -m telemetry_collector.operations reproject-past-builds``.
 """
 
 from __future__ import annotations
@@ -25,15 +33,20 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import uuid
 from collections.abc import Sequence
-from dataclasses import replace
+from dataclasses import asdict, replace
 from typing import Any, get_args
 
 from telemetry_collector import past_builds
 from telemetry_collector.database import create_database_engine
-from telemetry_collector.google_cloud import CloudTasksWorkerQueue
+from telemetry_collector.google_cloud import (
+    CloudTasksWorkerQueue,
+    GoogleCloudStorageIntake,
+)
 from telemetry_collector.huggingface_read import HuggingFaceReader
 from telemetry_collector.intake import (
+    BUCKET_PATTERN,
     JOB_PATTERN,
     QUEUE_PATTERN,
     SERVICE_ACCOUNT_PATTERN,
@@ -54,6 +67,7 @@ from telemetry_collector.submissions import (
 )
 
 OPERATIONS_REQUIREMENT = "running operator commands"
+REPROJECTION_REQUIREMENT = "projecting past builds again"
 
 
 def recover_stalled_jobs(
@@ -148,6 +162,15 @@ def _argument_parser() -> argparse.ArgumentParser:
         "past-builds",
         help="Print the inventory of past Microcosm builds as JSON.",
     )
+    reproject = commands.add_parser(
+        "reproject-past-builds",
+        help="Publish Orrery graph files for past builds from their staged inputs.",
+    )
+    reproject.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List what would be projected without reading or writing anything.",
+    )
     return parser
 
 
@@ -171,15 +194,21 @@ def _print_json(document: dict[str, Any]) -> None:
     print(json.dumps(document, sort_keys=True), flush=True)
 
 
+def _past_build_inventory(
+    reader: HuggingFaceReader, engine: Any
+) -> past_builds.PastBuildInventory:
+    runs = past_builds.recorded_runs(engine)
+    with past_builds.GitHubCommitClassifier() as classifier:
+        return past_builds.list_past_builds(reader, runs, classifier)
+
+
 def _print_past_builds(database_url: str) -> int:
     with HuggingFaceReader.from_environment() as reader:
         engine = create_database_engine(database_url)
         try:
-            runs = past_builds.recorded_runs(engine)
+            inventory = _past_build_inventory(reader, engine)
         finally:
             engine.dispose()
-        with past_builds.GitHubCommitClassifier() as classifier:
-            inventory = past_builds.list_past_builds(reader, runs, classifier)
     # One document for the inventory and then one for each build, so that no
     # log entry grows with the number of builds.
     document = inventory.to_json()
@@ -187,6 +216,49 @@ def _print_past_builds(database_url: str) -> int:
     _print_json(document)
     for build in builds:
         _print_json(build)
+    return 0
+
+
+def _reproject_past_builds(database_url: str, *, dry_run: bool) -> int:
+    # Imported here: the handlers, and the projections that run them, build
+    # on the worker, which recovery and reprocessing don't need.
+    from telemetry_collector import orrery_graphs, past_build_projections
+    from telemetry_collector.handlers import handlers_from_environment
+
+    intake_bucket = None
+    if not dry_run:
+        intake_bucket = resource_setting(
+            "COLLECTOR_INTAKE_BUCKET",
+            BUCKET_PATTERN,
+            required_by=REPROJECTION_REQUIREMENT,
+        )
+        if orrery_graphs.orrery_bucket() is None:
+            raise RuntimeError(
+                f"{orrery_graphs.BUCKET_SETTING} is required when "
+                f"{REPROJECTION_REQUIREMENT}."
+            )
+    holder = f"reprojection-{os.environ.get('CLOUD_RUN_EXECUTION') or uuid.uuid4().hex}"
+    with HuggingFaceReader.from_environment() as reader:
+        engine = create_database_engine(database_url)
+        try:
+            inventory = _past_build_inventory(reader, engine)
+            outcomes = past_build_projections.reproject_past_builds(
+                inventory,
+                reader,
+                submissions=PostgresSubmissionStore(engine),
+                objects=(
+                    None
+                    if intake_bucket is None
+                    else GoogleCloudStorageIntake(bucket_name=intake_bucket)
+                ),
+                handlers={} if dry_run else handlers_from_environment(engine=engine),
+                holder=holder,
+                dry_run=dry_run,
+            )
+        finally:
+            engine.dispose()
+    for outcome in outcomes:
+        _print_json(asdict(outcome))
     return 0
 
 
@@ -205,6 +277,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
         raise RuntimeError(f"DATABASE_URL is required when {OPERATIONS_REQUIREMENT}.")
     if options.command == "past-builds":
         return _print_past_builds(database_url)
+    if options.command == "reproject-past-builds":
+        return _reproject_past_builds(database_url, dry_run=options.dry_run)
     dry_run = options.command == "reprocess" and options.dry_run
     worker_queue = None if dry_run else _worker_queue_from_environment()
     engine = create_database_engine(database_url)

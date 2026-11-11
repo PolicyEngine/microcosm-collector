@@ -495,6 +495,12 @@ identity column needs no sequence privilege to insert rows.
   It reads Hugging Face, so an operator runs it as an execution of the worker
   job, the only job with the Hugging Face read token, with its arguments
   overridden (see "Past builds").
+- **Projecting past builds again** (`uv run --no-sync python -m
+  telemetry_collector.operations reproject-past-builds`, with `--dry-run` to
+  list first) makes an `orrery-inputs` submission for each past build that
+  can be projected and processes it at once. An operator runs it the same
+  way, and only while the worker's account may create objects in the intake
+  bucket (see "Projecting past builds again").
 
 None of these values is secret. Intake needs, in each environment's project
 and region, these resources, created by hand (both environments have them):
@@ -1216,6 +1222,75 @@ Running a job with overridden arguments needs `run.jobs.runWithOverrides` on
 it. Each printed document is one entry in the execution's log. A failed
 execution is retried up to twice, like any worker execution; a retry only
 repeats the reads.
+
+### Projecting past builds again
+
+`python -m telemetry_collector.operations reproject-past-builds` publishes
+Orrery graph files for past builds, as if each had sent its graph inputs as a
+new build does. It uses the inventory of past builds (see "Past builds") and
+`telemetry_collector/past_build_projections.py`.
+
+**Which builds.** A build is projected when the inventory classes it
+`after_1151`, its `rebuild` is `full`, and it isn't skipped. Every other build
+is listed as `left_out`, with the reason: skipped builds, builds classed
+`before_1144`, `between_1144_and_1151` or `unknown`, and builds whose staged
+folder holds the schema without the execution overlay, or no schema.
+
+**The submission.** For each build the command makes the `orrery-inputs`
+submission the build would have sent:
+
+| Field | Value |
+|---|---|
+| files | `graph.schema.json` (`schema`), `graph.execution.json` (`execution_overlay`) and every `upstream-<sha256>.json` (`upstream`) in the staged folder, read at the inventory's revision of the dataset. Evidence files are left out, since the collector never publishes them |
+| `licensed_data` | true, unless the build was staged in a public dataset (`HUGGINGFACE_DATASETS`): the UK and Belgian release datasets are private, so their documents are `private` |
+| `provenance` | the build's run ID as `run_id` and `build_id`, its country as Microcosm registers it (`GB` for `uk`), no release, and `huggingface`: the dataset, the staged folder and the folder's last commit, which Hugging Face's listing gives |
+| owner | `microcosm-collector`, an ID no Hugging Face user has |
+
+The submission ID is the hash of the request, as for any submission. So a
+second run makes the same submission, finds it already processed, and changes
+nothing; only a change to the staged folder makes a new one.
+
+**Processing.**
+1. The command creates each file in the intake bucket under the submission's
+   ID, create-only and with its SHA-256 in its metadata, as an upload does.
+2. It accepts the submission as completion accepts one: each stored object
+   must have the inventory's size and SHA-256, and a stored object that
+   differs rejects the submission with `stored_object_mismatch`.
+3. It runs the submission's job at once, through the worker's `run_job` and
+   the registered handlers. The worker hashes every stored file, and the
+   Orrery handler projects, validates, publishes and records the document (see
+   "Publishing Orrery graph files").
+4. A job that fails before its last attempt is released, stays `queued`, and
+   the scheduled recovery dispatches it to the worker job.
+
+The command prints one JSON document for each build: its run ID, its
+`outcome` (`left_out`, `would_reproject`, `refused` when the staged files
+break the submission rules, or the submission's status: `succeeded`,
+`rejected`, `failed` or `queued`), the reason, the submission ID, whether
+this run created the submission, and the handler's result.
+
+**Running it.** It needs `DATABASE_URL`, `COLLECTOR_HF_READ_TOKEN`,
+`COLLECTOR_INTAKE_BUCKET` and `COLLECTOR_ORRERY_BUCKET`, which the worker job
+has, and stops with a message naming a missing one. The worker's service
+account may only read the intake bucket. A run therefore also needs, for its
+duration only, permission for that account to create objects in its own
+environment's intake bucket (`roles/storage.objectCreator` on the bucket).
+That permission is a manual step before the run, and it is removed after it.
+Creating can't overwrite or delete an object. While the permission exists, a
+compromised worker could create a file where a pending upload is about to
+go. The worker's hash check would then reject that submission with
+`content_mismatch`; the file could not replace the upload's content.
+
+First list what a run would do, which reads and writes nothing:
+
+```bash
+gcloud run jobs execute <worker job> --project <project> --region <region> \
+  --args=run,--no-sync,python,-m,telemetry_collector.operations,reproject-past-builds,--dry-run \
+  --wait
+```
+
+Then run it without `--dry-run`, in staging first. The three values are the
+environment's GitHub variables, as for "Past builds".
 
 ## Calibration tree package
 
