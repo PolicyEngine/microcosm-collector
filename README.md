@@ -1189,9 +1189,10 @@ GitHub allows 60 such requests an hour from one IP address. Each distinct
 commit takes one or two requests. After a rate-limit answer, or any failure
 other than GitHub not having the commit, that commit and every later one are
 `unknown` with the reason, and the command sends no more requests; nothing is
-guessed. Cloud Run jobs reach
-GitHub from addresses that other Google Cloud users share, so part of the
-hour's allowance may already be used.
+guessed. Those builds also have `class_retry_later: true`, since a later run
+may class them; builds `unknown` for any other reason have `false`. Cloud Run
+jobs reach GitHub from addresses that other Google Cloud users share, so part
+of the hour's allowance may already be used.
 
 So that the builds that can be rebuilt are the ones classed when the
 allowance runs out, commits are checked in this order, while the inventory
@@ -1232,7 +1233,9 @@ new build does. It uses the inventory of past builds (see "Past builds") and
 
 **Which builds.** A build is projected when the inventory classes it
 `after_1151`, its `rebuild` is `full`, and it isn't skipped. Every other build
-is listed as `left_out`, with the reason: skipped builds, builds classed
+is listed as `left_out`, with the reason. A build left out only because GitHub stopped answering before
+it was classed (`class_retry_later` in the inventory) is also marked
+`incomplete`. Left out are: skipped builds, builds classed
 `before_1144`, `between_1144_and_1151` or `unknown`, builds whose staged
 folder holds the schema without the execution overlay, or no schema, and
 builds one of whose submitted files Hugging Face lists without a last commit.
@@ -1242,7 +1245,7 @@ submission the build would have sent:
 
 | Field | Value |
 |---|---|
-| files | `graph.schema.json` (`schema`), `graph.execution.json` (`execution_overlay`) and every `upstream-<sha256>.json` (`upstream`) in the staged folder, read at the inventory's revision of the dataset. Evidence files are left out, since the collector never publishes them. A file over its role's size limit (64 MiB for the schema and each upstream file, 32 MiB for the overlay) makes the build `refused` before anything is downloaded |
+| files | `graph.schema.json` (`schema`), `graph.execution.json` (`execution_overlay`) and every `upstream-<sha256>.json` (`upstream`) in the staged folder, read at the inventory's revision of the dataset. Evidence files are left out, since the collector never publishes them |
 | `licensed_data` | true, unless the build was staged in a public dataset (`HUGGINGFACE_DATASETS`): the UK and Belgian release datasets are private, so their documents are `private` |
 | `provenance` | the build's run ID as `run_id` and `build_id`, its country as Microcosm registers it (`GB` for `uk`), no release, and `huggingface`: the dataset, the staged folder, and the newest last commit among the submitted files, from one listing of the folder with `expand=true` |
 | owner | `microcosm-collector`, an ID no Hugging Face user has |
@@ -1252,11 +1255,19 @@ second run makes the same submission, finds it already processed, and changes
 nothing. Only a change to a submitted file makes a new one; a later change to
 another file in the folder, such as its staged manifest, doesn't.
 
+**Checks before downloading.** Each build is first checked from Hugging
+Face's listings alone, in a dry run too, and is `refused` or `left_out` when:
+- the files, with their listed sizes, break the submission rules (each role's
+  size limit, at most 256 files, at most 8 GiB in all);
+- the schema or the overlay is over the Orrery handler's 32 MiB input limit;
+- Hugging Face lists a submitted file without a last commit (`left_out`).
+
 **Processing.**
-1. The command downloads each file, checks it against the listing's size
-   and, for a file stored with LFS, its SHA-256, and creates it in the intake
-   bucket under the submission's ID, create-only and with its SHA-256 in its
-   metadata, as an upload does.
+1. The command downloads each file and checks it against the listing: its
+   size, and its SHA-256 for a file stored with LFS or its git blob ID
+   otherwise. It then creates the file in the intake bucket under the
+   submission's ID, create-only and with its SHA-256 in its metadata, as an
+   upload does.
 2. It accepts the submission as completion accepts one: each stored object
    must have the inventory's size and SHA-256, and a stored object that
    differs rejects the submission with `stored_object_mismatch`.
@@ -1266,14 +1277,16 @@ another file in the folder, such as its staged manifest, doesn't.
    "Publishing Orrery graph files").
 4. A job that fails before its last attempt is released, stays `queued`, and
    the scheduled recovery dispatches it to the worker job.
-5. A submission an earlier run left `awaiting_upload` is completed, and a job
-   it left `processing` is run again: the same lease holder may continue it.
-   A job another holder's live lease covers is skipped, and recovery queues
-   it again once that lease expires.
+5. A submission an earlier run left `awaiting_upload` is completed. A task
+   retry in the same Cloud Run execution continues a job its killed attempt
+   left `processing`, since it has the same lease holder. A later execution
+   has another holder, so the job is skipped (`processing`) until its
+   65-minute lease expires and recovery queues it again.
 
 The command prints one JSON document for each build, as soon as the build is
 done: its run ID, its `outcome`, the reason, the submission ID, whether this
-run created the submission, and the handler's result. The outcomes are:
+run created the submission, the handler's result, and whether it is
+`incomplete`, so a later run should try it again. The outcomes are:
 - `left_out` and, in a dry run, `would_reproject`;
 - `refused`, when the staged files break the submission rules;
 - `error`, when anything else stops that build, such as a failed Hugging
@@ -1281,7 +1294,11 @@ run created the submission, and the handler's result. The outcomes are:
 - the submission's status: `succeeded`, `rejected`, `failed`, `queued` or
   `processing`.
 
-The command exits non-zero when any build ended in `error`.
+It then prints a summary, `{"summary": {"outcomes": …, "incomplete_run_ids":
+[…]}}`, and exits non-zero when any build is incomplete: it ended in `error`,
+or GitHub stopped answering before it was classed. A run is complete only
+when its summary lists no incomplete builds. Judge the rebuild by the last
+attempt's summary, not by whether the execution succeeded.
 
 **Running it.** It needs `DATABASE_URL`, `COLLECTOR_HF_READ_TOKEN`,
 `COLLECTOR_INTAKE_BUCKET` and `COLLECTOR_ORRERY_BUCKET`, which the worker job
@@ -1299,12 +1316,16 @@ A run must finish within the worker job's one-hour task timeout, and every
 run downloads every eligible build's files again, even those already
 projected, to work out each submission's ID. When the command exits non-zero,
 or is stopped by the timeout, Cloud Run runs the task again, up to twice, like
-any worker execution. A rerun only repeats the reads and finishes what the
-last one left.
+any worker execution. A rerun builds the inventory again, makes the same
+submissions, completes any left awaiting upload, and runs each queued job
+again. Each run of a job is one more of its three attempts, so a job that
+fails three times ends `failed`. When GitHub's hourly allowance runs out,
+later builds stay incomplete; run the command again an hour later.
 
-First list what a run would do. A dry run downloads no build's files and
-writes nothing, but still reads what the inventory reads: Hugging Face's
-listings and staged manifests, the database and GitHub.
+First list what a run would do. A dry run makes the checks above, downloads
+no build's graph inputs and writes nothing. It still reads what the inventory
+reads (Hugging Face's listings and staged manifests, the database and GitHub)
+and each eligible build's folder listing.
 
 ```bash
 gcloud run jobs execute <worker job> --project <project> --region <region> \

@@ -20,8 +20,11 @@ build that can be projected again and processes it at once
 (``telemetry_collector.past_build_projections``). Besides the Hugging Face
 token it needs the worker job's intake and Orrery buckets, and permission for
 the worker's account to create objects in the intake bucket. It prints each
-build's outcome as it is produced, and exits non-zero when any build ended in
-an error. With ``--dry-run`` it only lists what it would project.
+build's outcome as it is produced, then a summary of the run, and exits
+non-zero when any build is incomplete: it ended in an error, or GitHub stopped
+answering before it was classed. With ``--dry-run`` it only lists what it would
+project, from Hugging Face's listings: it downloads no build's graph inputs
+and writes nothing.
 
 Run them with ``python -m telemetry_collector.operations recover``,
 ``python -m telemetry_collector.operations reprocess``,
@@ -35,6 +38,7 @@ import argparse
 import json
 import os
 import uuid
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import asdict, replace
 from typing import Any, get_args
@@ -170,7 +174,10 @@ def _argument_parser() -> argparse.ArgumentParser:
     reproject.add_argument(
         "--dry-run",
         action="store_true",
-        help="List what would be projected, downloading and writing nothing.",
+        help=(
+            "List what would be projected, downloading no graph inputs and "
+            "writing nothing."
+        ),
     )
     return parser
 
@@ -239,7 +246,8 @@ def _reproject_past_builds(database_url: str, *, dry_run: bool) -> int:
                 f"{REPROJECTION_REQUIREMENT}."
             )
     holder = f"reprojection-{os.environ.get('CLOUD_RUN_EXECUTION') or uuid.uuid4().hex}"
-    errors = 0
+    outcome_counts: Counter[str] = Counter()
+    incomplete_run_ids: list[str] = []
     with HuggingFaceReader.from_environment() as reader:
         engine = create_database_engine(database_url)
         try:
@@ -261,10 +269,22 @@ def _reproject_past_builds(database_url: str, *, dry_run: bool) -> int:
             # early still logs every build it finished.
             for outcome in outcomes:
                 _print_json(asdict(outcome))
-                errors += outcome.outcome == "error"
+                outcome_counts[outcome.outcome] += 1
+                if outcome.incomplete:
+                    incomplete_run_ids.append(outcome.run_id)
         finally:
             engine.dispose()
-    return 1 if errors else 0
+    # The summary says whether the run is complete; a task retry starts the
+    # inventory again, so only a summary without incomplete builds says so.
+    _print_json(
+        {
+            "summary": {
+                "outcomes": dict(outcome_counts),
+                "incomplete_run_ids": incomplete_run_ids,
+            }
+        }
+    )
+    return 1 if incomplete_run_ids else 0
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
