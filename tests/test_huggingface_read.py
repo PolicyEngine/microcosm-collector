@@ -299,3 +299,27 @@ def test_a_reader_from_the_environment_requires_the_token(
     )
     hub.add_dataset(UK_RELEASES)
     assert reader.dataset_info(UK_RELEASES)["private"] is True
+
+
+def test_folder_commits_are_read_page_by_page_at_the_revision() -> None:
+    hub = FakeHuggingFace(token=EXAMPLE_TOKEN, page_size=1)
+    stored = hub.add_dataset(
+        UK_RELEASES,
+        {
+            "staged/run-1/graph.schema.json": b"{}",
+            "staged/run-2/graph.schema.json": b"{}",
+            "staged/notes.txt": b"",
+        },
+    )
+    stored.folder_commits = {"staged/run-1": "1" * 40, "staged/run-2": "2" * 40}
+    reader = reader_for(hub)
+    assert callable(getattr(reader, "folder_commits", None))
+
+    commits = reader.folder_commits(UK_RELEASES, "staged", stored.head_commit)
+
+    assert commits == {"staged/run-1": "1" * 40, "staged/run-2": "2" * 40}
+    assert len(hub.requests) == 3
+    assert all(
+        f"/tree/{stored.head_commit}/staged" in request.url.raw_path.decode()
+        for request in hub.requests
+    )
