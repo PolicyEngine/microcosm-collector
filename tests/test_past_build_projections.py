@@ -30,13 +30,14 @@ from telemetry_collector.huggingface_read import (
     GENERIC_TOKEN_VARIABLES,
     TOKEN_VARIABLE,
     HuggingFaceReader,
+    HuggingFaceReadError,
 )
 from telemetry_collector.intake import UPLOAD_CONTENT_TYPE
 from telemetry_collector.past_builds import PastBuild, PastBuildInventory
 from telemetry_collector.submissions import intake_object_name
 from telemetry_collector.worker import SubmissionRejectedError
 from tests.fakes import FakeIntakeObjectStore, FakeSubmissionStore
-from tests.huggingface_fakes import FakeHuggingFace
+from tests.huggingface_fakes import DEFAULT_COMMIT_DATE, FakeHuggingFace
 from tests.test_orrery_graphs import (
     FIXTURE_ROOT,
     LINKLESS_CASE,
@@ -52,7 +53,7 @@ PROJECTIONS_MODULE = "telemetry_collector.past_build_projections"
 UK_RELEASES = "policyengine/populace-uk-private"
 US_RELEASES = "policyengine/populace-us"
 READ_TOKEN = "hf_collector_read_token"
-FOLDER_COMMIT = "1" * 40
+INPUTS_COMMIT = "1" * 40
 HOLDER = "reprojection-test"
 SCHEMA_BYTES = (FIXTURE_ROOT / LINKLESS_CASE / SCHEMA).read_bytes()
 OVERLAY_BYTES = (FIXTURE_ROOT / LINKLESS_CASE / OVERLAY).read_bytes()
@@ -80,9 +81,8 @@ def hugging_face_with(
     dataset: str, files: dict[str, bytes], *, private: bool = True
 ) -> FakeHuggingFace:
     hugging_face = FakeHuggingFace(token=READ_TOKEN)
-    folders = {"/".join(path.split("/")[:2]) for path in files}
     stored = hugging_face.add_dataset(dataset, files, private=private)
-    stored.folder_commits = {folder: FOLDER_COMMIT for folder in folders}
+    stored.last_commits = {path: (INPUTS_COMMIT, DEFAULT_COMMIT_DATE) for path in files}
     return hugging_face
 
 
@@ -130,6 +130,24 @@ def reader_for(hugging_face: FakeHuggingFace) -> HuggingFaceReader:
     )
 
 
+def reader_failing_on(
+    hugging_face: FakeHuggingFace, failing_path: str
+) -> HuggingFaceReader:
+    """A reader whose download of ``failing_path`` gets HTTP 503."""
+
+    class FailingReader(HuggingFaceReader):
+        def read_file(self, dataset: str, path: str, revision: str) -> bytes:
+            if path == failing_path:
+                raise HuggingFaceReadError(
+                    dataset, 503, f"Hugging Face answered HTTP 503 for {path}."
+                )
+            return super().read_file(dataset, path, revision)
+
+    return FailingReader.from_environment(
+        {TOKEN_VARIABLE: READ_TOKEN}, client=hugging_face.client()
+    )
+
+
 def stand_in_handler(results: list[Any]) -> Any:
     def handle(context: Any) -> dict[str, Any]:
         results.append(context.submission)
@@ -146,15 +164,19 @@ def reproject(
     intake: FakeIntakeObjectStore,
     handlers: dict[str, Any],
     dry_run: bool = False,
+    holder: str = HOLDER,
+    reader: HuggingFaceReader | None = None,
 ) -> list[Any]:
-    return projections_module().reproject_past_builds(
-        inventory,
-        reader_for(hugging_face),
-        submissions=submissions,
-        objects=intake,
-        handlers=handlers,
-        holder=HOLDER,
-        dry_run=dry_run,
+    return list(
+        projections_module().reproject_past_builds(
+            inventory,
+            reader or reader_for(hugging_face),
+            submissions=submissions,
+            objects=intake,
+            handlers=handlers,
+            holder=holder,
+            dry_run=dry_run,
+        )
     )
 
 
@@ -196,7 +218,7 @@ def test_a_full_build_after_1151_is_published_through_the_orrery_handler() -> No
         "release": None,
         "huggingface": {
             "repo": UK_RELEASES,
-            "commit": FOLDER_COMMIT,
+            "commit": INPUTS_COMMIT,
             "folder": "staged/uk-run-1",
         },
     }
@@ -531,39 +553,57 @@ def test_a_left_out_build_keeps_its_place_in_run_id_order() -> None:
     ]
 
 
-def test_each_dataset_s_folder_commits_are_read_once_at_its_revision() -> None:
-    files = {**staged_files("uk-run-1"), **staged_files("uk-run-2")}
-    hugging_face = hugging_face_with(UK_RELEASES, files)
-    hugging_face.datasets[UK_RELEASES].folder_commits["staged/uk-run-2"] = "2" * 40
-    inventory = inventory_of(
-        past_build("uk-run-1", hugging_face), past_build("uk-run-2", hugging_face)
+def test_the_provenance_commit_is_the_newest_among_the_submitted_files() -> None:
+    hugging_face = hugging_face_with(UK_RELEASES, staged_files("uk-run-1"))
+    stored = hugging_face.datasets[UK_RELEASES]
+    folder = "staged/uk-run-1"
+    stored.last_commits.update(
+        {
+            f"{folder}/{SCHEMA}": ("a" * 40, "2026-10-01T00:00:00.000Z"),
+            f"{folder}/{OVERLAY}": ("b" * 40, "2026-10-02T00:00:00.000Z"),
+            f"{folder}/{UPSTREAM_NAME}": ("a" * 40, "2026-10-01T00:00:00.000Z"),
+            # Not submitted, so a later change to it changes nothing.
+            f"{folder}/staged_manifest.json": ("c" * 40, "2026-10-05T00:00:00.000Z"),
+            folder: ("c" * 40, "2026-10-05T00:00:00.000Z"),
+        }
     )
     submissions = FakeSubmissionStore()
 
-    outcomes = reproject(
-        inventory,
+    (outcome,) = reproject(
+        inventory_of(past_build("uk-run-1", hugging_face)),
         hugging_face,
         submissions=submissions,
         intake=FakeIntakeObjectStore(),
         handlers={"orrery-inputs": stand_in_handler([])},
     )
 
-    commits = [
-        submissions.get_submission(outcome.submission_id).provenance["huggingface"][
-            "commit"
-        ]
-        for outcome in outcomes
-    ]
-    assert commits == [FOLDER_COMMIT, "2" * 40]
-    revision = hugging_face.datasets[UK_RELEASES].head_commit
-    folder_listings = [
+    record = submissions.get_submission(outcome.submission_id)
+    assert record.provenance["huggingface"]["commit"] == "b" * 40
+    revision = stored.head_commit
+    listings = [
         request.url.raw_path.decode()
         for request in hugging_face.requests
         if "expand=true" in str(request.url)
     ]
-    assert len(folder_listings) == 1
-    assert f"/tree/{revision}/staged" in folder_listings[0]
+    assert listings == [f"/api/datasets/{UK_RELEASES}/tree/{revision}/{folder}"]
     assert all(f"/resolve/{revision}/" in path for path in downloads(hugging_face))
+
+
+def test_a_build_whose_inputs_have_no_listed_last_commit_is_left_out() -> None:
+    hugging_face = hugging_face_with(UK_RELEASES, staged_files("uk-run-1"))
+    hugging_face.datasets[UK_RELEASES].last_commits[f"staged/uk-run-1/{OVERLAY}"] = None
+
+    (outcome,) = reproject(
+        inventory_of(past_build("uk-run-1", hugging_face)),
+        hugging_face,
+        submissions=FakeSubmissionStore(),
+        intake=FakeIntakeObjectStore(),
+        handlers={"orrery-inputs": stand_in_handler([])},
+    )
+
+    assert outcome.outcome == "left_out"
+    assert "last commit" in outcome.reason
+    assert downloads(hugging_face) == []
 
 
 def test_a_job_released_for_retry_is_reported_as_queued() -> None:
@@ -600,3 +640,188 @@ def test_left_out_reasons_cover_a_build_without_a_schema() -> None:
 
     assert outcome.outcome == "left_out"
     assert "nothing on Hugging Face" in outcome.reason
+
+
+def test_an_error_in_one_build_is_reported_and_the_next_build_is_projected() -> None:
+    files = {**staged_files("uk-run-1"), **staged_files("uk-run-2")}
+    hugging_face = hugging_face_with(UK_RELEASES, files)
+    inventory = inventory_of(
+        past_build("uk-run-1", hugging_face), past_build("uk-run-2", hugging_face)
+    )
+    handled: list[Any] = []
+
+    outcomes = reproject(
+        inventory,
+        hugging_face,
+        submissions=FakeSubmissionStore(),
+        intake=FakeIntakeObjectStore(),
+        handlers={"orrery-inputs": stand_in_handler(handled)},
+        reader=reader_failing_on(hugging_face, f"staged/uk-run-1/{OVERLAY}"),
+    )
+
+    assert [(outcome.run_id, outcome.outcome) for outcome in outcomes] == [
+        ("uk-run-1", "error"),
+        ("uk-run-2", "succeeded"),
+    ]
+    assert "HuggingFaceReadError" in outcomes[0].reason
+    assert "HTTP 503" in outcomes[0].reason
+    assert [submission.provenance["run_id"] for submission in handled] == ["uk-run-2"]
+
+
+def test_an_overlay_over_its_role_limit_is_refused_before_it_is_downloaded() -> None:
+    files = staged_files("uk-run-1")
+    files[f"staged/uk-run-1/{OVERLAY}"] = b" " * (32 * 1024 * 1024 + 1)
+    hugging_face = hugging_face_with(UK_RELEASES, files)
+    submissions = FakeSubmissionStore()
+
+    (outcome,) = reproject(
+        inventory_of(past_build("uk-run-1", hugging_face)),
+        hugging_face,
+        submissions=submissions,
+        intake=FakeIntakeObjectStore(),
+        handlers={"orrery-inputs": stand_in_handler([])},
+    )
+
+    assert outcome.outcome == "refused"
+    assert OVERLAY in outcome.reason
+    assert "execution_overlay" in outcome.reason
+    assert outcome.submission_id is None
+    assert not any(path.endswith(OVERLAY) for path in downloads(hugging_face))
+
+
+def test_a_job_its_own_holder_left_processing_is_resumed() -> None:
+    hugging_face = hugging_face_with(UK_RELEASES, staged_files("uk-run-1"))
+    inventory = inventory_of(past_build("uk-run-1", hugging_face))
+    submissions = FakeSubmissionStore()
+    intake = FakeIntakeObjectStore()
+
+    def interrupted_handler(context: Any) -> dict[str, Any]:
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        reproject(
+            inventory,
+            hugging_face,
+            submissions=submissions,
+            intake=intake,
+            handlers={"orrery-inputs": interrupted_handler},
+        )
+    handled: list[Any] = []
+
+    (outcome,) = reproject(
+        inventory,
+        hugging_face,
+        submissions=submissions,
+        intake=intake,
+        handlers={"orrery-inputs": stand_in_handler(handled)},
+    )
+
+    assert outcome.outcome == "succeeded"
+    assert outcome.new_submission is False
+    assert len(handled) == 1
+
+
+def test_a_job_another_holder_is_processing_is_reported_as_processing() -> None:
+    hugging_face = hugging_face_with(UK_RELEASES, staged_files("uk-run-1"))
+    inventory = inventory_of(past_build("uk-run-1", hugging_face))
+    submissions = FakeSubmissionStore()
+    intake = FakeIntakeObjectStore()
+
+    def interrupted_handler(context: Any) -> dict[str, Any]:
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        reproject(
+            inventory,
+            hugging_face,
+            submissions=submissions,
+            intake=intake,
+            handlers={"orrery-inputs": interrupted_handler},
+            holder="reprojection-killed-execution",
+        )
+    handled: list[Any] = []
+
+    (outcome,) = reproject(
+        inventory,
+        hugging_face,
+        submissions=submissions,
+        intake=intake,
+        handlers={"orrery-inputs": stand_in_handler(handled)},
+        holder="reprojection-later-execution",
+    )
+
+    assert outcome.outcome == "processing"
+    assert "lease" in outcome.reason
+    assert handled == []
+
+
+def test_a_submission_an_interrupted_run_left_awaiting_upload_is_completed() -> None:
+    hugging_face = hugging_face_with(UK_RELEASES, staged_files("uk-run-1"))
+    inventory = inventory_of(past_build("uk-run-1", hugging_face))
+    submissions = FakeSubmissionStore()
+
+    class InterruptedIntake(FakeIntakeObjectStore):
+        def create_object(self, object_name: str, source: Path, *, sha256: str) -> bool:
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        reproject(
+            inventory,
+            hugging_face,
+            submissions=submissions,
+            intake=InterruptedIntake(),
+            handlers={"orrery-inputs": stand_in_handler([])},
+        )
+    handled: list[Any] = []
+
+    (outcome,) = reproject(
+        inventory,
+        hugging_face,
+        submissions=submissions,
+        intake=FakeIntakeObjectStore(),
+        handlers={"orrery-inputs": stand_in_handler(handled)},
+    )
+
+    assert outcome.outcome == "succeeded"
+    assert outcome.new_submission is False
+    assert len(handled) == 1
+
+
+def test_the_command_prints_every_outcome_and_exits_non_zero_after_an_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    files = {**staged_files("uk-run-1"), **staged_files("uk-run-2")}
+    hugging_face = hugging_face_with(UK_RELEASES, files)
+    inventory = inventory_of(
+        past_build("uk-run-1", hugging_face), past_build("uk-run-2", hugging_face)
+    )
+    stand_in_command_services(monkeypatch)
+    handlers_module = importlib.import_module("telemetry_collector.handlers")
+
+    class StandInReader:
+        @staticmethod
+        def from_environment() -> HuggingFaceReader:
+            return reader_failing_on(hugging_face, f"staged/uk-run-1/{OVERLAY}")
+
+    monkeypatch.setattr(operations, "HuggingFaceReader", StandInReader)
+    monkeypatch.setattr(
+        operations, "_past_build_inventory", lambda reader, engine: inventory
+    )
+    monkeypatch.setattr(
+        operations,
+        "GoogleCloudStorageIntake",
+        lambda bucket_name: FakeIntakeObjectStore(),
+    )
+    monkeypatch.setattr(
+        handlers_module,
+        "handlers_from_environment",
+        lambda engine: {"orrery-inputs": stand_in_handler([])},
+    )
+
+    assert operations.main(["reproject-past-builds"]) == 1
+
+    printed = [json.loads(text) for text in capsys.readouterr().out.splitlines()]
+    assert [(document["run_id"], document["outcome"]) for document in printed] == [
+        ("uk-run-1", "error"),
+        ("uk-run-2", "succeeded"),
+    ]

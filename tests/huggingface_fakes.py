@@ -3,8 +3,8 @@
 It answers through ``httpx.MockTransport``, so no test reaches the network. It
 serves dataset information, recursive file lists (paginated with a ``Link``
 header, as Hugging Face does), one folder's entries with ``expand=true``
-(each folder entry with its ``lastCommit``) and file downloads, and redirects
-downloads of LFS files to a separate content host, as Hugging Face does.
+(each with its ``lastCommit``) and file downloads, and redirects downloads of
+LFS files to a separate content host, as Hugging Face does.
 """
 
 from __future__ import annotations
@@ -19,6 +19,8 @@ import httpx
 ENDPOINT = "https://huggingface.co"
 CONTENT_HOST = "https://cdn-lfs.example.test"
 LFS_POINTER_BYTES = 134
+#: The date of every last commit a test doesn't set.
+DEFAULT_COMMIT_DATE = "2026-10-23T00:42:24.000Z"
 
 
 @dataclass
@@ -29,8 +31,10 @@ class FakeDataset:
     head_commit: str = "0" * 40
     #: Answer every request for this dataset with this status instead.
     forced_status: int | None = None
-    #: The last commit of each folder, by path, for listings with expand=true.
-    folder_commits: dict[str, str] = field(default_factory=dict)
+    #: The last commit (ID and date) of each file or folder, by path, for
+    #: listings with expand=true; ``None`` leaves ``lastCommit`` out. A path
+    #: not listed gets the head commit and ``DEFAULT_COMMIT_DATE``.
+    last_commits: dict[str, tuple[str, str] | None] = field(default_factory=dict)
 
 
 class FakeHuggingFace:
@@ -148,7 +152,7 @@ class FakeHuggingFace:
         return httpx.Response(200, content=json.dumps(page), headers=headers)
 
     def _folder_entries(self, dataset: FakeDataset, folder: str) -> list[dict]:
-        """The entries directly inside ``folder``, each folder with its last commit."""
+        """The entries directly inside ``folder``, each with its last commit."""
 
         prefix = f"{folder}/"
         children = sorted(
@@ -163,30 +167,30 @@ class FakeHuggingFace:
             child_path = prefix + child
             if child_path in dataset.files:
                 content = dataset.files[child_path]
-                entries.append(
-                    {
-                        "type": "file",
-                        "oid": git_blob_id(content),
-                        "size": len(content),
-                        "path": child_path,
-                    }
-                )
-                continue
-            entries.append(
-                {
+                entry: dict = {
+                    "type": "file",
+                    "oid": git_blob_id(content),
+                    "size": len(content),
+                    "path": child_path,
+                }
+            else:
+                entry = {
                     "type": "directory",
                     "oid": "f" * 40,
                     "size": 0,
                     "path": child_path,
-                    "lastCommit": {
-                        "id": dataset.folder_commits.get(
-                            child_path, dataset.head_commit
-                        ),
-                        "title": f"Stage {child}",
-                        "date": "2026-10-23T00:42:24.000Z",
-                    },
                 }
+            last_commit = dataset.last_commits.get(
+                child_path, (dataset.head_commit, DEFAULT_COMMIT_DATE)
             )
+            if last_commit is not None:
+                commit, date = last_commit
+                entry["lastCommit"] = {
+                    "id": commit,
+                    "title": f"Change {child}",
+                    "date": date,
+                }
+            entries.append(entry)
         return entries
 
     def _entries(self, dataset: FakeDataset) -> list[dict]:
