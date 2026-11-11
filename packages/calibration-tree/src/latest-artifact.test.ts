@@ -57,7 +57,7 @@ import {
 import { buildCalibrationTree } from "./calibration-tree";
 import { missingReleasesRecord, missingRevision } from "./test-support/releases-record-responses";
 
-test("keeps Microcosm deployment configuration on its published Populace env contract", () => {
+test("keeps Microcosm deployment configuration on its published env contract", () => {
   expect([
     MICROCOSM_HF_REPO_ENV,
     MICROCOSM_UK_HF_REPO_ENV,

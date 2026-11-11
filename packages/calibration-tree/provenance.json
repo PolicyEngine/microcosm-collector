@@ -3,7 +3,10 @@
   "commit": "4d129fbc6931e0e6862febd4f28ca421fb94b24a",
   "directory": "frontend/packages/calibration-tree",
   "changed": {
-    "package.json": "Publishable from this repository: not private, with a license, the repository, public access, the published files, the worker's and the publication command's exports and their scripts."
+    "package.json": "Publishable from this repository: not private, with a license, the repository, public access, the published files, the worker's and the publication command's exports and their scripts.",
+    "src/countries.ts": "Its comments drop the microdata stack's former product name; its code matches the copy.",
+    "src/latest-artifact.test.ts": "One test name drops the microdata stack's former product name.",
+    "src/latest-artifact.ts": "One comment drops the microdata stack's former product name."
   },
   "collectorFiles": [
     "LICENSE",
