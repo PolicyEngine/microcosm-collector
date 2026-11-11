@@ -1,0 +1,91 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/v2/runs/us-run-failed",
+    "headers": {
+      "X-Telemetry-Read-Token": "dashboard-read-token"
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "run": {
+        "run_id": "us-run-failed",
+        "country_code": "US",
+        "pipeline": "us-fiscal-refresh",
+        "candidate_id": null,
+        "release_id": "us-2026.10",
+        "run_kind": "release",
+        "status": "failed",
+        "current_stage": "failed",
+        "registered_at": "2026-10-21T10:00:00Z",
+        "started_at": "2026-10-21T10:00:00Z",
+        "updated_at": "2026-10-21T11:05:00Z",
+        "ended_at": "2026-10-21T11:05:00Z",
+        "heartbeat_at": null,
+        "resources": null,
+        "work": null,
+        "failure": {
+          "message": "Release acceptance checks failed: 1 critical target is outside its tolerance.",
+          "error_type": "ReleaseAcceptanceError",
+          "error_code": "RELEASE_ACCEPTANCE",
+          "failure_class": "acceptance",
+          "failed_during": "release_acceptance"
+        },
+        "block": null,
+        "environment": null,
+        "reading": null,
+        "sleeps": []
+      },
+      "events": [
+        {
+          "schema_version": 1,
+          "event_id": "us-run-failed-1",
+          "run_id": "us-run-failed",
+          "producer_id": "us-failed-producer",
+          "sequence": 1,
+          "timestamp": "2026-10-21T10:00:04Z",
+          "event_type": "run",
+          "stage_id": "created",
+          "status": "started",
+          "message": "Run started",
+          "details": {},
+          "resources": null
+        },
+        {
+          "schema_version": 1,
+          "event_id": "us-run-failed-2",
+          "run_id": "us-run-failed",
+          "producer_id": "us-failed-producer",
+          "sequence": 2,
+          "timestamp": "2026-10-21T11:00:00Z",
+          "event_type": "stage",
+          "stage_id": "release_acceptance",
+          "status": "started",
+          "message": null,
+          "details": {},
+          "resources": null
+        },
+        {
+          "schema_version": 1,
+          "event_id": "us-run-failed-3",
+          "run_id": "us-run-failed",
+          "producer_id": "us-failed-producer",
+          "sequence": 3,
+          "timestamp": "2026-10-21T11:05:00Z",
+          "event_type": "run",
+          "stage_id": "release_acceptance",
+          "status": "failed",
+          "message": "Release acceptance checks failed: 1 critical target is outside its tolerance.",
+          "details": {
+            "error_type": "ReleaseAcceptanceError",
+            "error_code": "RELEASE_ACCEPTANCE",
+            "failure_class": "acceptance",
+            "failed_during": "release_acceptance"
+          },
+          "resources": null
+        }
+      ]
+    }
+  }
+}

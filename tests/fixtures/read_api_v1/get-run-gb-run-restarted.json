@@ -1,0 +1,176 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/v1/runs/gb-run-restarted",
+    "headers": {
+      "X-Telemetry-Read-Token": "dashboard-read-token"
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "run_id": "gb-run-restarted",
+      "country_code": "GB",
+      "progress": {
+        "schema_version": 2,
+        "run_id": "gb-run-restarted",
+        "country_code": "GB",
+        "operation_id": "gb-run-restarted",
+        "pipeline": {
+          "id": "uk-national",
+          "version": "collector-v1"
+        },
+        "candidate_id": null,
+        "release_id": null,
+        "run_kind": "calibration",
+        "non_release": true,
+        "started_at": "2026-10-23T08:00:05Z",
+        "updated_at": "2026-10-23T08:21:00Z",
+        "status": "running",
+        "current_stage": "calibrate",
+        "heartbeat_at": "2026-10-23T08:21:00Z",
+        "resources": {
+          "cpu_user_seconds": 90.5,
+          "cpu_system_seconds": 3.25,
+          "rss_bytes": 65536,
+          "peak_rss_bytes": 131072
+        },
+        "reading": null,
+        "work": {
+          "stage": "calibrate",
+          "done": 10,
+          "total": 200,
+          "unit": "epochs",
+          "elapsed_seconds": 30,
+          "updated_at": "2026-10-23T08:20:00+00:00",
+          "details": {}
+        },
+        "failure": null,
+        "block": null
+      },
+      "run_manifest": {
+        "schema_version": 2,
+        "run_id": "gb-run-restarted",
+        "country_code": "GB",
+        "operation_id": "gb-run-restarted",
+        "pipeline": {
+          "id": "uk-national",
+          "version": "collector-v1"
+        },
+        "candidate_id": null,
+        "release_id": null,
+        "run_kind": "calibration",
+        "non_release": true,
+        "started_at": "2026-10-23T08:00:05Z",
+        "updated_at": "2026-10-23T08:21:00Z",
+        "status": "running",
+        "current_stage": "calibrate",
+        "identity": null,
+        "environment": null,
+        "failure": null,
+        "block": null,
+        "delivery": {
+          "mode": "collector",
+          "upload_attempts": null,
+          "upload_successes": null
+        }
+      },
+      "calibration_progress": null,
+      "events": [
+        {
+          "schema_version": 2,
+          "sequence": 1,
+          "timestamp": "2026-10-23T07:00:02Z",
+          "time": "2026-10-23T07:00:02Z",
+          "event_type": "stage",
+          "run_id": "gb-run-restarted",
+          "stage_id": "created",
+          "stage": "created",
+          "status": "started",
+          "message": "Run started",
+          "details": {},
+          "resources": null,
+          "producer_id": "gb-restarted-first-attempt",
+          "event_id": "gb-run-restarted-first-1"
+        },
+        {
+          "schema_version": 2,
+          "sequence": 2,
+          "timestamp": "2026-10-23T07:30:00Z",
+          "time": "2026-10-23T07:30:00Z",
+          "event_type": "stage",
+          "run_id": "gb-run-restarted",
+          "stage_id": "calibrate",
+          "stage": "calibrate",
+          "status": "failed",
+          "message": "Worker preempted",
+          "details": {
+            "error_type": "WorkerLost"
+          },
+          "resources": null,
+          "producer_id": "gb-restarted-first-attempt",
+          "event_id": "gb-run-restarted-first-2"
+        },
+        {
+          "schema_version": 2,
+          "sequence": 3,
+          "timestamp": "2026-10-23T08:00:05Z",
+          "time": "2026-10-23T08:00:05Z",
+          "event_type": "stage",
+          "run_id": "gb-run-restarted",
+          "stage_id": "created",
+          "stage": "created",
+          "status": "started",
+          "message": "Run started",
+          "details": {},
+          "resources": null,
+          "producer_id": "gb-restarted-second-attempt",
+          "event_id": "gb-run-restarted-second-1"
+        },
+        {
+          "schema_version": 2,
+          "sequence": 4,
+          "timestamp": "2026-10-23T08:20:00Z",
+          "time": "2026-10-23T08:20:00Z",
+          "event_type": "stage",
+          "run_id": "gb-run-restarted",
+          "stage_id": "calibrate",
+          "stage": "calibrate",
+          "status": "progress",
+          "message": null,
+          "details": {
+            "done": 10,
+            "total": 200,
+            "unit": "epochs",
+            "elapsed_seconds": 30
+          },
+          "resources": null,
+          "producer_id": "gb-restarted-second-attempt",
+          "event_id": "gb-run-restarted-second-2"
+        },
+        {
+          "schema_version": 2,
+          "sequence": 5,
+          "timestamp": "2026-10-23T08:21:00Z",
+          "time": "2026-10-23T08:21:00Z",
+          "event_type": "stage",
+          "run_id": "gb-run-restarted",
+          "stage_id": null,
+          "stage": null,
+          "status": "progress",
+          "message": null,
+          "details": {},
+          "resources": {
+            "cpu_user_seconds": 90.5,
+            "cpu_system_seconds": 3.25,
+            "rss_bytes": 65536,
+            "peak_rss_bytes": 131072
+          },
+          "producer_id": "gb-restarted-second-attempt",
+          "event_id": "gb-run-restarted-second-3"
+        }
+      ],
+      "sleeps": []
+    }
+  }
+}

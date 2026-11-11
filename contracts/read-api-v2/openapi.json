@@ -1,0 +1,1628 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Microcosm collector read API",
+    "version": "2",
+    "description": "Version 2 of the Microcosm collector's read API. Each request carries the dashboard read credential in `X-Telemetry-Read-Token`. While a deployment is in progress, every request may answer 503 with `Retry-After`."
+  },
+  "paths": {
+    "/v2/runs": {
+      "get": {
+        "tags": [
+          "read API v2"
+        ],
+        "summary": "List runs, newest registration first",
+        "operationId": "listRuns",
+        "security": [
+          {
+            "ReadToken": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "country",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "pattern": "^[A-Z]{2}$"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only runs of this country, such as `US` or `GB`.",
+              "title": "Country"
+            },
+            "description": "Only runs of this country, such as `US` or `GB`."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 200,
+              "minimum": 1,
+              "description": "The most runs to return.",
+              "default": 60,
+              "title": "Limit"
+            },
+            "description": "The most runs to return."
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The previous page's `next_before`.",
+              "title": "Before"
+            },
+            "description": "The previous page's `next_before`."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunPage"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The read credential is missing or wrong.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "A deployment is in progress; retry after the `Retry-After` header's seconds.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v2/runs/{run_id}": {
+      "get": {
+        "tags": [
+          "read API v2"
+        ],
+        "summary": "A run's state and the events it was rebuilt from",
+        "operationId": "getRun",
+        "security": [
+          {
+            "ReadToken": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The read credential is missing or wrong.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "A deployment is in progress; retry after the `Retry-After` header's seconds.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The run was not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ErrorMessage": {
+        "properties": {
+          "detail": {
+            "type": "string",
+            "title": "Detail"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "detail"
+        ],
+        "title": "ErrorMessage",
+        "description": "An error explained in one sentence."
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "MachineEnvironment": {
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "local",
+              "modal_container"
+            ],
+            "title": "Kind"
+          },
+          "os": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Os"
+          },
+          "os_version": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Os Version"
+          },
+          "architecture": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Architecture"
+          },
+          "cpu_model": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cpu Model"
+          },
+          "logical_cpus": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Logical Cpus"
+          },
+          "memory_total_bytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Total Bytes"
+          },
+          "cgroup_cpu_limit_cores": {
+            "anyOf": [
+              {
+                "type": "number",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cgroup Cpu Limit Cores"
+          },
+          "cgroup_memory_limit_bytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cgroup Memory Limit Bytes"
+          },
+          "modal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ModalContainer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "emitter_version": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Emitter Version"
+          },
+          "python_version": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Python Version"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "kind",
+          "os",
+          "os_version",
+          "architecture",
+          "cpu_model",
+          "logical_cpus",
+          "memory_total_bytes",
+          "cgroup_cpu_limit_cores",
+          "cgroup_memory_limit_bytes",
+          "modal",
+          "emitter_version",
+          "python_version"
+        ],
+        "title": "MachineEnvironment",
+        "description": "Where a build runs, on its run's start (``details.environment``)."
+      },
+      "MachineReading": {
+        "properties": {
+          "memory_available_bytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Available Bytes"
+          },
+          "memory_compressed_bytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Compressed Bytes"
+          },
+          "memory_pressure_level": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "normal",
+                  "warning",
+                  "critical"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Pressure Level"
+          },
+          "memory_stall_some_share": {
+            "anyOf": [
+              {
+                "type": "number",
+                "maximum": 1.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Stall Some Share"
+          },
+          "memory_stall_full_share": {
+            "anyOf": [
+              {
+                "type": "number",
+                "maximum": 1.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Stall Full Share"
+          },
+          "swap_used_bytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Swap Used Bytes"
+          },
+          "swap_total_bytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Swap Total Bytes"
+          },
+          "swap_in_bytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Swap In Bytes"
+          },
+          "swap_out_bytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Swap Out Bytes"
+          },
+          "cpu_busy_share": {
+            "anyOf": [
+              {
+                "type": "number",
+                "maximum": 1.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cpu Busy Share"
+          },
+          "load_average_1m": {
+            "anyOf": [
+              {
+                "type": "number",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Load Average 1M"
+          },
+          "on_battery": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "On Battery"
+          },
+          "disk_free_bytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Disk Free Bytes"
+          },
+          "cgroup_memory_bytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cgroup Memory Bytes"
+          },
+          "cgroup_memory_limit_bytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cgroup Memory Limit Bytes"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "memory_available_bytes",
+          "memory_compressed_bytes",
+          "memory_pressure_level",
+          "memory_stall_some_share",
+          "memory_stall_full_share",
+          "swap_used_bytes",
+          "swap_total_bytes",
+          "swap_in_bytes",
+          "swap_out_bytes",
+          "cpu_busy_share",
+          "load_average_1m",
+          "on_battery",
+          "disk_free_bytes",
+          "cgroup_memory_bytes",
+          "cgroup_memory_limit_bytes"
+        ],
+        "title": "MachineReading",
+        "description": "The machine at one reading; each value the emitter can't read is null."
+      },
+      "ModalContainer": {
+        "properties": {
+          "task_id": {
+            "type": "string",
+            "maxLength": 200,
+            "title": "Task Id"
+          },
+          "region": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Region"
+          },
+          "cloud_provider": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cloud Provider"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "task_id",
+          "region",
+          "cloud_provider"
+        ],
+        "title": "ModalContainer",
+        "description": "The Modal container a build runs in."
+      },
+      "OuterProgress": {
+        "properties": {
+          "done": {
+            "type": "integer",
+            "title": "Done"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "unit": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unit"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "done",
+          "total",
+          "unit"
+        ],
+        "title": "OuterProgress",
+        "description": "The counter one level above a stage's own, such as the pass of a batch."
+      },
+      "ProcessTreeReading": {
+        "properties": {
+          "processes": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Processes"
+          },
+          "memory_bytes": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Memory Bytes"
+          },
+          "memory_peak_bytes": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Memory Peak Bytes"
+          },
+          "interval_memory_peak_bytes": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Interval Memory Peak Bytes"
+          },
+          "cpu_user_cores": {
+            "anyOf": [
+              {
+                "type": "number",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cpu User Cores"
+          },
+          "cpu_system_cores": {
+            "anyOf": [
+              {
+                "type": "number",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cpu System Cores"
+          },
+          "disk_read_bytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Disk Read Bytes"
+          },
+          "disk_written_bytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Disk Written Bytes"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "processes",
+          "memory_bytes",
+          "memory_peak_bytes",
+          "interval_memory_peak_bytes",
+          "cpu_user_cores",
+          "cpu_system_cores",
+          "disk_read_bytes",
+          "disk_written_bytes"
+        ],
+        "title": "ProcessTreeReading",
+        "description": "The build and every descendant process at one reading.\n\nMemory is the physical footprint on macOS and RSS elsewhere; the CPU\nshares are cores in use and the disk bytes those moved during the\nreading's interval."
+      },
+      "ProducerSleep": {
+        "properties": {
+          "started_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Started At"
+          },
+          "ended_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Ended At"
+          },
+          "seconds": {
+            "type": "number",
+            "minimum": 0.0,
+            "title": "Seconds"
+          },
+          "producer_id": {
+            "type": "string",
+            "title": "Producer Id"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "started_at",
+          "ended_at",
+          "seconds",
+          "producer_id"
+        ],
+        "title": "ProducerSleep",
+        "description": "One system sleep, with the producer that recorded it."
+      },
+      "RawEvent": {
+        "properties": {
+          "schema_version": {
+            "type": "integer",
+            "const": 1,
+            "title": "Schema Version"
+          },
+          "event_id": {
+            "type": "string",
+            "title": "Event Id"
+          },
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "producer_id": {
+            "type": "string",
+            "title": "Producer Id"
+          },
+          "sequence": {
+            "type": "integer",
+            "title": "Sequence"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Timestamp"
+          },
+          "event_type": {
+            "type": "string",
+            "enum": [
+              "run",
+              "stage",
+              "progress",
+              "calibration",
+              "heartbeat"
+            ],
+            "title": "Event Type"
+          },
+          "stage_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stage Id"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "started",
+              "progress",
+              "completed",
+              "failed",
+              "blocked"
+            ],
+            "title": "Status"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message"
+          },
+          "details": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Details"
+          },
+          "resources": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Resources"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "schema_version",
+          "event_id",
+          "run_id",
+          "producer_id",
+          "sequence",
+          "timestamp",
+          "event_type",
+          "stage_id",
+          "status",
+          "message",
+          "details",
+          "resources"
+        ],
+        "title": "RawEvent",
+        "description": "An event as the collector stored it.\n\nEvery field of the event model is present: an optional field the producer\nleft out is null (`details` an empty object), and the timestamp is in UTC."
+      },
+      "ReadingProgress": {
+        "properties": {
+          "stage_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$",
+            "title": "Stage Id"
+          },
+          "done": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Done"
+          },
+          "total": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total"
+          },
+          "unit": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unit"
+          },
+          "outer": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OuterProgress"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reported_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Reported At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "stage_id",
+          "done",
+          "total",
+          "unit",
+          "outer",
+          "reported_at"
+        ],
+        "title": "ReadingProgress",
+        "description": "The latest progress the build reported, as a reading repeats it.\n\n``done`` and ``total`` are null unless the build sent numbers."
+      },
+      "Resources": {
+        "properties": {
+          "cpu_user_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cpu User Seconds"
+          },
+          "cpu_system_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cpu System Seconds"
+          },
+          "rss_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rss Bytes"
+          },
+          "peak_rss_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Peak Rss Bytes"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "cpu_user_seconds",
+          "cpu_system_seconds",
+          "rss_bytes",
+          "peak_rss_bytes"
+        ],
+        "title": "Resources",
+        "description": "Cumulative CPU and current and peak resident memory of a process tree."
+      },
+      "RunBlock": {
+        "properties": {
+          "phase": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Phase"
+          },
+          "blocking_failure_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Blocking Failure Count"
+          },
+          "blocking_gate_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Blocking Gate Ids"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "phase",
+          "blocking_failure_count",
+          "blocking_gate_ids"
+        ],
+        "title": "RunBlock",
+        "description": "The acceptance checks' refusal, from the event that blocked the run."
+      },
+      "RunDetail": {
+        "properties": {
+          "run": {
+            "$ref": "#/components/schemas/RunState"
+          },
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/RawEvent"
+            },
+            "type": "array",
+            "title": "Events",
+            "description": "Every stored event of the run, in the order the collector applies them: producers by registration time, then producer id, and each producer's events by sequence."
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "run",
+          "events"
+        ],
+        "title": "RunDetail",
+        "description": "A run's state and every event it was rebuilt from."
+      },
+      "RunFailure": {
+        "properties": {
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message"
+          },
+          "error_type": {
+            "title": "Error Type"
+          },
+          "error_code": {
+            "title": "Error Code"
+          },
+          "failure_class": {
+            "title": "Failure Class"
+          },
+          "failed_during": {
+            "title": "Failed During"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "message",
+          "error_type",
+          "error_code",
+          "failure_class",
+          "failed_during"
+        ],
+        "title": "RunFailure",
+        "description": "Why a failed run failed, from the event that failed it."
+      },
+      "RunPage": {
+        "properties": {
+          "runs": {
+            "items": {
+              "$ref": "#/components/schemas/RunSummary"
+            },
+            "type": "array",
+            "title": "Runs"
+          },
+          "next_before": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Before",
+            "description": "Pass as `before` for the next page. Null when this page holds fewer runs than `limit`; a full last page is followed by an empty one."
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "runs",
+          "next_before"
+        ],
+        "title": "RunPage",
+        "description": "One page of runs, newest registration first."
+      },
+      "RunState": {
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "country_code": {
+            "type": "string",
+            "title": "Country Code"
+          },
+          "pipeline": {
+            "type": "string",
+            "title": "Pipeline"
+          },
+          "candidate_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidate Id"
+          },
+          "release_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Release Id"
+          },
+          "run_kind": {
+            "type": "string",
+            "title": "Run Kind"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "running",
+              "completed",
+              "failed",
+              "blocked"
+            ],
+            "title": "Status"
+          },
+          "current_stage": {
+            "type": "string",
+            "title": "Current Stage"
+          },
+          "registered_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Registered At"
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Started At"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Updated At"
+          },
+          "ended_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ended At"
+          },
+          "heartbeat_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Heartbeat At"
+          },
+          "resources": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Resources"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "work": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunWork"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "failure": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunFailure"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "block": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunBlock"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "environment": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MachineEnvironment"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reading": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TimedReading"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "sleeps": {
+            "items": {
+              "$ref": "#/components/schemas/ProducerSleep"
+            },
+            "type": "array",
+            "title": "Sleeps"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "run_id",
+          "country_code",
+          "pipeline",
+          "candidate_id",
+          "release_id",
+          "run_kind",
+          "status",
+          "current_stage",
+          "registered_at",
+          "started_at",
+          "updated_at",
+          "ended_at",
+          "heartbeat_at",
+          "resources",
+          "work",
+          "failure",
+          "block",
+          "environment",
+          "reading",
+          "sleeps"
+        ],
+        "title": "RunState",
+        "description": "A run's state, rebuilt from the events returned with it.\n\n`environment`, `reading` and `sleeps` come from the details microcosm-emitter\n0.14.0 and later write: the latest run start's machine description, the\ncurrent attempt's latest reading, and every attempt's sleeps. A stored value\nthat doesn't match its model is left out."
+      },
+      "RunSummary": {
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "country_code": {
+            "type": "string",
+            "title": "Country Code"
+          },
+          "pipeline": {
+            "type": "string",
+            "title": "Pipeline"
+          },
+          "candidate_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidate Id"
+          },
+          "release_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Release Id"
+          },
+          "run_kind": {
+            "type": "string",
+            "title": "Run Kind"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "running",
+              "completed",
+              "failed",
+              "blocked"
+            ],
+            "title": "Status"
+          },
+          "current_stage": {
+            "type": "string",
+            "title": "Current Stage"
+          },
+          "registered_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Registered At"
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Started At"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Updated At"
+          },
+          "ended_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ended At"
+          },
+          "heartbeat_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Heartbeat At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "run_id",
+          "country_code",
+          "pipeline",
+          "candidate_id",
+          "release_id",
+          "run_kind",
+          "status",
+          "current_stage",
+          "registered_at",
+          "started_at",
+          "updated_at",
+          "ended_at",
+          "heartbeat_at"
+        ],
+        "title": "RunSummary",
+        "description": "A run's registration and the stored summary of its state."
+      },
+      "RunWork": {
+        "properties": {
+          "stage": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stage"
+          },
+          "done": {
+            "title": "Done"
+          },
+          "total": {
+            "title": "Total"
+          },
+          "unit": {
+            "title": "Unit"
+          },
+          "elapsed_seconds": {
+            "title": "Elapsed Seconds"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Updated At",
+            "description": "The event's timestamp."
+          },
+          "details": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Details"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "stage",
+          "done",
+          "total",
+          "unit",
+          "elapsed_seconds",
+          "updated_at",
+          "details"
+        ],
+        "title": "RunWork",
+        "description": "The latest progress event that reported `done` and `total`.\n\nExcept for `stage` and `updated_at`, the values are the event's details as\nthe producer sent them."
+      },
+      "TimedReading": {
+        "properties": {
+          "interval_seconds": {
+            "type": "number",
+            "minimum": 0.0,
+            "title": "Interval Seconds"
+          },
+          "late_seconds": {
+            "type": "number",
+            "minimum": 0.0,
+            "title": "Late Seconds"
+          },
+          "stages": {
+            "items": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$"
+            },
+            "type": "array",
+            "maxItems": 32,
+            "title": "Stages"
+          },
+          "progress": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ReadingProgress"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "process_tree": {
+            "$ref": "#/components/schemas/ProcessTreeReading"
+          },
+          "machine": {
+            "$ref": "#/components/schemas/MachineReading"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Timestamp",
+            "description": "The heartbeat's timestamp."
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "interval_seconds",
+          "late_seconds",
+          "stages",
+          "progress",
+          "process_tree",
+          "machine",
+          "timestamp"
+        ],
+        "title": "TimedReading",
+        "description": "A heartbeat's reading of the build and its machine, with its time."
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    },
+    "securitySchemes": {
+      "ReadToken": {
+        "type": "apiKey",
+        "description": "The dashboard read credential.",
+        "in": "header",
+        "name": "X-Telemetry-Read-Token"
+      }
+    }
+  }
+}

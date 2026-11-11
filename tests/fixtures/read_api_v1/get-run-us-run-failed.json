@@ -1,0 +1,136 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/v1/runs/us-run-failed",
+    "headers": {
+      "X-Telemetry-Read-Token": "dashboard-read-token"
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "run_id": "us-run-failed",
+      "country_code": "US",
+      "progress": {
+        "schema_version": 2,
+        "run_id": "us-run-failed",
+        "country_code": "US",
+        "operation_id": "us-run-failed",
+        "pipeline": {
+          "id": "us-fiscal-refresh",
+          "version": "collector-v1"
+        },
+        "candidate_id": null,
+        "release_id": "us-2026.10",
+        "run_kind": "release",
+        "non_release": false,
+        "started_at": "2026-10-21T10:00:00Z",
+        "updated_at": "2026-10-21T11:05:00Z",
+        "status": "failed",
+        "current_stage": "failed",
+        "heartbeat_at": null,
+        "resources": null,
+        "reading": null,
+        "work": null,
+        "failure": {
+          "message": "Release acceptance checks failed: 1 critical target is outside its tolerance.",
+          "error_type": "ReleaseAcceptanceError",
+          "error_code": "RELEASE_ACCEPTANCE",
+          "failure_class": "acceptance",
+          "failed_during": "release_acceptance"
+        },
+        "block": null
+      },
+      "run_manifest": {
+        "schema_version": 2,
+        "run_id": "us-run-failed",
+        "country_code": "US",
+        "operation_id": "us-run-failed",
+        "pipeline": {
+          "id": "us-fiscal-refresh",
+          "version": "collector-v1"
+        },
+        "candidate_id": null,
+        "release_id": "us-2026.10",
+        "run_kind": "release",
+        "non_release": false,
+        "started_at": "2026-10-21T10:00:00Z",
+        "updated_at": "2026-10-21T11:05:00Z",
+        "status": "failed",
+        "current_stage": "failed",
+        "identity": null,
+        "environment": null,
+        "failure": {
+          "message": "Release acceptance checks failed: 1 critical target is outside its tolerance.",
+          "error_type": "ReleaseAcceptanceError",
+          "error_code": "RELEASE_ACCEPTANCE",
+          "failure_class": "acceptance",
+          "failed_during": "release_acceptance"
+        },
+        "block": null,
+        "delivery": {
+          "mode": "collector",
+          "upload_attempts": null,
+          "upload_successes": null
+        }
+      },
+      "calibration_progress": null,
+      "events": [
+        {
+          "schema_version": 2,
+          "sequence": 1,
+          "timestamp": "2026-10-21T10:00:04Z",
+          "time": "2026-10-21T10:00:04Z",
+          "event_type": "stage",
+          "run_id": "us-run-failed",
+          "stage_id": "created",
+          "stage": "created",
+          "status": "started",
+          "message": "Run started",
+          "details": {},
+          "resources": null,
+          "producer_id": "us-failed-producer",
+          "event_id": "us-run-failed-1"
+        },
+        {
+          "schema_version": 2,
+          "sequence": 2,
+          "timestamp": "2026-10-21T11:00:00Z",
+          "time": "2026-10-21T11:00:00Z",
+          "event_type": "stage",
+          "run_id": "us-run-failed",
+          "stage_id": "release_acceptance",
+          "stage": "release_acceptance",
+          "status": "started",
+          "message": null,
+          "details": {},
+          "resources": null,
+          "producer_id": "us-failed-producer",
+          "event_id": "us-run-failed-2"
+        },
+        {
+          "schema_version": 2,
+          "sequence": 3,
+          "timestamp": "2026-10-21T11:05:00Z",
+          "time": "2026-10-21T11:05:00Z",
+          "event_type": "stage",
+          "run_id": "us-run-failed",
+          "stage_id": "release_acceptance",
+          "stage": "release_acceptance",
+          "status": "failed",
+          "message": "Release acceptance checks failed: 1 critical target is outside its tolerance.",
+          "details": {
+            "error_type": "ReleaseAcceptanceError",
+            "error_code": "RELEASE_ACCEPTANCE",
+            "failure_class": "acceptance",
+            "failed_during": "release_acceptance"
+          },
+          "resources": null,
+          "producer_id": "us-failed-producer",
+          "event_id": "us-run-failed-3"
+        }
+      ],
+      "sleeps": []
+    }
+  }
+}

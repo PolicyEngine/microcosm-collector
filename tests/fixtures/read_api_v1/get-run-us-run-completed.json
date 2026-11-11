@@ -1,0 +1,238 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/v1/runs/us-run-completed",
+    "headers": {
+      "X-Telemetry-Read-Token": "dashboard-read-token"
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "run_id": "us-run-completed",
+      "country_code": "US",
+      "progress": {
+        "schema_version": 2,
+        "run_id": "us-run-completed",
+        "country_code": "US",
+        "operation_id": "us-run-completed",
+        "pipeline": {
+          "id": "us-fiscal-refresh",
+          "version": "collector-v1"
+        },
+        "candidate_id": "candidate-a",
+        "release_id": null,
+        "run_kind": "build",
+        "non_release": true,
+        "started_at": "2026-10-20T09:00:00Z",
+        "updated_at": "2026-10-20T09:31:00Z",
+        "status": "completed",
+        "current_stage": "complete",
+        "heartbeat_at": "2026-10-20T09:11:00Z",
+        "resources": {
+          "cpu_user_seconds": 600.25,
+          "cpu_system_seconds": null,
+          "rss_bytes": 4096,
+          "peak_rss_bytes": 8192
+        },
+        "reading": null,
+        "work": {
+          "stage": "calibrate",
+          "done": 50,
+          "total": 500,
+          "unit": "epochs",
+          "elapsed_seconds": 12.5,
+          "updated_at": "2026-10-20T09:10:00+00:00",
+          "details": {
+            "loss": 0.25
+          }
+        },
+        "failure": null,
+        "block": null
+      },
+      "run_manifest": {
+        "schema_version": 2,
+        "run_id": "us-run-completed",
+        "country_code": "US",
+        "operation_id": "us-run-completed",
+        "pipeline": {
+          "id": "us-fiscal-refresh",
+          "version": "collector-v1"
+        },
+        "candidate_id": "candidate-a",
+        "release_id": null,
+        "run_kind": "build",
+        "non_release": true,
+        "started_at": "2026-10-20T09:00:00Z",
+        "updated_at": "2026-10-20T09:31:00Z",
+        "status": "completed",
+        "current_stage": "complete",
+        "identity": {
+          "microcosm_version": "0.40.0",
+          "country": "us"
+        },
+        "environment": null,
+        "failure": null,
+        "block": null,
+        "delivery": {
+          "mode": "collector",
+          "upload_attempts": null,
+          "upload_successes": null
+        }
+      },
+      "calibration_progress": {
+        "schema_version": 2,
+        "run_id": "us-run-completed",
+        "candidate_id": "candidate-a",
+        "updated_at": "2026-10-20T09:31:00Z",
+        "events": [
+          {
+            "time": "2026-10-20T09:10:01Z",
+            "timestamp": "2026-10-20T09:10:01Z",
+            "epoch": 50,
+            "loss": 0.25
+          }
+        ]
+      },
+      "events": [
+        {
+          "schema_version": 2,
+          "sequence": 1,
+          "timestamp": "2026-10-20T09:00:05Z",
+          "time": "2026-10-20T09:00:05Z",
+          "event_type": "stage",
+          "run_id": "us-run-completed",
+          "stage_id": "created",
+          "stage": "created",
+          "status": "started",
+          "message": "Run started",
+          "details": {
+            "identity": {
+              "microcosm_version": "0.40.0",
+              "country": "us"
+            }
+          },
+          "resources": null,
+          "producer_id": "us-completed-producer",
+          "event_id": "us-run-completed-1"
+        },
+        {
+          "schema_version": 2,
+          "sequence": 2,
+          "timestamp": "2026-10-20T09:00:10Z",
+          "time": "2026-10-20T09:00:10Z",
+          "event_type": "stage",
+          "run_id": "us-run-completed",
+          "stage_id": "target_compilation",
+          "stage": "target_compilation",
+          "status": "started",
+          "message": "Compiling targets.",
+          "details": {},
+          "resources": {
+            "cpu_user_seconds": 2.0,
+            "cpu_system_seconds": 0.5,
+            "rss_bytes": 1024,
+            "peak_rss_bytes": 2048
+          },
+          "producer_id": "us-completed-producer",
+          "event_id": "us-run-completed-2"
+        },
+        {
+          "schema_version": 2,
+          "sequence": 3,
+          "timestamp": "2026-10-20T09:10:00Z",
+          "time": "2026-10-20T09:10:00Z",
+          "event_type": "stage",
+          "run_id": "us-run-completed",
+          "stage_id": "calibrate",
+          "stage": "calibrate",
+          "status": "progress",
+          "message": null,
+          "details": {
+            "done": 50,
+            "total": 500,
+            "unit": "epochs",
+            "elapsed_seconds": 12.5,
+            "loss": 0.25
+          },
+          "resources": null,
+          "producer_id": "us-completed-producer",
+          "event_id": "us-run-completed-3"
+        },
+        {
+          "schema_version": 2,
+          "sequence": 4,
+          "timestamp": "2026-10-20T09:10:01Z",
+          "time": "2026-10-20T09:10:01Z",
+          "event_type": "calibration",
+          "run_id": "us-run-completed",
+          "stage_id": "calibrate",
+          "stage": "calibrate",
+          "status": "progress",
+          "message": null,
+          "details": {
+            "epoch": 50,
+            "loss": 0.25
+          },
+          "resources": null,
+          "producer_id": "us-completed-producer",
+          "event_id": "us-run-completed-4"
+        },
+        {
+          "schema_version": 2,
+          "sequence": 5,
+          "timestamp": "2026-10-20T09:11:00Z",
+          "time": "2026-10-20T09:11:00Z",
+          "event_type": "stage",
+          "run_id": "us-run-completed",
+          "stage_id": null,
+          "stage": null,
+          "status": "progress",
+          "message": null,
+          "details": {},
+          "resources": {
+            "cpu_user_seconds": 600.25,
+            "cpu_system_seconds": null,
+            "rss_bytes": 4096,
+            "peak_rss_bytes": 8192
+          },
+          "producer_id": "us-completed-producer",
+          "event_id": "us-run-completed-5"
+        },
+        {
+          "schema_version": 2,
+          "sequence": 6,
+          "timestamp": "2026-10-20T09:30:00Z",
+          "time": "2026-10-20T09:30:00Z",
+          "event_type": "stage",
+          "run_id": "us-run-completed",
+          "stage_id": "calibrate",
+          "stage": "calibrate",
+          "status": "completed",
+          "message": null,
+          "details": {},
+          "resources": null,
+          "producer_id": "us-completed-producer",
+          "event_id": "us-run-completed-6"
+        },
+        {
+          "schema_version": 2,
+          "sequence": 7,
+          "timestamp": "2026-10-20T09:31:00Z",
+          "time": "2026-10-20T09:31:00Z",
+          "event_type": "stage",
+          "run_id": "us-run-completed",
+          "stage_id": "complete",
+          "stage": "complete",
+          "status": "completed",
+          "message": "Run completed",
+          "details": {},
+          "resources": null,
+          "producer_id": "us-completed-producer",
+          "event_id": "us-run-completed-7"
+        }
+      ],
+      "sleeps": []
+    }
+  }
+}

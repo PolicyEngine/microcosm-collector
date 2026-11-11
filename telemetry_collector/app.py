@@ -13,9 +13,20 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
-import jwt
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
+from fastapi import (
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Path,
+    Query,
+    Response,
+    Security,
+    status,
+)
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.security import APIKeyHeader
 from jwt import InvalidTokenError
 from pydantic import ValidationError
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -35,6 +46,7 @@ from telemetry_collector.intake_api import (
     submission_router,
 )
 from telemetry_collector.models import (
+    SAFE_IDENTIFIER,
     CollectorToken,
     EventBatch,
     PageCursor,
@@ -42,6 +54,20 @@ from telemetry_collector.models import (
     SessionScope,
     TokenExchangeRequest,
     require_telemetry_scope_for_lifetime,
+)
+from telemetry_collector.read_api_v2 import (
+    ErrorMessage,
+    RunDetail,
+    RunPage,
+    openapi_document,
+    run_detail,
+)
+from telemetry_collector.session_tokens import (
+    SIGNING_KEY_VARIABLE,
+    SessionSigningKey,
+    json_web_key_set,
+    sign_session_token,
+    verify_session_token,
 )
 from telemetry_collector.storage import (
     PostgresTelemetryStore,
@@ -54,8 +80,12 @@ from telemetry_collector.storage import (
 class CollectorSettings:
     """Secrets and policy read once when the collector starts."""
 
-    jwt_secret: str
+    # The HS256 secret. It signs new session tokens only while no signing key
+    # is configured, and verifies HS256 tokens for as long as it is configured.
+    jwt_secret: str | None
     read_token: str
+    # The ES256 key that signs new session tokens once it is configured.
+    signing_key: SessionSigningKey | None = None
     required_huggingface_org: str = "policyengine"
     collector_issuer: str = "policyengine-telemetry"
     collector_audience: str = "microcosm-telemetry-collector"
@@ -66,9 +96,14 @@ class CollectorSettings:
 
     @classmethod
     def from_environment(cls) -> CollectorSettings:
-        jwt_secret = _required_environment("TELEMETRY_JWT_SECRET")
+        jwt_secret = _optional_secret_environment("TELEMETRY_JWT_SECRET")
+        signing_key_pem = _optional_secret_environment(SIGNING_KEY_VARIABLE)
         read_token = _required_environment("TELEMETRY_READ_TOKEN")
-        if len(jwt_secret) < 32:
+        if jwt_secret is None and signing_key_pem is None:
+            raise RuntimeError(
+                f"{SIGNING_KEY_VARIABLE} or TELEMETRY_JWT_SECRET is required."
+            )
+        if jwt_secret is not None and len(jwt_secret) < 32:
             raise RuntimeError(
                 "TELEMETRY_JWT_SECRET must contain at least 32 characters."
             )
@@ -76,9 +111,18 @@ class CollectorSettings:
             raise RuntimeError(
                 "TELEMETRY_READ_TOKEN must contain at least 24 characters."
             )
+        try:
+            signing_key = (
+                None
+                if signing_key_pem is None
+                else SessionSigningKey.from_pem(signing_key_pem)
+            )
+        except ValueError as error:
+            raise RuntimeError(str(error)) from None
         return cls(
             jwt_secret=jwt_secret,
             read_token=read_token,
+            signing_key=signing_key,
             required_huggingface_org=os.environ.get("TELEMETRY_HF_ORG", "policyengine"),
             collector_issuer=os.environ.get(
                 "TELEMETRY_JWT_ISSUER", "policyengine-telemetry"
@@ -92,6 +136,10 @@ class CollectorSettings:
             maintenance_mode=os.environ.get("TELEMETRY_MAINTENANCE_MODE") == "1",
             intake=IntakeSettings.from_environment(),
         )
+
+    def __post_init__(self) -> None:
+        if self.signing_key is None and self.jwt_secret is None:
+            raise ValueError("Session tokens need a signing key or an HS256 secret.")
 
 
 @dataclass(frozen=True)
@@ -191,9 +239,28 @@ class MaintenanceModeMiddleware:
 
 
 def _required_environment(name: str) -> str:
-    value = os.environ.get(name, "").strip()
-    if not value:
+    value = _optional_environment(name)
+    if value is None:
         raise RuntimeError(f"{name} is required.")
+    return value
+
+
+def _optional_environment(name: str) -> str | None:
+    return os.environ.get(name, "").strip() or None
+
+
+def _optional_secret_environment(name: str) -> str | None:
+    """A secret that may be absent, but that stops startup when set and blank.
+
+    Deployment mounts each one from Secret Manager, so a blank value means a
+    mistaken secret version rather than a secret that isn't configured.
+    """
+
+    if name not in os.environ:
+        return None
+    value = _optional_environment(name)
+    if value is None:
+        raise RuntimeError(f"{name} is set but empty.")
     return value
 
 
@@ -217,9 +284,14 @@ def _page_cursor(registered_at: datetime, run_id: str) -> str:
     return base64.urlsafe_b64encode(payload).decode().rstrip("=")
 
 
-def _parse_page_cursor(value: str | None) -> tuple[datetime, str] | None:
-    if value is None:
-        return None
+class InvalidPageCursorError(ValueError):
+    """Raised for a pagination cursor that the collector did not issue."""
+
+
+INVALID_PAGE_CURSOR = "Pagination cursor is invalid."
+
+
+def _decode_page_cursor(value: str) -> tuple[datetime, str]:
     try:
         padded = value + "=" * (-len(value) % 4)
         raw = base64.b64decode(padded, altchars=b"-_", validate=True)
@@ -232,10 +304,59 @@ def _parse_page_cursor(value: str | None) -> tuple[datetime, str] | None:
         binascii.Error,
         ValidationError,
     ) as error:
-        raise HTTPException(
-            status_code=422, detail="Pagination cursor is invalid."
-        ) from error
+        raise InvalidPageCursorError(INVALID_PAGE_CURSOR) from error
     return timestamp, run_id
+
+
+def _parse_page_cursor(value: str | None) -> tuple[datetime, str] | None:
+    if value is None:
+        return None
+    try:
+        return _decode_page_cursor(value)
+    except InvalidPageCursorError as error:
+        raise HTTPException(status_code=422, detail=INVALID_PAGE_CURSOR) from error
+
+
+def _parse_page_cursor_v2(value: str | None) -> tuple[datetime, str] | None:
+    """Parse a cursor, refusing a bad one as FastAPI refuses other parameters."""
+
+    if value is None:
+        return None
+    try:
+        return _decode_page_cursor(value)
+    except InvalidPageCursorError as error:
+        raise RequestValidationError(
+            [
+                {
+                    "type": "value_error",
+                    "loc": ("query", "before"),
+                    "msg": INVALID_PAGE_CURSOR,
+                    "input": value,
+                }
+            ]
+        ) from error
+
+
+READ_TOKEN_HEADER = APIKeyHeader(
+    name="X-Telemetry-Read-Token",
+    scheme_name="ReadToken",
+    description="The dashboard read credential.",
+    auto_error=False,
+)
+
+V2_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
+    401: {
+        "model": ErrorMessage,
+        "description": "The read credential is missing or wrong.",
+    },
+    503: {
+        "model": ErrorMessage,
+        "description": (
+            "A deployment is in progress; retry after the `Retry-After` header's "
+            "seconds."
+        ),
+    },
+}
 
 
 SCOPE_REFUSALS: dict[str, str] = {
@@ -269,7 +390,7 @@ def _issue_session_token(
     delegation = {} if lifetime_seconds is None else {"delegated": True}
     now = datetime.now(UTC)
     expires = now + timedelta(seconds=granted_seconds)
-    encoded = jwt.encode(
+    encoded = sign_session_token(
         {
             "iss": settings.collector_issuer,
             "aud": settings.collector_audience,
@@ -281,8 +402,8 @@ def _issue_session_token(
             "exp": expires,
             **delegation,
         },
-        settings.jwt_secret,
-        algorithm="HS256",
+        signing_key=settings.signing_key,
+        hs256_secret=settings.jwt_secret,
     )
     return CollectorToken(
         access_token=encoded,
@@ -296,13 +417,12 @@ def _decode_token(
 ) -> dict[str, Any]:
     token = _bearer_token(authorization)
     try:
-        return jwt.decode(
+        return verify_session_token(
             token,
-            settings.jwt_secret,
-            algorithms=["HS256"],
+            signing_key=settings.signing_key,
+            hs256_secret=settings.jwt_secret,
             issuer=settings.collector_issuer,
             audience=settings.collector_audience,
-            options={"require": ["aud", "exp", "iat", "iss", "scope", "sub"]},
         )
     except InvalidTokenError as error:
         raise HTTPException(
@@ -380,11 +500,22 @@ def create_app(
     def require_read_token(
         token: Annotated[str | None, Header(alias="X-Telemetry-Read-Token")] = None,
     ) -> None:
-        if token is None or not hmac.compare_digest(token, settings.read_token):
+        # Compared as UTF-8 bytes: compare_digest refuses strings with
+        # characters above ASCII, which a Latin-1 decoded header can hold.
+        if token is None or not hmac.compare_digest(
+            token.encode("utf-8"), settings.read_token.encode("utf-8")
+        ):
             raise HTTPException(
                 status_code=401,
                 detail="A valid dashboard read credential is required.",
             )
+
+    # The same credential for read API v2, declared as a security scheme so
+    # that its OpenAPI document and typed client describe it.
+    def require_read_token_v2(
+        token: Annotated[str | None, Security(READ_TOKEN_HEADER)] = None,
+    ) -> None:
+        require_read_token(token)
 
     def session_claims(
         authorization: Annotated[str | None, Header()] = None,
@@ -418,6 +549,13 @@ def create_app(
                 detail="Telemetry database is unavailable or not fully migrated.",
             )
         return {"status": "ok"}
+
+    @application.get("/.well-known/jwks.json")
+    def session_token_key_set(response: Response) -> dict[str, Any]:
+        """Public keys that verify session tokens, by their ``kid``."""
+
+        response.headers["Cache-Control"] = "public, max-age=300"
+        return json_web_key_set(settings.signing_key)
 
     @application.post(
         "/v1/auth/huggingface/exchange",
@@ -519,6 +657,67 @@ def create_app(
         if run is None:
             raise HTTPException(status_code=404, detail="Run was not found.")
         return run
+
+    @application.get(
+        "/v2/runs",
+        response_model=RunPage,
+        dependencies=[Depends(require_read_token_v2)],
+        responses=V2_ERROR_RESPONSES,
+        operation_id="listRuns",
+        summary="List runs, newest registration first",
+        tags=["read API v2"],
+    )
+    def list_runs_v2(
+        country: Annotated[
+            str | None,
+            Query(
+                pattern=r"^[A-Z]{2}$",
+                description="Only runs of this country, such as `US` or `GB`.",
+            ),
+        ] = None,
+        limit: Annotated[
+            int, Query(ge=1, le=200, description="The most runs to return.")
+        ] = 60,
+        before: Annotated[
+            str | None,
+            Query(description="The previous page's `next_before`."),
+        ] = None,
+    ) -> RunPage:
+        runs = store.list_runs(
+            country=country,
+            limit=limit,
+            before=_parse_page_cursor_v2(before),
+        )
+        next_before = (
+            _page_cursor(runs[-1]["registered_at"], runs[-1]["run_id"])
+            if len(runs) == limit
+            else None
+        )
+        return RunPage.model_validate({"runs": runs, "next_before": next_before})
+
+    @application.get(
+        "/v2/runs/{run_id}",
+        response_model=RunDetail,
+        dependencies=[Depends(require_read_token_v2)],
+        responses={
+            **V2_ERROR_RESPONSES,
+            404: {"model": ErrorMessage, "description": "The run was not found."},
+        },
+        operation_id="getRun",
+        summary="A run's state and the events it was rebuilt from",
+        tags=["read API v2"],
+    )
+    def get_run_v2(
+        run_id: Annotated[str, Path(pattern=SAFE_IDENTIFIER)],
+    ) -> RunDetail:
+        record = store.get_run_record(run_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="Run was not found.")
+        return run_detail(record.registered_run, record.events)
+
+    @application.get("/v2/openapi.json", include_in_schema=False)
+    def read_api_v2_openapi() -> dict[str, Any]:
+        return openapi_document(application)
 
     return application
 

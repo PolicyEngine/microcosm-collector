@@ -1,0 +1,16 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/v2/runs?country=FR",
+    "headers": {
+      "X-Telemetry-Read-Token": "dashboard-read-token"
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "runs": [],
+      "next_before": null
+    }
+  }
+}

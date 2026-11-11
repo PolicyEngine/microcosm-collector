@@ -17,12 +17,30 @@ permissions:
 # is 'true'. It has been 'true' since 2026-10-20, when this repo took over
 # deployment from calibration-diagnostics; unset, releases are tagged but not
 # deployed. The jobs deploy one image to staging and, only after staging
-# succeeds, the same image to production. The staging and production
-# environments accept only main, and Google Cloud's Workload Identity provider
-# accepts this repo's tokens only for refs/heads/main. Both jobs also check for
-# a push to main. This workflow runs only for pushes to main, so that check is
-# always true; it keeps a trigger added later (tags, manual dispatch) from
-# reaching authentication.
+# succeeds, the same image to production. Each switches artifact intake on in
+# its environment and updates the environment's intake worker and recovery
+# jobs to that image; the worker job also gets the environment's private
+# Orrery bucket. Last, each deploys the environment's Orrery read service from
+# the same image, which serves Orrery graph files from that bucket, grants
+# only the service account of the environment's microcosm-runs deployments
+# the Cloud Run Invoker role on it, and checks that it refuses a call without
+# a token. The staging and production environments accept only main, and Google
+# Cloud's Workload Identity provider accepts this repo's tokens only for
+# refs/heads/main. Both jobs also check for a push to main.
+# This workflow runs only for pushes to main, so that check is always true; it
+# keeps a trigger added later (tags, manual dispatch) from reaching
+# authentication.
+#
+# Once production runs the release, and only if the repo variable
+# COLLECTOR_CLIENT_PUBLISH_ENABLED is 'true', pack-client installs and packs
+# the read API client in packages/collector-client, and publish-client
+# publishes that tarball to npm with the release's version. npm trusts this
+# workflow file in the npm environment (trusted publishing), so no job holds an
+# npm token. publish-client can request an OIDC token, so it installs nothing
+# and runs no package script: only the npm CLI that ships with Node runs there.
+# The Workload Identity provider must accept tokens only from the staging and
+# production environments before publishing is switched on (README, "The
+# TypeScript client").
 jobs:
   versioning:
     name: Update versioning
@@ -101,9 +119,30 @@ jobs:
       DATABASE_SECRET_NAME: ${{ vars.TELEMETRY_DATABASE_SECRET_NAME }}
       MIGRATION_DATABASE_SECRET_NAME: ${{ vars.TELEMETRY_MIGRATION_DATABASE_SECRET_NAME }}
       JWT_SECRET_NAME: ${{ vars.TELEMETRY_JWT_SECRET_NAME }}
+      JWT_SIGNING_KEY_SECRET_NAME: ${{ vars.TELEMETRY_JWT_SIGNING_KEY_SECRET_NAME }}
       READ_SECRET_NAME: ${{ vars.TELEMETRY_READ_SECRET_NAME }}
       PRODUCTION_CLOUD_SQL_CONNECTION: ${{ vars.TELEMETRY_PRODUCTION_CLOUD_SQL_CONNECTION }}
       PRODUCTION_SERVICE: ${{ vars.TELEMETRY_PRODUCTION_SERVICE }}
+      # Each environment has its own intake resources.
+      INTAKE_BUCKET: ${{ vars.TELEMETRY_INTAKE_BUCKET }}
+      WORKER_QUEUE: ${{ vars.TELEMETRY_WORKER_QUEUE }}
+      WORKER_JOB: ${{ vars.TELEMETRY_WORKER_JOB }}
+      RECOVERY_JOB: ${{ vars.TELEMETRY_RECOVERY_JOB }}
+      WORKER_SERVICE_ACCOUNT: ${{ vars.TELEMETRY_WORKER_SERVICE_ACCOUNT }}
+      WORKER_INVOKER_SERVICE_ACCOUNT: ${{ vars.TELEMETRY_WORKER_INVOKER_SERVICE_ACCOUNT }}
+      RECOVERY_SERVICE_ACCOUNT: ${{ vars.TELEMETRY_RECOVERY_SERVICE_ACCOUNT }}
+      # This environment's own Hugging Face read token, which only its
+      # worker job mounts and only its worker service account may read.
+      HF_READ_SECRET_NAME: ${{ vars.TELEMETRY_HF_READ_SECRET_NAME }}
+      CALIBRATION_TREE_BLOB_SECRET_NAME: ${{ vars.TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME }}
+      # This environment's private Orrery bucket: its worker job publishes
+      # Orrery graph files to it, and its Orrery read service reads them from
+      # it.
+      ORRERY_BUCKET: ${{ vars.TELEMETRY_ORRERY_BUCKET }}
+      # The Google service account this environment's microcosm-runs
+      # deployments act as: the deploy grants it the Cloud Run Invoker role
+      # on the Orrery read service, and no revision or job gets it.
+      ORRERY_READER_SERVICE_ACCOUNT: ${{ vars.TELEMETRY_ORRERY_READER_SERVICE_ACCOUNT }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -124,6 +163,9 @@ jobs:
 
       - name: Check required Secret Manager entries exist
         run: scripts/deploy.sh check-secrets-exist
+
+      - name: Check the worker and recovery jobs belong to this environment
+        run: scripts/deploy.sh check-intake-jobs
 
       - name: Configure Artifact Registry authentication
         run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
@@ -157,6 +199,16 @@ jobs:
       - name: Apply database migrations
         run: scripts/deploy.sh apply-migrations
 
+      - name: Update the worker job to the released image
+        run: scripts/deploy.sh configure-worker-job
+        env:
+          IMAGE_URI: ${{ steps.image.outputs.uri }}
+
+      - name: Update the recovery job to the released image
+        run: scripts/deploy.sh configure-recovery-job
+        env:
+          IMAGE_URI: ${{ steps.image.outputs.uri }}
+
       - name: Deploy an isolated candidate revision
         run: scripts/deploy.sh deploy-candidate
         env:
@@ -173,6 +225,11 @@ jobs:
 
       - name: Verify the stable service address
         run: scripts/deploy.sh verify-stable-service
+
+      - name: Deploy the Orrery read service and set who may call it
+        run: scripts/deploy.sh deploy-orrery-read-service
+        env:
+          IMAGE_URI: ${{ steps.image.outputs.uri }}
 
   deploy-production:
     name: Deploy staging image to production
@@ -203,14 +260,34 @@ jobs:
       DATABASE_SECRET_NAME: ${{ vars.TELEMETRY_DATABASE_SECRET_NAME }}
       MIGRATION_DATABASE_SECRET_NAME: ${{ vars.TELEMETRY_MIGRATION_DATABASE_SECRET_NAME }}
       JWT_SECRET_NAME: ${{ vars.TELEMETRY_JWT_SECRET_NAME }}
+      JWT_SIGNING_KEY_SECRET_NAME: ${{ vars.TELEMETRY_JWT_SIGNING_KEY_SECRET_NAME }}
       READ_SECRET_NAME: ${{ vars.TELEMETRY_READ_SECRET_NAME }}
       PRODUCTION_CLOUD_SQL_CONNECTION: ${{ vars.TELEMETRY_PRODUCTION_CLOUD_SQL_CONNECTION }}
       PRODUCTION_SERVICE: ${{ vars.TELEMETRY_PRODUCTION_SERVICE }}
-      # Only production runs the daily Hugging Face check: there is one read
-      # token and one schedule.
-      HF_CHECK_JOB: ${{ vars.TELEMETRY_HF_CHECK_JOB }}
+      # Each environment has its own intake resources.
+      INTAKE_BUCKET: ${{ vars.TELEMETRY_INTAKE_BUCKET }}
+      WORKER_QUEUE: ${{ vars.TELEMETRY_WORKER_QUEUE }}
+      WORKER_JOB: ${{ vars.TELEMETRY_WORKER_JOB }}
+      RECOVERY_JOB: ${{ vars.TELEMETRY_RECOVERY_JOB }}
       WORKER_SERVICE_ACCOUNT: ${{ vars.TELEMETRY_WORKER_SERVICE_ACCOUNT }}
+      WORKER_INVOKER_SERVICE_ACCOUNT: ${{ vars.TELEMETRY_WORKER_INVOKER_SERVICE_ACCOUNT }}
+      RECOVERY_SERVICE_ACCOUNT: ${{ vars.TELEMETRY_RECOVERY_SERVICE_ACCOUNT }}
+      # This environment's own Hugging Face read token, which only its
+      # worker job and the daily Hugging Face check job mount, and only its
+      # worker service account may read.
       HF_READ_SECRET_NAME: ${{ vars.TELEMETRY_HF_READ_SECRET_NAME }}
+      CALIBRATION_TREE_BLOB_SECRET_NAME: ${{ vars.TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME }}
+      # This environment's private Orrery bucket: its worker job publishes
+      # Orrery graph files to it, and its Orrery read service reads them from
+      # it.
+      ORRERY_BUCKET: ${{ vars.TELEMETRY_ORRERY_BUCKET }}
+      # The Google service account this environment's microcosm-runs
+      # deployments act as: the deploy grants it the Cloud Run Invoker role
+      # on the Orrery read service, and no revision or job gets it.
+      ORRERY_READER_SERVICE_ACCOUNT: ${{ vars.TELEMETRY_ORRERY_READER_SERVICE_ACCOUNT }}
+      # Only production runs the daily Hugging Face check: one schedule, and
+      # one set of alerts.
+      HF_CHECK_JOB: ${{ vars.TELEMETRY_HF_CHECK_JOB }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -231,6 +308,9 @@ jobs:
 
       - name: Check required Secret Manager entries exist
         run: scripts/deploy.sh check-secrets-exist
+
+      - name: Check the worker and recovery jobs belong to this environment
+        run: scripts/deploy.sh check-intake-jobs
 
       - name: Configure the daily Hugging Face check job
         run: scripts/deploy.sh configure-huggingface-check-job
@@ -265,6 +345,16 @@ jobs:
       - name: Apply database migrations
         run: scripts/deploy.sh apply-migrations
 
+      - name: Update the worker job to the released image
+        run: scripts/deploy.sh configure-worker-job
+        env:
+          IMAGE_URI: ${{ needs.deploy-staging.outputs.image_uri }}
+
+      - name: Update the recovery job to the released image
+        run: scripts/deploy.sh configure-recovery-job
+        env:
+          IMAGE_URI: ${{ needs.deploy-staging.outputs.image_uri }}
+
       - name: Deploy an isolated candidate revision
         run: scripts/deploy.sh deploy-candidate
         env:
@@ -281,3 +371,69 @@ jobs:
 
       - name: Verify the stable service address
         run: scripts/deploy.sh verify-stable-service
+
+      - name: Deploy the Orrery read service and set who may call it
+        run: scripts/deploy.sh deploy-orrery-read-service
+        env:
+          IMAGE_URI: ${{ needs.deploy-staging.outputs.image_uri }}
+
+  pack-client:
+    name: Pack the read API client
+    needs: deploy-production
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && vars.COLLECTOR_CLIENT_PUBLISH_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: packages/collector-client
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "24.22.1"
+          package-manager-cache: false
+      - run: npm ci
+      # Packing runs the client's prepack build. npm pack does not create its
+      # destination; RUNNER_TEMP exists, and is empty, at the start of each job.
+      # ci.yml's client job runs the same command on every pull request.
+      - run: npm pack --pack-destination "$RUNNER_TEMP"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: collector-client
+          path: ${{ runner.temp }}/*.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-client:
+    name: Publish the read API client to npm
+    needs: pack-client
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && vars.COLLECTOR_CLIENT_PUBLISH_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: npm
+    concurrency:
+      group: microcosm-collector-npm
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: collector-client
+          path: ${{ runner.temp }}/collector-client
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "24.22.1"
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - run: bash tools/publish-client.sh "$RUNNER_TEMP/collector-client"

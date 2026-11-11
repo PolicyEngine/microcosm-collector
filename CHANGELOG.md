@@ -1,3 +1,100 @@
+## [0.18.0] - 2026-11-11
+
+### Added
+
+- Add the `past-builds` operator command, which prints an inventory of past Microcosm builds as JSON and stores nothing: one entry for each `staged/<run_id>/` folder in each country's Hugging Face release dataset, read at the commit its `main` points at, and for each run in `telemetry_runs` (UK runs, which Microcosm registers as `GB`, listed as `uk`), joined by run ID. It prints a document with when the inventory was made, each dataset's revision and the totals, and then one document for each build. Each build gives its Microcosm commit, from its folder's `staged_manifest.json` (`summary.git_commit`) or else from its run's `run` events (`details.identity.git_commit`), with `commit_source` saying which; its class (`after_1151`, `between_1144_and_1151`, `before_1144` or `unknown`, with the reason), worked out with GitHub's compare API without a token, one or two requests for each distinct commit, with only that build `unknown` when GitHub has no such commit and every later commit `unknown` after a rate-limit answer or any other failure, and with staged builds that can be rebuilt checked first, then other staged builds, then recorded runs without a staged folder, each group newest first (descending run ID); the graph files the folder holds; and what can be rebuilt from Hugging Face (`full` with the schema and execution overlay, `declaration_only` with the schema alone, or `none`). Builds made before microcosm#1144, and builds made before microcosm#1151 with nothing to rebuild from, are listed as skipped, with the reason. `telemetry_collector.past_builds.list_past_builds` returns the same inventory to code. The command needs `DATABASE_URL` and `COLLECTOR_HF_READ_TOKEN`, so it runs as an execution of the worker job with its arguments overridden.
+
+
+## [0.17.0] - 2026-11-10
+
+### Added
+
+- Serve Orrery graph files to microcosm-runs alone, from the Orrery read service: a separate Cloud Run service, `<service>-orrery` in each environment, that every release deploys from the collector's image once the collector's service is live. It allows no unauthenticated calls, keeps Cloud Run's invoker check on, has no custom audience, so that a caller's identity token must be for the service's own URL, and its IAM policy grants the Cloud Run Invoker role to `TELEMETRY_ORRERY_READER_SERVICE_ACCOUNT` alone, which the deploy sets and reads back on every release; so Cloud Run checks each caller's Google identity token, and the service's code verifies none. Anyone granted, on the project, its folder or the organization, any role that includes `run.routes.invoke` can call it too, and so can anyone who may make identity tokens as the reader account (`iam.serviceAccounts.getOpenIdToken` on it); the README's "Who else can call it" lists the predefined roles that include each permission, from IAM's permissions reference. Each release then calls the service without a token and fails unless Cloud Run refuses the call with 401 or 403. `GET /v1/orrery-graphs?run_id=…&build_id=…` lists a run's or a build's recorded documents, each with its fields, its current flag (the newest `created_at` among the documents with its `country_code` and `build_id`, ties ordered by `document_sha256` and then by `submission_id`, the larger first) and its effective visibility, and `GET /v1/orrery-graphs/<submission_id>/<document_sha256>/<file_name>` returns `graph.orrery.json` or an `upstream-<sha256>.json` file from the private Orrery bucket. A file is read twice at the generation it was found at, holding at most one 1 MiB part: first to check that its SHA-256 is the document's recorded `document_sha256` or the one in the upstream file's name, then, only on a match, to send it (500 `orrery_graph_digest_mismatch` or `orrery_graph_changed` otherwise, never served). Each Cloud Storage request gives up after 10 seconds without connecting or without data, and each call retries for at most 30 seconds. A bucket or database that doesn't answer gives 503 (`orrery_storage_unavailable`, logged with the object or folder and the error's type, or `orrery_catalogue_unavailable`), and every answer of the read service's routes and middleware has `Cache-Control: private, no-store` (Cloud Run's own 401 and 403, and the plain-text 500 for an unexpected exception, don't). A document is private when its row is, or when a recorded submission with licensed data has the run ID or the build ID (whatever its country code) of the document or of a submission that produced one of its upstream files, matched by the file's SHA-256. A client must compare a served file's SHA-256 with its `ETag` before caching or showing it, since a read that fails after the answer has started ends the body early under a 200. The read service needs `COLLECTOR_ORRERY_BUCKET` and `DATABASE_URL` and refuses to start without either; the collector's main service mounts none of its routes and gets neither Orrery setting.
+
+### Changed
+
+- The Orrery graph handler rejects an `orrery-inputs` submission with `orrery_inputs_unusable` when an `upstream` file is not named `upstream-<its SHA-256>.json`, with 64 lowercase hex characters, as Microcosm names the files it copies. This replaces the narrower rejection of an upstream file named `graph.orrery.json`.
+
+### Fixed
+
+- Running the database migrations no longer turns off the collector's own loggers in the same process: the Alembic environment's logging setup keeps every logger its configuration doesn't name.
+
+
+## [0.16.0] - 2026-11-10
+
+### Added
+
+- Publish Orrery graph files from `orrery-inputs` submissions where the worker job has its environment's private Orrery bucket (`COLLECTOR_ORRERY_BUCKET`, which the deploy sets on the worker job only from `TELEMETRY_ORRERY_BUCKET`): the worker projects the schema and execution overlay, removes every link the published document could not resolve (evidence references keep their label and SHA-256 but lose their link, whatever its scheme; elsewhere `https://` links stay; links to submitted upstream files stay everywhere) and gives each node or edge that lost a link the projection's revision of the record as published, validates the document with the pinned Orrery validator, writes it and the upstream files it links to, the only upstream files it downloads, create-only under `graphs/<submission_id>/<document sha256>/`, and records it in the new `orrery_graph_files` table (migration `0003_orrery_graph_files`) with its run, build, versions and visibility, `private` for licensed builds. The schema and overlay are read as Microcosm's command reads its input (at most 32 MiB, strict JSON in UTF-8, nested no deeper than Python's JSON decoder can parse); an input that fails these rules, or a `TypeError`, `ValueError` or `RecursionError` from the projection, rejects the submission with `orrery_inputs_unusable`, and any other projection error fails the attempt. The worker's handlers now come from one registry, `telemetry_collector.handlers`.
+
+### Fixed
+
+- The worker now records a handler's rejection, an error's message and a handler's result with U+FFFD in place of each NUL and unpaired surrogate, which PostgreSQL's `jsonb` cannot store. Before, such text made the attempt crash while recording it, so a submission that should have been rejected ended `failed` once its attempts ran out.
+
+
+## [0.15.0] - 2026-11-09
+
+### Added
+
+- The collector checks the five `details` keys microcosm-emitter 0.14.0 and later write themselves (a heartbeat's `reading` and `sleep`, a run start's `environment`, a stage's `stage_span` and progress's `outer`). A key that doesn't match its model is removed from the stored event, named in `details.dropped_emitter_details` and logged, and the rest of the event is accepted. Both read APIs serve the run's machine description, the current attempt's latest reading with its time, and every attempt's sleeps: version 1 as `run_manifest.environment`, `progress.reading` and a top-level `sleeps`, version 2 as the run's `environment`, `reading` and `sleeps`, typed in its OpenAPI document and the TypeScript client. Values stored before these checks are checked again when served (microcosm-collector#46).
+
+
+## [0.14.0] - 2026-11-09
+
+### Added
+
+- Build calibration trees from `calibration-diagnostics` submissions where the worker job has its calibration tree Blob token (`COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN`): a build folder gives a release tree of that build and a staged bundle a staging tree of its run, built by the tree package's Bun worker without the token and published under a Postgres lock by a new publication command that writes the manifest with a compare-and-swap. A release build becomes its country's latest when its release is the country's default release (the UK's for now). The image now holds Bun 1.4.2 and the package's production install, and CI checks that the built image builds a tree.
+
+
+## [0.13.1] - 2026-11-09
+
+### Changed
+
+- The calibration tree package's version is raised to 0.1.1, so that the publish workflow has a version npm doesn't have yet. Its first publication through npm's trusted publishing, a manual run from `main` after the one-time setup, can then follow that setup within the 48 hours npm allows; the README's "Publishing to npm" now describes that order (microcosm-collector#48).
+
+
+## [0.13.0] - 2026-11-09
+
+### Added
+
+- Validate Orrery graph documents with one pinned `@axiom-foundation/orrery` (0.6.2) under Node: `orrery-validator` accepts exactly the graph file contents microcosm-runs' publication accepts (strict UTF-8 JSON, `parseGraphDocument` and `checkSources`), and its refusals never repeat a link's value, always encode as UTF-8 and never carry a NUL, and `telemetry_collector.orrery.validation` runs it from Python with only `PATH` and a UTF-8 locale in Node's environment, telling a refused document apart from a validator that could not run. The image now holds Node 24.21.0 and the installed validator, which adds about 130 MB, and CI checks the validator inside the built image. Nothing in the service or the worker validates documents yet.
+
+
+## [0.12.0] - 2026-11-09
+
+### Added
+
+- Add the calibration tree package, `packages/calibration-tree`, copied from calibration-diagnostics' `frontend/packages/calibration-tree` with a record of the commit and files it came from. A Bun worker, `src/calibration-tree-worker.ts`, builds one release's tree from local files and writes the same bytes as the publisher; pull requests run the package's tests, including the recorded golden trees, and its typecheck. `.github/workflows/publish-calibration-tree.yaml` publishes it to npm as `@policyengine/calibration-tree` through npm's trusted publishing, and stays switched off until `CALIBRATION_TREE_NPM_PUBLISH_ENABLED` is `true`; the README lists the one-time setup. Nothing in the service runs the worker yet, and the deployed image is unchanged.
+
+
+## [0.11.0] - 2026-11-09
+
+### Added
+
+- Sign session tokens with ES256 once `TELEMETRY_JWT_SIGNING_KEY` holds a P-256 private key, delegated tokens for builds on other machines included, and publish its public key at `GET /.well-known/jwks.json`. Each ES256 token names its key in the `kid` header, the RFC 7638 thumbprint of the public key. While `TELEMETRY_JWT_SECRET` is still configured, HS256 tokens signed with it are accepted too, so tokens issued before the switch keep working until they expire; once the key is set the secret is optional, and removing it from the deployment later retires HS256, no sooner than 24 hours after the last revision that issued HS256 tokens stopped serving, the longest a delegated token lasts. Either variable set but blank stops startup. Deployment mounts the key from the Secret Manager secret named by the new `TELEMETRY_JWT_SIGNING_KEY_SECRET_NAME` variable in the `staging` and `production` environments, and checks that the secret exists before changing traffic.
+
+
+## [0.10.0] - 2026-11-09
+
+### Added
+
+- Add `@policyengine/microcosm-collector-client` in `packages/collector-client`, a typed TypeScript client for read API v2 whose types are generated from the OpenAPI document and whose tests replay the recorded interactions. Each release gives it the collector's version. Once production runs a release, the Push workflow's new `pack-client` job packs it without an OIDC token, and `publish-client` publishes that tarball to npm with trusted publishing, installing nothing and running no package script. Both run only when the repo variable `COLLECTOR_CLIENT_PUBLISH_ENABLED` is `true`, which it is not yet. The README lists the manual steps that switch publishing on, starting with making the Workload Identity provider accept only tokens from the `staging` and `production` environments.
+- Serve read API v2: `GET /v2/runs` lists runs as v1 does, with typed answers, and `GET /v2/runs/{run_id}` returns a run's state together with every stored event with the fields its producer sent, the state folded from exactly those events, with all timestamps in UTC. Both take the dashboard read credential. `contracts/read-api-v2` holds the OpenAPI document, which the collector also serves at `GET /v2/openapi.json`, and recorded interactions; tests check the collector against both, from the in-memory store and from PostgreSQL, and record version 1's answers so that the dashboard's reads cannot change unnoticed.
+
+
+## [0.9.0] - 2026-11-06
+
+### Added
+
+- Switch artifact intake on in staging and production from the deployment. `scripts/deploy.sh` passes `COLLECTOR_INTAKE_ENABLED=1` and the other intake settings to both service revisions in both environments, and every release updates the worker and recovery Cloud Run jobs to the released image with their whole configuration, after the migration and before the candidate revision, without ever creating either job. Each environment's worker job mounts that environment's own Hugging Face read token as `COLLECTOR_HF_READ_TOKEN`, listed with `DATABASE_URL` in one `--set-secrets`; staging and production have separate tokens and secrets, each readable only by its own environment's worker service account. Before anything changes, the deploy refuses an intake name the collector's own patterns would refuse, and a job that does not exist, runs as another service account than the deploy gives it, or connects to another environment's Cloud SQL instance; it also checks that the environment's token secret exists. The deploy reads seven new `TELEMETRY_*` variables and `TELEMETRY_HF_READ_SECRET_NAME` in each environment; staging needs all eight created, production six, and a deploy without one stops before it authenticates.
+
+
+## [0.8.0] - 2026-11-06
+
+### Added
+
+- Read Hugging Face from worker jobs with the collector's own fine-grained read token, `COLLECTOR_HF_READ_TOKEN`, mounted from Secret Manager. `telemetry_collector.huggingface_read` refuses a missing or malformed token and any generic `HF_TOKEN`, lists the datasets the collector reads and the token's scope, and reads dataset information, file lists and files, sending the token only to Hugging Face. Nothing in the service or the existing worker reads Hugging Face yet; the README lists the manual steps that create the token, its secret, its access and its mount.
+
+
 ## [0.7.3] - 2026-11-05
 
 ### Changed

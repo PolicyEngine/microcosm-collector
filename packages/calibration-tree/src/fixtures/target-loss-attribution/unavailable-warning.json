@@ -1,0 +1,23 @@
+{
+  "schema_version": 6,
+  "final_loss": 0.15,
+  "diagnostic_warnings": [
+    {
+      "code": "target_loss_attribution_alignment_error",
+      "severity": "warning",
+      "message": "Final target-loss weights and scales must each have one value per target diagnostic."
+    }
+  ],
+  "targets": [
+    {
+      "name": "population@2024",
+      "target": 100.0,
+      "final_estimate": 110.0
+    },
+    {
+      "name": "income@2024",
+      "target": 200.0,
+      "final_estimate": 160.0
+    }
+  ]
+}

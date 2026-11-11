@@ -1,0 +1,506 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/v1/runs/us-run-with-readings",
+    "headers": {
+      "X-Telemetry-Read-Token": "dashboard-read-token"
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "run_id": "us-run-with-readings",
+      "country_code": "US",
+      "progress": {
+        "schema_version": 2,
+        "run_id": "us-run-with-readings",
+        "country_code": "US",
+        "operation_id": "us-run-with-readings",
+        "pipeline": {
+          "id": "us-fiscal-refresh",
+          "version": "collector-v1"
+        },
+        "candidate_id": null,
+        "release_id": null,
+        "run_kind": "build",
+        "non_release": true,
+        "started_at": "2026-10-20T11:59:55Z",
+        "updated_at": "2026-10-20T12:31:11Z",
+        "status": "completed",
+        "current_stage": "complete",
+        "heartbeat_at": "2026-10-20T12:30:41Z",
+        "resources": {
+          "cpu_user_seconds": 0.303434304,
+          "cpu_system_seconds": 0.138512624,
+          "rss_bytes": 91717632,
+          "peak_rss_bytes": 91717632
+        },
+        "reading": {
+          "timestamp": "2026-10-20T12:30:41Z",
+          "interval_seconds": 1.0,
+          "late_seconds": 0.0,
+          "machine": {
+            "cgroup_memory_bytes": null,
+            "cgroup_memory_limit_bytes": null,
+            "cpu_busy_share": null,
+            "disk_free_bytes": 98724352000,
+            "load_average_1m": 3.01,
+            "memory_available_bytes": 8711503872,
+            "memory_compressed_bytes": 10514912512,
+            "memory_pressure_level": "normal",
+            "memory_stall_full_share": null,
+            "memory_stall_some_share": null,
+            "on_battery": true,
+            "swap_in_bytes": null,
+            "swap_out_bytes": null,
+            "swap_total_bytes": 5368709120,
+            "swap_used_bytes": 4217241600
+          },
+          "process_tree": {
+            "cpu_system_cores": 0.0051,
+            "cpu_user_cores": 0.002,
+            "disk_read_bytes": 0,
+            "disk_written_bytes": 98304,
+            "interval_memory_peak_bytes": 76792312,
+            "memory_bytes": 76792312,
+            "memory_peak_bytes": 76792312,
+            "processes": 1
+          },
+          "progress": {
+            "done": 74,
+            "outer": {
+              "done": 57,
+              "total": 101,
+              "unit": "pass"
+            },
+            "reported_at": "2026-10-20T12:00:03+00:00",
+            "stage_id": "reform_validation",
+            "total": 177,
+            "unit": "scoring_batch"
+          },
+          "stages": [
+            "post_export_scoring",
+            "reform_validation"
+          ]
+        },
+        "work": {
+          "stage": "reform_validation",
+          "done": 74,
+          "total": 177,
+          "unit": "scoring_batch",
+          "elapsed_seconds": 0,
+          "updated_at": "2026-10-20T12:00:03+00:00",
+          "details": {
+            "outer": {
+              "done": 57,
+              "total": 101,
+              "unit": "pass"
+            },
+            "pass_name": "reform_validation reform income_tax@2026"
+          }
+        },
+        "failure": null,
+        "block": null
+      },
+      "run_manifest": {
+        "schema_version": 2,
+        "run_id": "us-run-with-readings",
+        "country_code": "US",
+        "operation_id": "us-run-with-readings",
+        "pipeline": {
+          "id": "us-fiscal-refresh",
+          "version": "collector-v1"
+        },
+        "candidate_id": null,
+        "release_id": null,
+        "run_kind": "build",
+        "non_release": true,
+        "started_at": "2026-10-20T11:59:55Z",
+        "updated_at": "2026-10-20T12:31:11Z",
+        "status": "completed",
+        "current_stage": "complete",
+        "identity": {
+          "microcosm_version": "0.41.0",
+          "country": "us"
+        },
+        "environment": {
+          "architecture": "arm64",
+          "cgroup_cpu_limit_cores": null,
+          "cgroup_memory_limit_bytes": null,
+          "cpu_model": "Apple M5",
+          "emitter_version": "0.14.0",
+          "kind": "local",
+          "logical_cpus": 10,
+          "memory_total_bytes": 34359738368,
+          "modal": null,
+          "os": "Darwin",
+          "os_version": "26.3",
+          "python_version": "3.14.6"
+        },
+        "failure": null,
+        "block": null,
+        "delivery": {
+          "mode": "collector",
+          "upload_attempts": null,
+          "upload_successes": null
+        }
+      },
+      "calibration_progress": null,
+      "events": [
+        {
+          "schema_version": 2,
+          "sequence": 1,
+          "timestamp": "2026-10-20T12:00:00Z",
+          "time": "2026-10-20T12:00:00Z",
+          "event_type": "stage",
+          "run_id": "us-run-with-readings",
+          "stage_id": "created",
+          "stage": "created",
+          "status": "started",
+          "message": "Microcosm build started.",
+          "details": {
+            "environment": {
+              "architecture": "arm64",
+              "cgroup_cpu_limit_cores": null,
+              "cgroup_memory_limit_bytes": null,
+              "cpu_model": "Apple M5",
+              "emitter_version": "0.14.0",
+              "kind": "local",
+              "logical_cpus": 10,
+              "memory_total_bytes": 34359738368,
+              "modal": null,
+              "os": "Darwin",
+              "os_version": "26.3",
+              "python_version": "3.14.6"
+            },
+            "identity": {
+              "microcosm_version": "0.41.0",
+              "country": "us"
+            }
+          },
+          "resources": {
+            "cpu_user_seconds": 0.2896632,
+            "cpu_system_seconds": 0.101769248,
+            "rss_bytes": 91209728,
+            "peak_rss_bytes": 91209728
+          },
+          "producer_id": "us-readings-producer",
+          "event_id": "us-run-with-readings-1"
+        },
+        {
+          "schema_version": 2,
+          "sequence": 2,
+          "timestamp": "2026-10-20T12:00:01Z",
+          "time": "2026-10-20T12:00:01Z",
+          "event_type": "stage",
+          "run_id": "us-run-with-readings",
+          "stage_id": "post_export_scoring",
+          "stage": "post_export_scoring",
+          "status": "started",
+          "message": null,
+          "details": {
+            "stage_span": {
+              "occurrence": 1,
+              "parent_stage_id": null
+            }
+          },
+          "resources": {
+            "cpu_user_seconds": 0.29204304,
+            "cpu_system_seconds": 0.107277832,
+            "rss_bytes": 91275264,
+            "peak_rss_bytes": 91275264
+          },
+          "producer_id": "us-readings-producer",
+          "event_id": "us-run-with-readings-2"
+        },
+        {
+          "schema_version": 2,
+          "sequence": 3,
+          "timestamp": "2026-10-20T12:00:02Z",
+          "time": "2026-10-20T12:00:02Z",
+          "event_type": "stage",
+          "run_id": "us-run-with-readings",
+          "stage_id": "reform_validation",
+          "stage": "reform_validation",
+          "status": "started",
+          "message": null,
+          "details": {
+            "stage_span": {
+              "occurrence": 1,
+              "parent_stage_id": "post_export_scoring"
+            }
+          },
+          "resources": {
+            "cpu_user_seconds": 0.294438208,
+            "cpu_system_seconds": 0.112837128,
+            "rss_bytes": 91291648,
+            "peak_rss_bytes": 91291648
+          },
+          "producer_id": "us-readings-producer",
+          "event_id": "us-run-with-readings-3"
+        },
+        {
+          "schema_version": 2,
+          "sequence": 4,
+          "timestamp": "2026-10-20T12:00:03Z",
+          "time": "2026-10-20T12:00:03Z",
+          "event_type": "stage",
+          "run_id": "us-run-with-readings",
+          "stage_id": "reform_validation",
+          "stage": "reform_validation",
+          "status": "progress",
+          "message": null,
+          "details": {
+            "done": 74,
+            "outer": {
+              "done": 57,
+              "total": 101,
+              "unit": "pass"
+            },
+            "pass_name": "reform_validation reform income_tax@2026",
+            "total": 177,
+            "unit": "scoring_batch"
+          },
+          "resources": {
+            "cpu_user_seconds": 0.296263328,
+            "cpu_system_seconds": 0.11812792,
+            "rss_bytes": 91308032,
+            "peak_rss_bytes": 91308032
+          },
+          "producer_id": "us-readings-producer",
+          "event_id": "us-run-with-readings-4"
+        },
+        {
+          "schema_version": 2,
+          "sequence": 5,
+          "timestamp": "2026-10-20T12:00:40Z",
+          "time": "2026-10-20T12:00:40Z",
+          "event_type": "stage",
+          "run_id": "us-run-with-readings",
+          "stage_id": "reform_validation",
+          "stage": "reform_validation",
+          "status": "progress",
+          "message": null,
+          "details": {
+            "reading": {
+              "interval_seconds": 31.092,
+              "late_seconds": 1.092,
+              "machine": {
+                "cgroup_memory_bytes": null,
+                "cgroup_memory_limit_bytes": null,
+                "cpu_busy_share": 0.7755,
+                "disk_free_bytes": 98724360192,
+                "load_average_1m": 3.01,
+                "memory_available_bytes": 8709242880,
+                "memory_compressed_bytes": 10514920128,
+                "memory_pressure_level": "normal",
+                "memory_stall_full_share": null,
+                "memory_stall_some_share": null,
+                "on_battery": true,
+                "swap_in_bytes": null,
+                "swap_out_bytes": null,
+                "swap_total_bytes": 5368709120,
+                "swap_used_bytes": 4217241600
+              },
+              "process_tree": {
+                "cpu_system_cores": 0.0007,
+                "cpu_user_cores": 0.0003,
+                "disk_read_bytes": 16384,
+                "disk_written_bytes": 360448,
+                "interval_memory_peak_bytes": 76792312,
+                "memory_bytes": 76792312,
+                "memory_peak_bytes": 76792312,
+                "processes": 1
+              },
+              "progress": {
+                "done": 74,
+                "outer": {
+                  "done": 57,
+                  "total": 101,
+                  "unit": "pass"
+                },
+                "reported_at": "2026-10-20T12:00:03+00:00",
+                "stage_id": "reform_validation",
+                "total": 177,
+                "unit": "scoring_batch"
+              },
+              "stages": [
+                "post_export_scoring",
+                "reform_validation"
+              ]
+            }
+          },
+          "resources": {
+            "cpu_user_seconds": 0.298160992,
+            "cpu_system_seconds": 0.123807416,
+            "rss_bytes": 91308032,
+            "peak_rss_bytes": 91308032
+          },
+          "producer_id": "us-readings-producer",
+          "event_id": "us-run-with-readings-5"
+        },
+        {
+          "schema_version": 2,
+          "sequence": 6,
+          "timestamp": "2026-10-20T12:30:41Z",
+          "time": "2026-10-20T12:30:41Z",
+          "event_type": "stage",
+          "run_id": "us-run-with-readings",
+          "stage_id": "reform_validation",
+          "stage": "reform_validation",
+          "status": "progress",
+          "message": null,
+          "details": {
+            "reading": {
+              "interval_seconds": 1.0,
+              "late_seconds": 0.0,
+              "machine": {
+                "cgroup_memory_bytes": null,
+                "cgroup_memory_limit_bytes": null,
+                "cpu_busy_share": null,
+                "disk_free_bytes": 98724352000,
+                "load_average_1m": 3.01,
+                "memory_available_bytes": 8711503872,
+                "memory_compressed_bytes": 10514912512,
+                "memory_pressure_level": "normal",
+                "memory_stall_full_share": null,
+                "memory_stall_some_share": null,
+                "on_battery": true,
+                "swap_in_bytes": null,
+                "swap_out_bytes": null,
+                "swap_total_bytes": 5368709120,
+                "swap_used_bytes": 4217241600
+              },
+              "process_tree": {
+                "cpu_system_cores": 0.0051,
+                "cpu_user_cores": 0.002,
+                "disk_read_bytes": 0,
+                "disk_written_bytes": 98304,
+                "interval_memory_peak_bytes": 76792312,
+                "memory_bytes": 76792312,
+                "memory_peak_bytes": 76792312,
+                "processes": 1
+              },
+              "progress": {
+                "done": 74,
+                "outer": {
+                  "done": 57,
+                  "total": 101,
+                  "unit": "pass"
+                },
+                "reported_at": "2026-10-20T12:00:03+00:00",
+                "stage_id": "reform_validation",
+                "total": 177,
+                "unit": "scoring_batch"
+              },
+              "stages": [
+                "post_export_scoring",
+                "reform_validation"
+              ]
+            },
+            "sleep": {
+              "ended_at": "2026-10-20T12:30:40.500000+00:00",
+              "seconds": 1800.0,
+              "started_at": "2026-10-20T12:00:40.500000+00:00"
+            }
+          },
+          "resources": {
+            "cpu_user_seconds": 0.30017696,
+            "cpu_system_seconds": 0.128928752,
+            "rss_bytes": 91701248,
+            "peak_rss_bytes": 91701248
+          },
+          "producer_id": "us-readings-producer",
+          "event_id": "us-run-with-readings-6"
+        },
+        {
+          "schema_version": 2,
+          "sequence": 7,
+          "timestamp": "2026-10-20T12:31:10Z",
+          "time": "2026-10-20T12:31:10Z",
+          "event_type": "stage",
+          "run_id": "us-run-with-readings",
+          "stage_id": "reform_validation",
+          "stage": "reform_validation",
+          "status": "completed",
+          "message": null,
+          "details": {
+            "stage_span": {
+              "asleep_seconds": 1800.0,
+              "awake_seconds": 68,
+              "closed_by": null,
+              "occurrence": 1,
+              "parent_stage_id": "post_export_scoring"
+            }
+          },
+          "resources": {
+            "cpu_user_seconds": 0.302025536,
+            "cpu_system_seconds": 0.13399704,
+            "rss_bytes": 91701248,
+            "peak_rss_bytes": 91701248
+          },
+          "producer_id": "us-readings-producer",
+          "event_id": "us-run-with-readings-7"
+        },
+        {
+          "schema_version": 2,
+          "sequence": 8,
+          "timestamp": "2026-10-20T12:31:11Z",
+          "time": "2026-10-20T12:31:11Z",
+          "event_type": "stage",
+          "run_id": "us-run-with-readings",
+          "stage_id": "post_export_scoring",
+          "stage": "post_export_scoring",
+          "status": "completed",
+          "message": null,
+          "details": {
+            "stage_span": {
+              "asleep_seconds": 1800.0,
+              "awake_seconds": 70,
+              "closed_by": "run_completed",
+              "occurrence": 1,
+              "parent_stage_id": null
+            }
+          },
+          "resources": {
+            "cpu_user_seconds": 0.303434304,
+            "cpu_system_seconds": 0.138512624,
+            "rss_bytes": 91717632,
+            "peak_rss_bytes": 91717632
+          },
+          "producer_id": "us-readings-producer",
+          "event_id": "us-run-with-readings-8"
+        },
+        {
+          "schema_version": 2,
+          "sequence": 9,
+          "timestamp": "2026-10-20T12:31:11Z",
+          "time": "2026-10-20T12:31:11Z",
+          "event_type": "stage",
+          "run_id": "us-run-with-readings",
+          "stage_id": "complete",
+          "stage": "complete",
+          "status": "completed",
+          "message": "Microcosm build completed.",
+          "details": {},
+          "resources": {
+            "cpu_user_seconds": 0.303434304,
+            "cpu_system_seconds": 0.138512624,
+            "rss_bytes": 91717632,
+            "peak_rss_bytes": 91717632
+          },
+          "producer_id": "us-readings-producer",
+          "event_id": "us-run-with-readings-9"
+        }
+      ],
+      "sleeps": [
+        {
+          "producer_id": "us-readings-producer",
+          "ended_at": "2026-10-20T12:30:40.500000+00:00",
+          "seconds": 1800.0,
+          "started_at": "2026-10-20T12:00:40.500000+00:00"
+        }
+      ]
+    }
+  }
+}

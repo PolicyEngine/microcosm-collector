@@ -1,0 +1,145 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/v1/runs/gb-run-blocked",
+    "headers": {
+      "X-Telemetry-Read-Token": "dashboard-read-token"
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "run_id": "gb-run-blocked",
+      "country_code": "GB",
+      "progress": {
+        "schema_version": 2,
+        "run_id": "gb-run-blocked",
+        "country_code": "GB",
+        "operation_id": "gb-run-blocked",
+        "pipeline": {
+          "id": "uk-local-areas",
+          "version": "collector-v1"
+        },
+        "candidate_id": "candidate-b",
+        "release_id": null,
+        "run_kind": "build",
+        "non_release": true,
+        "started_at": "2026-10-22T08:00:00Z",
+        "updated_at": "2026-10-22T09:20:00Z",
+        "status": "blocked",
+        "current_stage": "blocked",
+        "heartbeat_at": null,
+        "resources": null,
+        "reading": null,
+        "work": null,
+        "failure": null,
+        "block": {
+          "phase": "candidate",
+          "blocking_failure_count": 2,
+          "blocking_gate_ids": [
+            "local-area-totals",
+            "household-weights"
+          ]
+        }
+      },
+      "run_manifest": {
+        "schema_version": 2,
+        "run_id": "gb-run-blocked",
+        "country_code": "GB",
+        "operation_id": "gb-run-blocked",
+        "pipeline": {
+          "id": "uk-local-areas",
+          "version": "collector-v1"
+        },
+        "candidate_id": "candidate-b",
+        "release_id": null,
+        "run_kind": "build",
+        "non_release": true,
+        "started_at": "2026-10-22T08:00:00Z",
+        "updated_at": "2026-10-22T09:20:00Z",
+        "status": "blocked",
+        "current_stage": "blocked",
+        "identity": null,
+        "environment": null,
+        "failure": null,
+        "block": {
+          "phase": "candidate",
+          "blocking_failure_count": 2,
+          "blocking_gate_ids": [
+            "local-area-totals",
+            "household-weights"
+          ]
+        },
+        "delivery": {
+          "mode": "collector",
+          "upload_attempts": null,
+          "upload_successes": null
+        }
+      },
+      "calibration_progress": null,
+      "events": [
+        {
+          "schema_version": 2,
+          "sequence": 1,
+          "timestamp": "2026-10-22T08:00:03Z",
+          "time": "2026-10-22T08:00:03Z",
+          "event_type": "stage",
+          "run_id": "gb-run-blocked",
+          "stage_id": "created",
+          "stage": "created",
+          "status": "started",
+          "message": "Run started",
+          "details": {},
+          "resources": null,
+          "producer_id": "gb-blocked-producer",
+          "event_id": "gb-run-blocked-1"
+        },
+        {
+          "schema_version": 2,
+          "sequence": 2,
+          "timestamp": "2026-10-22T09:15:00Z",
+          "time": "2026-10-22T09:15:00Z",
+          "event_type": "stage",
+          "run_id": "gb-run-blocked",
+          "stage_id": "acceptance",
+          "stage": "acceptance",
+          "status": "started",
+          "message": null,
+          "details": {},
+          "resources": null,
+          "producer_id": "gb-blocked-producer",
+          "event_id": "gb-run-blocked-2"
+        },
+        {
+          "schema_version": 2,
+          "sequence": 3,
+          "timestamp": "2026-10-22T09:20:00Z",
+          "time": "2026-10-22T09:20:00Z",
+          "event_type": "stage",
+          "run_id": "gb-run-blocked",
+          "stage_id": "blocked",
+          "stage": "blocked",
+          "status": "blocked",
+          "message": "Acceptance checks refused the candidate.",
+          "details": {
+            "phase": "candidate",
+            "blocking_failure_count": 2,
+            "blocking_gate_ids": [
+              "local-area-totals",
+              "household-weights"
+            ],
+            "gate_statuses": {
+              "local-area-totals": "failed",
+              "household-weights": "failed",
+              "population": "passed"
+            }
+          },
+          "resources": null,
+          "producer_id": "gb-blocked-producer",
+          "event_id": "gb-run-blocked-3"
+        }
+      ],
+      "sleeps": []
+    }
+  }
+}

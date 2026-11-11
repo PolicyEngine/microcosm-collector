@@ -1,4 +1,4 @@
-"""Disclosure rules for outputs derived from submissions (decisions D5 and D10)."""
+"""Disclosure rules for outputs derived from submissions."""
 
 from __future__ import annotations
 
@@ -20,7 +20,10 @@ def test_calibration_trees_may_be_public_whether_or_not_licensed(
     )
 
 
-def test_orrery_artifacts_of_licensed_builds_stay_private_until_cleared() -> None:
+def test_orrery_artifacts_of_licensed_builds_stay_private() -> None:
+    # Served only to microcosm-runs, which shows them only to people signed
+    # in with policyengine.org Google accounts (tracker 2b · 7 and 4b · 3);
+    # no clearance step makes them public.
     assert output_visibility("orrery_artifact", licensed_data=True) == "private"
 
 

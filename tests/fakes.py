@@ -21,6 +21,7 @@ from telemetry_collector.intake import (
 )
 from telemetry_collector.models import RunRegistration, TelemetryEvent
 from telemetry_collector.storage import (
+    RunRecord,
     RunRegistrationConflictError,
     canonical_events,
     initial_run_state,
@@ -114,6 +115,9 @@ class FakeTelemetryStore:
             stored = self._events[run_id]
             for model in events:
                 event = model.model_dump(mode="python")
+                # PostgreSQL returns timestamptz values in the session's time
+                # zone, UTC, whatever offset the producer sent.
+                event["timestamp"] = event["timestamp"].astimezone(UTC)
                 sequence_key = (run_id, event["producer_id"], event["sequence"])
                 if event["event_id"] in stored or sequence_key in self._sequences:
                     duplicates += 1
@@ -152,11 +156,17 @@ class FakeTelemetryStore:
             return [run_summary(deepcopy(run)) for run in runs[:limit]]
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
+        record = self.get_run_record(run_id)
+        if record is None:
+            return None
+        return run_documents(record.registered_run, record.events)
+
+    def get_run_record(self, run_id: str) -> RunRecord | None:
         with self._lock:
             run = self._runs.get(run_id)
             if run is None:
                 return None
-            return run_documents(
+            return RunRecord(
                 deepcopy(run), deepcopy(list(self._events[run_id].values()))
             )
 
@@ -219,6 +229,12 @@ class FakeSubmissionStore:
         with self._lock:
             record = self._submissions.get(submission_id)
             return None if record is None else self._with_job(record)
+
+    def records(self) -> list[SubmissionRecord]:
+        """Every recorded submission, whatever its status."""
+
+        with self._lock:
+            return [self._with_job(record) for record in self._submissions.values()]
 
     def _add_job(self, record: SubmissionRecord, processing_round: int) -> None:
         values = new_job_values(
@@ -540,3 +556,26 @@ class FakeWorkerQueue:
         task_id = cloud_task_id(job_id, dispatch_number)
         if task_id not in self.task_ids:
             self.task_ids.append(task_id)
+
+
+class FakeOrreryGraphStore:
+    """In-memory ``orrery_graph_files``: the first record of each document stays.
+
+    ``created_at`` holds when each document was first recorded, as the
+    table's ``created_at`` column does.
+    """
+
+    def __init__(self, *, clock: Callable[[], datetime] | None = None) -> None:
+        self._clock = clock or (lambda: datetime.now(UTC))
+        self.records: dict[tuple[str, str], Any] = {}
+        self.created_at: dict[tuple[str, str], datetime] = {}
+        self.repeated: list[Any] = []
+
+    def record_graph(self, record: Any) -> bool:
+        key = (record.submission_id, record.document_sha256)
+        if key in self.records:
+            self.repeated.append(record)
+            return False
+        self.records[key] = record
+        self.created_at[key] = self._clock()
+        return True

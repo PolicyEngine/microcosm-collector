@@ -1,0 +1,13 @@
+{
+  "name": "microcosm-collector-orrery-validator",
+  "private": true,
+  "description": "Validates Orrery graph documents for the collector with one pinned @axiom-foundation/orrery.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.14.0"
+  },
+  "dependencies": {
+    "@axiom-foundation/orrery": "0.6.2"
+  }
+}

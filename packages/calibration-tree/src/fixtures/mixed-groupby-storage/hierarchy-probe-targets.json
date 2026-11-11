@@ -1,0 +1,700 @@
+[
+  {
+    "case": "ordinary a + layout a; disjoint sex cells",
+    "facts": [
+      {
+        "aggregate_fact_key": "a-explicit",
+        "aggregation": {
+          "method": "sum"
+        },
+        "dimension_labels": {
+          "loan_type": "Loan type",
+          "sex": "Sex"
+        },
+        "dimension_value_labels": {
+          "loan_type": {
+            "a": "A",
+            "b": "B"
+          },
+          "sex": {
+            "female": "Female",
+            "male": "Male"
+          }
+        },
+        "dimensions": {
+          "loan_type": "a",
+          "sex": "female"
+        },
+        "entity": {
+          "name": "person",
+          "role": "person"
+        },
+        "geography": {
+          "id": "GB",
+          "level": "country",
+          "name": "United Kingdom",
+          "vintage": "2024"
+        },
+        "label": "a-explicit",
+        "layout": {
+          "record_set_id": "table"
+        },
+        "observed_measure": {
+          "source_concept": "balance",
+          "source_measure_id": "balance"
+        },
+        "period": {
+          "type": "calendar_year",
+          "value": 2024
+        },
+        "source": {
+          "source_name": "Publisher",
+          "source_sha256": "digest"
+        },
+        "source_record_id": "a-explicit",
+        "source_release_key": "release",
+        "value": 20
+      },
+      {
+        "aggregate_fact_key": "b-layout",
+        "aggregation": {
+          "method": "sum"
+        },
+        "dimension_labels": {
+          "loan_type": "Loan type",
+          "sex": "Sex"
+        },
+        "dimension_value_labels": {
+          "loan_type": {
+            "a": "A",
+            "b": "B"
+          },
+          "sex": {
+            "female": "Female",
+            "male": "Male"
+          }
+        },
+        "dimensions": {
+          "sex": "male"
+        },
+        "entity": {
+          "name": "person",
+          "role": "person"
+        },
+        "geography": {
+          "id": "GB",
+          "level": "country",
+          "name": "United Kingdom",
+          "vintage": "2024"
+        },
+        "label": "b-layout",
+        "layout": {
+          "groupby_dimension": "loan_type",
+          "groupby_dimension_label": "Loan type",
+          "groupby_value_id": "a",
+          "groupby_value_label": "A",
+          "record_set_id": "table"
+        },
+        "observed_measure": {
+          "source_concept": "balance",
+          "source_measure_id": "balance"
+        },
+        "period": {
+          "type": "calendar_year",
+          "value": 2024
+        },
+        "source": {
+          "source_name": "Publisher",
+          "source_sha256": "digest"
+        },
+        "source_record_id": "b-layout",
+        "source_release_key": "release",
+        "value": 20
+      }
+    ],
+    "hierarchy_dimensions": [],
+    "representative": "b-layout",
+    "dashboard_target": {
+      "hierarchy": {
+        "category": {
+          "id": "balance",
+          "label": "Balance",
+          "provider_id": "provider"
+        },
+        "dimensions": [],
+        "geography": {
+          "id": "GB",
+          "label": "United Kingdom",
+          "level": "country"
+        },
+        "provider": {
+          "id": "provider",
+          "label": "Publisher"
+        },
+        "target": {
+          "id": "combined-balance",
+          "label": "Combined balance"
+        }
+      },
+      "metadata": {
+        "ledger_aggregate_fact_key": "b-layout",
+        "ledger_aggregation_method": "sum",
+        "ledger_aggregation_varying_dimensions": "[\"loan_type\",\"sex\"]",
+        "ledger_assertion_policy": "observed_only",
+        "ledger_entity_name": "person",
+        "ledger_entity_role": "person",
+        "ledger_fact_key": "b-layout",
+        "ledger_fact_label": "b-layout",
+        "ledger_fact_period": "2024",
+        "ledger_filter_sex": "male",
+        "ledger_geography_id": "GB",
+        "ledger_geography_level": "country",
+        "ledger_geography_name": "United Kingdom",
+        "ledger_geography_vintage": "2024",
+        "ledger_layout_groupby_dimension": "loan_type",
+        "ledger_layout_groupby_value_id": "a",
+        "ledger_layout_groupby_value_label": "A",
+        "ledger_layout_record_set_id": "table",
+        "ledger_measure_concept": "balance",
+        "ledger_member_aggregate_fact_keys": "[\"a-explicit\",\"b-layout\"]",
+        "ledger_member_fact_count": "2",
+        "ledger_member_fact_digest": "067bb1cac34f2d3078416a814cab198eb2f0af847e4e1db8c0e24ae8be01ff79",
+        "ledger_member_fact_keys": "[\"a-explicit\",\"b-layout\"]",
+        "ledger_period_match_policy": "latest_not_after",
+        "ledger_period_type": "calendar_year",
+        "ledger_resolved_assertion": "observation",
+        "ledger_selector_source_name": "Publisher",
+        "ledger_source": "policyengine-ledger-data",
+        "ledger_source_concept": "balance",
+        "ledger_source_record_id": "b-layout",
+        "ledger_value_operation": "sum"
+      },
+      "name": "combined-balance"
+    }
+  },
+  {
+    "case": "ordinary a in both; only representative layout a",
+    "facts": [
+      {
+        "aggregate_fact_key": "a-explicit",
+        "aggregation": {
+          "method": "sum"
+        },
+        "dimension_labels": {
+          "loan_type": "Loan type"
+        },
+        "dimension_value_labels": {
+          "loan_type": {
+            "a": "A",
+            "b": "B"
+          }
+        },
+        "dimensions": {
+          "loan_type": "a"
+        },
+        "entity": {
+          "name": "person",
+          "role": "person"
+        },
+        "geography": {
+          "id": "GB",
+          "level": "country",
+          "name": "United Kingdom",
+          "vintage": "2024"
+        },
+        "label": "a-explicit",
+        "layout": {
+          "record_set_id": "table"
+        },
+        "observed_measure": {
+          "source_concept": "balance",
+          "source_measure_id": "balance"
+        },
+        "period": {
+          "type": "calendar_year",
+          "value": 2024
+        },
+        "source": {
+          "source_name": "Publisher",
+          "source_sha256": "digest"
+        },
+        "source_record_id": "a-explicit",
+        "source_release_key": "release",
+        "value": 20
+      },
+      {
+        "aggregate_fact_key": "b-layout",
+        "aggregation": {
+          "method": "sum"
+        },
+        "dimension_labels": {
+          "loan_type": "Loan type"
+        },
+        "dimension_value_labels": {
+          "loan_type": {
+            "a": "A",
+            "b": "B"
+          }
+        },
+        "dimensions": {
+          "loan_type": "a"
+        },
+        "entity": {
+          "name": "person",
+          "role": "person"
+        },
+        "geography": {
+          "id": "GB",
+          "level": "country",
+          "name": "United Kingdom",
+          "vintage": "2024"
+        },
+        "label": "b-layout",
+        "layout": {
+          "groupby_dimension": "loan_type",
+          "groupby_dimension_label": "Loan type",
+          "groupby_value_id": "a",
+          "groupby_value_label": "A",
+          "record_set_id": "table"
+        },
+        "observed_measure": {
+          "source_concept": "balance",
+          "source_measure_id": "balance"
+        },
+        "period": {
+          "type": "calendar_year",
+          "value": 2024
+        },
+        "source": {
+          "source_name": "Publisher",
+          "source_sha256": "digest"
+        },
+        "source_record_id": "b-layout",
+        "source_release_key": "release",
+        "value": 20
+      }
+    ],
+    "hierarchy_dimensions": [
+      {
+        "id": "loan_type",
+        "label": "Loan type",
+        "value_id": "a",
+        "value_label": "A"
+      }
+    ],
+    "representative": "b-layout",
+    "dashboard_target": {
+      "hierarchy": {
+        "category": {
+          "id": "balance",
+          "label": "Balance",
+          "provider_id": "provider"
+        },
+        "dimensions": [
+          {
+            "id": "loan_type",
+            "label": "Loan type",
+            "value_id": "a",
+            "value_label": "A"
+          }
+        ],
+        "geography": {
+          "id": "GB",
+          "label": "United Kingdom",
+          "level": "country"
+        },
+        "provider": {
+          "id": "provider",
+          "label": "Publisher"
+        },
+        "target": {
+          "id": "combined-balance",
+          "label": "Combined balance"
+        }
+      },
+      "metadata": {
+        "ledger_aggregate_fact_key": "b-layout",
+        "ledger_aggregation_method": "sum",
+        "ledger_assertion_policy": "observed_only",
+        "ledger_entity_name": "person",
+        "ledger_entity_role": "person",
+        "ledger_fact_key": "b-layout",
+        "ledger_fact_label": "b-layout",
+        "ledger_fact_period": "2024",
+        "ledger_filter_loan_type": "a",
+        "ledger_geography_id": "GB",
+        "ledger_geography_level": "country",
+        "ledger_geography_name": "United Kingdom",
+        "ledger_geography_vintage": "2024",
+        "ledger_layout_groupby_dimension": "loan_type",
+        "ledger_layout_groupby_value_id": "a",
+        "ledger_layout_groupby_value_label": "A",
+        "ledger_layout_record_set_id": "table",
+        "ledger_measure_concept": "balance",
+        "ledger_member_aggregate_fact_keys": "[\"a-explicit\",\"b-layout\"]",
+        "ledger_member_fact_count": "2",
+        "ledger_member_fact_digest": "067bb1cac34f2d3078416a814cab198eb2f0af847e4e1db8c0e24ae8be01ff79",
+        "ledger_member_fact_keys": "[\"a-explicit\",\"b-layout\"]",
+        "ledger_period_match_policy": "latest_not_after",
+        "ledger_period_type": "calendar_year",
+        "ledger_resolved_assertion": "observation",
+        "ledger_selector_source_name": "Publisher",
+        "ledger_source": "policyengine-ledger-data",
+        "ledger_source_concept": "balance",
+        "ledger_source_record_id": "b-layout",
+        "ledger_value_operation": "sum"
+      },
+      "name": "combined-balance"
+    }
+  },
+  {
+    "case": "ordinary a in both; first layout b and representative layout a",
+    "facts": [
+      {
+        "aggregate_fact_key": "a-conflict",
+        "aggregation": {
+          "method": "sum"
+        },
+        "dimension_labels": {
+          "loan_type": "Loan type"
+        },
+        "dimension_value_labels": {
+          "loan_type": {
+            "a": "A",
+            "b": "B"
+          }
+        },
+        "dimensions": {
+          "loan_type": "a"
+        },
+        "entity": {
+          "name": "person",
+          "role": "person"
+        },
+        "geography": {
+          "id": "GB",
+          "level": "country",
+          "name": "United Kingdom",
+          "vintage": "2024"
+        },
+        "label": "a-conflict",
+        "layout": {
+          "groupby_dimension": "loan_type",
+          "groupby_dimension_label": "Loan type",
+          "groupby_value_id": "b",
+          "groupby_value_label": "B",
+          "record_set_id": "table"
+        },
+        "observed_measure": {
+          "source_concept": "balance",
+          "source_measure_id": "balance"
+        },
+        "period": {
+          "type": "calendar_year",
+          "value": 2024
+        },
+        "source": {
+          "source_name": "Publisher",
+          "source_sha256": "digest"
+        },
+        "source_record_id": "a-conflict",
+        "source_release_key": "release",
+        "value": 20
+      },
+      {
+        "aggregate_fact_key": "b-layout",
+        "aggregation": {
+          "method": "sum"
+        },
+        "dimension_labels": {
+          "loan_type": "Loan type"
+        },
+        "dimension_value_labels": {
+          "loan_type": {
+            "a": "A",
+            "b": "B"
+          }
+        },
+        "dimensions": {
+          "loan_type": "a"
+        },
+        "entity": {
+          "name": "person",
+          "role": "person"
+        },
+        "geography": {
+          "id": "GB",
+          "level": "country",
+          "name": "United Kingdom",
+          "vintage": "2024"
+        },
+        "label": "b-layout",
+        "layout": {
+          "groupby_dimension": "loan_type",
+          "groupby_dimension_label": "Loan type",
+          "groupby_value_id": "a",
+          "groupby_value_label": "A",
+          "record_set_id": "table"
+        },
+        "observed_measure": {
+          "source_concept": "balance",
+          "source_measure_id": "balance"
+        },
+        "period": {
+          "type": "calendar_year",
+          "value": 2024
+        },
+        "source": {
+          "source_name": "Publisher",
+          "source_sha256": "digest"
+        },
+        "source_record_id": "b-layout",
+        "source_release_key": "release",
+        "value": 20
+      }
+    ],
+    "hierarchy_dimensions": [
+      {
+        "id": "loan_type",
+        "label": "Loan type",
+        "value_id": "a",
+        "value_label": "A"
+      }
+    ],
+    "representative": "b-layout",
+    "dashboard_target": {
+      "hierarchy": {
+        "category": {
+          "id": "balance",
+          "label": "Balance",
+          "provider_id": "provider"
+        },
+        "dimensions": [
+          {
+            "id": "loan_type",
+            "label": "Loan type",
+            "value_id": "a",
+            "value_label": "A"
+          }
+        ],
+        "geography": {
+          "id": "GB",
+          "label": "United Kingdom",
+          "level": "country"
+        },
+        "provider": {
+          "id": "provider",
+          "label": "Publisher"
+        },
+        "target": {
+          "id": "combined-balance",
+          "label": "Combined balance"
+        }
+      },
+      "metadata": {
+        "ledger_aggregate_fact_key": "b-layout",
+        "ledger_aggregation_method": "sum",
+        "ledger_assertion_policy": "observed_only",
+        "ledger_entity_name": "person",
+        "ledger_entity_role": "person",
+        "ledger_fact_key": "b-layout",
+        "ledger_fact_label": "b-layout",
+        "ledger_fact_period": "2024",
+        "ledger_filter_loan_type": "a",
+        "ledger_geography_id": "GB",
+        "ledger_geography_level": "country",
+        "ledger_geography_name": "United Kingdom",
+        "ledger_geography_vintage": "2024",
+        "ledger_layout_groupby_dimension": "loan_type",
+        "ledger_layout_groupby_value_id": "a",
+        "ledger_layout_groupby_value_label": "A",
+        "ledger_layout_record_set_id": "table",
+        "ledger_measure_concept": "balance",
+        "ledger_member_aggregate_fact_keys": "[\"a-conflict\",\"b-layout\"]",
+        "ledger_member_fact_count": "2",
+        "ledger_member_fact_digest": "8a07bbca4c327d7db8d51bc940836ccc4b0574f6e70c5be9183e8e59eb8080cd",
+        "ledger_member_fact_keys": "[\"a-conflict\",\"b-layout\"]",
+        "ledger_period_match_policy": "latest_not_after",
+        "ledger_period_type": "calendar_year",
+        "ledger_resolved_assertion": "observation",
+        "ledger_selector_source_name": "Publisher",
+        "ledger_source": "policyengine-ledger-data",
+        "ledger_source_concept": "balance",
+        "ledger_source_record_id": "b-layout",
+        "ledger_value_operation": "sum"
+      },
+      "name": "combined-balance"
+    }
+  },
+  {
+    "case": "ordinary a + layout a; disjoint sex cells; explicit fact renamed z-explicit",
+    "facts": [
+      {
+        "aggregate_fact_key": "z-explicit",
+        "aggregation": {
+          "method": "sum"
+        },
+        "dimension_labels": {
+          "loan_type": "Loan type",
+          "sex": "Sex"
+        },
+        "dimension_value_labels": {
+          "loan_type": {
+            "a": "A",
+            "b": "B"
+          },
+          "sex": {
+            "female": "Female",
+            "male": "Male"
+          }
+        },
+        "dimensions": {
+          "loan_type": "a",
+          "sex": "female"
+        },
+        "entity": {
+          "name": "person",
+          "role": "person"
+        },
+        "geography": {
+          "id": "GB",
+          "level": "country",
+          "name": "United Kingdom",
+          "vintage": "2024"
+        },
+        "label": "z-explicit",
+        "layout": {
+          "record_set_id": "table"
+        },
+        "observed_measure": {
+          "source_concept": "balance",
+          "source_measure_id": "balance"
+        },
+        "period": {
+          "type": "calendar_year",
+          "value": 2024
+        },
+        "source": {
+          "source_name": "Publisher",
+          "source_sha256": "digest"
+        },
+        "source_record_id": "z-explicit",
+        "source_release_key": "release",
+        "value": 20
+      },
+      {
+        "aggregate_fact_key": "b-layout",
+        "aggregation": {
+          "method": "sum"
+        },
+        "dimension_labels": {
+          "loan_type": "Loan type",
+          "sex": "Sex"
+        },
+        "dimension_value_labels": {
+          "loan_type": {
+            "a": "A",
+            "b": "B"
+          },
+          "sex": {
+            "female": "Female",
+            "male": "Male"
+          }
+        },
+        "dimensions": {
+          "sex": "male"
+        },
+        "entity": {
+          "name": "person",
+          "role": "person"
+        },
+        "geography": {
+          "id": "GB",
+          "level": "country",
+          "name": "United Kingdom",
+          "vintage": "2024"
+        },
+        "label": "b-layout",
+        "layout": {
+          "groupby_dimension": "loan_type",
+          "groupby_dimension_label": "Loan type",
+          "groupby_value_id": "a",
+          "groupby_value_label": "A",
+          "record_set_id": "table"
+        },
+        "observed_measure": {
+          "source_concept": "balance",
+          "source_measure_id": "balance"
+        },
+        "period": {
+          "type": "calendar_year",
+          "value": 2024
+        },
+        "source": {
+          "source_name": "Publisher",
+          "source_sha256": "digest"
+        },
+        "source_record_id": "b-layout",
+        "source_release_key": "release",
+        "value": 20
+      }
+    ],
+    "hierarchy_dimensions": [],
+    "representative": "z-explicit",
+    "dashboard_target": {
+      "hierarchy": {
+        "category": {
+          "id": "balance",
+          "label": "Balance",
+          "provider_id": "provider"
+        },
+        "dimensions": [],
+        "geography": {
+          "id": "GB",
+          "label": "United Kingdom",
+          "level": "country"
+        },
+        "provider": {
+          "id": "provider",
+          "label": "Publisher"
+        },
+        "target": {
+          "id": "combined-balance",
+          "label": "Combined balance"
+        }
+      },
+      "metadata": {
+        "ledger_aggregate_fact_key": "z-explicit",
+        "ledger_aggregation_method": "sum",
+        "ledger_aggregation_varying_dimensions": "[\"loan_type\",\"sex\"]",
+        "ledger_assertion_policy": "observed_only",
+        "ledger_entity_name": "person",
+        "ledger_entity_role": "person",
+        "ledger_fact_key": "z-explicit",
+        "ledger_fact_label": "z-explicit",
+        "ledger_fact_period": "2024",
+        "ledger_filter_loan_type": "a",
+        "ledger_filter_sex": "female",
+        "ledger_geography_id": "GB",
+        "ledger_geography_level": "country",
+        "ledger_geography_name": "United Kingdom",
+        "ledger_geography_vintage": "2024",
+        "ledger_layout_record_set_id": "table",
+        "ledger_measure_concept": "balance",
+        "ledger_member_aggregate_fact_keys": "[\"b-layout\",\"z-explicit\"]",
+        "ledger_member_fact_count": "2",
+        "ledger_member_fact_digest": "eb3dad1fb156e6ef12a91f5324e7caa4107ae3e90881de27a2789c610c621049",
+        "ledger_member_fact_keys": "[\"b-layout\",\"z-explicit\"]",
+        "ledger_period_match_policy": "latest_not_after",
+        "ledger_period_type": "calendar_year",
+        "ledger_resolved_assertion": "observation",
+        "ledger_selector_source_name": "Publisher",
+        "ledger_source": "policyengine-ledger-data",
+        "ledger_source_concept": "balance",
+        "ledger_source_record_id": "z-explicit",
+        "ledger_value_operation": "sum"
+      },
+      "name": "combined-balance"
+    }
+  }
+]

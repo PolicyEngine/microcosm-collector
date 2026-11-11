@@ -1,0 +1,28 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/v2/runs/not%20a%20run%20id",
+    "headers": {
+      "X-Telemetry-Read-Token": "dashboard-read-token"
+    }
+  },
+  "response": {
+    "status": 422,
+    "body": {
+      "detail": [
+        {
+          "type": "string_pattern_mismatch",
+          "loc": [
+            "path",
+            "run_id"
+          ],
+          "msg": "String should match pattern '^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$'",
+          "input": "not a run id",
+          "ctx": {
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$"
+          }
+        }
+      ]
+    }
+  }
+}

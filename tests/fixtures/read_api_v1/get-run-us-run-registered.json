@@ -1,0 +1,70 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/v1/runs/us-run-registered",
+    "headers": {
+      "X-Telemetry-Read-Token": "dashboard-read-token"
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "run_id": "us-run-registered",
+      "country_code": "US",
+      "progress": {
+        "schema_version": 2,
+        "run_id": "us-run-registered",
+        "country_code": "US",
+        "operation_id": "us-run-registered",
+        "pipeline": {
+          "id": "us-fiscal-refresh",
+          "version": "collector-v1"
+        },
+        "candidate_id": null,
+        "release_id": null,
+        "run_kind": "build",
+        "non_release": true,
+        "started_at": "2026-10-24T12:00:00Z",
+        "updated_at": "2026-10-24T12:00:00Z",
+        "status": "running",
+        "current_stage": "created",
+        "heartbeat_at": null,
+        "resources": null,
+        "reading": null,
+        "work": null,
+        "failure": null,
+        "block": null
+      },
+      "run_manifest": {
+        "schema_version": 2,
+        "run_id": "us-run-registered",
+        "country_code": "US",
+        "operation_id": "us-run-registered",
+        "pipeline": {
+          "id": "us-fiscal-refresh",
+          "version": "collector-v1"
+        },
+        "candidate_id": null,
+        "release_id": null,
+        "run_kind": "build",
+        "non_release": true,
+        "started_at": "2026-10-24T12:00:00Z",
+        "updated_at": "2026-10-24T12:00:00Z",
+        "status": "running",
+        "current_stage": "created",
+        "identity": null,
+        "environment": null,
+        "failure": null,
+        "block": null,
+        "delivery": {
+          "mode": "collector",
+          "upload_attempts": null,
+          "upload_successes": null
+        }
+      },
+      "calibration_progress": null,
+      "events": [],
+      "sleeps": []
+    }
+  }
+}

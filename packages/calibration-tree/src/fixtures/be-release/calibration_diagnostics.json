@@ -1,0 +1,126 @@
+{
+  "schema_version": 1,
+  "description": "Microcosm-BE: synthetic Belgian population calibrated to Belgian administrative and national-accounts targets (sums of Chronicle facts; surveys validation-only). Support records: US survey donor pool, reweighted; a Belgian donor pool is the planned upgrade. Cross-engine agreement is evidence about the encodings.",
+  "effective_sample_size": 560.7099759427821,
+  "final_loss": 0.006225265748969901,
+  "fraction_within_10pct": 1.0,
+  "fraction_within_tolerance": 1.0,
+  "initial_loss": 0.2854260504245758,
+  "l0_lambda": 0.0,
+  "n_nonzero": 57240,
+  "n_records": 57240,
+  "options": {
+    "method": "adam",
+    "epochs": 2000,
+    "learning_rate": 0.1,
+    "mass": "free",
+    "max_weight_ratio": 50.0,
+    "target_records": null,
+    "l1_lambda": 0.0,
+    "l2_lambda": 0.0,
+    "seed": 0,
+    "target_loss_cap": 1000000.0,
+    "solver_source": "populace/packages/populace-calibrate at 09f93ecb3e8f2ee6bb0f9365970f3c72dca4ecaf"
+  },
+  "realized_max_weight_ratio": 49.58337498396423,
+  "top_1pct_weight_share": 0.5115731886787078,
+  "weight_entity": "household",
+  "target_surface": {
+    "schema_version": 1,
+    "weight_entity": "household",
+    "n_targets": 3,
+    "n_records": 57240,
+    "sha256": null
+  },
+  "skipped": [],
+  "targets": [
+    {
+      "name": "statbel_population_be1_male_0_17@2026",
+      "target_name": "statbel_population_be1_male_0_17",
+      "period": 2026,
+      "entity": "person",
+      "measure": {
+        "kind": "column",
+        "name": "be_people"
+      },
+      "filter": "cell_be1_male_0_17",
+      "source": "statbel.population_structure.cy2026.people.by_nuts1_age_sex.be1_male_0_17.people",
+      "metadata": {
+        "chronicle_source": "PolicyEngine/chronicle",
+        "chronicle_commit": "3cef97b4ece3a70601fca84fe121ffbb1a62388d",
+        "chronicle_record_ids": [
+          "statbel.population_structure.cy2026.people.by_nuts1_age_sex.be1_male_0_17.people"
+        ],
+        "classification": "hard_chronicle_statbel",
+        "concept": "population by NUTS1, sex, and age band",
+        "support_pool": "us_survey_donor",
+        "disclaimer": "Microcosm-BE: synthetic Belgian population calibrated to Belgian administrative and national-accounts targets (sums of Chronicle facts; surveys validation-only). Support records: US survey donor pool, reweighted; a Belgian donor pool is the planned upgrade. Cross-engine agreement is evidence about the encodings."
+      },
+      "target": 134606.0,
+      "compiled_target": 134606.0,
+      "initial_estimate": 141404.7353606938,
+      "final_estimate": 136457.6227767115,
+      "relative_error": 0.013755871036294854,
+      "within_tolerance": true
+    },
+    {
+      "name": "jrc_national_income_tax_amount@2023",
+      "target_name": "jrc_national_income_tax_amount",
+      "period": 2023,
+      "entity": "person",
+      "measure": {
+        "kind": "column",
+        "name": "cr_tin"
+      },
+      "filter": null,
+      "source": "jrc.euromod_be.cy2023.macrovalidation.external_amounts.a3_4_national_income_tax_external_2023.value",
+      "metadata": {
+        "chronicle_source": "PolicyEngine/chronicle",
+        "chronicle_commit": "3cef97b4ece3a70601fca84fe121ffbb1a62388d",
+        "chronicle_record_ids": [
+          "jrc.euromod_be.cy2023.macrovalidation.external_amounts.a3_4_national_income_tax_external_2023.value"
+        ],
+        "classification": "hard_chronicle_fact_sum",
+        "concept": "national personal income tax",
+        "support_pool": "us_survey_donor",
+        "disclaimer": "Microcosm-BE: synthetic Belgian population calibrated to Belgian administrative and national-accounts targets (sums of Chronicle facts; surveys validation-only). Support records: US survey donor pool, reweighted; a Belgian donor pool is the planned upgrade. Cross-engine agreement is evidence about the encodings."
+      },
+      "target": 69325000000.0,
+      "compiled_target": 69325000000.0,
+      "initial_estimate": 126523853683.15613,
+      "final_estimate": 68393536598.46842,
+      "relative_error": -0.013436183217188287,
+      "within_tolerance": true
+    },
+    {
+      "name": "nasa_taxable_movable_income_analogue@2024",
+      "target_name": "nasa_taxable_movable_income_analogue",
+      "period": 2024,
+      "entity": "person",
+      "measure": {
+        "kind": "column",
+        "name": "cr_yiy"
+      },
+      "filter": null,
+      "source": "eurostat.nasa_10_nf_tr.cy2024.household_non_financial_transactions.received.be.belgium_household_interest_received.amount + eurostat.nasa_10_nf_tr.cy2024.household_non_financial_transactions.received.be.belgium_household_distributed_income_of_corporations_received.amount",
+      "metadata": {
+        "chronicle_source": "PolicyEngine/chronicle",
+        "chronicle_commit": "3cef97b4ece3a70601fca84fe121ffbb1a62388d",
+        "chronicle_record_ids": [
+          "eurostat.nasa_10_nf_tr.cy2024.household_non_financial_transactions.received.be.belgium_household_interest_received.amount",
+          "eurostat.nasa_10_nf_tr.cy2024.household_non_financial_transactions.received.be.belgium_household_distributed_income_of_corporations_received.amount"
+        ],
+        "classification": "hard_chronicle_fact_sum",
+        "concept": "taxable-movable-income analogue (D41 + D42 received)",
+        "support_pool": "us_survey_donor",
+        "disclaimer": "Microcosm-BE: synthetic Belgian population calibrated to Belgian administrative and national-accounts targets (sums of Chronicle facts; surveys validation-only). Support records: US survey donor pool, reweighted; a Belgian donor pool is the planned upgrade. Cross-engine agreement is evidence about the encodings."
+      },
+      "target": 40087000000.0,
+      "compiled_target": 40087000000.0,
+      "initial_estimate": 82058305597.94191,
+      "final_estimate": 39764002645.62917,
+      "relative_error": -0.00805740899470718,
+      "within_tolerance": true
+    }
+  ]
+}

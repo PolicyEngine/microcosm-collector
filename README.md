@@ -46,8 +46,9 @@ returned JWT to the build.
   future endpoint that must not accept such tokens refuses tokens with this
   claim.
 - Until it expires, whoever holds the token can register runs and upload events
-  as the operator, and nothing else. Changing the signing secret is the only way
-  to revoke it early.
+  as the operator, and nothing else. Replacing the key that signed it is the
+  only way to revoke it early: the signing key for an ES256 token ("Switching
+  from HS256 to ES256"), or `TELEMETRY_JWT_SECRET` for an HS256 token.
 
 Without `lifetime_seconds`, the exchange is unchanged: the same lifetime, claims
 and response.
@@ -56,6 +57,110 @@ The dashboard query endpoints require `X-Telemetry-Read-Token`. The dashboard
 server retrieves this credential from Google Secret Manager at runtime. Vercel
 authenticates using its OIDC identity; the credential is never returned to the
 browser or passed through GitHub Actions.
+
+### Session tokens
+
+The collector signs its session tokens and is the only service that verifies
+them. The emitter treats a token as an opaque bearer credential: it keeps the
+token for `expires_in` seconds and exchanges again after a 401.
+
+- **Signing.** Once `TELEMETRY_JWT_SIGNING_KEY` holds an EC P-256 private key
+  (unencrypted PEM, PKCS #8 or SEC 1), new tokens are signed with ES256. Until
+  then they are signed with HS256 and `TELEMETRY_JWT_SECRET`. Either variable
+  set but blank stops startup.
+- **Key ID.** An ES256 token's header names its key in `kid`, the RFC 7638
+  SHA-256 thumbprint of the public key. The ID is derived from the key rather
+  than configured, so it cannot disagree with the key, and a new key always
+  has a new ID.
+- **Public key.** `GET /.well-known/jwks.json` publishes the public key as a
+  JSON Web Key Set, without credentials and with
+  `Cache-Control: public, max-age=300`:
+  `{"keys": [{"kty": "EC", "crv": "P-256", "x": "...", "y": "...", "kid": "...", "use": "sig", "alg": "ES256"}]}`.
+  Before a signing key is configured, `keys` is empty. Like every route but
+  `/health`, it answers 503 while the maintenance revision serves.
+- **Verification.** The header's `alg` chooses the key, and decoding then
+  allows only that algorithm. ES256 needs the configured key's `kid`. HS256
+  needs `TELEMETRY_JWT_SECRET` to be configured. Every other token, including
+  `none`, an unknown `kid` and an HS256 token keyed with the public key, gets
+  401.
+- **Claims.** `iss`, `aud`, `sub` (the Hugging Face user ID), `username`,
+  `organizations`, `scope`, `iat` and `exp`, and `"delegated": true` on a token
+  issued with `lifetime_seconds`. A token lasts
+  `TELEMETRY_SESSION_TOKEN_TTL_SECONDS`, one hour by default, or the lifetime
+  granted, at most 24 hours, when it is delegated ("Tokens for builds on other
+  machines").
+- **Scopes.** `scope` is exactly one of `telemetry:write`, which registers runs
+  and sends their events, and `artifacts:submit`, which only the artifact
+  submission endpoints accept. Each endpoint requires its own scope and answers
+  403 to the other, so neither token works for the other's endpoints. An
+  exchange without a body issues a `telemetry:write` token.
+
+### Switching from HS256 to ES256
+
+Every deployed revision mounts the signing key, as `TELEMETRY_JWT_SIGNING_KEY`,
+from the Secret Manager secret named by the `TELEMETRY_JWT_SIGNING_KEY_SECRET_NAME`
+variable of the `staging` and `production` environments. Without that
+variable, deployment stops at its first step, its configuration check. It also
+checks that the secret exists before changing traffic. Each environment has its
+own key in its own secret. As for the other secrets, grant two roles on the
+secret itself: `roles/secretmanager.secretAccessor` to the runtime service
+account, which reads the key, and `roles/secretmanager.viewer` to the
+deployment identity, whose existence check reads the secret's metadata.
+
+The switch window starts with the first deployment that mounts the signing key
+and ends with the change that stops mounting `TELEMETRY_JWT_SECRET`. During
+the window the collector issues ES256 tokens and accepts both kinds, so HS256
+tokens issued before the deployment keep working until they expire. The window
+must last at least 24 hours after the last revision that issued HS256 tokens
+stopped serving: a delegated token that revision issued to a build on another
+machine, such as a Microcosm stage on Modal, stays valid that long
+(`MAXIMUM_DELEGATED_LIFETIME_SECONDS`), and that build cannot exchange again
+for an ES256 token. Keep the window open longer, until rolling back to such a
+revision is no longer wanted.
+
+A revision from before the signing key answers 401 to ES256 tokens. After a
+rollback to one, an emitter that holds a Hugging Face token exchanges again,
+receives an HS256 token and carries on after one retry. A build holding a
+delegated ES256 token cannot exchange again, so the collector refuses its
+telemetry until that build ends; builds launched after the rollback get HS256
+tokens.
+
+To retire HS256:
+
+1. Stop mounting `TELEMETRY_JWT_SECRET`: remove it from both `--set-secrets`
+   lists in `scripts/deploy.sh`, and remove `JWT_SECRET_NAME` from every list
+   of variables the script requires, from its secret check and from
+   `.github/workflows/push.yaml`. Without the secret, the collector refuses to
+   start unless the signing key is set, and it refuses HS256 tokens.
+2. Once that release has deployed to both environments, delete the
+   `TELEMETRY_JWT_SECRET_NAME` variables and the HS256 secrets. Every revision
+   from the switch window mounts `TELEMETRY_JWT_SECRET`, so after this none of
+   them can start: delete the secrets only once rolling back to one is no
+   longer wanted.
+
+To rotate the signing key, put the new key in a new secret. Don't add a
+version to the secret the service already mounts. Cloud Run reads a secret
+mounted as an environment variable when each instance starts, so a new
+version would reach every instance the serving revision starts from then on,
+while its running instances keep the old key. Until the next deployment, a
+token signed by one instance would get 401 from another, and
+`/.well-known/jwks.json` would answer with whichever key the instance holds.
+
+1. Generate the new key straight into a new secret, and grant it the same two
+   roles as the first key.
+2. Set `TELEMETRY_JWT_SIGNING_KEY_SECRET_NAME` in that environment to the new
+   secret's name. The serving revision keeps reading the old secret.
+3. Deploy. Deployments run only from the release commit of a merge to
+   `main`, so the rotation takes effect with the next merged change; every
+   merge releases and deploys. The new revision signs with, and publishes,
+   only the new key.
+   Tokens signed with the previous key get 401 and are exchanged again. A
+   build holding a delegated token signed with the previous key cannot
+   exchange again, so the collector refuses its telemetry for the rest of its
+   run. Unless the previous key must stop working at once, rotate when no such
+   build has been launched in the previous 24 hours.
+4. Delete the old secret once rolling back to a revision that mounts it is no
+   longer wanted, since such a revision can't start without it.
 
 ## Responses a producer acts on
 
@@ -81,6 +186,153 @@ sending the same request again cannot succeed:
   event without a valid block (a safe-identifier `phase`, a
   `blocking_failure_count` of at least 1, and `blocking_gate_ids`).
 
+### Details the emitter writes
+
+microcosm-emitter 0.14.0 and later write five `details` keys themselves, and
+the collector checks each against a model in `telemetry_collector.models`:
+
+| Event | Key | Model |
+| --- | --- | --- |
+| `heartbeat` | `reading`: the build's process tree and the machine, on every heartbeat (every 30 s by default) | `Reading` |
+| `heartbeat` | `sleep`: a system sleep, on the heartbeat sent on waking | `SleepRecord` |
+| `run` | `environment`: a local machine or a Modal container | `MachineEnvironment` |
+| `stage` | `stage_span`: the parent stage, occurrence, awake and asleep seconds, and why the emitter closed it (`closed_by`) | `StageSpan` |
+| `progress` | `outer`: the counter one level above the stage's own | `OuterProgress` |
+
+A key that doesn't match its model is removed from the stored event and named
+in `details.dropped_emitter_details`, with a warning in the collector's log
+naming the event and run. The rest of the event is accepted, since a `422`
+would stop the emitter delivering the whole run. The models' numbers are
+strict (an integer or a float, never a boolean or numeric text) and their times
+are ISO 8601 text. The same keys on other
+event types are stored as sent, and only the collector writes
+`dropped_emitter_details`.
+
+Both read APIs serve them beside the events, in version 1 as
+`run_manifest.environment`, `progress.reading` and a top-level `sleeps`, and
+in version 2 as the run's `environment`, `reading` and `sleeps`:
+
+- the environment: the latest run start's machine description;
+- the reading: the latest reading of the run's current attempt, with its
+  heartbeat's `timestamp`, or `null` until that attempt sends one;
+- the sleeps: every attempt's sleeps, in event order, each with its
+  `producer_id`.
+
+Each is checked against its model again when it is served, and left out if it
+doesn't match, since a collector without these checks stored the keys as sent.
+Only the latest reading is checked, then the one before it, so a long run
+costs one check.
+
+## Read API
+
+Both versions take the dashboard read credential in `X-Telemetry-Read-Token`.
+
+- **Version 1**, `GET /v1/runs` and `GET /v1/runs/{run_id}`, is what the
+  dashboard reads today. A run comes back as the documents the dashboard used
+  to read from Hugging Face run files (`progress`, `run_manifest`,
+  `calibration_progress` and lifecycle `events`). It changes only by gaining
+  keys the dashboard doesn't yet read, such as the emitter's readings below:
+  `tests/fixtures/read_api_v1` records its answers, and a test fails if they
+  change.
+- **Version 2**, `GET /v2/runs` and `GET /v2/runs/{run_id}`, returns typed
+  answers. The list takes the same `country`, `limit` and `before` as version 1
+  and returns each run's registration and stored state. A run comes back as
+  `{"run": ..., "events": [...]}`: every stored event with the fields its
+  producer sent (an optional field it left out is null, and `details` an empty
+  object), in the order the collector applies them (producers by registration
+  time, then producer id, then sequence), and the run's state folded from
+  exactly those events, so the two agree while the run is still receiving
+  events. All timestamps are in UTC. Bad parameters, including an invalid cursor or run id,
+  answer 422 with FastAPI's validation errors; an unknown run answers 404.
+
+`contracts/read-api-v2` holds version 2's contract:
+
+- `openapi.json`, its OpenAPI document, which the collector also serves at
+  `GET /v2/openapi.json`;
+- `telemetry.json`, telemetry for a few runs (completed, failed, blocked,
+  restarted, only registered, and one whose emitter sent readings, a sleep,
+  its machine description and stage spans);
+- `interactions/`, one file per request, with the collector's answer once that
+  telemetry is stored.
+
+`tests/test_read_api_v2.py` checks that the collector serves exactly that
+document and those answers, from the in-memory store and from PostgreSQL, and
+that each answer matches the document's schema. After an intended change to
+either version, run `uv run python tools/update-read-api-contract.py`, review
+the changed files, and regenerate the client's types (below).
+
+### The TypeScript client
+
+`packages/collector-client` is `@policyengine/microcosm-collector-client`, a
+typed client for version 2. Its types are generated from `openapi.json`
+(`npm run generate`), and its tests answer it with the recorded interactions.
+CI fails if the generated types are out of date. Each release gives the client
+the collector's version (`tools/set-client-version.py`, run by
+`tools/update-version.sh`).
+
+Once production runs a release, and if the repo variable
+`COLLECTOR_CLIENT_PUBLISH_ENABLED` is `true`, the Push workflow publishes that
+version to npm in two jobs:
+
+- `pack-client` installs the client's dependencies and runs `npm pack`, which
+  builds it. It has no OIDC token.
+- `publish-client` publishes that tarball with `tools/publish-client.sh`, which
+  checks that it is this package at the release's version, skips a version
+  already on npm, and runs `npm publish --ignore-scripts`. It installs nothing
+  and runs no package script, so the only code that can request its OIDC token
+  is the npm CLI that ships with Node and GitHub's own actions. It runs in the
+  GitHub environment `npm` and uses npm's trusted publishing: npm accepts the
+  job's GitHub OIDC token for this workflow file and environment, so no npm
+  token is stored anywhere, and npm attaches a provenance attestation.
+
+Both jobs follow `deploy-production`, so they run only while
+`COLLECTOR_DEPLOY_ENABLED` is `true`; while it is not, releases are not
+published either, without any job failing.
+
+Publishing is not switched on. Switching it on is a manual step, after the
+first release that contains the client has reached production:
+
+1. **Google Cloud.** Make the Workload Identity provider accept only the
+   deployment environments ("Google Cloud access"), so that `publish-client`'s
+   token cannot obtain Google credentials. `TELEMETRY_GCP_WIF_PROVIDER`, a
+   secret of the `staging` and `production` environments, holds the provider's
+   resource name, which names its project, pool and provider:
+
+   ```bash
+   gcloud iam workload-identity-pools providers update-oidc <provider> \
+     --project <collector project> --location global --workload-identity-pool <pool> \
+     --attribute-condition "assertion.repository=='PolicyEngine/microcosm-collector' && assertion.ref=='refs/heads/main' && assertion.environment in ['staging', 'production']"
+   ```
+
+   The next release's deployment jobs then check that deployments still
+   authenticate. To undo it, run the same command with the condition without
+   its last clause.
+2. **First version.** npm can trust a workflow only for a package that already
+   exists, so a maintainer of the `@policyengine` npm scope, logged in with
+   two-factor authentication, publishes that release's version once from its
+   tag: `git switch --detach <version>`, then in `packages/collector-client`,
+   `npm ci` and `npm publish --access public`. This version has no provenance
+   attestation.
+3. **Environment.** Create the GitHub environment `npm` with a deployment
+   branch policy that accepts only `main`, as `staging` and `production` do.
+4. **Trusted publisher**, on a day when a pull request is ready to merge: a new
+   trusted publisher configuration expires if its first publication has not
+   succeeded within 2 days. With npm 11.15.0 or later:
+   `npm trust github @policyengine/microcosm-collector-client --file push.yaml --repo PolicyEngine/microcosm-collector --env npm --allow-publish`
+   (or, on npmjs.com, the package's settings, "Trusted publishing", GitHub
+   Actions, with the same organization, repo, workflow file and environment).
+5. **Switch.** Set the repo variable `COLLECTOR_CLIENT_PUBLISH_ENABLED` to
+   `true`, then merge the pull request. Its release's `publish-client` job
+   publishes its version, and `npm view @policyengine/microcosm-collector-client`
+   then lists it. If no publication succeeded within the 2 days, remove the
+   configuration and repeat step 4:
+   `npm trust list @policyengine/microcosm-collector-client` shows its id, and
+   `npm trust revoke --id <id> @policyengine/microcosm-collector-client`
+   removes it.
+
+To stop publishing, set the variable to anything else; to stop npm trusting the
+workflow, revoke the configuration in the same way.
+
 ## Artifact intake
 
 Builds hand calibration diagnostics and Orrery inputs to the collector as
@@ -91,19 +343,21 @@ upload URLs; `POST /v1/submissions/{id}/complete` checks the stored objects'
 sizes and recorded digests and dispatches a worker job through Cloud Tasks; the
 worker, a Cloud Run Job running
 `uv run --no-sync python -m telemetry_collector.worker`, recomputes every
-file's SHA-256 and runs the handler registered for the kind. Until the
-calibration-tree and Orrery workers register theirs, both kinds are only
-checked and kept.
+file's SHA-256 and runs the handler registered for the kind. Where the
+worker job has its calibration tree Blob token, `calibration-diagnostics`
+submissions build calibration trees ("Building trees from submissions"), and
+where it has its private Orrery bucket, `orrery-inputs` submissions publish
+Orrery graph files ("Publishing Orrery graph files"). Otherwise a kind's
+submissions are only checked and kept in intake storage.
 
 Intake is off unless `COLLECTOR_INTAKE_ENABLED` is exactly `1`. While it is
 off, the collector reads no other intake setting, and the token exchange for
 `{"scope": "artifacts:submit"}` and every `/v1/submissions` path answer 404 with
-the code `intake_not_enabled`. `scripts/deploy.sh` sets none of these
-variables, so a deployment leaves intake off. It still changes three things:
-the migration job applies `0002_artifact_intake`, which adds the two intake
-tables; token responses gain `scope`; and the token exchange, which used to
-ignore its request body, now answers 422 for unknown fields and 404
-`intake_not_enabled` for `{"scope": "artifacts:submit"}`.
+the code `intake_not_enabled`. `scripts/deploy.sh` switches intake on in both
+environments: it sets `COLLECTOR_INTAKE_ENABLED=1` and the other intake
+settings on both service revisions, and updates both intake jobs (see "Worker
+jobs and recovery"). Switching an environment's intake off past its next
+release therefore takes a change to `scripts/deploy.sh`.
 
 Once `0002_artifact_intake` is applied, an image without it cannot run against
 the database. That includes every earlier collector release and the old copy in
@@ -115,30 +369,52 @@ every submission and job in them. Run it with this release's code, for
 example as its migration job with overridden arguments, and as the migration
 database user, before deploying the older image: the older code can't find
 the revision either, and the runtime user doesn't own the tables. That is an
-exception to the rule below that downgrades are for disposable test databases;
-while intake is off, both tables stay empty.
+exception to the rule below that downgrades are for disposable test databases.
+Both tables stay empty only while an environment's intake has never been
+switched on. In an environment whose intake is or was on, the downgrade
+deletes the record of every submission and job; the files stay in the
+bucket.
 
-| Setting | Read by | Value |
-|---|---|---|
-| `COLLECTOR_INTAKE_ENABLED` | service | `1` switches intake on |
-| `COLLECTOR_INTAKE_BUCKET` | service, worker | the private intake bucket's name |
-| `COLLECTOR_INTAKE_SIGNING_SERVICE_ACCOUNT` | service | the runtime service account, which signs upload URLs through IAM `signBlob` |
-| `COLLECTOR_WORKER_QUEUE` | service, operations | `projects/<project>/locations/<region>/queues/<queue>` |
-| `COLLECTOR_WORKER_JOB` | service, operations | `projects/<project>/locations/<region>/jobs/<job>` |
-| `COLLECTOR_WORKER_INVOKER_SERVICE_ACCOUNT` | service, operations | the account whose OAuth token each Cloud Task uses to run the worker job |
-| `COLLECTOR_WORKER_JOB_ID` | worker | set on each execution by its Cloud Task |
-| `DATABASE_URL` | worker, operations | the runtime database secret, as for the service |
+| Setting | Read by | Value | The deploy sets it from |
+|---|---|---|---|
+| `COLLECTOR_INTAKE_ENABLED` | service | `1` switches intake on | always `1` |
+| `COLLECTOR_INTAKE_BUCKET` | service, worker | the private intake bucket's name | `TELEMETRY_INTAKE_BUCKET` |
+| `COLLECTOR_INTAKE_SIGNING_SERVICE_ACCOUNT` | service | the runtime service account, which signs upload URLs through IAM `signBlob` | `TELEMETRY_RUNTIME_SERVICE_ACCOUNT` |
+| `COLLECTOR_WORKER_QUEUE` | service, operations | `projects/<project>/locations/<region>/queues/<queue>` | `TELEMETRY_WORKER_QUEUE`, the queue's name, in the deployment's project and region |
+| `COLLECTOR_WORKER_JOB` | service, operations | `projects/<project>/locations/<region>/jobs/<job>` | `TELEMETRY_WORKER_JOB`, the worker job's name, likewise |
+| `COLLECTOR_WORKER_INVOKER_SERVICE_ACCOUNT` | service, operations | the account whose OAuth token each Cloud Task uses to run the worker job | `TELEMETRY_WORKER_INVOKER_SERVICE_ACCOUNT` |
+| `COLLECTOR_WORKER_JOB_ID` | worker | set on each execution by its Cloud Task | not set by the deploy |
+| `DATABASE_URL` | worker, operations, Orrery read service | the runtime database secret, as for the service | `TELEMETRY_DATABASE_SECRET_NAME` |
+| `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN` | worker | the read-write token of the environment's own calibration tree Vercel Blob store, a Secret Manager secret; without it, `calibration-diagnostics` submissions stay in intake storage (see "Building trees from submissions") | `TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME`, the secret's name |
+| `COLLECTOR_ORRERY_BUCKET` | worker, Orrery read service | the name of the environment's private Orrery bucket. For the worker, the bucket it publishes Orrery graph files to; without it, `orrery-inputs` submissions stay in intake storage (see "Publishing Orrery graph files"). For the Orrery read service, the bucket it serves them from; it refuses to start without it (see "Serving Orrery graph files"). The service doesn't get it | `TELEMETRY_ORRERY_BUCKET` |
+
+The `TELEMETRY_*` names are GitHub `staging` and `production` environment
+variables, which `.github/workflows/push.yaml` passes to `scripts/deploy.sh`.
+The deploy also reads these, to update the two jobs and to deploy the Orrery
+read service:
+
+| Variable | Value |
+|---|---|
+| `TELEMETRY_RECOVERY_JOB` | the recovery job's name |
+| `TELEMETRY_WORKER_SERVICE_ACCOUNT` | the worker job's service account |
+| `TELEMETRY_RECOVERY_SERVICE_ACCOUNT` | the recovery job's service account |
+| `TELEMETRY_HF_READ_SECRET_NAME` | the environment's own Hugging Face read token's secret, mounted on the worker job (see "Hugging Face read access") |
+| `TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME` | the secret holding the read-write token of the environment's own calibration tree Blob store, mounted on the worker job only as `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN` (see "Building trees from submissions") |
+| `TELEMETRY_ORRERY_BUCKET` | the name of the environment's private Orrery bucket, set on the worker job and on the Orrery read service as `COLLECTOR_ORRERY_BUCKET`; the service revisions and the recovery job don't get it (see "Publishing Orrery graph files" and "Serving Orrery graph files") |
+| `TELEMETRY_ORRERY_READER_SERVICE_ACCOUNT` | the address of the Google service account the environment's microcosm-runs deployments act as: the one member the deploy grants the Cloud Run Invoker role on the Orrery read service. No revision, job or service gets it as a setting (see "Serving Orrery graph files") |
 
 The two service-account settings accept only user-managed accounts,
 `<name>@<project>.iam.gserviceaccount.com`. The collector refuses to start
 with the default Compute Engine account
 (`<number>-compute@developer.gserviceaccount.com`), so the runtime and invoker
-accounts must be user-managed ones.
+accounts must be user-managed ones. The deploy checks the Orrery reader
+account's address against the same pattern.
 
 ### Database access
 
 The migration job's database user owns the tables it creates; the service,
-the worker and the operator commands connect as the runtime database user.
+the worker, the Orrery read service and the operator commands connect as the
+runtime database user.
 The migrations grant nothing. The runtime user's access to the telemetry
 tables was granted by hand when each database was set up, outside this
 repo. Its access to every table created since then comes from the
@@ -178,7 +454,13 @@ role creates in `public` after they are set.
   is true for each of them and each of the four privileges.
 
 The intake code needs `SELECT`, `INSERT` and `UPDATE`; row locks
-(`SELECT ... FOR UPDATE`) need `UPDATE`. No table uses a sequence. A `serial`
+(`SELECT ... FOR UPDATE`) need `UPDATE`. The Orrery graph handler needs
+`SELECT` and `INSERT` on `orrery_graph_files`, which migration
+`0003_orrery_graph_files` creates: it records each published graph file with
+`INSERT ... ON CONFLICT DO NOTHING RETURNING`, and `RETURNING` needs
+`SELECT`. The Orrery read service, which connects as the runtime user too,
+needs `SELECT` on `orrery_graph_files` and `artifact_submissions`. No table
+uses a sequence. A `serial`
 column would need `USAGE` on its sequence, which these default privileges
 don't give, so a migration that adds one needs
 `GRANT USAGE, SELECT ON SEQUENCES` added to the default privileges first; an
@@ -208,37 +490,93 @@ identity column needs no sequence privilege to insert rows.
   runs it as an execution of the recovery job with its arguments overridden,
   or locally through the Cloud SQL Auth Proxy with Application Default
   Credentials that may enqueue on the queue and act as the invoker account.
+- **The inventory of past builds** (`uv run --no-sync python -m
+  telemetry_collector.operations past-builds`) prints, and changes nothing.
+  It reads Hugging Face, so an operator runs it as an execution of the worker
+  job, the only job with the Hugging Face read token, with its arguments
+  overridden (see "Past builds").
 
-None of these values is secret. Switching intake on for an environment needs,
-in that environment's project and region:
+None of these values is secret. Intake needs, in each environment's project
+and region, these resources, created by hand (both environments have them):
 
 - **A bucket** with uniform bucket-level access, public access prevention
   enforced, and no lifecycle deletion, so intake files stay available for
   back-building.
 - **A Cloud Tasks queue** for worker jobs.
-- **The worker Cloud Run Job** described above, running the released image
-  with the worker command, with the runtime database secret as `DATABASE_URL`,
-  the Cloud SQL connection and `COLLECTOR_INTAKE_BUCKET`.
-- **The recovery Cloud Run Job** on the same image with the recovery command,
-  the runtime database secret as `DATABASE_URL`, the Cloud SQL connection and
-  the three `COLLECTOR_WORKER_*` queue settings, and a Cloud Scheduler job that
-  runs it every 10 minutes.
-- **Database access:** after the migration, the runtime database user has
-  `SELECT`, `INSERT`, `UPDATE` and `DELETE` on `artifact_submissions` and
-  `artifact_jobs`, through the migration user's default privileges, which
-  both environments already have (see "Database access").
+- **The worker Cloud Run Job** described above and **the recovery Cloud Run
+  Job**, and a Cloud Scheduler job that runs the recovery job every 10
+  minutes. The deploy updates both jobs but never creates one, so each must
+  exist, with the permissions below, before the release that first deploys
+  to its environment.
+- **Database access:** after the migrations, the runtime database user has
+  `SELECT`, `INSERT`, `UPDATE` and `DELETE` on `artifact_submissions`,
+  `artifact_jobs` and `orrery_graph_files`, through the migration user's
+  default privileges, which both environments already have (see "Database
+  access").
 - **Permissions:** the runtime service account may create and read objects in
   the bucket, sign as itself (`roles/iam.serviceAccountTokenCreator` on
-  itself), enqueue on the queue, and act as the invoker account; the invoker
+  itself), enqueue on the queue, act as the invoker account, and list and
+  read objects in its environment's private Orrery bucket
+  (`roles/storage.objectViewer`), for the Orrery read service, which runs as
+  it (see "Serving Orrery graph files"); the invoker
   account may run the worker job with overrides; the worker's service account
-  may read the bucket, connect to Cloud SQL and read the runtime database
-  secret; the recovery job's service account may connect to Cloud SQL, read the
-  runtime database secret, enqueue on the queue and act as the invoker
-  account; Cloud Scheduler's account may run the recovery job.
-- **Deployment wiring:** `scripts/deploy.sh` passing the settings to the
-  service and updating both jobs' images on every release, from new `staging`
-  and `production` environment variables. That change is the one that
-  switches intake on.
+  may read the bucket, create and read objects in its environment's private
+  Orrery bucket (see "Publishing Orrery graph files"), connect to Cloud SQL
+  and read the runtime database secret, its environment's Hugging Face read
+  token's secret and its environment's calibration tree Blob token's secret;
+  the recovery
+  job's service account may connect to Cloud SQL, read the runtime database
+  secret, enqueue on the queue and act as the invoker account; Cloud
+  Scheduler's account may run the recovery job; and the deployment service
+  account may update both jobs and act as the worker and recovery accounts,
+  and may deploy the Orrery read service as the runtime account and set its
+  IAM policy (Cloud Run Admin, `roles/run.admin`, on the project).
+
+Each release, in each environment, `scripts/deploy.sh`:
+
+1. checks, before it changes anything:
+   - that every intake name, the Orrery bucket's name and the Orrery reader
+     account's address have the shape the collector accepts, and that the
+     Orrery read service's name fits Cloud Run's 49 characters
+     (`require-configuration`, before it authenticates), so
+     a malformed name stops the deploy before a revision or job that reads it
+     fails to start;
+   - that each job exists, already runs as the service account the deploy
+     gives it, and connects to the environment's own Cloud SQL instance
+     (`check-intake-jobs`), so a variable naming the other environment's job
+     stops the deploy. To move a job to another account, update the job by
+     hand first;
+   - that the environment's seven secrets exist, its Hugging Face read
+     token's and its calibration tree Blob token's among them
+     (`check-secrets-exist`);
+2. passes the intake settings in the first table to the maintenance and
+   candidate revisions;
+3. after the migration and before the candidate revision, updates the worker
+   job (`configure-worker-job`) and then the recovery job
+   (`configure-recovery-job`) to the released image, with their whole
+   configuration: service account, Cloud SQL connection, secrets, settings,
+   command, task count, retries, task timeout, CPU and memory. Each update
+   sets the job's secrets with `--set-secrets`, which replaces every mount,
+   so the worker job's lists `DATABASE_URL`, `COLLECTOR_HF_READ_TOKEN` and
+   `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN` together, and sets the worker
+   job's settings, `COLLECTOR_INTAKE_BUCKET` and `COLLECTOR_ORRERY_BUCKET`,
+   with `--set-env-vars`. The deploy changes neither the schedule nor any
+   job's permissions;
+4. last, once the service is live, deploys the Orrery read service, sets
+   who may call it and checks that it refuses a call without a token
+   (`deploy-orrery-read-service`; see "Serving Orrery graph files").
+
+Maintenance mode holds only the service. An execution of either job keeps the
+image it started with, for all its attempts: a worker execution that is
+running during a migration (up to three attempts of an hour each), or one that
+a scheduled recovery run or a Cloud Tasks retry starts before the job is
+updated, runs the previous release's code against the migrated schema. A
+migration that changes the intake tables must therefore keep working with the
+previous release's worker and recovery code.
+
+Each dispatch is a `jobs.run` call that returns once the execution is created,
+so the queue's limit on concurrent dispatches does not limit how many worker
+executions run at once.
 
 ## Local development
 
@@ -249,10 +587,13 @@ uv run uvicorn telemetry_collector.app:create_app_from_environment \
   --factory --host 127.0.0.1 --port 8080 --no-access-log
 ```
 
-Before running the migration or service, provide the database connection, JWT
-signing secret, and dashboard read credential through the documented runtime
-environment variables. Use at least 32 random characters for the JWT signing
-secret and at least 24 for the dashboard read credential. Use Microcosm's
+Before running the migration or service, provide the database connection, a
+session signing key, and the dashboard read credential through the documented
+runtime environment variables. Generate a P-256 key for local use with
+`openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256` and pass the
+PEM text as `TELEMETRY_JWT_SIGNING_KEY`. `TELEMETRY_JWT_SECRET`, at least 32
+random characters, is needed only to issue or accept HS256 tokens. Use at
+least 24 random characters for the dashboard read credential. Use Microcosm's
 loopback-only development option when testing ingestion. Production Microcosm
 builds use the fixed collector origin shipped by the package and do not accept
 a destination environment variable.
@@ -261,9 +602,14 @@ a destination environment variable.
 
 ```bash
 uv sync --locked --dev
+npm ci --prefix orrery-validator --omit=dev --omit=peer --ignore-scripts
 uv run pytest -q
 bash tools/check-quality.sh
 ```
+
+The Orrery validator's tests (`tests/test_orrery_validation.py`) run the
+real validator, so they need Node 22.14 or later and the validator's
+packages installed as above; CI uses Node 24.21.0, the release the image holds.
 
 `tools/check-quality.sh` runs Ruff's lint and format checks and syntax-checks
 every shell script in `tools/` and `scripts/` with `bash -n`, as CI does.
@@ -280,8 +626,8 @@ database.
 projection. `orrery_json_from_schema(schema, execution=overlay)` turns a
 build's saved compiler schema (`graph.schema.json`) and execution overlay
 (`graph.execution.json`) into the Orrery JSON that Microcosm's projection
-writes from them, byte for byte. It needs only the standard library. Nothing
-in the service calls it yet; the collector's Orrery worker will.
+writes from them, byte for byte. It needs only the standard library. The
+worker's Orrery graph handler calls it ("Publishing Orrery graph files").
 
 `provenance.py` records the Microcosm commit the modules were copied from,
 each source file's git blob ID, and what the one changed module,
@@ -311,13 +657,775 @@ modules named in `provenance.py`, in
 Once Microcosm hands its Orrery inputs to the collector and removes its copy,
 this copy is the only one, and changes to the projection are made here.
 
+### Orrery validation
+
+`orrery-validator/validate-orrery-document.mjs` validates an Orrery graph
+document under Node with one version of `@axiom-foundation/orrery`, pinned in
+`orrery-validator/package.json` and its lockfile (0.6.2; its validation code
+is identical to 0.6.1's, which microcosm-runs uses). It accepts exactly the
+graph file contents microcosm-runs' publication accepts (`lib/service.ts`):
+
+- the bytes decode as strict UTF-8 and parse as JSON, or the answer is
+  `invalid_json`;
+- Orrery's `parseGraphDocument` accepts the document, or it is
+  `invalid_graph`, with Orrery's issues;
+- `checkSources`: every `url` is an `https://` URL without a user name or
+  password, or names, before any `#`, a file published with the document, or
+  it is `invalid_source`. An `https://` value that is not a URL is refused
+  here; microcosm-runs answers 503 for it instead.
+
+A refusal says where a link is (its JSON path), never what it holds, since a
+link may carry a credential, and keeps at most 100 issues of at most 500
+characters (code points) each. Issue text always encodes as UTF-8 and can be
+stored in PostgreSQL's `jsonb`: shortening keeps whole characters, and an
+unpaired surrogate or a NUL, which a document's JSON can escape and Orrery
+repeats in its issues, becomes U+FFFD. microcosm-runs also
+refuses a graph file over 64 MiB and file names outside its role patterns;
+those are checks on a publication to microcosm-runs, not on the document. The
+collector publishes graph files to its own private bucket instead
+("Publishing Orrery graph files"), and its projection already refuses a
+document over 64 MiB.
+
+`telemetry_collector.orrery.validation.validate_orrery_document(document,
+published_file_names)` runs it and returns the Orrery version, raises
+`OrreryDocumentRefusedError` with the code, issues and Orrery version for a
+refused document, and raises `OrreryValidatorError` when the validator could
+not run. Node gets only `PATH` and `LANG=C.UTF-8`, so none of the worker's
+settings or credentials, such as `DATABASE_URL`, reach it, and its answer is
+read as UTF-8 whatever the worker's locale; output that is not UTF-8 is a
+validator error. By hand:
+
+```bash
+uv run python -m telemetry_collector.orrery.validation graph.orrery.json NAME...
+```
+
+The image holds Node 24.21.0, copied from the official image by digest, and the
+validator installed with `npm ci`. npm is not in the image. CI checks the built
+image with `tools/check-worker-image.sh`, which runs the validator inside it on
+a projected document and on one Orrery refuses. The worker's Orrery graph
+handler validates every document it publishes.
+
+To move to another Orrery version, change the version in
+`orrery-validator/package.json`, run `npm install --prefix orrery-validator
+--package-lock-only --ignore-scripts`, and update `ORRERY_VERSION` in
+`tests/test_orrery_validation.py` and `tests/test_orrery_graphs.py`.
+
+### Publishing Orrery graph files
+
+The worker job publishes an Orrery graph file from each `orrery-inputs`
+submission (`telemetry_collector/orrery_graphs.py`) where it has
+`COLLECTOR_ORRERY_BUCKET`, the name of its environment's private Orrery
+bucket, which the deploy sets on the worker job and on the Orrery read
+service, which serves the files ("Serving Orrery graph files"), from the
+GitHub environment variable `TELEMETRY_ORRERY_BUCKET`. Without it,
+submissions stay in intake storage and can be reprocessed later (`reprocess
+--kind orrery-inputs --intake-only`). The handler is registered in
+`telemetry_collector/handlers.py`, the worker's one registry, beside the
+calibration tree handler.
+
+- **Inputs.** Each attempt downloads the schema and the execution overlay
+  into a new temporary directory. Upstream files are downloaded only after
+  links are removed, and only those the document still links to: removing
+  links needs only their names, from the submission's file list, and the
+  projection doesn't read them. Evidence files are never downloaded. The
+  handler reads the schema and overlay as Microcosm's own command reads its
+  input (`_read_json` at the projection's source commit): at most 32 MiB,
+  strict JSON in UTF-8, no key repeated within an object, no `NaN` or
+  infinity, and nested no deeper than Python's JSON decoder can parse. The
+  projection, `orrery_json_from_schema(schema, execution=overlay)`, builds
+  the document. These reject the submission with `orrery_inputs_unusable`:
+  - a schema or overlay that fails those reading rules. A schema over
+    32 MiB is rejected here, although intake accepts schemas up to 64 MiB;
+  - a `TypeError`, `ValueError` or `RecursionError` from the projection, with
+    its message shortened to 500 characters. Microcosm's command treats these
+    as input errors, and also `OSError` and `GraphRuntimeError`, which the
+    copied projection never raises;
+  - an upstream file not named `upstream-<its SHA-256>.json`: `upstream-`,
+    64 lowercase hex characters that are the SHA-256 the worker verified for
+    the file, and `.json`. Microcosm names each producing run's file it
+    copies that way (`save_graph_schema`), and the Orrery read service takes
+    a served upstream file's SHA-256 from its name ("Serving Orrery graph
+    files"). The rule also keeps an upstream file from taking the document's
+    own name, `graph.orrery.json`.
+
+  The worker records a NUL or an unpaired surrogate in a rejection's message,
+  such as a schema column name the projection repeats, as U+FFFD, as it does
+  for every handler, because PostgreSQL's `jsonb` cannot store them. Any
+  exception from the projection other than a `TypeError`, `ValueError` or
+  `RecursionError`, for example a `KeyError` or an `AttributeError`, fails the
+  attempt and is retried, as Microcosm's own command would crash on it.
+- **Links.** Evidence files stay in private intake storage, so a published
+  document doesn't link to them: each evidence reference keeps its label and
+  SHA-256 but loses its link, whatever the link's scheme, `https://`
+  included. The evidence references are the overlay's phase references
+  (`metadata.execution.phases[].references`) and the document's `artifacts`,
+  which the projection builds only from the overlay: it copies a phase
+  reference's `url` into its artifact's `uri`. There every `url` and `uri` is
+  removed unless it names a submitted upstream file before any `#`.
+  Everywhere else, a `url` or `uri` stays only when it starts with
+  `https://` or names a submitted upstream file before any `#`, as Microcosm
+  writes those links (`upstream-<sha256>.json`), and every other one is
+  removed. The rest of each object stays.
+- **What removal changes.** Each node or edge that lost a link gets a new
+  `revision`: the projection's digest of the record as published, computed as
+  the projection computes it. `metadata.execution` is the submitted overlay
+  with its links removed as above, and `metadata.microcosm.extensions` the
+  schema's extensions likewise. The digests that describe the submitted files
+  are not changed: `metadata.microcosm.schema_sha256` and the document's own
+  `revision` still describe the schema and overlay as submitted. The document
+  is serialised exactly as the projection serialises it, so a document with
+  nothing removed has the projection's bytes.
+- **Checks.** The pinned validator ("Orrery validation") validates the
+  document, with the upstream files it still links to as its published
+  files. A refusal rejects the submission with `orrery_document_refused`,
+  naming the validator's code and its first issue's path; a validator that
+  could not run fails the attempt, so it runs again.
+- **Storage.** The document and each upstream file it links to are written
+  to `graphs/<submission_id>/<document sha256>/` in the bucket, as
+  `graph.orrery.json` and under their own names, upstream files first, with
+  the content type `application/json` and their SHA-256 in the `sha256`
+  metadata, as intake objects carry it. A write only ever creates an object
+  (`if_generation_match=0`). An existing object with the same SHA-256 is
+  kept, so a retry, or a reprocessing with the same code, writes nothing
+  new, and a reprocessing after the projection changes writes a new folder.
+  An existing object with another SHA-256 fails the attempt. Upstream files
+  the document doesn't link to, and evidence files, are not written.
+- **Record.** Each document is recorded in `orrery_graph_files`: its
+  submission and processing round, run, build and country, its folder,
+  SHA-256 and size, how many upstream files it links to, the Orrery version
+  that validated it, the Microcosm commit the projection was copied from
+  (`projection_source`), the collector's version, whether it was
+  reconstructed (false for every document built from a submission's own
+  inputs), and its visibility. A document already recorded for the
+  submission keeps its first row.
+- **Visibility.** A licensed build's graph file is recorded `private`: it
+  stays in the private bucket, and no clearance step makes it public. Any
+  other build's is recorded `public`. The Orrery read service serves both
+  only to microcosm-runs, which shows licensed runs' files only to people
+  signed in with policyengine.org Google accounts (tracker 2b · 7 and
+  4b · 3), and treats a recorded `public` document as private when a run or
+  a build it comes from had licensed data (see "Serving Orrery graph
+  files").
+- **Result.** The receipt's result is `{"processed_by": "orrery-graph",
+  "object_prefix", "document_sha256", "document_bytes", "upstream_files",
+  "orrery_version", "visibility", "removed_links"}`, where `removed_links`
+  counts the `url` and `uri` keys removed.
+
+Each environment's bucket, and the worker account's access to it, are set up
+before the first deploy, as the permissions list in "Worker jobs and
+recovery" describes. The deploy neither creates nor checks them. Each
+bucket needs:
+
+- **Private:** uniform bucket-level access, with public access prevention
+  enforced.
+- **Access:** only that environment's worker service account and runtime
+  service account may use its objects. The worker's account has
+  `roles/storage.objectCreator` and `roles/storage.objectViewer` on the
+  bucket: it creates objects and reads an existing object's SHA-256 back,
+  and can neither replace nor delete one. The runtime account, which the
+  Orrery read service runs as, has `roles/storage.objectViewer` on the
+  bucket: it lists and reads objects to serve them ("Serving Orrery graph
+  files"), and can neither create, replace nor delete one.
+
+Once `0003_orrery_graph_files` is applied, an image without it cannot run
+against the database, as with `0002_artifact_intake` above: its migration job
+cannot find the revision and its `/ready` check fails. To roll back to such
+an image, first run `alembic downgrade 0002_artifact_intake` with this
+release's code, as the migration database user. That drops
+`orrery_graph_files` and every record in it; the graph files stay in the
+bucket, and reprocessing the submissions records them again.
+
+### Serving Orrery graph files
+
+The Orrery read service serves the Orrery graph files the worker published
+to microcosm-runs alone, for every document, public or private.
+microcosm-runs decides what to show to whom: it shows licensed runs' files
+only to people signed in with policyengine.org Google accounts (tracker
+4b · 3). The read service is a separate Cloud Run service in each
+environment, named `<service>-orrery` after the environment's collector
+service (`TELEMETRY_SERVICE`). It runs the collector's image with an
+application that mounts only the two routes below
+(`telemetry_collector/orrery_read_app.py`; the routes are in
+`telemetry_collector/orrery_graph_api.py`). The collector's own service
+mounts neither route, and gets no Orrery setting.
+
+**Cloud Run's caller check is the read service's only access control.** Its
+code verifies no token and reads no credential, so the service must never
+allow unauthenticated calls, and its Cloud Run invoker check must never be
+switched off: either would serve every file, licensed ones included, to
+anyone. Every deploy sets all of it again, and then checks it:
+
+- `--no-allow-unauthenticated` and `--invoker-iam-check`;
+- no custom audience (`--clear-custom-audiences`), so a token must be for
+  the service's own URL, which Cloud Run always accepts;
+- the service's whole IAM policy: the Cloud Run Invoker role
+  (`roles/run.invoker`) for the environment's microcosm-runs account,
+  `TELEMETRY_ORRERY_READER_SERVICE_ACCOUNT`, and nothing else, so `allUsers`,
+  `allAuthenticatedUsers` or another member added by hand is removed. The
+  deploy then reads the policy back and fails unless it is exactly that;
+- a call without a token: the deploy reads the service's URL (`gcloud run
+  services describe <service>-orrery --format 'value(status.url)'`), sends
+  `GET <URL>/v1/orrery-graphs?run_id=deploy-access-check` with no
+  `Authorization` header, and fails unless the answer is 401 or 403. It
+  prints only the status code. IAM can take a few minutes to apply a policy
+  change, so the first deploy after someone grants `allUsers` by hand can
+  fail this check even though it has removed the grant; re-running the job
+  then shows whether the service refuses the call.
+
+**Who else can call it.** The service's own IAM policy covers only roles
+granted on the service itself. Anyone granted, on the project, its folder or
+the organization, any role that includes the permission to invoke services,
+`run.routes.invoke`, can call the read service too, beside the reader
+account its policy names: IAM passes roles granted on a folder or the
+organization down to the project. That covers custom roles with the
+permission as well as predefined ones. IAM's permissions reference
+(<https://docs.cloud.google.com/iam/docs/roles-permissions/run>, the row for
+`run.routes.invoke`) lists these predefined roles as including it:
+
+| Role, as the reference titles it | Role ID |
+|---|---|
+| Admin | `roles/admin` |
+| Writer | `roles/writer` |
+| Owner (Legacy) | `roles/owner` |
+| Editor (Legacy) | `roles/editor` |
+| Cloud Run Admin | `roles/run.admin`, which the deployment service account holds |
+| Cloud Run Developer | `roles/run.developer` |
+| Cloud Run Editor | `roles/run.editor` |
+| Cloud Run Invoker | `roles/run.invoker` |
+| Cloud Run Service Invoker | `roles/run.servicesInvoker` |
+| Cloud Run Source Developer | `roles/run.sourceDeveloper` |
+| Cloud Functions Admin | `roles/cloudfunctions.admin` |
+| Cloud Functions Editor | `roles/cloudfunctions.editor` |
+| Cloud Functions Developer | `roles/cloudfunctions.developer` |
+| Firebase Admin | `roles/firebase.admin` |
+| Firebase Develop Admin | `roles/firebase.developAdmin` |
+| Data Scientist | `roles/iam.dataScientist` |
+| Dev Ops | `roles/iam.devOps` |
+| ML Engineer | `roles/iam.mlEngineer` |
+
+The same row also lists twelve service agent roles, which the reference says
+to grant only to service agents, the Google-managed accounts that act for a
+Google service: `roles/aiplatform.serviceAgent`, `roles/ces.serviceAgent`,
+`roles/cloudfunctions.serviceAgent`,
+`roles/cloudfunctions.standardServiceAgent`, `roles/dialogflow.serviceAgent`,
+`roles/firebaseapphosting.serviceAgent`,
+`roles/firebasedataconnect.serviceAgent`, `roles/integrations.serviceAgent`,
+`roles/monitoring.notificationServiceAgent`, `roles/run.serviceAgent`,
+`roles/spanner.serviceAgent` and `roles/visionai.serviceAgent`. Cloud Run's
+access control page names only some of these roles, so check the permissions
+reference's row, which changes as Google adds roles.
+
+Anyone who may make identity tokens as the reader account can also call the
+read service, as that account. Making one needs
+`iam.serviceAccounts.getOpenIdToken` on the account. The Workload Identity
+principals of the matching Vercel deployments have it, and so does anyone
+granted, on the account, on the project that holds it, or on that project's
+folder or organization, a role that includes it. IAM's permissions reference
+(<https://docs.cloud.google.com/iam/docs/roles-permissions/iam>, the row for
+`iam.serviceAccounts.getOpenIdToken`) lists these predefined roles, beside
+service agent roles:
+
+| Role, as the reference titles it | Role ID |
+|---|---|
+| Service Account OpenID Connect Identity Token Creator | `roles/iam.serviceAccountOpenIdTokenCreator` |
+| Service Account Token Creator | `roles/iam.serviceAccountTokenCreator` |
+| Workload Identity User | `roles/iam.workloadIdentityUser` |
+
+No basic role includes it, not even Admin or Owner (Legacy), but anyone who
+may change the account's or the project's IAM policy can grant themselves
+one of these roles.
+
+Grant the roles that include `run.routes.invoke` only to administrators, and
+the roles that include `iam.serviceAccounts.getOpenIdToken` on the reader
+account only to the matching Vercel deployments' principals. In particular, grant an account that must run a job, such as the worker's
+invoker account or Cloud Scheduler's account, its role on that job, not on
+the project. Whether any account other than an administrator holds one of
+these roles in either environment is not checked.
+
+| Setting | Value | The deploy sets it from |
+|---|---|---|
+| `COLLECTOR_ORRERY_BUCKET` | the environment's private Orrery bucket's name, checked as the worker checks it | `TELEMETRY_ORRERY_BUCKET` |
+| `DATABASE_URL` | the collector's database, as for the service | the runtime database secret, `TELEMETRY_DATABASE_SECRET_NAME` |
+
+The read service refuses to start without either setting.
+
+**The deployed service** (`scripts/deploy.sh deploy-orrery-read-service`).
+Each deploy job runs it last, once the collector's service is live, so that
+a failure leaves the service released and out of maintenance mode. The
+read service reads the migrated database, so it is deployed after the
+migration; it has no maintenance mode, and while a migration runs, its
+previous revision keeps answering.
+
+| What | Value | Why |
+|---|---|---|
+| Name | `<service>-orrery` | needs no variable of its own; `require-configuration` checks it fits Cloud Run's 49 characters before the deploy authenticates |
+| Identity | the runtime service account | it may read the bucket, connect to Cloud SQL and read the runtime database secret, as the service does |
+| Start | `uv run --no-sync uvicorn telemetry_collector.orrery_read_app:create_orrery_read_app_from_environment --factory --host 0.0.0.0 --port 8080 --no-access-log`, with container port 8080 | Cloud Run sends requests to and probes port 8080. The TCP startup probe checks only that the service listens: it has no health route |
+| Request timeout | 300 seconds | a fetch of a 64 MiB file reads it twice, in about 130 ranged reads of 1 MiB one after another, and sends it during the second read. Each Cloud Storage request gives up after 10 seconds without connecting or without data, and each call retries for at most 30 seconds: under a quarter of the timeout together |
+| Memory, CPU, concurrency | 512 MiB, 1 CPU, 10 requests per instance | a request holds about one 1 MiB part of a file at a time, so ten fit beside the Python process with room to spare; hashing and sending are light work for one CPU |
+| Instances | 0 to 2, in both environments | each instance's database pool holds at most five connections, so the read service holds at most ten. microcosm-runs calls it only to show a run's files, and may cache public ones |
+
+The deployment service account deploys it as the runtime account and sets
+its IAM policy with Cloud Run Admin (`roles/run.admin`) on the project; it
+already may act as the runtime account, as it does for the service. The
+runtime service account has `roles/storage.objectViewer` on its
+environment's bucket, so it can list and read objects and can neither
+create, replace nor delete one, and the runtime database user reads
+`orrery_graph_files` and `artifact_submissions` (see "Database access").
+Both were set up before the first release that serves the files; the deploy
+neither creates nor checks them.
+
+**How microcosm-runs calls it.** microcosm-runs gets a Google-signed
+identity token for its environment's reader account from its Vercel
+deployment's identity, without a stored key: it calls the IAM Credentials
+API's `generateIdToken` for that account with the read service's URL as the
+audience, `"audience": "<read service URL>"`, and `"includeEmail": true`. It
+sends the token as `Authorization: Bearer <token>` to that same URL. The URL
+is the deployed service's `run.app` URL, a scheme and a host with no path,
+exactly as `gcloud run services describe <service>-orrery --region <region>
+--format 'value(status.url)'` shows it; the `Service URL:` that `gcloud run
+deploy` prints in the deploy job's log is the same. Cloud Run
+always accepts a token whose audience is the service's URL, and the service
+has no custom audience. The read service has no load balancer or hostname of
+its own. Each environment's read service has its own URL, so the audience
+differs between environments. microcosm-runs' production deployments use
+the collector's production environment, and its preview deployments use
+staging; each environment has its own reader account, which only the
+matching Vercel deployments can act as.
+
+Cloud Run's documentation doesn't say whether it needs the token's `email`
+claim. Its authentication pages name only the audience (`aud`) as the claim
+to set, and its own examples get tokens without `email`: the metadata
+server's identity endpoint without `format=full`, and `gcloud auth
+print-identity-token` without `--include-email`. Asking for the claim costs
+nothing, and the read service reads no claim.
+
+**Answers.**
+
+- **Cloud Run's own refusals,** before a request reaches the read service:
+  401 for an `Authorization` header without a Bearer ID token, a token that
+  isn't a validly signed Google ID token, or one for another audience; 403
+  for a valid token of an account without the Invoker role. Cloud Run's
+  documentation says a request without a token can get 403 too. These are
+  Cloud Run's answers, not the collector's: they have neither its
+  `{"detail", "code"}` shape nor its `Cache-Control` header.
+- **`GET /v1/orrery-graphs?run_id=<run>&build_id=<build>`**, with either or
+  both, lists the recorded documents of the run, the build, or both, newest
+  first, as `{"documents": [...]}`. Each has `submission_id`,
+  `document_sha256`, `document_bytes`, `run_id`, `build_id`, `country_code`,
+  `orrery_version`, `projection_source`, `collector_version`,
+  `reconstructed`, `created_at`, `visibility` (its effective visibility,
+  below), `current`, and `document_path` and `upstream_paths`, the paths of
+  the document and of each upstream file in its folder. Neither filter, or a
+  malformed one, answers 422 with `orrery_graph_query_invalid`.
+- **`GET /v1/orrery-graphs/<submission_id>/<document_sha256>/<file_name>`**
+  returns `graph.orrery.json` or one of its `upstream-<sha256>.json` files
+  from the bucket. Each part is checked before it names an object: the
+  submission ID as the collector derives it (`sub-` and 32 lowercase hex
+  characters), the digest as 64 lowercase hex characters, and the file name
+  as exactly one of those two forms. Any other path, a document without a
+  row, and an object that doesn't exist answer 404 with
+  `orrery_graph_not_found`; a path holding a parent folder or an encoded
+  slash never names an object.
+  - **The check.** Objects are never replaced, so the service reads the
+    object at the generation it found, twice, in ranged reads of 1 MiB,
+    holding at most one part at once. The first read hashes the bytes,
+    keeping none, and their SHA-256 must equal the document's
+    `document_sha256` in its row, or, for an upstream file, the SHA-256 in
+    its name, which the worker checked is the file's own. The objects'
+    `sha256` metadata is not read. Only on a match does the second read send
+    the bytes, so nothing is sent before the whole file has matched.
+  - 500 (`orrery_graph_digest_mismatch`), logged, nothing served: the bytes
+    don't match, or the storage client reports a checksum failure.
+  - 500 (`orrery_graph_changed`), logged, nothing served: the generation
+    found is no longer stored when the first read asks for it.
+  - **A client must check the body against the `ETag`.** If the second read
+    fails (the generation is no longer stored, the bucket stops answering,
+    or the storage client reports a checksum failure), the status 200 and
+    the headers have already been sent. The read service logs the failure
+    and stops sending, so the body ends early. Whether an HTTP client then
+    reports an error depends on the client and on what Cloud Run's front
+    end passes on, which is not checked. So before it caches or shows a
+    file, microcosm-runs must compare the SHA-256 of the body it received
+    with the `ETag`, and with the listed `document_sha256` for a document
+    or the SHA-256 in an upstream file's name, and discard the file when
+    they differ (tracker 4b · 3).
+- **A bucket that doesn't answer** gives 503 with
+  `orrery_storage_unavailable` and `Retry-After`, on both endpoints, and a
+  warning in the log with the object or folder and the storage error's type,
+  never its message, which can quote the request. Each Cloud Storage
+  request gives up after 10 seconds without connecting or without data,
+  instead of the client's 60, and each call retries for at most 30 seconds,
+  instead of the client's 120.
+- **A database that doesn't answer** gives 503 with
+  `orrery_catalogue_unavailable` and `Retry-After`, on both endpoints.
+- **Headers.** A served file has `Content-Type: application/json`, its
+  SHA-256 as its `ETag` (`"<sha256>"`), and the document's effective
+  visibility as `X-Orrery-Visibility: public` or `private`. It is sent in
+  1 MiB parts without `Content-Length`, so that Cloud Run streams a file
+  larger than its 32 MiB limit on a whole response. Every answer of the
+  read service, the errors above and the 404 for any other path included,
+  has `Cache-Control: private, no-store`. The errors with the codes above
+  have the collector's `{"detail", "code"}` shape. Two answers have only
+  `{"detail"}`, without a `code`: a 405 for a method a route doesn't serve,
+  such as `POST`, and the 404 for a path that matches neither route, such
+  as one with an encoded slash or with too few or too many parts. Only an
+  unexpected exception, which the server answers with a plain-text 500 from
+  outside the read service's own middleware, lacks both the header and a
+  JSON body.
+- **Current documents.** A build is a country code and a build ID: the
+  contract doesn't require build IDs to differ between countries. Among
+  all documents with the same `country_code` and `build_id`, whichever run
+  recorded them, the one with the newest `created_at` is `current: true`.
+  Documents recorded at the same moment are ordered by `document_sha256`,
+  then by `submission_id`, the larger first. The others are listed with
+  their dates. A listing by `build_id` that holds documents of two
+  countries has a current document for each.
+- **Effective visibility,** computed for every answer, so that a
+  submission recorded later still counts. A document is `private` when its
+  row is (its submission had licensed data), or when any recorded
+  submission with licensed data has the run ID or the build ID of the
+  document or of a producing submission of one of its upstream files.
+  Otherwise it is `public`. Both IDs count because the contract defines
+  `licensed_data` per build, and one build can be submitted from more than
+  one run; matching on either can only make a document more private. The
+  build ID is matched alone, whatever the submission's `country_code`,
+  unlike `current`: matching more widely can only make more documents
+  private. Upstream references carry no run ID. Microcosm copies a
+  producing run's own file, byte for byte, as `upstream-<sha256>.json` (its
+  graph declaration, run manifest, compiler schema or execution evidence
+  index), so the file's SHA-256 is the link, taken from the file's name:
+  the producing submissions of an upstream file are the recorded
+  submissions, of any kind and status, that hold a file with that SHA-256
+  in any role but `upstream`. A submission that lists the file only as its
+  own upstream file copied it, so it is no producer. **An upstream file
+  whose SHA-256 no recorded submission holds in another role does not
+  change the visibility.**
+- **Outside the read API.** The routes are not part of read API v2: the
+  collector's service, which serves read API v2, doesn't mount them, and
+  the read service publishes no OpenAPI document.
+
+**Running it locally.** `uv run uvicorn
+telemetry_collector.orrery_read_app:create_orrery_read_app_from_environment
+--factory --host 127.0.0.1 --port 8081`, with `COLLECTOR_ORRERY_BUCKET`,
+`DATABASE_URL` and Google credentials that may read the bucket. Nothing
+checks the caller there, so keep it on `127.0.0.1`.
+
+### Past builds
+
+`python -m telemetry_collector.operations past-builds` prints an inventory of
+past Microcosm builds as JSON, so that their Orrery graph documents can be
+rebuilt. It writes nothing, and nothing stores the inventory:
+`list_past_builds` in `telemetry_collector/past_builds.py` makes it afresh each
+time, and later code that rebuilds documents calls the same function.
+
+**What it lists.** One entry per build, from two places, joined by run ID:
+
+- **Staged folders:** every `staged/<run_id>/` folder in each country's
+  release dataset (`RELEASE_REPOS`), read with the collector's Hugging Face
+  read token. Each dataset is read at the commit its `main` points at when the
+  inventory starts, and the inventory records that revision.
+- **Recorded runs:** every run in `telemetry_runs`. A run with no staged
+  folder is listed with nothing to rebuild from Hugging Face. Microcosm
+  registers UK runs as `GB`; the inventory calls the country `uk`, as
+  `RELEASE_REPOS` does.
+
+Each entry gives the run ID, country, dataset and revision, staged folder,
+whether the collector recorded the run, the Microcosm commit and where it
+came from (`commit_source`), its class, the graph files the folder holds (`graph.schema.json`, `graph.execution.json`,
+`graph.orrery.json`, `execution.evidence.json`, `orrery.publication.json`)
+and what can be rebuilt from Hugging Face:
+
+| `rebuild` | The staged folder holds |
+|---|---|
+| `full` | the schema (`graph.schema.json`) and the execution overlay (`graph.execution.json`) |
+| `declaration_only` | the schema without the overlay |
+| `none` | no schema, or there is no staged folder |
+
+The inventory also records when it was made, each dataset's revision and the
+number of builds in each class, in each `rebuild` value and skipped. The
+command prints that first, as one JSON document, and then one JSON document
+for each build, so that no log entry grows with the number of builds.
+
+**The Microcosm commit and its class.** The commit is `git rev-parse HEAD`
+where the build ran, read from one of two places:
+
+| `commit_source` | Where |
+|---|---|
+| `staged_manifest` | `summary.git_commit` in the folder's `staged_manifest.json`, which Microcosm copies from the build manifest's `git_commit` |
+| `telemetry` | when no staged manifest records one: `details.identity.git_commit` in the run's `run` events, which the build's emitter (the microcosm-emitter package) sends from Microcosm's `runtime_identity()`; the first non-null one, in the order the events were emitted |
+
+GitHub's compare API then says, for each distinct commit, whether it has the
+merge commit of microcosm#1151 as an ancestor, and if not, whether it has
+that of microcosm#1144. It compares `<commit>...<merge commit>`, so that when
+the commit contains the merge commit, GitHub's answer lists no commits or
+files:
+
+| `commit_class` | The commit |
+|---|---|
+| `after_1151` | contains microcosm#1151 (one request) |
+| `between_1144_and_1151` | contains microcosm#1144 but not #1151 (two requests) |
+| `before_1144` | contains neither |
+| `unknown` | couldn't be classed; `class_reason` says why |
+
+A build is `unknown` when neither its staged manifest nor its telemetry
+records a commit (for example, its folder has no staged manifest, or the
+manifest isn't JSON), the commit isn't a 40-character commit hash, GitHub has
+no such commit in PolicyEngine/microcosm, or GitHub gave no usable answer.
+
+**Skipped builds.** Builds made before microcosm#1144 are skipped, since they
+recorded no execution evidence, and so are builds made between #1144 and #1151
+whose `rebuild` is `none`. Both stay in the inventory with `skipped` true and
+the reason in `skip_reason`. `unknown` builds are never skipped.
+
+**GitHub's rate limit.** The inventory calls GitHub without a token, and
+GitHub allows 60 such requests an hour from one IP address. Each distinct
+commit takes one or two requests. After a rate-limit answer, or any failure
+other than GitHub not having the commit, that commit and every later one are
+`unknown` with the reason, and the command sends no more requests; nothing is
+guessed. Cloud Run jobs reach
+GitHub from addresses that other Google Cloud users share, so part of the
+hour's allowance may already be used.
+
+So that the builds that can be rebuilt are the ones classed when the
+allowance runs out, commits are checked in this order, while the inventory
+stays in run-ID order:
+
+1. staged builds whose `rebuild` is `full` or `declaration_only`;
+2. other staged builds;
+3. recorded runs without a staged folder.
+
+Within each group they are checked in descending run-ID order. That puts
+newer builds first among run IDs that share a prefix, such as
+`uk-frs-calibration-attempt-<UTC time>-<suffix>`.
+
+**Running it.** It needs `DATABASE_URL` and `COLLECTOR_HF_READ_TOKEN`, which
+only the worker job mounts, and stops with a message naming either variable
+when it is missing. Run it as an execution of the worker job with its
+arguments overridden:
+
+```bash
+gcloud run jobs execute <worker job> --project <project> --region <region> \
+  --args=run,--no-sync,python,-m,telemetry_collector.operations,past-builds \
+  --wait
+```
+
+The three values are the environment's GitHub variables
+`TELEMETRY_WORKER_JOB`, `TELEMETRY_GCP_PROJECT_ID` and `TELEMETRY_GCP_REGION`.
+Running a job with overridden arguments needs `run.jobs.runWithOverrides` on
+it. Each printed document is one entry in the execution's log. A failed
+execution is retried up to twice, like any worker execution; a retry only
+repeats the reads.
+
+## Calibration tree package
+
+`packages/calibration-tree` is the calibration tree package: the TypeScript
+tree builder, its schema-6 types and readers, the release and staging readers
+it builds from, and the GitHub Actions publisher that calibration-diagnostics
+runs today. It was copied from calibration-diagnostics'
+`frontend/packages/calibration-tree` and is published to npm as
+`@policyengine/calibration-tree`, so the dashboard can import it from npm
+instead of keeping its own copy. Until the dashboard does, calibration-diagnostics
+keeps its copy, and its GitHub Actions workflow still publishes the production
+trees with it.
+
+The package ships TypeScript source; Bun runs it directly and Next.js
+compiles it through `transpilePackages`. Its own
+[README](packages/calibration-tree/README.md) describes how to import it.
+
+### The tree worker
+
+`src/calibration-tree-worker.ts` builds one release's or one staged run's
+tree from local files and writes its gzip parts to a directory, as its own Bun
+process, and `src/calibration-tree-publication.ts` uploads those parts and adds
+the build to the manifest:
+
+```bash
+cd packages/calibration-tree
+bun run src/calibration-tree-worker.ts REQUEST.json OUTPUT_DIRECTORY
+CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN=... \
+  bun run src/calibration-tree-publication.ts PUBLICATION.json
+```
+
+The worker builds a release exactly as the publisher builds it from the same
+files, commit and publication time, and a staged run as the publisher builds a
+staging tree, from the files it is given. It prints the manifest entry the
+publisher would record. The publication command uploads each part to its
+immutable path (keeping a part already stored with the same bytes), then
+writes the manifest with a compare-and-swap: it creates the manifest only if
+it is still absent and replaces it only if its ETag is still the one read, so
+a manifest another writer changed is never overwritten, and a manifest read
+without an ETag is never replaced. A build asked to become its country's
+latest does so only if it is at least as new (`createdAt`) as the current
+latest. Exit 2 means the build is refused: another build is already recorded
+for the same release build or staged run, or the same build was already
+recorded from another submission of the same files, whose index records
+another time or label.
+
+### Building trees from submissions
+
+The worker job builds a calibration tree from each `calibration-diagnostics`
+submission (`telemetry_collector/calibration_trees.py`) where it has
+`COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN`, the read-write token of its
+environment's own Vercel Blob store, which the deploy mounts on the worker job
+only, from the secret `TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME` names.
+Each environment has its own store, which nothing reads until the dashboard
+switches to it, and its own secret, which only its worker service account may
+read. Without the token, submissions stay in intake storage and can be
+reprocessed later. Nothing here
+reads Hugging Face: every value comes from the submission.
+
+- **Which tree.** A build folder, `releases/<release>/<build>`, gives a release
+  tree whose release ID is `<release>/<build>`; its `release` and `build_id`
+  must name the same release and build. A staged bundle, `staged/<run_id>`,
+  gives a staging tree of that run, labelled with the submission's `release`
+  (the candidate release) or, when that is null, the run ID; its `run_id`
+  must be the folder's. Files must come from the country's release repo, or,
+  for a staged bundle, its staging repo. Contradicting provenance and other
+  repos reject the submission. Other folders, and countries the collector
+  does not list, stay in intake storage with the reason in the result.
+- **Time.** The tree records the submission's `accepted_at` as its
+  publication time, so reprocessing a submission builds the same tree.
+- **Latest.** A release build becomes its country's latest when its release
+  is the country's default release, listed in `DEFAULT_RELEASES`: the UK's is
+  `microcosm-uk-2024-25-national`; the US's is added once its stable releases
+  are agreed. It takes the latest only from an older build, by publication
+  time, so a retried or reprocessed older build never takes the latest back.
+  Builds of other releases are recorded without moving the latest.
+- **Size.** The worker job has 8 GiB of memory and 2 CPUs: building the
+  tree for the largest current diagnostics file (a 128.7 MB US release) peaked
+  at 3.5 GB, and Cloud Run keeps the downloaded and written files in memory.
+  Each execution is billed only while it runs.
+- **How.** Each attempt downloads the files into a new temporary directory
+  and runs the tree worker with only `PATH`, `LANG` and the package's size
+  limits (`CALIBRATION_TREE_MAX_RAW_BYTES`, `CALIBRATION_TREE_MAX_GZIP_BYTES`)
+  in its environment, never the Blob token. That keeps the token out of the
+  builder's environment, arguments and output, but it is not isolation: the
+  builder runs as the same user as the worker, which holds the token in its
+  own environment. It then runs the publication command, with the token,
+  inside a Postgres transaction lock (`pg_advisory_xact_lock`), so the
+  collector's writers change the manifest one at a time.
+- **Results.** A published tree's result names its build ID, kind, how many
+  parts were uploaded or already stored, and whether it became the latest.
+  The worker refusing the files (`calibration_tree_unbuildable`), or the
+  build being refused (`calibration_tree_refused`: another build already
+  recorded for the same release build or staged run, or the same files
+  already recorded from another submission), rejects the submission; any
+  other failure, including a manifest another writer changed meanwhile, fails
+  the attempt so it runs again.
+
+The image holds Bun 1.4.2, copied from the official image by digest, and the
+package's production install, without its tests, fixtures and test support.
+CI checks the built image with `tools/check-calibration-tree-image.sh`, which
+builds a small staged run's tree inside it and runs the publication command
+without a token, which must refuse to run.
+
+### Tests
+
+The "Calibration tree package" job in `.github/workflows/pr.yaml` runs the
+package's Bun tests and its typecheck on every pull request, with Bun 1.4.2.
+The golden tests rebuild recorded US, UK and Belgian releases, staging runs
+and comparisons, and require every part's raw JSON and deflate stream to match
+`src/fixtures/calibration-tree-golden.json`, which calibration-diagnostics'
+builder recorded. The worker's tests run it as a separate process on the
+recorded releases and require the same bytes on disk.
+
+```bash
+cd packages/calibration-tree
+bun install --frozen-lockfile
+bun test src/calibration-tree-worker.test.ts
+bun run typecheck
+```
+
+### Carrying over changes from calibration-diagnostics
+
+`packages/calibration-tree/provenance.json` records the calibration-diagnostics
+commit the package was copied from, each copied file's git blob ID, the copied
+files changed here and why (only `package.json`), and the files that exist only
+here. `src/provenance.test.ts` fails when a copied file no longer has its
+recorded blob ID, when a file is neither copied nor listed as the collector's
+own, or when a file listed as changed is identical to the dashboard's.
+
+While calibration-diagnostics keeps its copy, a change merged there is carried
+over by copying the changed files from a calibration-diagnostics commit,
+keeping this repo's changes to `package.json`, and recording that commit and
+the new blob IDs, which git lists with:
+
+```bash
+git -C ../calibration-diagnostics ls-tree -r \
+  --format='%(objectname) %(path)' COMMIT -- frontend/packages/calibration-tree
+```
+
+Once the dashboard imports the published package and removes its copy, this
+copy is the only one, and the package is changed here.
+
+### Publishing to npm
+
+`.github/workflows/publish-calibration-tree.yaml` publishes the package when a
+push to `main` changes `packages/calibration-tree` and npm does not have its
+`package.json` version yet. To release a change, raise `version` in the same
+pull request; a change without a new version publishes nothing. The
+workflow's first job tests and typechecks the package. Its second job, the
+only one that can request a GitHub OIDC token, installs nothing: it checks
+that Node and npm are the pinned versions (`tools/check-npm-toolchain.sh`),
+then runs `tools/publish-calibration-tree.sh`, which asks npm for the version
+and publishes only if npm does not have it. It publishes under npm's default
+`latest` tag, which npm refuses for a prerelease version or one lower than the
+latest, so a release raises the version to a new highest one. One run goes at
+a time, so versions merged one after another publish in that order. The
+workflow can be run by hand from `main` (`workflow_dispatch`) to retry a
+failed publication, or to publish a version that was merged while publishing
+was switched off.
+
+The workflow uses npm's trusted publishing: npm accepts the publish job's
+GitHub OIDC token in place of a stored npm token, and adds provenance because
+this repo is public. npm does not check the branch, so the `npm` environment's
+rule is what keeps other branches out. Nothing is published until the repo
+variable `CALIBRATION_TREE_NPM_PUBLISH_ENABLED` is `true`, which needs this
+one-time setup first, in this order:
+
+1. **Google Cloud.** Unless it was already done for the read API client ("The
+   TypeScript client", step 1), make the Workload Identity provider accept
+   only the deployment environments ("Google Cloud access"), so that the
+   publish job's token cannot obtain Google credentials. Its condition must
+   then be:
+
+   ```
+   assertion.repository=='PolicyEngine/microcosm-collector' && assertion.ref=='refs/heads/main' && assertion.environment in ['staging', 'production']
+   ```
+
+2. **The first version, by hand.** npm can only trust a workflow for a package
+   that exists, so a member of the `policyengine` npm organization publishes
+   the first version from a clean checkout of the `main` commit that added the
+   package: `bun install --frozen-lockfile`, then `npm pack --dry-run` to check
+   the file list, then `npm publish --access public` in
+   `packages/calibration-tree`.
+3. **The environment.** In this repo's settings, create the `npm` environment
+   and allow deployments from `main` only, so a run from any other branch
+   cannot obtain npm's trust. Create it before the trusted publisher: GitHub
+   creates a missing environment, without that rule, when a job first names
+   it.
+4. **The trusted publisher.** In the package's settings on npmjs.com, add a
+   GitHub Actions trusted publisher: organization `PolicyEngine`, repo
+   `microcosm-collector`, workflow `publish-calibration-tree.yaml`,
+   environment `npm`. A new trusted publisher expires unless a publication
+   through it succeeds within two days, so add it only when step 5 and a
+   publication can follow within that time: merge a pull request that raises
+   the version after step 5, or, if `main` already has a version npm doesn't
+   have, run the workflow by hand from `main` after step 5. An expired one is
+   deleted and added again.
+5. **The switch.** Set the repo variable
+   `CALIBRATION_TREE_NPM_PUBLISH_ENABLED` to `true`.
+
 ## Hugging Face read access
 
 Only the collector's worker jobs read Hugging Face, for backfills, old
 releases and back-building. The service itself holds no Hugging Face
 credential: a build's own token reaches it only at the token exchange, and is
-never stored. The worker jobs read with one purpose-specific, fine-grained
-read token, never a generic `HF_TOKEN`:
+never stored. The worker jobs read with a purpose-specific, fine-grained
+read token, never a generic `HF_TOKEN`. Staging and production each have
+their own token, with the same scope, so either can be replaced or revoked
+without the other:
 
 | Setting | Read by | Provider |
 |---|---|---|
@@ -341,23 +1449,29 @@ The datasets the worker jobs read are listed once, in `HUGGINGFACE_DATASETS`:
 | `policyengine/populace-us-staging` | US staging builds and run files | yes |
 | `policyengine/populace-uk-staging` | UK staging builds and run files | yes |
 
-Setting up the token is a manual step, repeated whenever a dataset is added
-here:
+Setting up each environment's token is a manual step, repeated whenever a
+dataset is added here:
 
 1. **Token:** a fine-grained Hugging Face token whose only permission is
    "Read access to contents of selected repos", for every dataset in the
    token's scope above. It has no write, organization, inference or webhook
    permission.
-2. **Secret:** the token is the latest version of one Secret Manager secret in
-   the collector's Google Cloud project. It is never copied into GitHub.
-3. **Access:** only the collector's worker service account may read the
-   secret's value, through `roles/secretmanager.secretAccessor` on that secret
-   alone.
-4. **Mount:** each worker job that reads Hugging Face mounts the secret as
-   `COLLECTOR_HF_READ_TOKEN`, for example with
+2. **Secret:** the token is the latest version of the environment's own
+   Secret Manager secret in the collector's Google Cloud project. It is
+   never copied into GitHub.
+3. **Access:** only the environment's worker service account may read the
+   secret's value, through `roles/secretmanager.secretAccessor` on that
+   secret alone; the other environment's worker cannot read it.
+4. **Mount:** each environment's worker job mounts its secret as
+   `COLLECTOR_HF_READ_TOKEN`. Each release's deploy sets it in both
+   environments (`scripts/deploy.sh configure-worker-job`), naming the secret
+   from the environment variable `TELEMETRY_HF_READ_SECRET_NAME`, and first
+   checks that the secret exists. Any other job that reads Hugging Face
+   mounts it too, for example with
    `gcloud run jobs update JOB --update-secrets COLLECTOR_HF_READ_TOKEN=SECRET:latest`.
    A command that sets a job's secrets with `--set-secrets` replaces all of
-   its mounts, so any such command for these jobs must list this one too.
+   its mounts, so any such command for these jobs must list this one too, as
+   the deploy's does.
 
 ## Daily Hugging Face check
 
@@ -511,9 +1625,13 @@ is enabled, it then authenticates to Google Cloud with GitHub OIDC and pushes
 one image identified by the commit SHA. It first applies the migration to the
 persistent staging PostgreSQL database, verifies both the Alembic revision and
 the complete SQLAlchemy metadata, and deploys the staging collector. Production receives that exact image only when the staging sequence
-succeeds. Before either environment changes, deployment checks only that its
-runtime database, migration database, JWT signing, and read-token secret
-resources exist. It does not access their payloads or test their values. The
+succeeds. Before either environment changes, deployment checks only that the
+environment's seven secrets exist (the runtime database URL, the migration
+database URL, the HS256 JWT secret, the ES256 signing key, the dashboard's
+read token, the Hugging Face read token and the calibration tree Blob token),
+and that its worker and recovery jobs exist and belong to that environment
+(see "Worker jobs and recovery"). It does not access the secrets' payloads or
+test their values. The
 previous HF authentication and write/read deployment qualification is removed.
 
 Each deployment first routes traffic to a verified maintenance revision that
@@ -521,8 +1639,9 @@ returns HTTP 503 for data operations, then waits for prior requests to finish.
 Production also creates a completed Cloud SQL backup before its migration. The
 workflow runs the image as a one-task Cloud Run job to apply and verify Alembic
 migrations, deploys a candidate without stable traffic, checks the candidate's
-`/ready` endpoint, and only then directs traffic to the candidate. Once a
-production migration begins, failures leave the maintenance revision serving
+`/ready` endpoint, and only then directs traffic to the candidate. Last, it
+deploys the Orrery read service, a separate Cloud Run service from the same
+image (see "Serving Orrery graph files"). Once a production migration begins, failures leave the maintenance revision serving
 retryable responses; the workflow does not restore schema-incompatible
 application code. To repeat a deployment, re-run the failed jobs of that push.
 
@@ -534,7 +1653,12 @@ credential has only the data access required by the application. The dashboard r
 address and Secret Manager resource references through non-secret configuration.
 Public ingress lets developer machines reach the service;
 ingestion still requires an expiring collector credential issued after
-Hugging Face authentication.
+Hugging Face authentication. The Orrery read service, a separate service,
+allows no unauthenticated calls: its IAM policy grants the Cloud Run Invoker
+role only to microcosm-runs' own service account. Anyone granted a role that
+includes `run.routes.invoke` on the project, its folder or the organization,
+or who may make identity tokens as that account, can call it too (see "Who
+else can call it" under "Serving Orrery graph files").
 
 ### Google Cloud access
 
@@ -553,7 +1677,23 @@ assertion.repository=='PolicyEngine/microcosm-collector' && assertion.ref=='refs
 The service account grants `roles/iam.workloadIdentityUser` to this repo's
 principal set (`attribute.repository/PolicyEngine/microcosm-collector`). A job
 running for a tag, a pull request or any other branch cannot obtain Google
-credentials. No other job requests an OIDC token.
+credentials.
+
+Two other jobs request an OIDC token, both to publish to npm in the `npm`
+environment: `publish-client`, which publishes the read API client ("The
+TypeScript client"), and the `publish` job of
+`publish-calibration-tree.yaml`, which publishes the calibration tree package
+("Publishing to npm"). The condition above does not check the environment, so
+a token from either job would pass it too. Before either is switched on, the
+condition must become:
+
+```
+assertion.repository=='PolicyEngine/microcosm-collector' && assertion.ref=='refs/heads/main' && assertion.environment in ['staging', 'production']
+```
+
+The deployment jobs run in those two environments, so they keep their access,
+and a token from a job in any other environment, or in none, is refused. From
+then on, every job that authenticates to Google Cloud must name one of the two.
 
 Both deployment jobs also require
 `github.event_name == 'push' && github.ref == 'refs/heads/main'`. The Push
@@ -576,11 +1716,25 @@ The deployment's access and configuration are provisioned:
 - The `staging` and `production` environments each hold the secrets
   `TELEMETRY_GCP_WIF_PROVIDER` (this repo's provider) and
   `TELEMETRY_GCP_DEPLOY_SERVICE_ACCOUNT`, and the 15 `TELEMETRY_*` variables
-  that `.github/workflows/push.yaml` reads. They were first copied from the
-  calibration-diagnostics `staging` and `Production` environments; the project
-  move pointed each environment's project, Cloud SQL connections, service
-  accounts, provider and deployment account at the collector's project (the
-  runbook's section 14 lists them).
+  for the service and its migration that `.github/workflows/push.yaml`
+  reads. They were first copied from the calibration-diagnostics `staging`
+  and `Production` environments; the project move pointed each environment's
+  project, Cloud SQL connections, service accounts, provider and deployment
+  account at the collector's project (the runbook's section 14 lists them).
+- For intake, each environment also holds the seven `TELEMETRY_*` variables
+  for its bucket, queue, jobs and the service accounts that run them, and
+  `TELEMETRY_HF_READ_SECRET_NAME` for its own Hugging Face read token's
+  secret (see "Artifact intake"), and
+  `TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME` for its own calibration tree
+  Blob store's token's secret (see "Building trees from submissions"), and
+  `TELEMETRY_ORRERY_BUCKET` for its own private Orrery bucket (see
+  "Publishing Orrery graph files"), and
+  `TELEMETRY_ORRERY_READER_SERVICE_ACCOUNT` for the service account of its
+  own microcosm-runs deployments, the only account its Orrery read
+  service's IAM policy grants the Cloud Run Invoker role (see "Serving
+  Orrery graph files").
+  `scripts/deploy.sh require-configuration` names any that is missing, and
+  the deployment stops before it authenticates.
 
 The move from calibration-diagnostics is complete:
 
