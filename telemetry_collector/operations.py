@@ -9,8 +9,15 @@ them, when they used their attempts or dispatches, or dispatches them again.
 dispatches it: after the calibration-tree or Orrery worker registers its
 handler, or when the projection or Orrery changes.
 
-Run them with ``python -m telemetry_collector.operations recover`` and
-``python -m telemetry_collector.operations reprocess``.
+``past-builds`` prints the inventory of past Microcosm builds
+(``telemetry_collector.past_builds``) as JSON documents, the inventory's
+totals first and then one for each build, and changes nothing. It reads
+Hugging Face, so it runs as an execution of the worker job, the only job with
+``COLLECTOR_HF_READ_TOKEN``.
+
+Run them with ``python -m telemetry_collector.operations recover``,
+``python -m telemetry_collector.operations reprocess`` and
+``python -m telemetry_collector.operations past-builds``.
 """
 
 from __future__ import annotations
@@ -22,8 +29,10 @@ from collections.abc import Sequence
 from dataclasses import replace
 from typing import Any, get_args
 
+from telemetry_collector import past_builds
 from telemetry_collector.database import create_database_engine
 from telemetry_collector.google_cloud import CloudTasksWorkerQueue
+from telemetry_collector.huggingface_read import HuggingFaceReader
 from telemetry_collector.intake import (
     JOB_PATTERN,
     QUEUE_PATTERN,
@@ -44,7 +53,7 @@ from telemetry_collector.submissions import (
     SubmissionKind,
 )
 
-OPERATIONS_REQUIREMENT = "running artifact job operations"
+OPERATIONS_REQUIREMENT = "running operator commands"
 
 
 def recover_stalled_jobs(
@@ -135,6 +144,10 @@ def _argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="List the selected submissions without reprocessing them.",
     )
+    commands.add_parser(
+        "past-builds",
+        help="Print the inventory of past Microcosm builds as JSON.",
+    )
     return parser
 
 
@@ -158,6 +171,25 @@ def _print_json(document: dict[str, Any]) -> None:
     print(json.dumps(document, sort_keys=True), flush=True)
 
 
+def _print_past_builds(database_url: str) -> int:
+    with HuggingFaceReader.from_environment() as reader:
+        engine = create_database_engine(database_url)
+        try:
+            runs = past_builds.recorded_runs(engine)
+        finally:
+            engine.dispose()
+        with past_builds.GitHubCommitClassifier() as classifier:
+            inventory = past_builds.list_past_builds(reader, runs, classifier)
+    # One document for the inventory and then one for each build, so that no
+    # log entry grows with the number of builds.
+    document = inventory.to_json()
+    builds = document.pop("builds")
+    _print_json(document)
+    for build in builds:
+        _print_json(build)
+    return 0
+
+
 def main(arguments: Sequence[str] | None = None) -> int:
     """Run one operator command; non-zero when a reprocessing was refused."""
 
@@ -171,6 +203,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
     database_url = os.environ.get("DATABASE_URL", "").strip()
     if not database_url:
         raise RuntimeError(f"DATABASE_URL is required when {OPERATIONS_REQUIREMENT}.")
+    if options.command == "past-builds":
+        return _print_past_builds(database_url)
     dry_run = options.command == "reprocess" and options.dry_run
     worker_queue = None if dry_run else _worker_queue_from_environment()
     engine = create_database_engine(database_url)
