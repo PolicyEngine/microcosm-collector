@@ -164,6 +164,16 @@ class DatasetFile:
     lfs_sha256: str | None
 
 
+@dataclass(frozen=True)
+class LastCommit:
+    """The newest commit that changed a file or folder, as a listing gives it."""
+
+    commit: str
+    #: Hugging Face's ISO 8601 time of the commit, such as
+    #: ``2026-10-23T00:42:24.000Z``.
+    date: str
+
+
 def _check_dataset_name(dataset: str) -> None:
     if not _DATASET_NAME.fullmatch(dataset):
         raise ValueError("A Hugging Face dataset name is owner/name.")
@@ -243,14 +253,15 @@ class HuggingFaceReader:
             if entry.get("type") != "directory"
         ]
 
-    def folder_commits(
+    def last_commits(
         self, dataset: str, folder: str, revision: str
-    ) -> dict[str, str]:
-        """The last commit of each folder directly inside ``folder``, by path.
+    ) -> dict[str, LastCommit]:
+        """The last commit of each file and folder directly inside ``folder``.
 
         Hugging Face's listing with ``expand=true`` gives each entry's
-        ``lastCommit``: for a folder, the newest commit that changed anything
-        in it at ``revision``.
+        ``lastCommit`` at ``revision``: the newest commit that changed it. An
+        entry listed without one is left out, and one with an unusable one is
+        an error.
         """
 
         _check_dataset_name(dataset)
@@ -258,22 +269,24 @@ class HuggingFaceReader:
             f"/api/datasets/{dataset}/tree/{quote(revision, safe='')}/"
             f"{quote(folder, safe='/')}"
         )
-        commits: dict[str, str] = {}
+        commits: dict[str, LastCommit] = {}
         for entry in self._list_entries(
             dataset, url, "folder list", {"expand": "true"}
         ):
-            if entry.get("type") != "directory":
+            last_commit = entry.get("lastCommit")
+            if last_commit is None:
                 continue
             path = entry.get("path")
-            last_commit = entry.get("lastCommit")
             commit = last_commit.get("id") if isinstance(last_commit, dict) else None
+            date = last_commit.get("date") if isinstance(last_commit, dict) else None
             if (
                 not isinstance(path, str)
                 or not isinstance(commit, str)
                 or not _COMMIT.fullmatch(commit)
+                or not isinstance(date, str)
             ):
                 raise _unusable(dataset, "folder list")
-            commits[path] = commit
+            commits[path] = LastCommit(commit=commit, date=date)
         return commits
 
     def _list_entries(

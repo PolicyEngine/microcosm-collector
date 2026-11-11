@@ -19,8 +19,9 @@ Hugging Face, so it runs as an execution of the worker job, the only job with
 build that can be projected again and processes it at once
 (``telemetry_collector.past_build_projections``). Besides the Hugging Face
 token it needs the worker job's intake and Orrery buckets, and permission for
-the worker's account to create objects in the intake bucket. With
-``--dry-run`` it only lists what it would project.
+the worker's account to create objects in the intake bucket. It prints each
+build's outcome as it is produced, and exits non-zero when any build ended in
+an error. With ``--dry-run`` it only lists what it would project.
 
 Run them with ``python -m telemetry_collector.operations recover``,
 ``python -m telemetry_collector.operations reprocess``,
@@ -169,7 +170,7 @@ def _argument_parser() -> argparse.ArgumentParser:
     reproject.add_argument(
         "--dry-run",
         action="store_true",
-        help="List what would be projected without reading or writing anything.",
+        help="List what would be projected, downloading and writing nothing.",
     )
     return parser
 
@@ -238,6 +239,7 @@ def _reproject_past_builds(database_url: str, *, dry_run: bool) -> int:
                 f"{REPROJECTION_REQUIREMENT}."
             )
     holder = f"reprojection-{os.environ.get('CLOUD_RUN_EXECUTION') or uuid.uuid4().hex}"
+    errors = 0
     with HuggingFaceReader.from_environment() as reader:
         engine = create_database_engine(database_url)
         try:
@@ -255,11 +257,14 @@ def _reproject_past_builds(database_url: str, *, dry_run: bool) -> int:
                 holder=holder,
                 dry_run=dry_run,
             )
+            # Each outcome is printed as it is produced, so a run that stops
+            # early still logs every build it finished.
+            for outcome in outcomes:
+                _print_json(asdict(outcome))
+                errors += outcome.outcome == "error"
         finally:
             engine.dispose()
-    for outcome in outcomes:
-        _print_json(asdict(outcome))
-    return 0
+    return 1 if errors else 0
 
 
 def main(arguments: Sequence[str] | None = None) -> int:

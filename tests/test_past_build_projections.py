@@ -581,7 +581,7 @@ def test_the_provenance_commit_is_the_newest_among_the_submitted_files() -> None
     assert record.provenance["huggingface"]["commit"] == "b" * 40
     revision = stored.head_commit
     listings = [
-        request.url.raw_path.decode()
+        request.url.path
         for request in hugging_face.requests
         if "expand=true" in str(request.url)
     ]

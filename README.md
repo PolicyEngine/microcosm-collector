@@ -1233,26 +1233,30 @@ new build does. It uses the inventory of past builds (see "Past builds") and
 **Which builds.** A build is projected when the inventory classes it
 `after_1151`, its `rebuild` is `full`, and it isn't skipped. Every other build
 is listed as `left_out`, with the reason: skipped builds, builds classed
-`before_1144`, `between_1144_and_1151` or `unknown`, and builds whose staged
-folder holds the schema without the execution overlay, or no schema.
+`before_1144`, `between_1144_and_1151` or `unknown`, builds whose staged
+folder holds the schema without the execution overlay, or no schema, and
+builds one of whose submitted files Hugging Face lists without a last commit.
 
 **The submission.** For each build the command makes the `orrery-inputs`
 submission the build would have sent:
 
 | Field | Value |
 |---|---|
-| files | `graph.schema.json` (`schema`), `graph.execution.json` (`execution_overlay`) and every `upstream-<sha256>.json` (`upstream`) in the staged folder, read at the inventory's revision of the dataset. Evidence files are left out, since the collector never publishes them |
+| files | `graph.schema.json` (`schema`), `graph.execution.json` (`execution_overlay`) and every `upstream-<sha256>.json` (`upstream`) in the staged folder, read at the inventory's revision of the dataset. Evidence files are left out, since the collector never publishes them. A file over its role's size limit (64 MiB for the schema and each upstream file, 32 MiB for the overlay) makes the build `refused` before anything is downloaded |
 | `licensed_data` | true, unless the build was staged in a public dataset (`HUGGINGFACE_DATASETS`): the UK and Belgian release datasets are private, so their documents are `private` |
-| `provenance` | the build's run ID as `run_id` and `build_id`, its country as Microcosm registers it (`GB` for `uk`), no release, and `huggingface`: the dataset, the staged folder and the folder's last commit, which Hugging Face's listing gives |
+| `provenance` | the build's run ID as `run_id` and `build_id`, its country as Microcosm registers it (`GB` for `uk`), no release, and `huggingface`: the dataset, the staged folder, and the newest last commit among the submitted files, from one listing of the folder with `expand=true` |
 | owner | `microcosm-collector`, an ID no Hugging Face user has |
 
 The submission ID is the hash of the request, as for any submission. So a
 second run makes the same submission, finds it already processed, and changes
-nothing; only a change to the staged folder makes a new one.
+nothing. Only a change to a submitted file makes a new one; a later change to
+another file in the folder, such as its staged manifest, doesn't.
 
 **Processing.**
-1. The command creates each file in the intake bucket under the submission's
-   ID, create-only and with its SHA-256 in its metadata, as an upload does.
+1. The command downloads each file, checks it against the listing's size
+   and, for a file stored with LFS, its SHA-256, and creates it in the intake
+   bucket under the submission's ID, create-only and with its SHA-256 in its
+   metadata, as an upload does.
 2. It accepts the submission as completion accepts one: each stored object
    must have the inventory's size and SHA-256, and a stored object that
    differs rejects the submission with `stored_object_mismatch`.
@@ -1262,12 +1266,22 @@ nothing; only a change to the staged folder makes a new one.
    "Publishing Orrery graph files").
 4. A job that fails before its last attempt is released, stays `queued`, and
    the scheduled recovery dispatches it to the worker job.
+5. A submission an earlier run left `awaiting_upload` is completed, and a job
+   it left `processing` is run again: the same lease holder may continue it.
+   A job another holder's live lease covers is skipped, and recovery queues
+   it again once that lease expires.
 
-The command prints one JSON document for each build: its run ID, its
-`outcome` (`left_out`, `would_reproject`, `refused` when the staged files
-break the submission rules, or the submission's status: `succeeded`,
-`rejected`, `failed` or `queued`), the reason, the submission ID, whether
-this run created the submission, and the handler's result.
+The command prints one JSON document for each build, as soon as the build is
+done: its run ID, its `outcome`, the reason, the submission ID, whether this
+run created the submission, and the handler's result. The outcomes are:
+- `left_out` and, in a dry run, `would_reproject`;
+- `refused`, when the staged files break the submission rules;
+- `error`, when anything else stops that build, such as a failed Hugging
+  Face or Cloud Storage request; the next build is still projected;
+- the submission's status: `succeeded`, `rejected`, `failed`, `queued` or
+  `processing`.
+
+The command exits non-zero when any build ended in `error`.
 
 **Running it.** It needs `DATABASE_URL`, `COLLECTOR_HF_READ_TOKEN`,
 `COLLECTOR_INTAKE_BUCKET` and `COLLECTOR_ORRERY_BUCKET`, which the worker job
@@ -1281,7 +1295,16 @@ compromised worker could create a file where a pending upload is about to
 go. The worker's hash check would then reject that submission with
 `content_mismatch`; the file could not replace the upload's content.
 
-First list what a run would do, which reads and writes nothing:
+A run must finish within the worker job's one-hour task timeout, and every
+run downloads every eligible build's files again, even those already
+projected, to work out each submission's ID. When the command exits non-zero,
+or is stopped by the timeout, Cloud Run runs the task again, up to twice, like
+any worker execution. A rerun only repeats the reads and finishes what the
+last one left.
+
+First list what a run would do. A dry run downloads no build's files and
+writes nothing, but still reads what the inventory reads: Hugging Face's
+listings and staged manifests, the database and GitHub.
 
 ```bash
 gcloud run jobs execute <worker job> --project <project> --region <region> \
