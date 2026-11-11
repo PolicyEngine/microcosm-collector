@@ -242,6 +242,8 @@ def test_a_full_build_after_1151_is_published_through_the_orrery_handler() -> No
     assert published.run_id == "uk-run-1"
     assert published.country_code == "GB"
     assert published.visibility == "private"
+    # Rebuilt from a past build, so marked reconstructed for microcosm-runs.
+    assert published.reconstructed is True
     assert outcome.result["document_sha256"] == published.document_sha256
 
 
@@ -1099,3 +1101,61 @@ def test_a_download_whose_lfs_sha256_differs_from_its_listing_is_an_error() -> N
 
     assert outcome.outcome == "error"
     assert "differs from Hugging Face's listing" in outcome.reason
+
+
+def test_unpublished_builds_are_listed_without_failing_the_command(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    hugging_face = hugging_face_with(UK_RELEASES, staged_files("uk-run-2"))
+    unclassed = {
+        "commit_class": "unknown",
+        "class_reason": "GitHub's rate limit for requests without a token was reached",
+    }
+    schema_only = replace(
+        past_build("uk-run-1", hugging_face, rebuild="declaration_only", **unclassed),
+        class_retry_later=True,
+    )
+    released_for_retry = past_build("uk-run-2", hugging_face)
+    without_schema = replace(
+        past_build("uk-run-3", hugging_face, rebuild="none", **unclassed),
+        graph_files=(),
+        class_retry_later=True,
+    )
+    inventory = inventory_of(schema_only, released_for_retry, without_schema)
+    stand_in_command_services(monkeypatch)
+    handlers_module = importlib.import_module("telemetry_collector.handlers")
+
+    class StandInReader:
+        @staticmethod
+        def from_environment() -> HuggingFaceReader:
+            return reader_for(hugging_face)
+
+    def failing_handler(context: Any) -> dict[str, Any]:
+        raise OSError("Cloud Storage is unavailable.")
+
+    monkeypatch.setattr(operations, "HuggingFaceReader", StandInReader)
+    monkeypatch.setattr(
+        operations, "_past_build_inventory", lambda reader, engine: inventory
+    )
+    monkeypatch.setattr(
+        operations,
+        "GoogleCloudStorageIntake",
+        lambda bucket_name: FakeIntakeObjectStore(),
+    )
+    monkeypatch.setattr(
+        handlers_module,
+        "handlers_from_environment",
+        lambda engine: {"orrery-inputs": failing_handler},
+    )
+
+    assert operations.main(["reproject-past-builds"]) == 0
+
+    printed = [json.loads(text) for text in capsys.readouterr().out.splitlines()]
+    assert [document.get("outcome") for document in printed[:-1]] == [
+        "left_out",
+        "queued",
+        "left_out",
+    ]
+    summary = printed[-1]["summary"]
+    assert summary["incomplete_run_ids"] == []
+    assert summary.get("unpublished_run_ids") == ["uk-run-2"]
