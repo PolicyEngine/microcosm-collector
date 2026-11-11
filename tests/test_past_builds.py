@@ -374,6 +374,30 @@ def test_a_rate_limit_answer_leaves_later_commits_unknown_newest_rebuildable_fir
     assert [build.run_id for build in inventory.builds] == sorted(builds)
 
 
+def test_other_staged_builds_are_classed_newest_first_before_recorded_runs() -> None:
+    github = FakeGitHub(requests_answered=1)
+    module = past_builds_module()
+    staged_files = {
+        **staged_folder("uk-run-1-older", COMMIT_BETWEEN_1144_AND_1151),
+        **staged_folder("uk-run-2-newer", COMMIT_AFTER_1151),
+    }
+    recorded_runs = [
+        module.RecordedRun(
+            run_id="uk-run-3-recorded",
+            country_code="uk",
+            microcosm_commit=GRAPH_SCHEMA_MERGE,
+        )
+    ]
+
+    inventory, _ = list_builds(staged_files, github, recorded_runs)
+
+    builds = builds_by_run_id(inventory)
+    assert builds["uk-run-2-newer"].commit_class == "after_1151"
+    assert builds["uk-run-1-older"].commit_class == "unknown"
+    assert builds["uk-run-3-recorded"].commit_class == "unknown"
+    assert github.comparisons()[0] == (COMMIT_AFTER_1151, GRAPH_SCHEMA_MERGE)
+
+
 def test_a_staged_folder_without_a_usable_manifest_has_no_commit() -> None:
     github = FakeGitHub()
     staged_files = {

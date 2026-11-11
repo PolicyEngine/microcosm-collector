@@ -1180,9 +1180,10 @@ the reason in `skip_reason`. `unknown` builds are never skipped.
 
 **GitHub's rate limit.** The inventory calls GitHub without a token, and
 GitHub allows 60 such requests an hour from one IP address. Each distinct
-commit takes one or two requests. After a rate-limit answer, or any failure,
-that commit and every later one are `unknown` with the reason, and the
-command sends no more requests; nothing is guessed. Cloud Run jobs reach
+commit takes one or two requests. After a rate-limit answer, or any failure
+other than GitHub not having the commit, that commit and every later one are
+`unknown` with the reason, and the command sends no more requests; nothing is
+guessed. Cloud Run jobs reach
 GitHub from addresses that other Google Cloud users share, so part of the
 hour's allowance may already be used.
 

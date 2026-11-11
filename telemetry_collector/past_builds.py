@@ -146,8 +146,9 @@ class GitHubCommitClassifier:
     """Classes Microcosm commits with GitHub's compare API, without a token.
 
     Each distinct commit is checked once: against #1151 first, and against
-    #1144 only when it doesn't contain #1151. After a rate-limit answer or any
-    other failure, that commit and every later one are ``unknown``.
+    #1144 only when it doesn't contain #1151. A commit GitHub doesn't have
+    (404) is ``unknown`` on its own. After a rate-limit answer or any other
+    failure, that commit and every later one are ``unknown``.
     """
 
     def __init__(self, *, client: httpx.Client | None = None) -> None:
