@@ -2,7 +2,8 @@
 
 It answers through ``httpx.MockTransport``, so no test reaches the network. It
 serves dataset information, recursive file lists (paginated with a ``Link``
-header, as Hugging Face does) and file downloads, and redirects downloads of
+header, as Hugging Face does), one folder's entries with ``expand=true``
+(each with its ``lastCommit``) and file downloads, and redirects downloads of
 LFS files to a separate content host, as Hugging Face does.
 """
 
@@ -18,6 +19,8 @@ import httpx
 ENDPOINT = "https://huggingface.co"
 CONTENT_HOST = "https://cdn-lfs.example.test"
 LFS_POINTER_BYTES = 134
+#: The date of every last commit a test doesn't set.
+DEFAULT_COMMIT_DATE = "2026-10-23T00:42:24.000Z"
 
 
 @dataclass
@@ -28,6 +31,10 @@ class FakeDataset:
     head_commit: str = "0" * 40
     #: Answer every request for this dataset with this status instead.
     forced_status: int | None = None
+    #: The last commit (ID and date) of each file or folder, by path, for
+    #: listings with expand=true; ``None`` leaves ``lastCommit`` out. A path
+    #: not listed gets the head commit and ``DEFAULT_COMMIT_DATE``.
+    last_commits: dict[str, tuple[str, str] | None] = field(default_factory=dict)
 
 
 class FakeHuggingFace:
@@ -77,8 +84,11 @@ class FakeHuggingFace:
             if len(parts) == 2:
                 return self._guarded(request, name, self._information)
             if len(parts) >= 4 and parts[2] == "tree":
+                folder = "/".join(parts[4:])
                 return self._guarded(
-                    request, name, lambda dataset: self._tree(request, name, parts[3])
+                    request,
+                    name,
+                    lambda dataset: self._tree(request, name, parts[3], folder),
                 )
         if path.startswith("/datasets/"):
             parts = path.removeprefix("/datasets/").split("/")
@@ -114,26 +124,74 @@ class FakeHuggingFace:
     def _check_revision(self, dataset: FakeDataset, revision: str) -> bool:
         return revision in {"main", dataset.head_commit}
 
-    def _tree(self, request: httpx.Request, name: str, revision: str):
+    def _tree(self, request: httpx.Request, name: str, revision: str, folder: str):
         dataset = self.datasets[name]
         if not self._check_revision(dataset, revision):
             return httpx.Response(404, json={"error": "Revision not found"})
         query = parse_qs(request.url.query.decode())
-        if query.get("recursive") != ["true"]:
-            return httpx.Response(400, json={"error": "expected recursive=true"})
-        entries = self._entries(dataset)
+        if query.get("recursive") == ["true"] and not folder:
+            entries = self._entries(dataset)
+            listing_query = {"recursive": "true"}
+            listing_path = f"{ENDPOINT}/api/datasets/{name}/tree/{revision}"
+        elif query.get("expand") == ["true"] and folder:
+            entries = self._folder_entries(dataset, folder)
+            if not entries:
+                return httpx.Response(404, json={"error": "Entry not found"})
+            listing_query = {"expand": "true"}
+            listing_path = f"{ENDPOINT}/api/datasets/{name}/tree/{revision}/{folder}"
+        else:
+            return httpx.Response(
+                400, json={"error": "expected recursive=true or a folder with expand"}
+            )
         offset = int(query.get("cursor", ["0"])[0])
         page = entries[offset : offset + self.page_size]
         headers = {}
         if offset + self.page_size < len(entries):
-            next_query = urlencode(
-                {"recursive": "true", "cursor": offset + self.page_size}
-            )
-            headers["Link"] = (
-                f"<{ENDPOINT}/api/datasets/{name}/tree/{revision}?{next_query}>; "
-                'rel="next"'
-            )
+            next_query = urlencode({**listing_query, "cursor": offset + self.page_size})
+            headers["Link"] = f'<{listing_path}?{next_query}>; rel="next"'
         return httpx.Response(200, content=json.dumps(page), headers=headers)
+
+    def _folder_entries(self, dataset: FakeDataset, folder: str) -> list[dict]:
+        """The entries directly inside ``folder``, each with its last commit."""
+
+        prefix = f"{folder}/"
+        children = sorted(
+            {
+                file_path.removeprefix(prefix).split("/", 1)[0]
+                for file_path in dataset.files
+                if file_path.startswith(prefix)
+            }
+        )
+        entries: list[dict] = []
+        for child in children:
+            child_path = prefix + child
+            if child_path in dataset.files:
+                content = dataset.files[child_path]
+                entry: dict = {
+                    "type": "file",
+                    "oid": git_blob_id(content),
+                    "size": len(content),
+                    "path": child_path,
+                }
+            else:
+                entry = {
+                    "type": "directory",
+                    "oid": "f" * 40,
+                    "size": 0,
+                    "path": child_path,
+                }
+            last_commit = dataset.last_commits.get(
+                child_path, (dataset.head_commit, DEFAULT_COMMIT_DATE)
+            )
+            if last_commit is not None:
+                commit, date = last_commit
+                entry["lastCommit"] = {
+                    "id": commit,
+                    "title": f"Change {child}",
+                    "date": date,
+                }
+            entries.append(entry)
+        return entries
 
     def _entries(self, dataset: FakeDataset) -> list[dict]:
         folders = sorted(

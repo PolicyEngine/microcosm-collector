@@ -66,7 +66,9 @@ def _default_credentials() -> Any:
 class GoogleCloudStorageIntake:
     """The private intake bucket, signing URLs through IAM without a key file.
 
-    The worker only reads, so it constructs this without a signing account.
+    The worker reads, so it constructs this without a signing account. The
+    ``reproject-past-builds`` command also creates objects, create-only
+    (``create_object``), when the worker's account has been allowed to.
     """
 
     def __init__(
@@ -139,6 +141,17 @@ class GoogleCloudStorageIntake:
             )
         return listed
 
+    def create_object(self, object_name: str, source: Path, *, sha256: str) -> bool:
+        """Create the object as an upload would; False when an equal one is kept."""
+
+        return _create_object_once(
+            self._bucket,
+            object_name,
+            source,
+            sha256=sha256,
+            content_type=UPLOAD_CONTENT_TYPE,
+        )
+
     def read_chunks(
         self,
         object_name: str,
@@ -159,6 +172,35 @@ class GoogleCloudStorageIntake:
 
 class StoredObjectConflictError(RuntimeError):
     """An object already stored under a name holds other content."""
+
+
+def _create_object_once(
+    bucket: Any, object_name: str, source: Path, *, sha256: str, content_type: str
+) -> bool:
+    """Create an object only if none has its name; False when an equal one is kept.
+
+    The object records its SHA-256 in its metadata. An existing object with
+    the same recorded SHA-256 is kept, and any other raises
+    ``StoredObjectConflictError``.
+    """
+
+    blob = bucket.blob(object_name)
+    blob.metadata = {"sha256": sha256}
+    try:
+        blob.upload_from_filename(
+            str(source), content_type=content_type, if_generation_match=0
+        )
+    except PreconditionFailed:
+        stored = bucket.get_blob(object_name)
+        stored_sha256 = (
+            None if stored is None else (stored.metadata or {}).get("sha256")
+        )
+        if stored_sha256 != sha256:
+            raise StoredObjectConflictError(
+                f"{object_name} is already stored without this file's SHA-256."
+            ) from None
+        return False
+    return True
 
 
 class GoogleCloudStorageOrreryGraphs:
@@ -183,23 +225,13 @@ class GoogleCloudStorageOrreryGraphs:
     ) -> bool:
         """Create the object from ``source``; False when an equal one is kept."""
 
-        blob = self._bucket.blob(object_name)
-        blob.metadata = {"sha256": sha256}
-        try:
-            blob.upload_from_filename(
-                str(source), content_type=content_type, if_generation_match=0
-            )
-        except PreconditionFailed:
-            stored = self._bucket.get_blob(object_name)
-            stored_sha256 = (
-                None if stored is None else (stored.metadata or {}).get("sha256")
-            )
-            if stored_sha256 != sha256:
-                raise StoredObjectConflictError(
-                    f"{object_name} is already stored without this file's SHA-256."
-                ) from None
-            return False
-        return True
+        return _create_object_once(
+            self._bucket,
+            object_name,
+            source,
+            sha256=sha256,
+            content_type=content_type,
+        )
 
 
 # What the storage client raises when the bucket does not answer as expected;

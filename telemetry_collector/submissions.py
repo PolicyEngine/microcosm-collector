@@ -39,6 +39,9 @@ MAX_JOB_DISPATCHES = 3
 UNCLAIMED_JOB_IDLE_SECONDS = 30 * 60
 # The ``processed_by`` of the default handler, which only checks the bytes.
 INTAKE_ONLY_HANDLER = "intake-only"
+#: The owner of the submissions the collector makes itself for past builds
+#: (``reproject-past-builds``). No Hugging Face user has this ID.
+COLLECTOR_OWNER_HF_ID = "microcosm-collector"
 
 SubmissionKind = Literal["calibration-diagnostics", "orrery-inputs"]
 SubmissionStatus = Literal[

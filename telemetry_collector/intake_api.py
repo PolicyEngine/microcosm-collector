@@ -24,6 +24,9 @@ from telemetry_collector.intake import (
     StoredObject,
     WorkerQueueUnavailableError,
     dispatch_job,
+    storage_problems,
+    stored_generations,
+    stored_object_mismatch,
 )
 from telemetry_collector.submission_store import (
     SubmissionOwnershipError,
@@ -180,50 +183,6 @@ def receipt_document(record: SubmissionRecord) -> dict[str, Any]:
     return receipt
 
 
-def storage_problems(
-    record: SubmissionRecord, stored: dict[str, StoredObject]
-) -> list[dict[str, str]]:
-    """Inventory files whose stored object is missing or differs from it.
-
-    ``missing`` can be fixed by uploading. ``size_mismatch`` and
-    ``sha256_mismatch`` cannot, because a stored object is never replaced.
-    """
-
-    problems = []
-    for file in record.files:
-        stored_object = stored.get(
-            intake_object_name(record.submission_id, file["name"])
-        )
-        if stored_object is None:
-            problem = "missing"
-        elif stored_object.size != file["size"]:
-            problem = "size_mismatch"
-        elif stored_object.sha256 != file["sha256"]:
-            problem = "sha256_mismatch"
-        else:
-            continue
-        problems.append({"name": file["name"], "problem": problem})
-    return problems
-
-
-def stored_object_mismatch(problems: list[dict[str, str]]) -> dict[str, str] | None:
-    """The final rejection for objects that can never match, if there are any."""
-
-    mismatched = [problem for problem in problems if problem["problem"] != "missing"]
-    if not mismatched:
-        return None
-    listed = ", ".join(
-        f"{problem['name']} ({problem['problem']})" for problem in mismatched
-    )
-    return {
-        "code": "stored_object_mismatch",
-        "message": (
-            "Stored objects differ from the inventory and cannot be replaced: "
-            f"{listed}."
-        ),
-    }
-
-
 def submission_router(
     *,
     services: IntakeServices,
@@ -319,13 +278,7 @@ def submission_router(
                     problems=problems,
                 )
             record = submissions.accept_submission(
-                submission_id,
-                {
-                    file["name"]: stored[
-                        intake_object_name(submission_id, file["name"])
-                    ].generation
-                    for file in record.files
-                },
+                submission_id, stored_generations(record, stored)
             )
         if record.status == "queued" and record.job_dispatch_count == 0:
             assert record.job_id is not None, "An accepted submission has a job."

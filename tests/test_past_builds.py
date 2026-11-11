@@ -670,3 +670,36 @@ def test_the_past_builds_command_requires_the_database_and_hugging_face_token(
 
     with pytest.raises(RuntimeError, match=missing_name):
         operations.main(["past-builds"])
+
+
+def test_only_a_commit_github_stopped_classing_can_be_classed_later() -> None:
+    github = FakeGitHub(requests_answered=1)
+    staged_files = {
+        **staged_folder("uk-run-0", COMMIT_BEFORE_1144, ALL_GRAPH_FILES),
+        **staged_folder("uk-run-1", "not-a-commit", ALL_GRAPH_FILES),
+        **staged_folder("uk-run-2", COMMIT_BETWEEN_1144_AND_1151, ALL_GRAPH_FILES),
+        **staged_folder("uk-run-3", COMMIT_AFTER_1151, ALL_GRAPH_FILES),
+    }
+
+    inventory, _ = list_builds(staged_files, github)
+
+    builds = builds_by_run_id(inventory)
+    # Checked after GitHub stopped answering, so never asked.
+    assert builds["uk-run-0"].commit_class == "unknown"
+    assert getattr(builds["uk-run-0"], "class_retry_later", None) is True
+    assert builds["uk-run-3"].commit_class == "after_1151"
+    assert builds["uk-run-2"].commit_class == "unknown"
+    assert getattr(builds["uk-run-2"], "class_retry_later", None) is True
+    assert getattr(builds["uk-run-1"], "class_retry_later", None) is False
+    assert getattr(builds["uk-run-3"], "class_retry_later", None) is False
+
+
+def test_a_commit_github_does_not_have_is_not_classed_later() -> None:
+    inventory, _ = list_builds(
+        staged_folder("uk-run-1", COMMIT_UNKNOWN_TO_GITHUB, ALL_GRAPH_FILES),
+        FakeGitHub(),
+    )
+
+    build = builds_by_run_id(inventory)["uk-run-1"]
+    assert build.commit_class == "unknown"
+    assert build.class_retry_later is False

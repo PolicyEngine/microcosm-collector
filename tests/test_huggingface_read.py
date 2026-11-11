@@ -299,3 +299,38 @@ def test_a_reader_from_the_environment_requires_the_token(
     )
     hub.add_dataset(UK_RELEASES)
     assert reader.dataset_info(UK_RELEASES)["private"] is True
+
+
+def test_last_commits_are_read_page_by_page_at_the_revision() -> None:
+    hub = FakeHuggingFace(token=EXAMPLE_TOKEN, page_size=1)
+    stored = hub.add_dataset(
+        UK_RELEASES,
+        {
+            "staged/run-1/graph.schema.json": b"{}",
+            "staged/run-1/graph.execution.json": b"{}",
+            "staged/run-1/notes.txt": b"",
+        },
+    )
+    stored.last_commits = {
+        "staged/run-1/graph.schema.json": ("1" * 40, "2026-10-01T00:00:00.000Z"),
+        "staged/run-1/graph.execution.json": ("2" * 40, "2026-10-02T00:00:00.000Z"),
+        "staged/run-1/notes.txt": None,
+    }
+    reader = reader_for(hub)
+    assert callable(getattr(reader, "last_commits", None))
+
+    commits = reader.last_commits(UK_RELEASES, "staged/run-1", stored.head_commit)
+
+    assert {
+        path: (last_commit.commit, last_commit.date)
+        for path, last_commit in commits.items()
+    } == {
+        "staged/run-1/graph.schema.json": ("1" * 40, "2026-10-01T00:00:00.000Z"),
+        "staged/run-1/graph.execution.json": ("2" * 40, "2026-10-02T00:00:00.000Z"),
+    }
+    assert len(hub.requests) == 3
+    assert all(
+        f"/tree/{stored.head_commit}/staged/run-1" in request.url.raw_path.decode()
+        and "expand=true" in str(request.url)
+        for request in hub.requests
+    )
