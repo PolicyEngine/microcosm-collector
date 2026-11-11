@@ -1106,6 +1106,88 @@ telemetry_collector.orrery_read_app:create_orrery_read_app_from_environment
 `DATABASE_URL` and Google credentials that may read the bucket. Nothing
 checks the caller there, so keep it on `127.0.0.1`.
 
+### Past builds
+
+`python -m telemetry_collector.operations past-builds` prints an inventory of
+past Microcosm builds as one JSON document, so that their Orrery graph
+documents can be rebuilt. It writes nothing, and nothing stores the inventory:
+`list_past_builds` in `telemetry_collector/past_builds.py` makes it afresh each
+time, and later code that rebuilds documents calls the same function.
+
+**What it lists.** One entry per build, from two places, joined by run ID:
+
+- **Staged folders:** every `staged/<run_id>/` folder in each country's
+  release dataset (`RELEASE_REPOS`), read with the collector's Hugging Face
+  read token. Each dataset is read at the commit its `main` points at when the
+  inventory starts, and the inventory records that revision.
+- **Recorded runs:** every run in `telemetry_runs`. A run with no staged
+  folder is listed with nothing to rebuild from Hugging Face.
+
+Each entry gives the run ID, country, dataset and revision, staged folder,
+whether the collector recorded the run, the Microcosm commit, its class, the
+graph files the folder holds (`graph.schema.json`, `graph.execution.json`,
+`graph.orrery.json`, `execution.evidence.json`, `orrery.publication.json`)
+and what can be rebuilt from Hugging Face:
+
+| `rebuild` | The staged folder holds |
+|---|---|
+| `full` | the schema (`graph.schema.json`) and the execution overlay (`graph.execution.json`) |
+| `declaration_only` | the schema without the overlay |
+| `none` | no schema, or there is no staged folder |
+
+The inventory also records when it was made and the number of builds in each
+class, in each `rebuild` value and skipped.
+
+**The Microcosm commit and its class.** The commit is `summary.git_commit` in
+the folder's `staged_manifest.json`, which Microcosm copies from the build
+manifest's `git_commit` (`git rev-parse HEAD` where the build ran). Recorded
+runs record no commit. GitHub's compare API then says, for each distinct
+commit, whether it has the merge commit of microcosm#1151 as an ancestor, and
+if not, whether it has that of microcosm#1144:
+
+| `commit_class` | The commit |
+|---|---|
+| `after_1151` | contains microcosm#1151 (one request) |
+| `between_1144_and_1151` | contains microcosm#1144 but not #1151 (two requests) |
+| `before_1144` | contains neither |
+| `unknown` | couldn't be classed; `class_reason` says why |
+
+A build is `unknown` when its folder has no staged manifest, the manifest
+records no commit, the commit isn't a 40-character commit hash, GitHub has no
+such commit in PolicyEngine/microcosm, or GitHub gave no usable answer.
+
+**Skipped builds.** Builds made before microcosm#1144 are skipped, since they
+recorded no execution evidence, and so are builds made between #1144 and #1151
+whose `rebuild` is `none`. Both stay in the inventory with `skipped` true and
+the reason in `skip_reason`. `unknown` builds are never skipped.
+
+**GitHub's rate limit.** The inventory calls GitHub without a token, and
+GitHub allows 60 such requests an hour from one IP address. Each distinct
+commit takes one or two requests. After a rate-limit answer, or any failure,
+that commit and every later one are `unknown` with the reason, and the
+command sends no more requests; nothing is guessed. Cloud Run jobs reach
+GitHub from addresses that other Google Cloud users share, so part of the
+hour's allowance may already be used.
+
+**Running it.** It needs `DATABASE_URL` and `COLLECTOR_HF_READ_TOKEN`, which
+only the worker job mounts, and stops with a message naming either variable
+when it is missing. Run it as an execution of the worker job with its
+arguments overridden:
+
+```bash
+gcloud run jobs execute <worker job> --project <project> --region <region> \
+  --args=run,--no-sync,python,-m,telemetry_collector.operations,past-builds \
+  --wait
+```
+
+The three values are the environment's GitHub variables
+`TELEMETRY_WORKER_JOB`, `TELEMETRY_GCP_PROJECT_ID` and `TELEMETRY_GCP_REGION`.
+Running a job with overridden arguments needs `run.jobs.runWithOverrides` on
+it. The inventory is the execution's log
+entry for standard output; Cloud Logging keeps entries of up to 256 KB. A
+failed execution is retried up to twice, like any worker execution; a retry
+only repeats the reads.
+
 ## Calibration tree package
 
 `packages/calibration-tree` is the calibration tree package: the TypeScript
