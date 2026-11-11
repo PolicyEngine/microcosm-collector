@@ -3,8 +3,9 @@
 Past builds come from two places: the folders staged under ``staged/<run_id>/``
 in each country's Hugging Face release dataset, and the collector's recorded
 runs. Each build is classed by the Microcosm commit its staged manifest
-records, relative to microcosm#1144 and microcosm#1151, using GitHub's compare
-API, and says what its Orrery graph document can be rebuilt from.
+records, or else the commit its run's ``run`` events record, relative to
+microcosm#1144 and microcosm#1151, using GitHub's compare API, and says what its
+Orrery graph document can be rebuilt from.
 """
 
 from __future__ import annotations
@@ -49,11 +50,16 @@ COMMIT_AFTER_1151 = "a" * 40
 COMMIT_BETWEEN_1144_AND_1151 = "b" * 40
 COMMIT_BEFORE_1144 = "c" * 40
 COMMIT_UNKNOWN_TO_GITHUB = "e" * 40
+#: On a branch that left main after #1144 and before #1151.
+COMMIT_ON_DIVERGED_BRANCH = "f" * 40
 MERGES_CONTAINED = {
     COMMIT_AFTER_1151: {EXECUTION_EVIDENCE_MERGE, GRAPH_SCHEMA_MERGE},
     COMMIT_BETWEEN_1144_AND_1151: {EXECUTION_EVIDENCE_MERGE},
     COMMIT_BEFORE_1144: set(),
+    GRAPH_SCHEMA_MERGE: {EXECUTION_EVIDENCE_MERGE, GRAPH_SCHEMA_MERGE},
+    COMMIT_ON_DIVERGED_BRANCH: {EXECUTION_EVIDENCE_MERGE},
 }
+DIVERGED_COMMITS = {COMMIT_ON_DIVERGED_BRANCH}
 
 ALL_GRAPH_FILES = (
     "graph.schema.json",
@@ -73,10 +79,12 @@ def past_builds_module() -> ModuleType:
 class FakeGitHub:
     """Answers GitHub's compare API for PolicyEngine/microcosm.
 
-    A comparison ``<base>...<head>`` answers as GitHub does for commits on one
-    history: ``behind`` when the head is an ancestor of the base, that is when
-    the base commit contains the head merge commit (``MERGES_CONTAINED``), and
-    ``ahead`` otherwise. A base commit it doesn't know gets 404. After
+    A comparison ``<base>...<head>`` answers as GitHub does: ``identical`` for
+    one commit, ``behind`` when the head is an ancestor of the base, that is
+    when the base commit contains the head merge commit (``MERGES_CONTAINED``),
+    ``diverged`` for a base commit on a branch that left main
+    (``DIVERGED_COMMITS``), and ``ahead`` otherwise. A base commit it doesn't
+    know gets 404. After
     ``requests_answered`` requests, every later one gets GitHub's rate-limit
     answer.
     """
@@ -114,10 +122,15 @@ class FakeGitHub:
         commit, merge = self.comparisons()[-1]
         if commit not in MERGES_CONTAINED:
             return httpx.Response(404, json={"message": "Not Found"})
-        contains_merge = merge in MERGES_CONTAINED[commit]
-        return httpx.Response(
-            200, json={"status": "behind" if contains_merge else "ahead"}
-        )
+        if commit == merge:
+            comparison = "identical"
+        elif merge in MERGES_CONTAINED[commit]:
+            comparison = "behind"
+        elif commit in DIVERGED_COMMITS:
+            comparison = "diverged"
+        else:
+            comparison = "ahead"
+        return httpx.Response(200, json={"status": comparison})
 
 
 def staged_folder(
@@ -312,23 +325,53 @@ def test_builds_sharing_a_commit_make_one_set_of_calls() -> None:
     assert len(github.requests) == 2
 
 
-def test_a_rate_limit_answer_makes_that_commit_and_later_ones_unknown() -> None:
-    github = FakeGitHub(requests_answered=1)
+def test_identical_and_diverged_answers_are_classed() -> None:
     staged_files = {
-        **staged_folder("uk-run-1", COMMIT_AFTER_1151, ALL_GRAPH_FILES),
-        **staged_folder("uk-run-2", COMMIT_BETWEEN_1144_AND_1151, ALL_GRAPH_FILES),
-        **staged_folder("uk-run-3", COMMIT_BEFORE_1144, ALL_GRAPH_FILES),
+        **staged_folder("uk-run-1", GRAPH_SCHEMA_MERGE, ALL_GRAPH_FILES),
+        **staged_folder("uk-run-2", COMMIT_ON_DIVERGED_BRANCH, ALL_GRAPH_FILES),
     }
 
-    inventory, _ = list_builds(staged_files, github)
+    inventory, _ = list_builds(staged_files, FakeGitHub())
 
     builds = builds_by_run_id(inventory)
     assert builds["uk-run-1"].commit_class == "after_1151"
-    for run_id in ("uk-run-2", "uk-run-3"):
+    assert builds["uk-run-2"].commit_class == "between_1144_and_1151"
+
+
+def test_a_rate_limit_answer_leaves_later_commits_unknown_newest_rebuildable_first() -> (
+    None
+):
+    """Builds that can be rebuilt are classed first, newest first, so that
+    they are the ones classed when GitHub's allowance runs out."""
+
+    github = FakeGitHub(requests_answered=1)
+    module = past_builds_module()
+    staged_files = {
+        **staged_folder("uk-run-1-old", COMMIT_BEFORE_1144),
+        **staged_folder("uk-run-2", COMMIT_BETWEEN_1144_AND_1151, ALL_GRAPH_FILES),
+        **staged_folder("uk-run-3-newest", COMMIT_AFTER_1151, ALL_GRAPH_FILES),
+    }
+    recorded_runs = [
+        module.RecordedRun(
+            run_id="uk-run-0-recorded",
+            country_code="uk",
+            microcosm_commit=COMMIT_BEFORE_1144,
+        )
+    ]
+
+    inventory, _ = list_builds(staged_files, github, recorded_runs)
+
+    builds = builds_by_run_id(inventory)
+    assert builds["uk-run-3-newest"].commit_class == "after_1151"
+    for run_id in ("uk-run-0-recorded", "uk-run-1-old", "uk-run-2"):
         assert builds[run_id].commit_class == "unknown"
         assert "rate limit" in builds[run_id].class_reason
         assert builds[run_id].skipped is False
-    assert len(github.requests) == 2
+    assert github.comparisons() == [
+        (COMMIT_AFTER_1151, GRAPH_SCHEMA_MERGE),
+        (COMMIT_BETWEEN_1144_AND_1151, GRAPH_SCHEMA_MERGE),
+    ]
+    assert [build.run_id for build in inventory.builds] == sorted(builds)
 
 
 def test_a_staged_folder_without_a_usable_manifest_has_no_commit() -> None:
@@ -463,13 +506,15 @@ def test_recorded_runs_are_read_from_the_telemetry_runs_table(
                 [
                     recorded_run("uk-run-1", "GB"),
                     recorded_run("us-run-2", "US"),
+                    recorded_run("us-run-3-without-events", "US"),
+                    recorded_run("us-run-4", "US"),
                 ]
             )
             session.flush()
             session.add_all(
                 [
-                    TelemetryProducer(run_id="uk-run-1", producer_id="producer-1"),
-                    TelemetryProducer(run_id="us-run-2", producer_id="producer-1"),
+                    TelemetryProducer(run_id=run_id, producer_id="producer-1")
+                    for run_id in ("uk-run-1", "us-run-2", "us-run-4")
                 ]
             )
             session.flush()
@@ -484,7 +529,15 @@ def test_recorded_runs_are_read_from_the_telemetry_runs_table(
                     run_event(
                         "uk-run-1", 2, "stage", {"identity": {"git_commit": "d" * 40}}
                     ),
+                    # The first run event records no commit; a later one does.
                     run_event("us-run-2", 1, "run", {"identity": {"git_commit": None}}),
+                    run_event(
+                        "us-run-2",
+                        2,
+                        "run",
+                        {"identity": {"git_commit": COMMIT_AFTER_1151}},
+                    ),
+                    run_event("us-run-4", 1, "run", {"identity": "not an object"}),
                 ]
             )
 
@@ -495,7 +548,17 @@ def test_recorded_runs_are_read_from_the_telemetry_runs_table(
                 microcosm_commit=COMMIT_BEFORE_1144,
             ),
             module.RecordedRun(
-                run_id="us-run-2", country_code="us", microcosm_commit=None
+                run_id="us-run-2",
+                country_code="us",
+                microcosm_commit=COMMIT_AFTER_1151,
+            ),
+            module.RecordedRun(
+                run_id="us-run-3-without-events",
+                country_code="us",
+                microcosm_commit=None,
+            ),
+            module.RecordedRun(
+                run_id="us-run-4", country_code="us", microcosm_commit=None
             ),
         ]
     finally:
