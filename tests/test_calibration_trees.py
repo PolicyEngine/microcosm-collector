@@ -67,6 +67,11 @@ ACCEPTED_AT = "2026-10-20T09:00:00Z"
 BLOB_TOKEN = "vercel_blob_rw_test_token"
 READ_TOKEN = "hf_collector_read_token"
 UK_DENSE_RELEASE = "microcosm-uk-2024-25-dense"
+US_RELEASE_REPO = "policyengine/populace-us"
+US_DEFAULT_RELEASE = "microcosm-us-2024-national"
+US_BUILD = "populace-us-2024-spm-20261101"
+BE_RELEASE_REPO = "policyengine/populace-be-private"
+BE_RELEASE = "microcosm-be-2024-national"
 OTHER_BUILD = "uk-frs-calibration-attempt-20261101T000000Z-0a1b2c3d"
 CONTENTS = {
     "calibration_diagnostics.json": b'{"schema_version": 8, "targets": []}',
@@ -320,9 +325,15 @@ def releases_record(
 def uk_release_repo(record: bytes | None) -> FakeHuggingFace:
     """The UK release repo, with ``record`` as its releases.json when given."""
 
+    return release_repo(UK_RELEASE_REPO, record)
+
+
+def release_repo(repo: str, record: bytes | None) -> FakeHuggingFace:
+    """``repo``, with ``record`` as its releases.json when given."""
+
     hugging_face = FakeHuggingFace(token=READ_TOKEN)
     hugging_face.add_dataset(
-        UK_RELEASE_REPO,
+        repo,
         {} if record is None else {"releases.json": record},
         head_commit="c" * 40,
     )
@@ -1324,6 +1335,98 @@ def test_the_releases_record_handler_is_registered_beside_the_tree_handler() -> 
         "releases-record",
     }
     assert with_token["releases-record"] is not DEFAULT_HANDLERS["releases-record"]
+
+
+# Every country the collector lists ----------------------------------------------
+
+US_RECORD = releases_record(
+    default=US_DEFAULT_RELEASE,
+    release=US_DEFAULT_RELEASE,
+    current=US_BUILD,
+    builds=(US_BUILD,),
+)
+
+
+def test_a_us_build_releases_json_names_current_becomes_the_us_latest() -> None:
+    # DEFAULT_RELEASES names no US release: only releases.json decides.
+    runner = RecordingRunner()
+    submission = accepted(
+        provenance(
+            f"releases/{US_DEFAULT_RELEASE}/{US_BUILD}",
+            release=US_DEFAULT_RELEASE,
+            repo=US_RELEASE_REPO,
+            country_code="US",
+        )
+        | {"build_id": US_BUILD}
+    )
+
+    submission.run(
+        handler_with(runner, hugging_face=release_repo(US_RELEASE_REPO, US_RECORD))
+    )
+
+    assert submission.record().status == "succeeded"
+    assert published_make_latest(runner) is True
+
+
+def test_a_be_build_without_releases_json_does_not_become_the_latest() -> None:
+    # Without releases.json, DEFAULT_RELEASES decides, and it names no BE
+    # release yet.
+    runner = RecordingRunner()
+    submission = accepted(
+        provenance(
+            f"releases/{BE_RELEASE}/{RUN_ID}",
+            release=BE_RELEASE,
+            repo=BE_RELEASE_REPO,
+            country_code="BE",
+        )
+    )
+
+    submission.run(
+        handler_with(runner, hugging_face=release_repo(BE_RELEASE_REPO, None))
+    )
+
+    assert submission.record().status == "succeeded"
+    assert published_make_latest(runner) is False
+
+
+def test_a_us_releases_record_moves_the_us_latest() -> None:
+    runner = RecordingRunner()
+    submission = accepted_releases_record(
+        US_RECORD,
+        release=US_DEFAULT_RELEASE,
+        build=US_BUILD,
+        repo=US_RELEASE_REPO,
+        country_code="US",
+    )
+
+    submission.run(
+        latest_handler_with(runner, release_repo(US_RELEASE_REPO, US_RECORD))
+    )
+
+    assert submission.record().status == "succeeded"
+    assert runner.call("latest")["inputs"]["latest.json"] == {
+        "country": "us",
+        "releaseId": f"{US_DEFAULT_RELEASE}/{US_BUILD}",
+    }
+    assert submission.record().result["made_latest"] is True
+
+
+def test_a_be_releases_record_without_releases_json_at_the_head_leaves_the_latest() -> (
+    None
+):
+    record = releases_record(
+        default=BE_RELEASE, release=BE_RELEASE, current=RUN_ID, builds=(RUN_ID,)
+    )
+    runner = RecordingRunner()
+    submission = accepted_releases_record(
+        record, release=BE_RELEASE, repo=BE_RELEASE_REPO, country_code="BE"
+    )
+
+    submission.run(latest_handler_with(runner, release_repo(BE_RELEASE_REPO, None)))
+
+    assert submission.record().status == "succeeded"
+    assert submission.record().result["latest_unchanged"] == "no_releases_record"
+    assert "latest" not in runner.events
 
 
 def test_the_manifest_lock_lets_one_writer_in_at_a_time(postgres_url: str) -> None:
