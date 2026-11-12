@@ -5,7 +5,10 @@ runs the tree package's Bun worker on the downloaded files without the Blob
 token, then runs its publication command under one Postgres lock. These tests
 replace the two Bun processes with a recording command runner and run the
 handler through the worker framework, so each exit code ends as the framework
-records it: succeeded, rejected, or returned for another attempt.
+records it: succeeded, rejected, or returned for another attempt. A release
+build becomes its country's latest when the release repo's ``releases.json``,
+read from a stand-in for Hugging Face, names it as its default release's
+current build.
 """
 
 from __future__ import annotations
@@ -13,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import importlib.util
+import inspect
 import json
 import runpy
 import subprocess
@@ -31,9 +35,17 @@ import yaml
 
 from telemetry_collector.auth import HuggingFacePrincipal
 from telemetry_collector.database import create_database_engine
+from telemetry_collector.huggingface_read import (
+    GENERIC_TOKEN_VARIABLES,
+    TOKEN_VARIABLE,
+    HuggingFaceReadConfigurationError,
+    HuggingFaceReader,
+    HuggingFaceReadSettings,
+)
 from telemetry_collector.submissions import SubmissionRequest, intake_object_name
 from telemetry_collector.worker import DEFAULT_HANDLERS, JobOutcome, run_job
 from tests.fakes import FakeIntakeObjectStore, FakeSubmissionStore
+from tests.huggingface_fakes import FakeHuggingFace
 from tests.test_submission_store import SteppingClock
 from tests.test_submissions import calibration_submission
 
@@ -45,6 +57,9 @@ COMMIT = "0123456789abcdef0123456789abcdef01234567"
 # SteppingClock's time, when the fake store accepts a submission.
 ACCEPTED_AT = "2026-10-20T09:00:00Z"
 BLOB_TOKEN = "vercel_blob_rw_test_token"
+READ_TOKEN = "hf_collector_read_token"
+UK_DENSE_RELEASE = "microcosm-uk-2024-25-dense"
+OTHER_BUILD = "uk-frs-calibration-attempt-20261101T000000Z-0a1b2c3d"
 CONTENTS = {
     "calibration_diagnostics.json": b'{"schema_version": 8, "targets": []}',
     "build_manifest.json": b'{"build": "uk-frs-calibration-attempt-1"}',
@@ -181,20 +196,78 @@ class RecordingRunner:
         return call
 
 
-def handler_with(runner: RecordingRunner, **settings: Any) -> Any:
+def handler_with(
+    runner: RecordingRunner,
+    *,
+    hugging_face: FakeHuggingFace | None = None,
+    **settings: Any,
+) -> Any:
     @contextmanager
     def recorded_lock() -> Iterator[None]:
         runner.events.append("lock taken")
         yield
         runner.events.append("lock released")
 
-    return trees().calibration_tree_handler(
+    handler_factory = trees().calibration_tree_handler
+    if hugging_face is not None:
+        # A release build's tree reads releases.json to decide the latest.
+        if "reader" not in inspect.signature(handler_factory).parameters:
+            pytest.fail(
+                "calibration_tree_handler takes no Hugging Face reader, which "
+                "the releases.json latest rule needs."
+            )
+        settings["reader"] = HuggingFaceReader(
+            HuggingFaceReadSettings(token=READ_TOKEN), client=hugging_face.client()
+        )
+    return handler_factory(
         blob_token=BLOB_TOKEN,
         manifest_lock=recorded_lock,
         bun="/usr/local/bin/bun",
         run_command=runner,
         **settings,
     )
+
+
+def releases_record(
+    *,
+    default: str | None = UK_DEFAULT_RELEASE,
+    release: str = UK_DEFAULT_RELEASE,
+    current: str | None = RUN_ID,
+    builds: Sequence[str] = (RUN_ID,),
+) -> bytes:
+    """A releases.json with one release, as Microcosm's release writer writes it."""
+
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "default": default,
+            "releases": {
+                release: {
+                    "role": "national",
+                    "current": current,
+                    "builds": {
+                        build: {
+                            "published_at": "2026-10-20T09:00:00Z",
+                            "withdrawn": False,
+                        }
+                        for build in builds
+                    },
+                }
+            },
+        }
+    ).encode()
+
+
+def uk_release_repo(record: bytes | None) -> FakeHuggingFace:
+    """The UK release repo, with ``record`` as its releases.json when given."""
+
+    hugging_face = FakeHuggingFace(token=READ_TOKEN)
+    hugging_face.add_dataset(
+        UK_RELEASE_REPO,
+        {} if record is None else {"releases.json": record},
+        head_commit="c" * 40,
+    )
+    return hugging_face
 
 
 def test_a_build_folder_submission_plans_a_tree_of_that_build() -> None:
@@ -362,7 +435,11 @@ def test_the_worker_request_names_each_file_by_its_hugging_face_path() -> None:
 def test_a_release_build_s_request_names_its_build_folder() -> None:
     runner = RecordingRunner()
 
-    accepted(RELEASED).run(handler_with(runner))
+    # The latest rule reads releases.json; this repo has none, so the UK's
+    # default release in DEFAULT_RELEASES decides.
+    accepted(RELEASED).run(
+        handler_with(runner, hugging_face=uk_release_repo(record=None))
+    )
 
     request = runner.call("build")["inputs"]["request.json"]
     build_folder = f"{UK_DEFAULT_RELEASE}/{RUN_ID}"
@@ -500,9 +577,13 @@ def test_the_tree_handler_is_registered_only_where_its_blob_token_is_set() -> No
     registry = importlib.import_module("telemetry_collector.handlers")
 
     without_token = registry.handlers_from_environment(engine=None, environ={})
+    # The handler also reads releases.json, so it needs the read token too.
     with_token = registry.handlers_from_environment(
         engine=None,
-        environ={"COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN": BLOB_TOKEN},
+        environ={
+            "COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN": BLOB_TOKEN,
+            TOKEN_VARIABLE: READ_TOKEN,
+        },
     )
 
     assert trees().registered_handlers(engine=None, environ={}) == {}
@@ -512,6 +593,131 @@ def test_the_tree_handler_is_registered_only_where_its_blob_token_is_set() -> No
         with_token["calibration-diagnostics"]
         is not DEFAULT_HANDLERS["calibration-diagnostics"]
     )
+
+
+def test_the_tree_handler_needs_the_read_token_beside_its_blob_token() -> None:
+    with pytest.raises(HuggingFaceReadConfigurationError, match=TOKEN_VARIABLE):
+        trees().registered_handlers(
+            engine=None,
+            environ={"COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN": BLOB_TOKEN},
+        )
+
+
+# The latest build, from releases.json ------------------------------------------
+
+
+def published_make_latest(runner: RecordingRunner) -> bool:
+    return runner.call("publication")["inputs"]["publication.json"]["makeLatest"]
+
+
+def releases_record_reads(hugging_face: FakeHuggingFace) -> list[str]:
+    return [
+        request.url.path
+        for request in hugging_face.requests
+        if request.url.path.endswith("/releases.json")
+    ]
+
+
+def test_a_build_releases_json_names_current_becomes_the_latest() -> None:
+    # Not the UK's default release in DEFAULT_RELEASES: only releases.json
+    # can make this build the latest.
+    hugging_face = uk_release_repo(
+        releases_record(default=UK_DENSE_RELEASE, release=UK_DENSE_RELEASE)
+    )
+    runner = RecordingRunner()
+    submission = accepted(
+        provenance(f"releases/{UK_DENSE_RELEASE}/{RUN_ID}", release=UK_DENSE_RELEASE)
+    )
+
+    submission.run(handler_with(runner, hugging_face=hugging_face))
+
+    assert submission.record().status == "succeeded"
+    assert published_make_latest(runner) is True
+    # Read at the head commit when the tree is built.
+    assert releases_record_reads(hugging_face) == [
+        f"/datasets/{UK_RELEASE_REPO}/resolve/{'c' * 40}/releases.json"
+    ]
+
+
+def test_a_build_releases_json_does_not_name_current_is_not_the_latest() -> None:
+    # The UK's default release in DEFAULT_RELEASES, whose current build is
+    # another one.
+    hugging_face = uk_release_repo(
+        releases_record(current=OTHER_BUILD, builds=(RUN_ID, OTHER_BUILD))
+    )
+    runner = RecordingRunner()
+    submission = accepted(RELEASED)
+
+    submission.run(handler_with(runner, hugging_face=hugging_face))
+
+    assert submission.record().status == "succeeded"
+    assert published_make_latest(runner) is False
+    assert "latest_skipped" not in submission.record().result
+
+
+def test_without_releases_json_the_default_release_rule_decides() -> None:
+    hugging_face = uk_release_repo(record=None)
+    default_runner = RecordingRunner()
+    other_runner = RecordingRunner()
+
+    accepted(RELEASED).run(handler_with(default_runner, hugging_face=hugging_face))
+    accepted(
+        provenance(f"releases/{UK_DENSE_RELEASE}/{RUN_ID}", release=UK_DENSE_RELEASE)
+    ).run(handler_with(other_runner, hugging_face=hugging_face))
+
+    assert published_make_latest(default_runner) is True
+    assert published_make_latest(other_runner) is False
+    assert len(releases_record_reads(hugging_face)) == 2
+
+
+@pytest.mark.parametrize(
+    "refused_record",
+    [
+        releases_record(current="uk-frs-calibration-attempt-unlisted"),
+        releases_record(default="microcosm-uk-unlisted"),
+        json.dumps({"schema_version": 2, "default": None, "releases": {}}).encode(),
+        b"not json",
+    ],
+    ids=["unlisted-current", "unlisted-default", "schema-2", "not-json"],
+)
+def test_a_releases_json_the_rules_refuse_publishes_without_moving_the_latest(
+    refused_record: bytes,
+) -> None:
+    hugging_face = uk_release_repo(refused_record)
+    runner = RecordingRunner()
+    submission = accepted(RELEASED)
+
+    submission.run(handler_with(runner, hugging_face=hugging_face))
+
+    assert submission.record().status == "succeeded"
+    assert published_make_latest(runner) is False
+    assert submission.record().result["latest_skipped"] == "releases_record_refused"
+
+
+@pytest.mark.parametrize("status_code", [401, 429, 500, 503])
+def test_a_failed_releases_json_read_returns_the_job_before_anything_is_built(
+    status_code: int,
+) -> None:
+    hugging_face = uk_release_repo(releases_record())
+    hugging_face.datasets[UK_RELEASE_REPO].forced_status = status_code
+    runner = RecordingRunner()
+    submission = accepted(RELEASED)
+
+    outcome = submission.run(handler_with(runner, hugging_face=hugging_face))
+
+    assert outcome is JobOutcome.RETRY
+    assert submission.record().status == "queued"
+    assert runner.calls == []
+
+
+def test_a_staged_bundle_reads_nothing_from_hugging_face() -> None:
+    hugging_face = uk_release_repo(releases_record())
+    runner = RecordingRunner()
+
+    accepted(STAGED).run(handler_with(runner, hugging_face=hugging_face))
+
+    assert hugging_face.requests == []
+    assert published_make_latest(runner) is False
 
 
 def test_the_manifest_lock_lets_one_writer_in_at_a_time(postgres_url: str) -> None:
@@ -573,6 +779,10 @@ def test_the_worker_job_builds_trees_where_its_blob_token_is_set(
     monkeypatch.setenv("DATABASE_URL", "postgresql://user:password@127.0.0.1:1/none")
     monkeypatch.setenv("COLLECTOR_INTAKE_BUCKET", "collector-intake")
     monkeypatch.setenv("COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN", BLOB_TOKEN)
+    # The handler reads releases.json with the worker job's read token.
+    monkeypatch.setenv(TOKEN_VARIABLE, READ_TOKEN)
+    for name in GENERIC_TOKEN_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.delenv("COLLECTOR_ORRERY_BUCKET", raising=False)
 
     assert worker.main() == 0

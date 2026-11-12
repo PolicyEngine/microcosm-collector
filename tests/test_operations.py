@@ -1,14 +1,19 @@
-"""Operator commands: recovering stalled jobs and reprocessing submissions."""
+"""Operator commands: recovery, reprocessing and backfilling calibration trees."""
 
 from __future__ import annotations
 
+import importlib
+import importlib.util
 import json
+from collections.abc import Iterator
+from types import ModuleType
 from typing import Any
 
 import pytest
 
 from telemetry_collector import operations
 from telemetry_collector.auth import HuggingFacePrincipal
+from telemetry_collector.huggingface_read import GENERIC_TOKEN_VARIABLES
 from telemetry_collector.operations import (
     recover_stalled_jobs,
     reprocess_submissions,
@@ -284,3 +289,249 @@ def test_the_commands_require_the_database_and_worker_queue(
 
     with pytest.raises(RuntimeError, match=missing_name):
         operations.main(["recover"])
+
+
+# Backfilling calibration trees -------------------------------------------------
+
+BACKFILL_MODULE = "telemetry_collector.calibration_tree_backfill"
+BACKFILL_COMMAND = "backfill-calibration-trees"
+PRODUCTION_URL = "https://dashboard.example.test/api/microcosm/tree-manifest"
+BACKFILL_ENVIRONMENT = {
+    "DATABASE_URL": "postgresql://user:password@127.0.0.1:1/none",
+    "COLLECTOR_HF_READ_TOKEN": "hf_collector_read_token",
+    "COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN": "vercel_blob_rw_test_token",
+}
+LATEST_BUILD = "a" * 64
+
+
+def backfill_module() -> ModuleType:
+    if importlib.util.find_spec(BACKFILL_MODULE) is None:
+        pytest.fail(f"{BACKFILL_MODULE} does not exist yet.")
+    return importlib.import_module(BACKFILL_MODULE)
+
+
+def stand_in_backfill(
+    monkeypatch: pytest.MonkeyPatch, outcomes: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Replace the backfill with one that yields ``outcomes`` and records its options."""
+
+    module = backfill_module()
+    given: dict[str, Any] = {}
+
+    class StandInEngine:
+        def dispose(self) -> None:
+            given["disposed"] = True
+
+    def recorded_backfill(**options: Any) -> Iterator[Any]:
+        given.update(options)
+        for outcome in outcomes:
+            yield module.BackfillOutcome(**outcome)
+
+    monkeypatch.setattr(module, "backfill_calibration_trees", recorded_backfill)
+    monkeypatch.setattr(
+        operations, "create_database_engine", lambda database_url: StandInEngine()
+    )
+    for name in GENERIC_TOKEN_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+    for name, value in BACKFILL_ENVIRONMENT.items():
+        monkeypatch.setenv(name, value)
+    return given
+
+
+BUILT_LATEST = {
+    "country": "us",
+    "kind": "release",
+    "source_id": "microcosm-us-2025",
+    "outcome": "built",
+    "make_latest": True,
+    "production_build_artifact_id": LATEST_BUILD,
+    "build_artifact_id": LATEST_BUILD,
+    "matches_production": True,
+    "made_latest": True,
+}
+ALREADY_STORED = {
+    "country": "us",
+    "kind": "staging",
+    "source_id": "us-calibration-attempt-1",
+    "outcome": "already_stored",
+}
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        [BACKFILL_COMMAND],
+        [
+            BACKFILL_COMMAND,
+            "--production-manifest-url",
+            "http://dashboard.example.test/x",
+        ],
+        [BACKFILL_COMMAND, "--production-manifest-url", "dashboard.example.test/x"],
+    ],
+    ids=["no-url", "http", "no-scheme"],
+)
+def test_the_backfill_needs_an_https_production_manifest_address(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    arguments: list[str],
+) -> None:
+    for name, value in BACKFILL_ENVIRONMENT.items():
+        monkeypatch.setenv(name, value)
+
+    with pytest.raises(SystemExit) as exited:
+        operations.main(arguments)
+
+    assert exited.value.code == 2
+    assert "--production-manifest-url" in capsys.readouterr().err
+
+
+def test_the_backfill_refuses_a_country_or_kind_it_does_not_know(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stand_in_backfill(monkeypatch, [])
+    url = ["--production-manifest-url", PRODUCTION_URL]
+
+    with pytest.raises(SystemExit) as unknown_country:
+        operations.main([BACKFILL_COMMAND, *url, "--country", "fr"])
+    with pytest.raises(SystemExit) as unknown_kind:
+        operations.main([BACKFILL_COMMAND, *url, "--kind", "comparison"])
+
+    assert unknown_country.value.code == 2
+    assert unknown_kind.value.code == 2
+    errors = capsys.readouterr().err
+    assert "--country" in errors
+    assert "--kind" in errors
+
+
+def test_the_backfill_passes_its_address_countries_kind_and_dry_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    given = stand_in_backfill(monkeypatch, [])
+
+    exit_status = operations.main(
+        [
+            BACKFILL_COMMAND,
+            "--production-manifest-url",
+            PRODUCTION_URL,
+            "--country",
+            "uk",
+            "--country",
+            "us",
+            "--kind",
+            "staging",
+            "--dry-run",
+        ]
+    )
+
+    assert exit_status == 0
+    assert given["production_manifest_url"] == PRODUCTION_URL
+    assert list(given["countries"]) == ["uk", "us"]
+    assert list(given["kinds"]) == ["staging"]
+    assert given["dry_run"] is True
+    assert given["disposed"] is True
+
+
+def test_by_default_the_backfill_covers_every_country_and_kind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    given = stand_in_backfill(monkeypatch, [])
+
+    operations.main([BACKFILL_COMMAND, "--production-manifest-url", PRODUCTION_URL])
+
+    assert list(given["countries"]) == ["us", "uk", "be"]
+    assert sorted(given["kinds"]) == ["release", "staging"]
+    assert given["dry_run"] is False
+
+
+@pytest.mark.parametrize("missing_name", list(BACKFILL_ENVIRONMENT))
+def test_the_backfill_names_a_missing_variable(
+    monkeypatch: pytest.MonkeyPatch, missing_name: str
+) -> None:
+    stand_in_backfill(monkeypatch, [])
+    monkeypatch.delenv(missing_name)
+
+    with pytest.raises(RuntimeError, match=missing_name):
+        operations.main([BACKFILL_COMMAND, "--production-manifest-url", PRODUCTION_URL])
+
+
+def test_the_backfill_prints_one_document_per_entry_then_the_summary(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stand_in_backfill(monkeypatch, [BUILT_LATEST, ALREADY_STORED])
+
+    exit_status = operations.main(
+        [BACKFILL_COMMAND, "--production-manifest-url", PRODUCTION_URL]
+    )
+
+    assert exit_status == 0
+    printed = [json.loads(text) for text in capsys.readouterr().out.splitlines()]
+    assert len(printed) == 3
+    assert [
+        (document["source_id"], document["outcome"]) for document in printed[:2]
+    ] == [
+        ("microcosm-us-2025", "built"),
+        ("us-calibration-attempt-1", "already_stored"),
+    ]
+    assert printed[2] == {
+        "summary": {
+            "outcomes": {"built": 1, "already_stored": 1},
+            "incomplete": False,
+            "release_builds_differing_from_production": 0,
+            "latest": {
+                "us": {"build": LATEST_BUILD, "made_latest": True},
+                "uk": {"build": None, "made_latest": None},
+                "be": {"build": None, "made_latest": None},
+            },
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    "incomplete_outcome",
+    [
+        {**ALREADY_STORED, "outcome": "error", "reason": "boom", "incomplete": True},
+        {**ALREADY_STORED, "outcome": "deferred", "incomplete": True},
+        {"country": "uk", "outcome": "error", "reason": "HTTP 500", "incomplete": True},
+        {**BUILT_LATEST, "outcome": "latest_not_moved", "made_latest": False},
+        {**BUILT_LATEST, "outcome": "invalid", "made_latest": False},
+    ],
+    ids=["error", "deferred", "country-failed", "latest-not-moved", "latest-invalid"],
+)
+def test_the_backfill_exits_1_when_anything_is_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    incomplete_outcome: dict[str, Any],
+) -> None:
+    stand_in_backfill(monkeypatch, [incomplete_outcome])
+
+    exit_status = operations.main(
+        [BACKFILL_COMMAND, "--production-manifest-url", PRODUCTION_URL]
+    )
+
+    assert exit_status == 1
+    summary = json.loads(capsys.readouterr().out.splitlines()[-1])["summary"]
+    assert summary["incomplete"] is True
+
+
+def test_final_refusals_alone_do_not_fail_the_backfill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stand_in_backfill(
+        monkeypatch,
+        [
+            {**ALREADY_STORED, "outcome": outcome, "source_id": f"run-{outcome}"}
+            for outcome in (
+                "unbuildable",
+                "refused",
+                "too_large",
+                "invalid",
+                "mismatch",
+            )
+        ],
+    )
+
+    exit_status = operations.main(
+        [BACKFILL_COMMAND, "--production-manifest-url", PRODUCTION_URL]
+    )
+
+    assert exit_status == 0
