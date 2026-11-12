@@ -1,10 +1,11 @@
 """Read access to Hugging Face for the collector's worker jobs.
 
 Only the collector's worker jobs read Hugging Face, for backfills, old
-releases and back-building; the API service never holds a Hugging Face
-credential. They read with one purpose-specific, fine-grained read token,
-which Google Secret Manager holds and Cloud Run mounts into each job that
-needs it as ``COLLECTOR_HF_READ_TOKEN``. The token is scoped to the datasets
+releases, back-building and the calibration tree handler's latest rule; the
+API service never holds a Hugging Face credential. They read with one
+purpose-specific, fine-grained read token, which Google Secret Manager holds
+and Cloud Run mounts into each job that needs it as
+``COLLECTOR_HF_READ_TOKEN``. The token is scoped to the datasets
 in ``HUGGINGFACE_DATASETS`` that are not public (``token_scope()``).
 
 Code that reads Hugging Face builds its reader with
@@ -16,6 +17,12 @@ to a credential with a different scope.
 The reader sends the token only to Hugging Face: it never follows an API
 redirect or a file-list page to another host, and httpx drops the
 ``Authorization`` header when a download is redirected to another host.
+
+A read Hugging Face answers with anything but HTTP 200 raises
+``HuggingFaceReadError`` with the status and, for a 404, Hugging Face's
+``X-Error-Code`` (``RepoNotFound``, ``RevisionNotFound``, ``EntryNotFound``),
+so a reader can tell a missing file or folder from a missing repo or revision
+(``is_missing_path``).
 """
 
 from __future__ import annotations
@@ -148,12 +155,37 @@ class HuggingFaceReadError(RuntimeError):
 
     ``status_code`` is ``None`` when Hugging Face could not be reached, and 200
     when it answered with something the reader could not use.
+    ``error_code`` is Hugging Face's ``X-Error-Code`` header, when it sent one.
     """
 
-    def __init__(self, dataset: str, status_code: int | None, message: str) -> None:
+    def __init__(
+        self,
+        dataset: str,
+        status_code: int | None,
+        message: str,
+        *,
+        error_code: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.dataset = dataset
         self.status_code = status_code
+        self.error_code = error_code
+
+
+#: Hugging Face's ``X-Error-Code`` values for a 404 about the repo or the
+#: revision, rather than the file or folder asked for.
+MISSING_REPO_OR_REVISION: Final = frozenset({"RepoNotFound", "RevisionNotFound"})
+
+
+def is_missing_path(error: HuggingFaceReadError) -> bool:
+    """Whether ``error`` says the file or folder asked for is not at its revision.
+
+    That is a 404 without ``RepoNotFound`` or ``RevisionNotFound``. A 404 with
+    either says the repo or the revision could not be found, and, like any
+    other failed read, is not a missing path.
+    """
+
+    return error.status_code == 404 and error.error_code not in MISSING_REPO_OR_REVISION
 
 
 @dataclass(frozen=True)
@@ -337,7 +369,7 @@ class HuggingFaceReader:
                 "GET", url, headers=self._authorization(), follow_redirects=True
             ) as response:
                 if response.status_code != 200:
-                    raise _status_error(dataset, response.status_code, f"file {path}")
+                    raise _status_error(dataset, response, f"file {path}")
                 content = bytearray()
                 for chunk in response.iter_bytes():
                     content.extend(chunk)
@@ -384,17 +416,19 @@ class HuggingFaceReader:
         except httpx.HTTPError as error:
             raise _unreachable(dataset, description) from error
         if response.status_code != 200:
-            raise _status_error(dataset, response.status_code, description)
+            raise _status_error(dataset, response, description)
         return response
 
 
 def _status_error(
-    dataset: str, status_code: int, description: str
+    dataset: str, response: httpx.Response, description: str
 ) -> HuggingFaceReadError:
+    status_code = response.status_code
     return HuggingFaceReadError(
         dataset,
         status_code,
         f"Hugging Face answered HTTP {status_code} for the {description} of {dataset}.",
+        error_code=response.headers.get("X-Error-Code"),
     )
 
 

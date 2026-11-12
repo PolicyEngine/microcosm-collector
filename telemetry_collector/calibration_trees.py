@@ -12,15 +12,24 @@ It then runs the package's publication command, which holds the token, inside
 one Postgres transaction lock, so collector writers add to the manifest one
 at a time.
 
-Nothing here reads Hugging Face: every value comes from the submission. The
-publication time recorded in the tree is the submission's ``accepted_at``, so
-reprocessing a submission builds the same tree. A release build becomes its
-country's latest when its release is the country's default release in
-``DEFAULT_RELEASES``.
+The tree's files and provenance come from the submission. The publication
+time recorded in the tree is the submission's ``accepted_at``, so
+reprocessing a submission builds the same tree. Only the latest build is
+decided from Hugging Face: a release build becomes its country's latest when
+the release repo's ``releases.json``, read at the repo's head commit when the
+tree is built, names it as its default release's current build, as the
+GitHub Actions publisher decides. A repo without ``releases.json`` keeps the
+rule of ``DEFAULT_RELEASES``: a build of the country's default release there
+becomes its latest. A failed read of ``releases.json`` fails the attempt
+before anything is downloaded, so it runs again; a ``releases.json`` that
+breaks the record's rules publishes the tree without moving the latest, and
+the result says why (``latest_skipped``). Staging trees never become the
+latest.
 
 The worker registers this handler only where ``COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN``
-is set (``registered_handlers``, which ``telemetry_collector.handlers`` reads);
-elsewhere submissions stay in intake storage and can be reprocessed once it is.
+is set (``registered_handlers``, which ``telemetry_collector.handlers`` reads),
+and then needs ``COLLECTOR_HF_READ_TOKEN`` too; elsewhere submissions stay in
+intake storage and can be reprocessed once it is.
 """
 
 from __future__ import annotations
@@ -32,13 +41,19 @@ import subprocess
 import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
 import sqlalchemy as sa
 
+from telemetry_collector.huggingface_read import (
+    HuggingFaceReader,
+    HuggingFaceReadError,
+    HuggingFaceReadSettings,
+    is_missing_path,
+)
 from telemetry_collector.submission_store import SubmissionRecord
 from telemetry_collector.submissions import INTAKE_ONLY_HANDLER
 from telemetry_collector.worker import (
@@ -75,8 +90,9 @@ STAGING_REPOS: Mapping[str, str] = {
     "us": "policyengine/populace-us-staging",
     "uk": "policyengine/populace-uk-staging",
 }
-#: Each country's default (national) release. A build of it becomes the
-#: country's latest. The US's is added once its stable releases are agreed.
+#: Each country's default (national) release, for a release repo without
+#: ``releases.json``: there, a build of it becomes the country's latest. The
+#: US's is added once its stable releases are agreed.
 DEFAULT_RELEASES: Mapping[str, str] = {"uk": "microcosm-uk-2024-25-national"}
 
 #: The key of the transaction lock every manifest writer takes.
@@ -90,6 +106,8 @@ EXIT_UNBUILDABLE_INPUT = 2
 EXIT_ENTRY_REFUSED = 2
 
 _SEGMENT = r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
+#: A release, build or run name: one path segment that cannot leave its folder.
+SAFE_IDENTIFIER: Final = re.compile(_SEGMENT)
 _RELEASE_FOLDER = re.compile(rf"releases/(?P<release>{_SEGMENT})/(?P<build>{_SEGMENT})")
 _STAGED_FOLDER = re.compile(rf"staged/(?P<run>{_SEGMENT})")
 # The submission's roles, as the worker's request names them.
@@ -180,6 +198,8 @@ def plan_tree_build(
                 f"{folder} is not the folder of release {provenance['release']} "
                 f"build {provenance['build_id']}.",
             )
+        # DEFAULT_RELEASES's rule; the handler replaces it with releases.json's
+        # where the repo has one (release_latest).
         return TreeBuildPlan(
             kind="release",
             release_id=f"{release}/{build}",
@@ -231,6 +251,147 @@ def worker_request(
     }
 
 
+# releases.json ----------------------------------------------------------------
+
+#: The record of a release repo's builds, read by the latest rule.
+RELEASES_RECORD_PATH: Final = "releases.json"
+#: The largest releases.json the record's writer accepts.
+MAX_RELEASES_RECORD_BYTES: Final = 4 * 1024 * 1024
+_ROLE_IDENTIFIER: Final = re.compile(r"[a-z][a-z0-9_]{0,63}")
+_RECORD_KEYS: Final = frozenset({"default", "releases", "schema_version"})
+_RELEASE_KEYS: Final = frozenset({"builds", "current", "role"})
+_BUILD_KEYS: Final = frozenset({"published_at", "withdrawn"})
+
+
+class ReleasesRecordRefusedError(ValueError):
+    """A releases.json that breaks the record's rules."""
+
+
+def _refuse_record(message: str) -> ReleasesRecordRefusedError:
+    return ReleasesRecordRefusedError(f"{RELEASES_RECORD_PATH}: {message}")
+
+
+def _is_safe_identifier(value: object) -> bool:
+    return isinstance(value, str) and SAFE_IDENTIFIER.fullmatch(value) is not None
+
+
+def _reject_constant(constant: str) -> None:
+    # JSON.parse refuses NaN and Infinity, which Python's json reads.
+    raise ValueError(f"{constant} is not JSON.")
+
+
+def current_default_build(content: bytes) -> str | None:
+    """The current build of the record's default release, as ``<release>/<build>``.
+
+    ``None`` while the record names no default release or that release has no
+    current build. A record the tree package's ``parseReleasesRecordBytes``
+    would refuse raises ``ReleasesRecordRefusedError``: one larger than 4 MiB,
+    not a JSON document, without exactly its keys or ``schema_version`` 1,
+    with a release or build name that is not a safe identifier, a role that
+    is not one, a malformed build, a ``current`` that is not a listed build
+    or is withdrawn, or a ``default`` that is not a listed release.
+    """
+
+    if len(content) > MAX_RELEASES_RECORD_BYTES:
+        raise _refuse_record(f"larger than {MAX_RELEASES_RECORD_BYTES} bytes.")
+    try:
+        # As TextDecoder reads it: invalid UTF-8 refused, a leading BOM dropped.
+        document = json.loads(
+            content.decode("utf-8-sig"), parse_constant=_reject_constant
+        )
+    except ValueError:
+        raise _refuse_record("not a readable JSON document.") from None
+    if not isinstance(document, dict) or set(document) != _RECORD_KEYS:
+        raise _refuse_record("must have exactly default, releases, schema_version.")
+    schema_version = document["schema_version"]
+    if isinstance(schema_version, bool) or schema_version != 1:
+        raise _refuse_record("schema_version must be 1.")
+    releases = document["releases"]
+    if not isinstance(releases, dict):
+        raise _refuse_record("releases must be an object.")
+    for release, entry in releases.items():
+        if not _is_safe_identifier(release):
+            raise _refuse_record("a release name is not a safe identifier.")
+        if not isinstance(entry, dict) or set(entry) != _RELEASE_KEYS:
+            raise _refuse_record(f"release {release} must have builds, current, role.")
+        role = entry["role"]
+        if not isinstance(role, str) or _ROLE_IDENTIFIER.fullmatch(role) is None:
+            raise _refuse_record(f"release {release} has an invalid role.")
+        if entry["current"] is not None and not isinstance(entry["current"], str):
+            raise _refuse_record(f"release {release} current must be a build or null.")
+        builds = entry["builds"]
+        if not isinstance(builds, dict):
+            raise _refuse_record(f"release {release} builds must be an object.")
+        for build, build_entry in builds.items():
+            if not _is_safe_identifier(build):
+                raise _refuse_record("a build name is not a safe identifier.")
+            if (
+                not isinstance(build_entry, dict)
+                or set(build_entry) != _BUILD_KEYS
+                or not isinstance(build_entry["published_at"], str)
+                or not build_entry["published_at"]
+                or not isinstance(build_entry["withdrawn"], bool)
+            ):
+                raise _refuse_record(f"build {build} of {release} is malformed.")
+    default = document["default"]
+    if default is not None and not isinstance(default, str):
+        raise _refuse_record("default must be a release name or null.")
+    if default is not None and default not in releases:
+        raise _refuse_record(f"default {default} is not listed.")
+    for release, entry in releases.items():
+        current = entry["current"]
+        if current is None:
+            continue
+        if current not in entry["builds"]:
+            raise _refuse_record(f"current build {current} of {release} is not listed.")
+        if entry["builds"][current]["withdrawn"]:
+            raise _refuse_record(f"current build {current} of {release} is withdrawn.")
+    if default is None or releases[default]["current"] is None:
+        return None
+    return f"{default}/{releases[default]['current']}"
+
+
+@dataclass(frozen=True)
+class LatestDecision:
+    """Whether a release build's tree becomes its country's latest, and why not."""
+
+    make_latest: bool
+    #: Set when releases.json could not decide: ``releases_record_refused``.
+    skipped: str | None = None
+    skipped_reason: str | None = None
+
+
+def release_latest(plan: TreeBuildPlan, reader: HuggingFaceReader) -> LatestDecision:
+    """Decide a release build's latest from its repo's releases.json at the head.
+
+    The build becomes the latest when the record names it as its default
+    release's current build; names are compared, as the GitHub Actions
+    publisher compares them first. A 404 without ``RepoNotFound`` or
+    ``RevisionNotFound`` means the repo has no record, and ``plan.make_latest``
+    (``DEFAULT_RELEASES``'s rule) stands. Any other failed read raises
+    ``HuggingFaceReadError``, so the attempt runs again.
+    """
+
+    head_commit = reader.head_commit(plan.hf_repo)
+    try:
+        content = reader.read_file(plan.hf_repo, RELEASES_RECORD_PATH, head_commit)
+    except HuggingFaceReadError as error:
+        if is_missing_path(error):
+            return LatestDecision(make_latest=plan.make_latest)
+        raise
+    try:
+        current = current_default_build(content)
+    except ReleasesRecordRefusedError as error:
+        return LatestDecision(
+            make_latest=False,
+            skipped="releases_record_refused",
+            skipped_reason=shortened_message(str(error)),
+        )
+    return LatestDecision(make_latest=current == plan.release_id)
+
+
+# Building and publishing --------------------------------------------------------
+
 CommandRunner = Callable[
     [Sequence[str], Mapping[str, str], float], subprocess.CompletedProcess[str]
 ]
@@ -268,7 +429,13 @@ def postgres_manifest_lock(engine: sa.Engine) -> ManifestLock:
     return lock
 
 
-def _shortened(text: str) -> str:
+def shortened_message(text: str) -> str:
+    """``text`` stripped and shortened to ``MAX_MESSAGE_CHARACTERS``.
+
+    An empty message becomes "(no message)". Used for the messages a job's
+    result records.
+    """
+
     text = text.strip() or "(no message)"
     return (
         text
@@ -294,15 +461,23 @@ def _answer(completed: subprocess.CompletedProcess[str], step: str) -> dict[str,
     return answer
 
 
+# The handler ----------------------------------------------------------------------
+
+
 def calibration_tree_handler(
     *,
     blob_token: str,
     manifest_lock: ManifestLock,
+    reader: HuggingFaceReader,
     bun: str = "bun",
     size_limits: Mapping[str, str] | None = None,
     run_command: CommandRunner = run_bun,
 ) -> JobHandler:
-    """The ``calibration-diagnostics`` handler, writing with ``blob_token``."""
+    """The ``calibration-diagnostics`` handler, writing with ``blob_token``.
+
+    A release build reads its repo's releases.json with ``reader`` to decide
+    the latest (``release_latest``).
+    """
 
     base_environment = {"PATH": os.environ.get("PATH", os.defpath), "LANG": "C.UTF-8"}
     build_environment = {**base_environment, **(size_limits or {})}
@@ -319,6 +494,11 @@ def calibration_tree_handler(
                 "verified_files": len(context.files()),
                 "reason": plan.reason,
             }
+        latest = LatestDecision(make_latest=False)
+        if plan.kind == "release":
+            # Before anything is downloaded, so a failed read costs nothing.
+            latest = release_latest(plan, reader)
+            plan = replace(plan, make_latest=latest.make_latest)
         with tempfile.TemporaryDirectory(prefix="calibration-tree-") as directory:
             attempt_directory = Path(directory)
             files_directory = attempt_directory / "files"
@@ -348,11 +528,12 @@ def calibration_tree_handler(
             )
             if built.returncode == EXIT_UNBUILDABLE_INPUT:
                 raise SubmissionRejectedError(
-                    "calibration_tree_unbuildable", _shortened(built.stderr)
+                    "calibration_tree_unbuildable", shortened_message(built.stderr)
                 )
             if built.returncode != 0:
                 raise CalibrationTreeCommandError(
-                    f"The tree worker exited with {built.returncode}: {_shortened(built.stderr)}"
+                    f"The tree worker exited with {built.returncode}: "
+                    f"{shortened_message(built.stderr)}"
                 )
             publication_path = attempt_directory / "publication.json"
             publication_path.write_text(
@@ -373,15 +554,15 @@ def calibration_tree_handler(
                 )
             if published.returncode == EXIT_ENTRY_REFUSED:
                 raise SubmissionRejectedError(
-                    "calibration_tree_refused", _shortened(published.stderr)
+                    "calibration_tree_refused", shortened_message(published.stderr)
                 )
             if published.returncode != 0:
                 raise CalibrationTreeCommandError(
                     f"The tree publication exited with {published.returncode}: "
-                    f"{_shortened(published.stderr)}"
+                    f"{shortened_message(published.stderr)}"
                 )
             answer = _answer(published, "publication")
-        return {
+        result: dict[str, Any] = {
             "processed_by": "calibration-tree",
             "build_artifact_id": answer["buildArtifactId"],
             "kind": answer["kind"],
@@ -389,6 +570,10 @@ def calibration_tree_handler(
             "kept_parts": answer["keptParts"],
             "made_latest": answer["madeLatest"],
         }
+        if latest.skipped is not None:
+            result["latest_skipped"] = latest.skipped
+            result["latest_skipped_reason"] = latest.skipped_reason
+        return result
 
     return build_tree
 
@@ -396,11 +581,17 @@ def calibration_tree_handler(
 def registered_handlers(
     *, engine: sa.Engine | None, environ: Mapping[str, str] = os.environ
 ) -> dict[str, JobHandler]:
-    """The tree handler, only where the worker job has its Blob token."""
+    """The tree handler, only where the worker job has its Blob token.
+
+    It also reads releases.json, so it needs ``COLLECTOR_HF_READ_TOKEN``: with
+    the Blob token and without the read token, this raises
+    ``HuggingFaceReadConfigurationError`` naming the variable.
+    """
 
     blob_token = environ.get(BLOB_TOKEN_SETTING, "").strip()
     if not blob_token:
         return {}
+    reader = HuggingFaceReader(HuggingFaceReadSettings.from_environment(environ))
     size_limits = {
         name: environ[name].strip()
         for name in SIZE_LIMIT_SETTINGS
@@ -414,6 +605,9 @@ def registered_handlers(
 
     return {
         "calibration-diagnostics": calibration_tree_handler(
-            blob_token=blob_token, manifest_lock=manifest_lock, size_limits=size_limits
+            blob_token=blob_token,
+            manifest_lock=manifest_lock,
+            size_limits=size_limits,
+            reader=reader,
         ),
     }

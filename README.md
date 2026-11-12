@@ -1468,8 +1468,10 @@ only, from the secret `TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME` names.
 Each environment has its own store, which nothing reads until the dashboard
 switches to it, and its own secret, which only its worker service account may
 read. Without the token, submissions stay in intake storage and can be
-reprocessed later. Nothing here
-reads Hugging Face: every value comes from the submission.
+reprocessed later. With it, the worker job also needs
+`COLLECTOR_HF_READ_TOKEN`, which the deploy mounts beside it, and stops with
+a message naming that variable without it. A tree's files and provenance come
+from the submission; only the latest build is decided from Hugging Face.
 
 - **Which tree.** A build folder, `releases/<release>/<build>`, gives a release
   tree whose release ID is `<release>/<build>`; its `release` and `build_id`
@@ -1482,12 +1484,29 @@ reads Hugging Face: every value comes from the submission.
   does not list, stay in intake storage with the reason in the result.
 - **Time.** The tree records the submission's `accepted_at` as its
   publication time, so reprocessing a submission builds the same tree.
-- **Latest.** A release build becomes its country's latest when its release
-  is the country's default release, listed in `DEFAULT_RELEASES`: the UK's is
-  `microcosm-uk-2024-25-national`; the US's is added once its stable releases
-  are agreed. It takes the latest only from an older build, by publication
-  time, so a retried or reprocessed older build never takes the latest back.
-  Builds of other releases are recorded without moving the latest.
+- **Latest.** A release build becomes its country's latest when the release
+  repo's `releases.json`, read at the repo's head commit when the tree is
+  built, names it as the current build of its default release, as the GitHub
+  Actions publisher decides (the names are compared). Other builds are
+  recorded without moving the latest.
+  - A repo without `releases.json` (Hugging Face's 404 without the
+    `RepoNotFound` or `RevisionNotFound` error code) keeps the
+    `DEFAULT_RELEASES` rule: a build of the country's default release there
+    becomes its latest. The UK's is `microcosm-uk-2024-25-national`; the
+    US's is added once its stable releases are agreed.
+  - Any other failure to read `releases.json` fails the attempt before the
+    submission's files are downloaded, so it runs again.
+  - A `releases.json` the record's rules refuse (as the tree package's
+    `release-record.ts` reads it: at most 4 MiB, exactly its keys,
+    `schema_version` 1, safe names, each `current` a listed build that isn't
+    withdrawn, `default` a listed release or null) isn't retried: the tree is
+    published without moving the latest, and the result records
+    `latest_skipped: "releases_record_refused"` and the reason.
+  - A build takes the latest only from an older build, by publication time,
+    so a retried or reprocessed older build never takes the latest back.
+  - A build made current later, or a change to `releases.json` that comes
+    with no new build, doesn't move the latest through a submission.
+  - Staging trees never become the latest.
 - **Size.** The worker job has 8 GiB of memory and 2 CPUs: building the
   tree for the largest current diagnostics file (a 128.7 MB US release) peaked
   at 3.5 GB, and Cloud Run keeps the downloaded and written files in memory.
@@ -1616,7 +1635,8 @@ one-time setup first, in this order:
 ## Hugging Face read access
 
 Only the collector's worker jobs read Hugging Face, for backfills, old
-releases and back-building. The service itself holds no Hugging Face
+releases, back-building and the calibration tree handler's latest rule. The
+service itself holds no Hugging Face
 credential: a build's own token reaches it only at the token exchange, and is
 never stored. The worker jobs read with a purpose-specific, fine-grained
 read token, never a generic `HF_TOKEN`. Staging and production each have
@@ -1634,6 +1654,17 @@ missing or malformed token stops the job with a message naming the variable.
 Face's own tools read without being asked, are refused if set, so a job
 cannot fall back to a token with another scope. No message includes a token,
 and the reader sends it only to `huggingface.co`.
+
+What reads Hugging Face:
+- the inventory of past builds, and projecting them again;
+- the calibration tree handler, which reads each release build's repo
+  `releases.json` at its head commit to decide the latest (see "Building
+  trees from submissions"), and so needs the token wherever it has the Blob
+  token.
+
+A read answered with anything but HTTP 200 reports the status and, for a
+404, Hugging Face's `X-Error-Code`, so a missing file (`EntryNotFound`) can be
+told from a missing repo or revision (`RepoNotFound`, `RevisionNotFound`).
 
 The datasets the worker jobs read are listed once, in `HUGGINGFACE_DATASETS`:
 
