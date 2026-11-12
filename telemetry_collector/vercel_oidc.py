@@ -15,6 +15,14 @@ message includes one.
 Three settings, all or none, switch Vercel OIDC reads on; with none set (unset
 or blank) the collector refuses every Vercel OIDC token. ``scripts/deploy.sh``
 checks the same patterns before a deployment.
+
+A fourth, optional setting, ``TELEMETRY_VERCEL_OIDC_TREE_BUILD_CALLERS``,
+lists the projects and environments that may queue calibration tree builds
+(``POST /v1/calibration-tree-builds``). It is a list of its own, so that being
+a reader never gives that right, and it needs the three settings above, whose
+team the callers' tokens must belong to. ``VercelOidcVerifier.caller`` makes
+every check ``verify`` makes except the readers check; the endpoint then
+checks the callers list.
 """
 
 from __future__ import annotations
@@ -34,6 +42,8 @@ TEAM_SLUG_SETTING = "TELEMETRY_VERCEL_OIDC_TEAM_SLUG"
 TEAM_ID_SETTING = "TELEMETRY_VERCEL_OIDC_TEAM_ID"
 READERS_SETTING = "TELEMETRY_VERCEL_OIDC_READERS"
 SETTING_NAMES = (TEAM_SLUG_SETTING, TEAM_ID_SETTING, READERS_SETTING)
+#: The projects and environments that may queue calibration tree builds.
+TREE_BUILD_CALLERS_SETTING = "TELEMETRY_VERCEL_OIDC_TREE_BUILD_CALLERS"
 
 # The patterns use only syntax that Python's re and bash's [[ =~ ]] (POSIX
 # extended regular expressions) read alike, since the deploy script holds the
@@ -84,6 +94,10 @@ class VercelOidcReaderNotAllowedError(VercelOidcError):
 
 class VercelOidcKeysUnavailableError(VercelOidcError):
     """Vercel's signing keys could not be read, and none usable is cached."""
+
+
+class VercelOidcTeamNotAllowedError(VercelOidcError):
+    """The token is valid, but Vercel issued it to another team."""
 
 
 @dataclass(frozen=True)
@@ -143,6 +157,37 @@ class VercelOidcSettings:
             )
         readers = frozenset(VercelOidcReader(*entry.split(":", 1)) for entry in entries)
         return cls(team_slug=team_slug, team_id=team_id, readers=readers)
+
+
+def tree_build_callers_from_environment(
+    environ: Mapping[str, str] = os.environ,
+) -> frozenset[VercelOidcReader] | None:
+    """The projects and environments that may queue calibration tree builds.
+
+    ``None`` while ``TELEMETRY_VERCEL_OIDC_TREE_BUILD_CALLERS`` is unset or
+    blank. Its entries are whitespace-separated ``<project ID>:<environment>``
+    pairs, checked with the readers' pattern. Raises ``RuntimeError`` naming
+    the setting, without its value, when it is malformed or when any of the
+    three Vercel OIDC settings is unset, since a caller's token must belong to
+    their team.
+    """
+
+    value = environ.get(TREE_BUILD_CALLERS_SETTING, "").strip()
+    if not value:
+        return None
+    missing = [name for name in SETTING_NAMES if not environ.get(name, "").strip()]
+    if missing:
+        raise RuntimeError(
+            f"{TREE_BUILD_CALLERS_SETTING} needs all of {', '.join(SETTING_NAMES)}; "
+            f"missing: {' '.join(missing)}."
+        )
+    entries = value.split()
+    if not all(re.fullmatch(READER_PATTERN, entry) for entry in entries):
+        raise RuntimeError(
+            f"{TREE_BUILD_CALLERS_SETTING} is not a whitespace-separated list of "
+            "<project ID>:<environment> entries."
+        )
+    return frozenset(VercelOidcReader(*entry.split(":", 1)) for entry in entries)
 
 
 def _usable_keys(answer: Any) -> dict[str, jwt.PyJWK] | None:
@@ -217,6 +262,33 @@ class VercelOidcVerifier:
         ``VercelOidcReaderNotAllowedError`` or ``VercelOidcKeysUnavailableError``.
         """
 
+        owner_id, reader = self._identity(token)
+        if owner_id != self.settings.team_id or reader not in self.settings.readers:
+            raise VercelOidcReaderNotAllowedError(
+                "The token's team, project or environment may not read."
+            )
+        return reader
+
+    def caller(self, token: str) -> VercelOidcReader:
+        """The project and environment the token belongs to, after every check
+        ``verify`` makes except the readers check: the caller decides which
+        projects and environments it accepts.
+
+        Raises ``InvalidVercelOidcTokenError``, ``VercelOidcTeamNotAllowedError``
+        or ``VercelOidcKeysUnavailableError``.
+        """
+
+        owner_id, caller = self._identity(token)
+        if owner_id != self.settings.team_id:
+            raise VercelOidcTeamNotAllowedError(
+                "The token was issued to another Vercel team."
+            )
+        return caller
+
+    def _identity(self, token: str) -> tuple[str, VercelOidcReader]:
+        """The token's ``owner_id``, project and environment, once its
+        signature, issuer, audience, times and claims are checked."""
+
         if len(token) > MAXIMUM_TOKEN_LENGTH:
             raise InvalidVercelOidcTokenError("The token is too long.")
         try:
@@ -256,12 +328,9 @@ class VercelOidcVerifier:
             raise InvalidVercelOidcTokenError(
                 "The token lacks its owner, project or environment."
             )
-        reader = VercelOidcReader(project_id=project_id, environment=environment)
-        if owner_id != self.settings.team_id or reader not in self.settings.readers:
-            raise VercelOidcReaderNotAllowedError(
-                "The token's team, project or environment may not read."
-            )
-        return reader
+        return owner_id, VercelOidcReader(
+            project_id=project_id, environment=environment
+        )
 
     def _signing_key(self, key_id: str) -> jwt.PyJWK:
         with self._state_lock:

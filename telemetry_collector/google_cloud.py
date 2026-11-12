@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
@@ -56,6 +57,8 @@ READ_CHUNK_BYTES = 8 * 1024 * 1024
 # 256-file response well inside the API's 30 s request timeout.
 SIGNING_CONCURRENCY = 16
 QUEUE_REQUEST_TIMEOUT_SECONDS = 10.0
+#: The task IDs Cloud Tasks accepts.
+TASK_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,500}")
 
 
 def _default_credentials() -> Any:
@@ -373,12 +376,18 @@ def cloud_task_id(job_id: str, dispatch_number: int) -> str:
 
 
 class CloudTasksWorkerQueue:
-    """Creates one named Cloud Task per dispatch; the task starts the worker job.
+    """Creates named Cloud Tasks that each start one execution of the worker job.
 
-    The task calls the Cloud Run Admin API's ``jobs.run`` with an OAuth token
-    for the invoker service account, overriding the job ID variable. A task
-    name can be used once, so repeating a dispatch is a no-op, and recovery
-    dispatches again under the next number.
+    A task calls the Cloud Run Admin API's ``jobs.run`` with an OAuth token
+    for the invoker service account. A task name can be used once, so
+    repeating a task is a no-op.
+
+    - ``dispatch`` starts a submission job's execution at once, overriding the
+      job ID variable; recovery dispatches again under the next number.
+    - ``schedule_run`` starts an execution at a given time with the
+      container's arguments overridden, for a calibration tree build request
+      (``telemetry_collector.calibration_tree_builds``). The arguments replace
+      the job's own; its command, ``uv``, stays.
     """
 
     def __init__(
@@ -394,42 +403,83 @@ class CloudTasksWorkerQueue:
         self._invoker_service_account = invoker_service_account
         self._session = session or AuthorizedSession(_default_credentials())
 
-    def _task(self, job_id: str, dispatch_number: int) -> dict[str, Any]:
-        run_request = {
-            "overrides": {
-                "containerOverrides": [
-                    {"env": [{"name": WORKER_JOB_ID_VARIABLE, "value": job_id}]}
-                ],
-                "taskCount": 1,
-            }
-        }
+    def _run_request(self, overrides: dict[str, Any]) -> dict[str, Any]:
+        """The task's call of ``jobs.run`` on the worker job with ``overrides``."""
+
         return {
-            "name": f"{self._queue}/tasks/{cloud_task_id(job_id, dispatch_number)}",
-            "httpRequest": {
-                "httpMethod": "POST",
-                "url": f"https://run.googleapis.com/v2/{self._worker_job}:run",
-                "headers": {"Content-Type": "application/json"},
-                "body": base64.b64encode(json.dumps(run_request).encode()).decode(),
-                "oauthToken": {
-                    "serviceAccountEmail": self._invoker_service_account,
-                    "scope": CLOUD_PLATFORM_SCOPE,
-                },
+            "httpMethod": "POST",
+            "url": f"https://run.googleapis.com/v2/{self._worker_job}:run",
+            "headers": {"Content-Type": "application/json"},
+            "body": base64.b64encode(
+                json.dumps({"overrides": overrides}).encode()
+            ).decode(),
+            "oauthToken": {
+                "serviceAccountEmail": self._invoker_service_account,
+                "scope": CLOUD_PLATFORM_SCOPE,
             },
         }
 
-    def dispatch(self, job_id: str, dispatch_number: int) -> None:
+    def _task(self, job_id: str, dispatch_number: int) -> dict[str, Any]:
+        return {
+            "name": f"{self._queue}/tasks/{cloud_task_id(job_id, dispatch_number)}",
+            "httpRequest": self._run_request(
+                {
+                    "containerOverrides": [
+                        {"env": [{"name": WORKER_JOB_ID_VARIABLE, "value": job_id}]}
+                    ],
+                    "taskCount": 1,
+                }
+            ),
+        }
+
+    def _create(self, task: dict[str, Any]) -> bool:
+        """Create ``task``; False when a task of its name exists already.
+
+        Raises ``WorkerQueueUnavailableError`` for any other answer.
+        """
+
         try:
             response = self._session.post(
                 f"https://cloudtasks.googleapis.com/v2/{self._queue}/tasks",
-                json={"task": self._task(job_id, dispatch_number)},
+                json={"task": task},
                 timeout=QUEUE_REQUEST_TIMEOUT_SECONDS,
             )
         except (requests.RequestException, GoogleAuthError) as error:
             raise WorkerQueueUnavailableError(
                 "The worker queue could not be reached."
             ) from error
-        # 409 means a task with this name already exists: this dispatch happened.
-        if response.status_code not in {200, 409}:
+        # 409 means a task with this name already exists.
+        if response.status_code == 409:
+            return False
+        if response.status_code != 200:
             raise WorkerQueueUnavailableError(
                 f"The worker queue answered HTTP {response.status_code}."
             )
+        return True
+
+    def dispatch(self, job_id: str, dispatch_number: int) -> None:
+        # A task that exists already means this dispatch happened.
+        self._create(self._task(job_id, dispatch_number))
+
+    def schedule_run(
+        self, task_id: str, *, run_at: datetime, arguments: Sequence[str]
+    ) -> bool:
+        """Create the task ``task_id``, which runs the worker job at ``run_at``
+        with ``arguments`` as the container's arguments.
+
+        False when a task of that name exists already (Cloud Tasks' 409).
+        Raises ``ValueError`` for a task ID Cloud Tasks would not accept, and
+        ``WorkerQueueUnavailableError`` for any other answer.
+        """
+
+        if not TASK_ID_PATTERN.fullmatch(task_id):
+            raise ValueError("A Cloud Task ID is 1 to 500 letters, digits, - or _.")
+        return self._create(
+            {
+                "name": f"{self._queue}/tasks/{task_id}",
+                "scheduleTime": run_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "httpRequest": self._run_request(
+                    {"containerOverrides": [{"args": list(arguments)}], "taskCount": 1}
+                ),
+            }
+        )

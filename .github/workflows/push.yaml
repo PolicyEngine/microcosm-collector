@@ -152,6 +152,11 @@ jobs:
       VERCEL_OIDC_TEAM_SLUG: ${{ vars.TELEMETRY_VERCEL_OIDC_TEAM_SLUG }}
       VERCEL_OIDC_TEAM_ID: ${{ vars.TELEMETRY_VERCEL_OIDC_TEAM_ID }}
       VERCEL_OIDC_READERS: ${{ vars.TELEMETRY_VERCEL_OIDC_READERS }}
+      # The <project ID>:<environment> entries whose Vercel OIDC tokens may
+      # queue calibration tree builds (POST /v1/calibration-tree-builds).
+      # Optional, and only beside the three settings above; the deploy sets
+      # it on the service revisions only.
+      VERCEL_OIDC_TREE_BUILD_CALLERS: ${{ vars.TELEMETRY_VERCEL_OIDC_TREE_BUILD_CALLERS }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -304,6 +309,11 @@ jobs:
       VERCEL_OIDC_TEAM_SLUG: ${{ vars.TELEMETRY_VERCEL_OIDC_TEAM_SLUG }}
       VERCEL_OIDC_TEAM_ID: ${{ vars.TELEMETRY_VERCEL_OIDC_TEAM_ID }}
       VERCEL_OIDC_READERS: ${{ vars.TELEMETRY_VERCEL_OIDC_READERS }}
+      # The <project ID>:<environment> entries whose Vercel OIDC tokens may
+      # queue calibration tree builds (POST /v1/calibration-tree-builds).
+      # Optional, and only beside the three settings above; the deploy sets
+      # it on the service revisions only.
+      VERCEL_OIDC_TREE_BUILD_CALLERS: ${{ vars.TELEMETRY_VERCEL_OIDC_TREE_BUILD_CALLERS }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:

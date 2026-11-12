@@ -351,7 +351,9 @@ revisions only:
 `scripts/deploy.sh require-configuration` checks them with the collector's
 patterns, all three or none, before the deployment authenticates. The
 worker, recovery and migration jobs and the Orrery read service never get
-them. None is set yet: setting the three variables in both environments is a
+them. A fourth setting, `TELEMETRY_VERCEL_OIDC_TREE_BUILD_CALLERS`, lists
+the projects and environments that may queue calibration tree builds, apart
+from the readers ("Queuing calibration tree builds"). None is set yet: setting the three variables in both environments is a
 manual step, and the next release deploys them.
 
 **Security.** A Vercel OIDC token's audience is the team, not the
@@ -572,8 +574,13 @@ The intake code needs `SELECT`, `INSERT` and `UPDATE`; row locks
 `0003_orrery_graph_files` creates: it records each published graph file with
 `INSERT ... ON CONFLICT DO NOTHING RETURNING`, and `RETURNING` needs
 `SELECT`. The Orrery read service, which connects as the runtime user too,
-needs `SELECT` on `orrery_graph_files` and `artifact_submissions`. No table
-uses a sequence. A `serial`
+needs `SELECT` on `orrery_graph_files` and `artifact_submissions`. The
+calibration tree build endpoint and the `reconcile-calibration-trees`
+command need `SELECT`, `INSERT` and `UPDATE` on
+`calibration_tree_build_requests`, which migration
+`0004_calibration_tree_build_requests` creates: the endpoint writes each
+request with `INSERT ... ON CONFLICT DO UPDATE`. The command also needs
+`SELECT` on `artifact_submissions`. No table uses a sequence. A `serial`
 column would need `USAGE` on its sequence, which these default privileges
 don't give, so a migration that adds one needs
 `GRANT USAGE, SELECT ON SEQUENCES` added to the default privileges first; an
@@ -1837,6 +1844,238 @@ Then the real run, the same without `--dry-run`, until a summary shows
 `"incomplete": false`. Do both in staging, then in production, before the
 dashboard switches to the store. Read each attempt's summary with the logging
 query in "Projecting past builds again".
+
+### Queuing calibration tree builds
+
+A submission builds a tree only from a `releases/<release>/<build>` or a
+`staged/<run_id>` folder. So no submission builds a staging run whose
+diagnostics are only in a staging repo's `runs/<id>/`, a BE release while BE's
+release repo has no `releases.json`, or a release build whose submission was
+never made, failed or was rejected. The dashboard's Hugging Face webhook asks
+the collector to build those: `POST /v1/calibration-tree-builds`
+(`telemetry_collector/calibration_tree_builds.py`) queues an execution of the
+worker job that runs the `reconcile-calibration-trees` operations command
+(`telemetry_collector/calibration_tree_reconciliation.py`).
+
+**The request.**
+
+```
+POST /v1/calibration-tree-builds
+Authorization: Bearer <Vercel OIDC token>
+Content-Type: application/json
+
+{"country": "uk", "kind": "staging", "hf_repo": "<the country's staging repo>",
+ "hf_ref": "refs/heads/main", "hf_commit": "<40 lowercase hex digits>"}
+```
+
+- `country` is `us`, `uk` or `be`, and `kind` is `release` or `staging`;
+  `staging` is refused for `be`, which has no staging repo.
+- `hf_repo` must be the collector's own repo for that country and kind
+  (`RELEASE_REPOS` or `STAGING_REPOS` in `telemetry_collector/calibration_trees.py`).
+  The dashboard's repo names come from its deployment settings and the
+  collector's don't, so a mismatch is refused rather than building another
+  repo.
+- `hf_ref` (`refs/heads/...` or `refs/tags/...`) and `hf_commit` are
+  optional and only recorded: the execution reads each repo at its head.
+- Any other field is refused.
+
+**Who may call.** One optional setting, which needs the three
+`TELEMETRY_VERCEL_OIDC_*` settings in "Vercel OIDC tokens", since a caller's
+token must belong to their team:
+
+| Setting | Value |
+|---|---|
+| `TELEMETRY_VERCEL_OIDC_TREE_BUILD_CALLERS` | the `<project ID>:<environment>` entries that may queue builds, separated by whitespace, with the readers' pattern |
+
+A token gets every check read API v2 gives it, except that its project and
+environment must be among these callers instead of the readers: a reader is
+never a caller, and a caller need not be a reader. Queuing a build starts a
+2-CPU, 8 GiB execution that writes the store, which no reader should be able
+to do. The token is checked before the body is read, so a caller without a
+valid token learns nothing about the body's rules. The staging collector is
+to list the dashboard's `preview` environment, and the production collector
+its `production` environment. With the setting set and any of the three
+missing, or with a malformed entry, the collector refuses to start, naming
+the setting but not its value. The route exists only while intake is on and
+the setting is set.
+
+| Setting | Provider | Path to the collector |
+|---|---|---|
+| `TELEMETRY_VERCEL_OIDC_TREE_BUILD_CALLERS` | GitHub environment variable of `staging` and `production` | `vars.TELEMETRY_VERCEL_OIDC_TREE_BUILD_CALLERS` → `deploy-staging`'s and `deploy-production`'s `env:` as `VERCEL_OIDC_TREE_BUILD_CALLERS` → `scripts/deploy.sh require-configuration` (checked), `deploy-maintenance` and `deploy-candidate` → `--set-env-vars`, the entries separated by single spaces → the service revision's environment → `tree_build_callers_from_environment` |
+
+The worker, recovery and migration jobs and the Orrery read service never get
+it.
+
+**Queuing.** A request falls in a 10-minute window of Unix time,
+`floor(t / 600)`. The first request of a country and kind in a window
+creates one Cloud Task, `calibration-trees-<country>-<kind>-<window>`, on the
+worker queue, scheduled for the window's end. Every later request in the
+window gets Cloud Tasks' 409 and is answered `already_queued`. So at most one
+execution per country and kind is waiting, and it starts after every request
+it answers. A task name is never used again, since window numbers only grow.
+The task calls the Cloud Run Admin API's `jobs.run` on the worker job, with
+an OAuth token for the same invoker account every dispatch uses, and
+overrides only the container's arguments:
+
+```
+run,--no-sync,python,-m,telemetry_collector.operations,reconcile-calibration-trees,--country,<cc>,--kind,<kind>,--request-id,<task ID>
+```
+
+The job's command, `uv`, stays, and so do its limits: one task, two task
+retries, one hour, 2 CPUs and 8 GiB. The arguments come only from constants
+and checked values; nothing the caller sends reaches them. No access is new:
+the runtime account may already enqueue on the queue and act as the invoker
+account, and the invoker account may already run the worker job with
+overrides. These executions have no `artifact_jobs` row, so recovery never
+dispatches them again; Cloud Run's task retries and the next webhook
+delivery cover a failed one.
+
+**The answers.**
+
+| Case | Status | Body |
+|---|---|---|
+| Task created | 202 | `{"status": "queued", "task_id", "country", "kind", "not_before"}` |
+| This window's task exists | 202 | `{"status": "already_queued", ...}`, with the same fields |
+| The callers setting is unset, or intake is off | 404 | `{"detail", "code": "calibration_tree_builds_not_enabled"}`, for every method |
+| No bearer token | 401 | `A Vercel OIDC token is required.` |
+| A token that is malformed, expired, or for another issuer or audience | 401 | `The Vercel OIDC token is invalid or expired.` |
+| A valid token whose team, project or environment isn't a caller | 403 | `This Vercel project and environment may not queue calibration tree builds.` |
+| Vercel's signing keys can't be read, and none usable is cached | 503, without `Retry-After` | `Vercel's token signing keys could not be read.` |
+| A body that isn't JSON, has an unknown field, an unregistered country, `staging` for BE, or a malformed repo, ref or commit | 422 | FastAPI's `detail`, each error without its `input` |
+| `hf_repo` isn't the collector's repo for the country and kind | 422 | `{"detail", "code": "repo_not_registered"}` |
+| The request table can't be written, or Cloud Tasks can't be reached or answers anything but 200 or 409 | 503, `Retry-After: 30` | `{"detail", "code": "worker_queue_unavailable"}` |
+| A deployment is in progress | 503, `Retry-After: 60` | as every route answers then |
+| A body over 1 MiB | 413 | as every route answers |
+
+`not_before` is the window's end, in UTC with an explicit offset. The route
+is left out of the OpenAPI documents.
+
+**The record.** Each request writes one JSON document to standard output,
+`{"calibration_tree_build_request": {...}}`, with the caller's project ID and
+environment, `country`, `kind`, `hf_repo`, `hf_ref`, `hf_commit`, the task
+ID, `not_before`, the outcome (`queued`, `already_queued` or `refused`), the
+status and, for a refusal, its code. A body that fails its checks is logged
+without its values. Each task also has one row in
+`calibration_tree_build_requests` (migration
+`0004_calibration_tree_build_requests`), keyed by its task ID:
+
+- the service writes the row before it creates the task, adding one to
+  `request_count` and keeping `first_requested_at`, `last_requested_at`, the
+  last caller's project ID and environment, `hf_repo`, `last_hf_ref`,
+  `last_hf_commit` and `not_before`; it sets `queued_at` when Cloud Tasks
+  first answers 200 or 409;
+- the execution, by its `--request-id`, adds one to `attempts` and sets
+  `execution` (`CLOUD_RUN_EXECUTION`) and `started_at` at each attempt's
+  start, clearing the last attempt's finish, and sets `finished_at` and
+  `summary` when the attempt ends, or stops on an unexpected error.
+
+There is at most one row per country, kind and 10 minutes. No answer, log
+document or row holds the token.
+
+**The command.** `python -m telemetry_collector.operations
+reconcile-calibration-trees --country <cc> [--kind release|staging]
+[--request-id <task ID>] [--dry-run]` reads the country's repos at their
+head commit with the GitHub Actions publisher's listing rules ported to
+Python. Without `--kind` it covers both kinds, or only releases for BE.
+
+- **Release:** every build the release repo's `releases.json` lists,
+  withdrawn ones included, read by `telemetry_collector/releases_record.py`.
+  A build the store holds under its release ID is `already_stored`, with no
+  further read. Any other build's commit is the newest last commit among its
+  folder's files; its folder must hold `calibration_diagnostics.json`, and
+  its `release_manifest.json` must name the same release and build. Its tree
+  records the record's `published_at` as `toISOString` writes it. The current
+  default build is built first.
+- **Staging:** the runs in the staging repo's `runs/<id>/` folders. A run the
+  store holds is `already_stored`, and its files are not read. Of the
+  others, a structured run's status is its run manifest's, and a schema-1
+  run's is the one a schema-1 `runs.json` records, else its
+  `progress.json`'s; only `passed`, `published` and `completed` runs are
+  built, the newest first. Its label is its candidate release, else its run
+  ID, and its time its progress's `updated_at`, else its run manifest's.
+- A build whose folder (`releases/<release>/<build>` or `staged/<run>`) a
+  `queued` or `processing` `calibration-diagnostics` submission holds is
+  `submission_in_progress`: the submission builds it.
+- Builds use the backfill's steps, one at a time; a file over 256 MiB is
+  `too_large`, and no build starts after 40 minutes of the execution.
+- Each kind runs inside a Postgres session advisory lock of its own country
+  and kind, so executions for the same country and kind run one after
+  another. An execution waits for it for up to 15 minutes, and then reports
+  `lock_wait_expired` and exits 1, so Cloud Run tries again. The store's
+  manifest is read once for each kind, inside its lock.
+- Nothing it publishes becomes the country's latest.
+
+It prints one JSON document for each build, then
+`{"summary": {"country", "kinds", "request_id", "dry_run", "outcomes",
+"incomplete", "incomplete_sources", "latest"}}`, where `latest` is
+`"not_handled"` for a run that covers releases.
+
+| Outcome | Means | Final |
+|---|---|---|
+| `would_build` | a dry run would build it | |
+| `built` | built and published, never as the latest | yes |
+| `already_stored` | the store holds it | yes |
+| `submission_in_progress` | a `queued` or `processing` submission of its folder builds it | yes |
+| `ineligible` | a release folder without diagnostics, or whose release manifest is absent or names another build; a staging run that isn't final | yes |
+| `unbuildable` | the worker refused the files (exit 2), or a staging run's documents are incompatible: a run manifest that isn't a JSON object, names another run or has an unsupported schema, and the backfill's own checks of a run's files | yes |
+| `too_large` | a file is over 256 MiB | yes |
+| `refused` | the publication refused the build (exit 2) | yes |
+| `no_releases_record` | the release repo has no `releases.json`; nothing is built | yes |
+| `releases_record_refused` | `releases.json` breaks the record's rules; nothing is built | yes |
+| `error` | a Hugging Face failure, the store's manifest could not be read, a Bun exit 1 or 3, or a timeout | no |
+| `deferred` | the time limit passed before it started | no |
+| `lock_wait_expired` | another execution held the country's and kind's lock for 15 minutes | no |
+
+The command exits 0 when the run is complete, 1 when anything ended in
+`error`, `deferred` or `lock_wait_expired`, and 2 for an argument error,
+such as `--kind staging` for BE, a `--request-id` of another country or
+kind, or `--request-id` beside `--dry-run`. It needs `DATABASE_URL`,
+`COLLECTOR_HF_READ_TOKEN` and `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN`, which
+the worker job has, and stops with a message naming a missing one.
+
+**Running it by hand.** As an execution of the worker job, by someone who
+may run it with overridden arguments. First the dry run, which reads the
+Hugging Face listings and the store's manifest, downloads no diagnostics,
+builds nothing and takes no lock:
+
+```bash
+gcloud run jobs execute <worker job> --project <project> --region <region> \
+  --args=run,--no-sync,python,-m,telemetry_collector.operations,reconcile-calibration-trees,--country,<cc>,--kind,<release or staging>,--dry-run \
+  --wait
+```
+
+Then the same without `--dry-run`. A run without `--request-id` writes no
+row. Read each attempt's documents with the logging query in "Projecting
+past builds again".
+
+**Manual steps for each environment.** Each is its own tracker task:
+
+- before the merge, in the staging (4a · 11) and production (4a · 12)
+  databases, check with `\ddp` that the migration user's default privileges
+  still give the runtime user `SELECT`, `INSERT`, `UPDATE` and `DELETE` on
+  new tables in `public` ("Database access");
+- after the release, set the GitHub environment variable
+  `TELEMETRY_VERCEL_OIDC_TREE_BUILD_CALLERS` in `staging` to
+  `<dashboard project ID>:preview` (4a · 14) and in `production` to
+  `<dashboard project ID>:production` (4a · 15). Until then the route
+  answers 404.
+
+**Limits.**
+
+- A release run doesn't move the country's latest yet. A change of current
+  build with no new build reaches the collector only through this endpoint,
+  so it moves the latest only once a release run calls the rule that makes
+  the latest follow `releases.json`, which another task adds.
+- `releases.json` has two parsers with the same rules: this command's, which
+  lists every build, and the tree handler's `current_default_build`. One is
+  to replace both.
+- Stored trees' parts are not audited or repaired, as the GitHub Actions
+  publisher audits them.
+- A repo without `releases.json` builds nothing: its tags and pointer files
+  are not read. BE is to publish with `releases.json` before the
+  switch-over.
+- A staging run reads the manifests of every run the store lacks, including
+  runs that will never be final.
 
 ### Tests
 
