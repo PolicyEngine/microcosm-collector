@@ -49,9 +49,14 @@ def test_the_readme_says_how_the_check_runs_and_reaches_a_person() -> None:
     section = readme_section()
 
     assert "python -m telemetry_collector.huggingface_check" in section
-    assert "Cloud Scheduler" in section
-    assert "Cloud Monitoring" in section
+    assert "python -m telemetry_collector.huggingface_issues" in section
+    assert "`.github/workflows/huggingface-check.yaml`" in section
     assert "configure-huggingface-check-job" in section
+    assert "GitHub issue" in section
+    # Issues replace the email alerts, and the workflow replaces the schedule.
+    assert "Cloud Scheduler" not in section
+    assert "Cloud Monitoring" not in section
+    assert "notification channel" not in section
 
 
 def test_the_readme_says_what_switching_on_the_releases_json_check_needs() -> None:
@@ -77,21 +82,32 @@ def test_the_readme_says_which_manifest_fields_the_file_check_reads() -> None:
     assert "`files` list" not in section
 
 
-def test_the_readme_gives_the_schedule_the_absence_alert_relies_on() -> None:
-    section = readme_section()
-
-    assert "`0 6,18 * * *`" in section
-    assert "no execution has succeeded for 23 hours" in section
-
-
-def test_the_readme_says_to_create_the_alert_policies_before_the_first_run() -> None:
-    # A metric-absence condition starts watching only after the job writes a
-    # data point once the policy exists, so policies created after the last
-    # successful run never report a schedule that never starts the job.
+def test_the_readme_gives_the_workflow_schedule_and_its_dry_run() -> None:
     section = " ".join(readme_section().split())
 
-    assert (
-        "Create the notification channel and both alert policies before the "
-        "job's first execution" in section
-    )
-    assert "at least one data point after the policy is created" in section
+    assert "`17 6 * * *`" in section
+    assert "dry run" in section
+    assert "no successful execution" not in section
+
+
+def test_the_readme_says_when_issues_open_update_reopen_and_close() -> None:
+    section = " ".join(readme_section().split())
+
+    for verb in ("opens", "updates", "reopens", "closes"):
+        assert verb in section, verb
+    assert "did not report a result" in section
+    assert "`huggingface-check` label" in section
+
+
+def test_the_readme_names_the_check_environment_and_its_secrets() -> None:
+    section = readme_section()
+
+    assert "`huggingface-check` environment" in section
+    for secret in (
+        "TELEMETRY_GCP_WIF_PROVIDER",
+        "TELEMETRY_HF_CHECK_SERVICE_ACCOUNT",
+        "TELEMETRY_GCP_PROJECT_ID",
+        "TELEMETRY_GCP_REGION",
+        "TELEMETRY_HF_CHECK_JOB",
+    ):
+        assert f"`{secret}`" in section, secret

@@ -41,6 +41,10 @@ WORKLOAD_IDENTITY_SECRETS = {
 # npm's trusted publishing takes this job's GitHub OIDC token; it never
 # authenticates to Google Cloud (tests/test_calibration_tree_package.py).
 NPM_PUBLISH_JOB = ("publish-calibration-tree.yaml", "publish")
+# The daily Hugging Face check starts the check job and reads its logs as an
+# account of its own, from the huggingface-check environment, on a schedule
+# and by hand from main (tests/test_huggingface_check_workflow.py).
+CHECK_JOB = ("huggingface-check.yaml", "check")
 CALIBRATION_TREE_PACKAGE = Path("packages") / "calibration-tree"
 
 
@@ -113,6 +117,7 @@ def test_deployment_runs_only_when_collector_deploy_is_enabled() -> None:
         ("push.yaml", "deploy-production"): "production",
         ("push.yaml", PUBLISH_CLIENT_JOB): "npm",
         NPM_PUBLISH_JOB: "npm",
+        CHECK_JOB: "huggingface-check",
     }
 
 
@@ -134,7 +139,7 @@ def test_google_cloud_authentication_runs_only_on_pushes_to_main() -> None:
     push_only_oidc_jobs = {
         job_key: workflow_and_job
         for job_key, workflow_and_job in oidc_jobs.items()
-        if job_key != NPM_PUBLISH_JOB
+        if job_key not in {NPM_PUBLISH_JOB, CHECK_JOB}
     }
 
     # Only the release pass of push.yaml reaches these jobs, and pull requests,
@@ -142,6 +147,7 @@ def test_google_cloud_authentication_runs_only_on_pushes_to_main() -> None:
     assert set(authenticating_jobs) == {
         ("push.yaml", "deploy-staging"),
         ("push.yaml", "deploy-production"),
+        CHECK_JOB,
     }
     assert set(oidc_jobs) == set(authenticating_jobs) | {
         ("push.yaml", PUBLISH_CLIENT_JOB),
@@ -182,8 +188,11 @@ def test_oidc_tokens_and_workload_identity_secrets_stay_with_their_jobs() -> Non
         )
         if workflow_path.name == NPM_PUBLISH_JOB[0]:
             expected_jobs = {NPM_PUBLISH_JOB[1]}
+        if workflow_path.name == CHECK_JOB[0]:
+            expected_jobs = {CHECK_JOB[1]}
         assert oidc_jobs == expected_jobs, workflow_path.name
     assert NPM_PUBLISH_JOB[0] in {path.name for path in workflow_paths()}
+    assert CHECK_JOB[0] in {path.name for path in workflow_paths()}
 
     jobs = load_workflow(PUSH_WORKFLOW)["jobs"]
     for job_name in DEPLOY_JOBS:
