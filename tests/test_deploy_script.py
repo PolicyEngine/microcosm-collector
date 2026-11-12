@@ -1,10 +1,12 @@
 import importlib
+import importlib.util
 import json
 import os
 import re
 import subprocess
 import urllib.parse
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -49,6 +51,21 @@ ORRERY_SETTINGS = {"ORRERY_BUCKET": "orrery-bucket"}
 # environment, the only member of the Orrery read service's IAM policy.
 READER_ACCOUNT = "microcosm-runs-reader@example-project.iam.gserviceaccount.com"
 ORRERY_READER_SETTINGS = {"ORRERY_READER_SERVICE_ACCOUNT": READER_ACCOUNT}
+# The Vercel projects and environments whose Vercel OIDC tokens read API v2
+# accepts, with the team they belong to: optional, all three or none.
+# Placeholders, not the real team's or projects' values.
+VERCEL_OIDC_SETTINGS = {
+    "VERCEL_OIDC_TEAM_SLUG": "example-team",
+    "VERCEL_OIDC_TEAM_ID": "team_example",
+    "VERCEL_OIDC_READERS": "prj_dashboard:preview prj_dashboard:production",
+}
+# What each becomes on the service revisions.
+COLLECTOR_VERCEL_OIDC_SETTING_NAMES = {
+    "VERCEL_OIDC_TEAM_SLUG": "TELEMETRY_VERCEL_OIDC_TEAM_SLUG",
+    "VERCEL_OIDC_TEAM_ID": "TELEMETRY_VERCEL_OIDC_TEAM_ID",
+    "VERCEL_OIDC_READERS": "TELEMETRY_VERCEL_OIDC_READERS",
+}
+VERCEL_OIDC_MODULE = "telemetry_collector.vercel_oidc"
 LOGGING_GCLOUD = (
     "printf 'gcloud' >> \"$COMMAND_LOG\"\n"
     'printf \' <%s>\' "$@" >> "$COMMAND_LOG"\n'
@@ -130,6 +147,11 @@ def install_command_stub(directory: Path, name: str, body: str) -> None:
     command = directory / name
     command.write_text(f"#!/usr/bin/env bash\nset -Eeuo pipefail\n{body}\n")
     command.chmod(0o755)
+
+
+def vercel_oidc() -> ModuleType:
+    assert importlib.util.find_spec(VERCEL_OIDC_MODULE) is not None
+    return importlib.import_module(VERCEL_OIDC_MODULE)
 
 
 def test_deploy_script_has_valid_bash_syntax_and_is_executable() -> None:
@@ -680,6 +702,131 @@ def test_deploy_script_patterns_are_the_collectors() -> None:
     assert JOB_PATTERN.endswith("/jobs/" + job_name.removeprefix("^"))
 
 
+@pytest.mark.parametrize("with_vercel_oidc", [False, True])
+@pytest.mark.parametrize("deployment_environment", ["staging", "production"])
+def test_require_configuration_accepts_all_or_none_of_the_vercel_oidc_settings(
+    deployment_environment: str, with_vercel_oidc: bool
+) -> None:
+    configuration = complete_configuration(deployment_environment)
+    if with_vercel_oidc:
+        configuration.update(VERCEL_OIDC_SETTINGS)
+
+    result = run_deploy("require-configuration", environment=configuration)
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    "missing_variables",
+    [
+        ["VERCEL_OIDC_TEAM_SLUG"],
+        ["VERCEL_OIDC_TEAM_ID"],
+        ["VERCEL_OIDC_READERS"],
+        ["VERCEL_OIDC_TEAM_SLUG", "VERCEL_OIDC_TEAM_ID"],
+        ["VERCEL_OIDC_TEAM_ID", "VERCEL_OIDC_READERS"],
+    ],
+)
+@pytest.mark.parametrize("missing_value", [None, "", " "])
+def test_require_configuration_names_the_missing_vercel_oidc_settings(
+    missing_variables: list[str], missing_value: str | None
+) -> None:
+    configuration = {**complete_configuration("production"), **VERCEL_OIDC_SETTINGS}
+    for variable in missing_variables:
+        if missing_value is None:
+            del configuration[variable]
+        else:
+            configuration[variable] = missing_value
+
+    result = run_deploy("require-configuration", environment=configuration)
+
+    assert result.returncode == 1
+    assert result.stderr == (
+        f"Missing telemetry deployment configuration: {' '.join(missing_variables)}\n"
+    )
+
+
+VERCEL_OIDC_REFUSALS = {
+    "VERCEL_OIDC_TEAM_SLUG": "VERCEL_OIDC_TEAM_SLUG is not a valid Vercel team slug.\n",
+    "VERCEL_OIDC_TEAM_ID": "VERCEL_OIDC_TEAM_ID is not a valid Vercel team ID.\n",
+    "VERCEL_OIDC_READERS": (
+        "VERCEL_OIDC_READERS is not a whitespace-separated list of "
+        "<project ID>:<environment> entries.\n"
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [
+        ("VERCEL_OIDC_TEAM_SLUG", "e"),
+        ("VERCEL_OIDC_TEAM_SLUG", "example-team-2"),
+        ("VERCEL_OIDC_TEAM_SLUG", "e" * 100),
+        ("VERCEL_OIDC_TEAM_SLUG", "e" * 101),
+        ("VERCEL_OIDC_TEAM_SLUG", "Example-Team"),
+        ("VERCEL_OIDC_TEAM_SLUG", "-example-team"),
+        ("VERCEL_OIDC_TEAM_SLUG", "example-team-"),
+        ("VERCEL_OIDC_TEAM_SLUG", "example_team"),
+        ("VERCEL_OIDC_TEAM_SLUG", "https://vercel.com/example-team"),
+        ("VERCEL_OIDC_TEAM_ID", "team_" + "e" * 64),
+        ("VERCEL_OIDC_TEAM_ID", "team_" + "e" * 65),
+        ("VERCEL_OIDC_TEAM_ID", "team_"),
+        ("VERCEL_OIDC_TEAM_ID", "team_example-1"),
+        ("VERCEL_OIDC_TEAM_ID", "example-team"),
+        ("VERCEL_OIDC_READERS", "prj_dashboard:development"),
+        ("VERCEL_OIDC_READERS", "prj_" + "d" * 64 + ":preview"),
+        ("VERCEL_OIDC_READERS", "prj_" + "d" * 65 + ":preview"),
+        ("VERCEL_OIDC_READERS", "  prj_dashboard:preview\n\tprj_other:production "),
+        ("VERCEL_OIDC_READERS", "prj_dashboard:preview,prj_other:production"),
+        ("VERCEL_OIDC_READERS", "prj_dashboard:preview prj_other"),
+        ("VERCEL_OIDC_READERS", "prj_dashboard:staging"),
+        ("VERCEL_OIDC_READERS", "prj_dashboard:Preview"),
+        ("VERCEL_OIDC_READERS", "prj_dashboard:*"),
+        ("VERCEL_OIDC_READERS", "*"),
+        ("VERCEL_OIDC_READERS", "team_example:preview"),
+    ],
+)
+def test_require_configuration_refuses_exactly_the_vercel_oidc_settings_the_collector_refuses(
+    variable: str, value: str
+) -> None:
+    collector_settings = {
+        COLLECTOR_VERCEL_OIDC_SETTING_NAMES[name]: setting_value
+        for name, setting_value in {**VERCEL_OIDC_SETTINGS, variable: value}.items()
+    }
+    try:
+        vercel_oidc().VercelOidcSettings.from_environment(collector_settings)
+    except RuntimeError:
+        collector_accepts = False
+    else:
+        collector_accepts = True
+    configuration = {
+        **complete_configuration("production"),
+        **VERCEL_OIDC_SETTINGS,
+        variable: value,
+    }
+
+    result = run_deploy("require-configuration", environment=configuration)
+
+    if collector_accepts:
+        assert result.returncode == 0, result.stderr
+    else:
+        assert result.returncode == 1
+        assert result.stderr == VERCEL_OIDC_REFUSALS[variable]
+
+
+def test_deploy_script_vercel_oidc_patterns_are_the_collectors() -> None:
+    module = vercel_oidc()
+
+    assert deploy_script_pattern("VERCEL_OIDC_TEAM_SLUG_PATTERN") == (
+        module.TEAM_SLUG_PATTERN
+    )
+    assert deploy_script_pattern("VERCEL_OIDC_TEAM_ID_PATTERN") == (
+        module.TEAM_ID_PATTERN
+    )
+    assert deploy_script_pattern("VERCEL_OIDC_READER_PATTERN") == (
+        module.READER_PATTERN
+    )
+
+
 @pytest.mark.parametrize(
     ("deploy_command", "variable", "value"),
     [
@@ -1050,6 +1197,145 @@ def test_service_revisions_switch_intake_on_in_every_environment(
     command = command_log.read_text()
     assert f" {expected_service_settings(maintenance_mode)} " in command
     assert command.count("<--set-env-vars>") == 1
+
+
+@pytest.mark.parametrize("with_vercel_oidc", [False, True])
+@pytest.mark.parametrize(
+    ("deploy_command", "maintenance_mode"),
+    [("deploy-maintenance", "1"), ("deploy-candidate", "0")],
+)
+def test_service_revisions_get_the_vercel_oidc_settings_only_when_they_are_set(
+    tmp_path: Path, deploy_command: str, maintenance_mode: str, with_vercel_oidc: bool
+) -> None:
+    command_log = tmp_path / "commands.log"
+    install_command_stub(tmp_path, "gcloud", LOGGING_GCLOUD)
+    environment = service_deploy_environment(tmp_path, command_log, "staging")
+    if with_vercel_oidc:
+        environment.update(VERCEL_OIDC_SETTINGS)
+
+    result = run_deploy(deploy_command, environment=environment)
+
+    assert result.returncode == 0, result.stderr
+    command = command_log.read_text()
+    assert command.count("<--set-env-vars>") == 1
+    settings = logged_setting_values(command)
+    oidc_settings = {
+        name: value for name, value in settings.items() if "VERCEL_OIDC" in name
+    }
+    if with_vercel_oidc:
+        assert oidc_settings == {
+            COLLECTOR_VERCEL_OIDC_SETTING_NAMES[name]: value
+            for name, value in VERCEL_OIDC_SETTINGS.items()
+        }
+        assert expected_service_settings(maintenance_mode).removesuffix(">") in command
+    else:
+        assert oidc_settings == {}
+        assert f" {expected_service_settings(maintenance_mode)} " in command
+        assert "VERCEL" not in command
+
+
+def test_the_vercel_oidc_settings_the_revisions_get_are_ones_the_collector_accepts(
+    tmp_path: Path,
+) -> None:
+    module = vercel_oidc()
+    command_log = tmp_path / "commands.log"
+    install_command_stub(tmp_path, "gcloud", LOGGING_GCLOUD)
+    environment = {
+        **service_deploy_environment(tmp_path, command_log, "production"),
+        **VERCEL_OIDC_SETTINGS,
+        # A GitHub variable may hold its readers on several lines.
+        "VERCEL_OIDC_READERS": "prj_dashboard:production\n  prj_other:preview\n",
+    }
+
+    result = run_deploy("deploy-candidate", environment=environment)
+
+    assert result.returncode == 0, result.stderr
+    settings = logged_setting_values(command_log.read_text())
+    # One line per setting: the readers are passed separated by single spaces.
+    assert settings["TELEMETRY_VERCEL_OIDC_READERS"] == (
+        "prj_dashboard:production prj_other:preview"
+    )
+    assert module.VercelOidcSettings.from_environment(settings) == (
+        module.VercelOidcSettings(
+            team_slug="example-team",
+            team_id="team_example",
+            readers=frozenset(
+                {
+                    module.VercelOidcReader("prj_dashboard", "production"),
+                    module.VercelOidcReader("prj_other", "preview"),
+                }
+            ),
+        )
+    )
+
+
+@pytest.mark.parametrize("deploy_command", ["deploy-maintenance", "deploy-candidate"])
+def test_service_revision_deploys_stop_before_gcloud_with_part_of_the_vercel_oidc_settings(
+    tmp_path: Path, deploy_command: str
+) -> None:
+    command_log = tmp_path / "commands.log"
+    install_command_stub(tmp_path, "gcloud", LOGGING_GCLOUD)
+    environment = {
+        **service_deploy_environment(tmp_path, command_log, "production"),
+        "VERCEL_OIDC_TEAM_SLUG": VERCEL_OIDC_SETTINGS["VERCEL_OIDC_TEAM_SLUG"],
+    }
+
+    result = run_deploy(deploy_command, environment=environment)
+
+    assert result.returncode == 1
+    assert result.stderr == (
+        "Missing telemetry deployment configuration: "
+        "VERCEL_OIDC_TEAM_ID VERCEL_OIDC_READERS\n"
+    )
+    assert not command_log.exists()
+
+
+@pytest.mark.parametrize("deploy_command", ["deploy-maintenance", "deploy-candidate"])
+def test_service_revision_deploys_stop_before_gcloud_with_a_malformed_vercel_oidc_setting(
+    tmp_path: Path, deploy_command: str
+) -> None:
+    command_log = tmp_path / "commands.log"
+    install_command_stub(tmp_path, "gcloud", LOGGING_GCLOUD)
+    environment = {
+        **service_deploy_environment(tmp_path, command_log, "production"),
+        **VERCEL_OIDC_SETTINGS,
+        "VERCEL_OIDC_READERS": "prj_dashboard:preview,prj_dashboard:production",
+    }
+
+    result = run_deploy(deploy_command, environment=environment)
+
+    assert result.returncode == 1
+    assert result.stderr == VERCEL_OIDC_REFUSALS["VERCEL_OIDC_READERS"]
+    assert not command_log.exists()
+
+
+def test_the_jobs_and_the_orrery_read_service_never_get_the_vercel_oidc_settings(
+    tmp_path: Path,
+) -> None:
+    command_log = tmp_path / "commands.log"
+    install_command_stub(tmp_path, "gcloud", IAM_POLICY_GCLOUD)
+    environment = {
+        **job_deploy_environment(tmp_path, command_log, "production"),
+        **read_service_deploy_environment(tmp_path, command_log, "production"),
+        **VERCEL_OIDC_SETTINGS,
+        "MIGRATION_JOB": "migration-job",
+        "MIGRATION_SERVICE_ACCOUNT": "migrator@example.invalid",
+        "MIGRATION_DATABASE_SECRET_NAME": "migration-database-url",
+    }
+
+    for deploy_command in (
+        "configure-migration-job",
+        "configure-worker-job",
+        "configure-recovery-job",
+        "deploy-orrery-read-service",
+    ):
+        result = run_deploy(deploy_command, environment=environment)
+        assert result.returncode == 0, (deploy_command, result.stderr)
+
+    command = command_log.read_text()
+    assert "VERCEL" not in command
+    for value in VERCEL_OIDC_SETTINGS.values():
+        assert value not in command
 
 
 def job_deploy_environment(

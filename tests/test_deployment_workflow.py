@@ -461,6 +461,22 @@ def test_both_deploy_jobs_read_their_orrery_reader_service_account() -> None:
     assert PUSH_WORKFLOW.read_text(encoding="utf-8").count(mapping) == 2
 
 
+@pytest.mark.parametrize("setting", ["TEAM_SLUG", "TEAM_ID", "READERS"])
+def test_both_deploy_jobs_pass_their_vercel_oidc_settings(setting: str) -> None:
+    jobs = load_workflow(PUSH_WORKFLOW)["jobs"]
+    variable = f"VERCEL_OIDC_{setting}"
+    mapping = f"${{{{ vars.TELEMETRY_VERCEL_OIDC_{setting} }}}}"
+
+    # Each environment names its own readers, at job level; no step sets them.
+    # The deploy passes them to the service revisions only
+    # (tests/test_deploy_script.py).
+    for job_name in DEPLOY_JOBS:
+        assert jobs[job_name]["env"].get(variable) == mapping, job_name
+        for step in jobs[job_name]["steps"]:
+            assert variable not in step.get("env", {}), (job_name, step)
+    assert PUSH_WORKFLOW.read_text(encoding="utf-8").count(mapping) == 2
+
+
 def deploy_step(job: dict, command: str) -> dict:
     matching_steps = [
         step

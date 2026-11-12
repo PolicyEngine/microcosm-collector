@@ -16,6 +16,9 @@ import {
 
 const BASE_URL = "https://collector.example";
 const READ_TOKEN = "dashboard-read-token";
+const AUTHORIZATION = "Authorization";
+// Not a real token: the client sends whatever string it is given.
+const VERCEL_OIDC_TOKEN = "header.claims.signature";
 const INTERACTIONS_URL = new URL(
   "../../../contracts/read-api-v2/interactions/",
   import.meta.url,
@@ -79,7 +82,9 @@ function recordedCollector(): { fetch: typeof fetch; sent: SentRequest[] } {
         request.method === method &&
         recordedHeaders.every(([name, value]) => headers.get(name) === value) &&
         (request.headers?.[READ_TOKEN_HEADER] !== undefined ||
-          !headers.has(READ_TOKEN_HEADER))
+          !headers.has(READ_TOKEN_HEADER)) &&
+        (request.headers?.[AUTHORIZATION] !== undefined ||
+          !headers.has(AUTHORIZATION))
       ) {
         return Response.json(response.body, { status: response.status });
       }
@@ -91,14 +96,35 @@ function recordedCollector(): { fetch: typeof fetch; sent: SentRequest[] } {
 
 function clientFor(
   fetchFunction: typeof fetch,
-  overrides: Partial<CollectorClientOptions> = {},
+  overrides: {
+    readToken?: string | (() => string | Promise<string>);
+    timeoutMs?: number | undefined;
+  } = {},
 ): CollectorClient {
   return createCollectorClient({
     baseUrl: BASE_URL,
-    readToken: READ_TOKEN,
     fetch: fetchFunction,
     ...overrides,
+    readToken: overrides.readToken ?? READ_TOKEN,
   });
+}
+
+// Options as a JavaScript caller may pass them, unchecked by the types, so
+// that the client's own checks of its credential options are what the tests
+// exercise.
+function untypedOptions(options: Record<string, unknown>): CollectorClientOptions {
+  return options as unknown as CollectorClientOptions;
+}
+
+// A client that sends a consumer app's Vercel OIDC token instead of the read
+// credential.
+function vercelOidcClientFor(
+  fetchFunction: typeof fetch,
+  vercelOidcToken: unknown,
+): CollectorClient {
+  return createCollectorClient(
+    untypedOptions({ baseUrl: BASE_URL, vercelOidcToken, fetch: fetchFunction }),
+  );
 }
 
 function body(name: string): unknown {
@@ -168,6 +194,29 @@ const REFUSALS: Record<string, (client: CollectorClient) => Promise<void>> = {
       );
       return true;
     });
+  },
+  "list-runs-with-a-bearer-token-while-vercel-oidc-is-off": async () => {
+    const collector = recordedCollector();
+    const client = vercelOidcClientFor(
+      collector.fetch,
+      "not-a-vercel-oidc-token",
+    );
+    await assert.rejects(client.listRuns(), (error: unknown) => {
+      assert.ok(error instanceof CollectorRequestError);
+      assert.equal(error.status, 401);
+      assert.equal(error.retryable, false);
+      assert.deepEqual(
+        error.detail,
+        (
+          body("list-runs-with-a-bearer-token-while-vercel-oidc-is-off") as {
+            detail: unknown;
+          }
+        ).detail,
+      );
+      return true;
+    });
+    assert.equal(collector.sent.length, 1);
+    assert.equal(collector.sent[0]?.headers.has(READ_TOKEN_HEADER), false);
   },
   "list-runs-with-an-invalid-cursor": async (client) => {
     await assert.rejects(client.listRuns({ before: "not-a-cursor" }), (error) => {
@@ -548,5 +597,92 @@ describe("configuration", () => {
       RangeError,
     );
     assert.equal(collector.sent.length, 0);
+  });
+});
+
+describe("a Vercel OIDC token", () => {
+  // A collector that answers the run list and one run with their recorded
+  // answers, whatever credential a request carries, and keeps each request's
+  // headers.
+  function answeringCollector(): { fetch: typeof fetch; sent: Headers[] } {
+    const sent: Headers[] = [];
+    const fetchStub = async (input: string | URL | Request, init?: RequestInit) => {
+      sent.push(new Headers(init?.headers));
+      const requestPath = new URL(String(input)).pathname;
+      return Response.json(
+        body(
+          requestPath === "/v2/runs" ? "list-runs" : "get-run-us-run-completed",
+        ),
+      );
+    };
+    return { fetch: fetchStub as typeof fetch, sent };
+  }
+
+  test("is sent as a bearer token, without the read credential", async () => {
+    const collector = answeringCollector();
+    const client = vercelOidcClientFor(collector.fetch, VERCEL_OIDC_TOKEN);
+
+    await assert.doesNotReject(client.listRuns());
+    await assert.doesNotReject(client.getRun("us-run-completed"));
+
+    assert.equal(collector.sent.length, 2);
+    for (const headers of collector.sent) {
+      assert.equal(headers.get(AUTHORIZATION), `Bearer ${VERCEL_OIDC_TOKEN}`);
+      assert.equal(headers.has(READ_TOKEN_HEADER), false);
+    }
+  });
+
+  test("is asked of its function for each request", async () => {
+    let calls = 0;
+    const collector = answeringCollector();
+    const client = vercelOidcClientFor(collector.fetch, async () => {
+      calls += 1;
+      return `${VERCEL_OIDC_TOKEN}-${calls}`;
+    });
+
+    await assert.doesNotReject(client.listRuns());
+    await assert.doesNotReject(client.listRuns());
+
+    assert.equal(calls, 2);
+    assert.deepEqual(
+      collector.sent.map((headers) => headers.get(AUTHORIZATION)),
+      [`Bearer ${VERCEL_OIDC_TOKEN}-1`, `Bearer ${VERCEL_OIDC_TOKEN}-2`],
+    );
+  });
+
+  test("that is blank is refused before sending anything", async () => {
+    for (const blankToken of ["", " ", async () => "\t"]) {
+      const collector = answeringCollector();
+      const client = vercelOidcClientFor(collector.fetch, blankToken);
+
+      await assert.rejects(client.listRuns(), /Vercel OIDC token is empty/);
+      assert.equal(collector.sent.length, 0);
+    }
+  });
+
+  test("and the read credential together are refused", () => {
+    assert.throws(
+      () =>
+        createCollectorClient(
+          untypedOptions({
+            baseUrl: BASE_URL,
+            readToken: READ_TOKEN,
+            vercelOidcToken: VERCEL_OIDC_TOKEN,
+          }),
+        ),
+      TypeError,
+    );
+  });
+
+  test("or the read credential is required", () => {
+    for (const options of [
+      { baseUrl: BASE_URL },
+      { baseUrl: BASE_URL, readToken: undefined, vercelOidcToken: undefined },
+    ]) {
+      assert.throws(
+        () => createCollectorClient(untypedOptions(options)),
+        TypeError,
+      );
+    }
   });
 });
