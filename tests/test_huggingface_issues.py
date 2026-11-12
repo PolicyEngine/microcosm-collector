@@ -923,3 +923,49 @@ def test_a_workflow_that_failed_before_the_check_reported_opens_the_no_result_is
     assert github.issues[1]["title"] == NO_RESULT_TITLE
     assert WORKFLOW_FAILED_REASON in github.issues[1]["body"]
     assert "actions/runs/1" in github.issues[1]["body"]
+
+
+# -- Review round 2 --------------------------------------------------------------
+
+
+def test_an_issue_without_check_and_dataset_fields_is_read_from_its_key() -> None:
+    # A dataset name has a slash of its own: check/owner/name/code.
+    github = FakeGitHub(labels={LABEL})
+    key = f"{RELEASES_RECORD_CHECK}/{US}/SHA256_MISMATCH"
+    github.add_issue(
+        "an older issue", f'<!-- huggingface-check:state {{"key": "{key}"}} -->'
+    )
+
+    stopped = sync(github, Report((), completed_checks=ran(US)))
+    finished = sync(github, Report((), completed_checks=ran(US, record=[US])))
+
+    assert stopped == {key: ("not-checked", 1)}
+    assert finished == {key: ("closed", 1)}
+
+
+def test_the_checks_summary_entry_tells_the_sync_which_checks_finished() -> None:
+    # The field names are shared by two modules; read the real summary entry.
+    from telemetry_collector.huggingface_check import main as check_main
+    from telemetry_collector.huggingface_read import (
+        HUGGINGFACE_DATASETS,
+        TOKEN_VARIABLE,
+    )
+    from tests.huggingface_fakes import FakeHuggingFace
+
+    hub = FakeHuggingFace(token="hf_test_collector_read_token")
+    for dataset in HUGGINGFACE_DATASETS:
+        hub.add_dataset(dataset.name, private=not dataset.public)
+    output = io.StringIO()
+    check_main(
+        {TOKEN_VARIABLE: "hf_test_collector_read_token"},
+        client=hub.client(),
+        output=output,
+    )
+    entries = [json.loads(line) for line in output.getvalue().splitlines()]
+
+    report = parse_report(entries)
+
+    assert report.completed
+    assert report.completed_checks == ran(
+        *(dataset.name for dataset in HUGGINGFACE_DATASETS)
+    )

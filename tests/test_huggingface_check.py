@@ -285,21 +285,34 @@ class StandInRecordError(Exception):
     violations: tuple = ()
 
 
-def stand_in_release_rules(folder_check=None) -> SimpleNamespace:
-    """Rules that find nothing wrong with a releases.json listing no releases.
+def stand_in_release_rules(
+    folder_check=None, *, builds: dict[str, list[str]] | None = None, refuse=False
+) -> SimpleNamespace:
+    """Rules that find nothing wrong with a releases.json listing ``builds``.
 
     The real rules come from the interface package, which CI doesn't install;
-    these let a releases.json check run to its end without it. ``folder_check``
-    stands in for the interface's check of every listed build's folder.
+    these let a releases.json check run without it. ``folder_check`` stands in
+    for the interface's check of every listed build's folder; ``builds`` maps
+    each listed release to its builds; ``refuse`` refuses the record itself.
     """
+
+    def parse(content):
+        if refuse:
+            error = StandInRecordError("unreadable")
+            error.violations = (SimpleNamespace(code="RECORD_INVALID", message="no"),)
+            raise error
+        return SimpleNamespace(
+            releases={
+                release: SimpleNamespace(builds={build: None for build in names})
+                for release, names in (builds or {}).items()
+            }
+        )
 
     release_rules = SimpleNamespace(
         RELEASES_RECORD_PATH="releases.json",
         RELEASE_MANIFEST_NAME="release_manifest.json",
         ReleaseRecordError=StandInRecordError,
-        ReleasesRecord=SimpleNamespace(
-            parse=lambda content: SimpleNamespace(releases={})
-        ),
+        ReleasesRecord=SimpleNamespace(parse=parse),
         is_pointer_file=lambda path: path.rsplit("/", 1)[-1].startswith("latest"),
         build_folder=lambda release, build: f"releases/{release}/{build}",
     )
@@ -542,3 +555,73 @@ def test_a_manifest_without_a_usable_artifacts_map_is_refused(
 ) -> None:
     with pytest.raises(ValueError):
         manifest_file_digests(manifest)
+
+
+# -- Review round 2: a releases.json check that compared no files of a build ----
+
+
+LISTED_BUILD = {"release": ["build-1"]}
+LISTED_MANIFEST = "releases/release/build-1/release_manifest.json"
+
+
+def test_a_build_without_its_release_manifest_leaves_the_check_unfinished() -> None:
+    hub, dataset = switched_on_hub({"releases.json": b"{}"})
+
+    outcome = run_all_checks(
+        reader_for(hub),
+        [dataset],
+        release_rules_loader=lambda: stand_in_release_rules(builds=LISTED_BUILD),
+    )
+
+    assert outcome.releases_record_completed == ()
+
+
+def test_a_build_whose_manifest_lists_no_files_leaves_the_check_unfinished() -> None:
+    hub, dataset = switched_on_hub(
+        {"releases.json": b"{}", LISTED_MANIFEST: b"not a manifest"}
+    )
+
+    outcome = run_all_checks(
+        reader_for(hub),
+        [dataset],
+        release_rules_loader=lambda: stand_in_release_rules(builds=LISTED_BUILD),
+    )
+
+    assert [finding.code for finding in outcome.findings] == [
+        "MANIFEST_FILES_UNREADABLE"
+    ]
+    assert outcome.releases_record_completed == ()
+
+
+def test_a_build_whose_files_were_compared_finishes_the_check() -> None:
+    data = b"one published file"
+    manifest = {"artifacts": {"data": artifact("data.bin", digest(data))}}
+    hub, dataset = switched_on_hub(
+        {
+            "releases.json": b"{}",
+            LISTED_MANIFEST: json.dumps(manifest).encode(),
+            "releases/release/build-1/data.bin": data,
+        }
+    )
+
+    outcome = run_all_checks(
+        reader_for(hub),
+        [dataset],
+        release_rules_loader=lambda: stand_in_release_rules(builds=LISTED_BUILD),
+    )
+
+    assert outcome.findings == []
+    assert outcome.releases_record_completed == (dataset.name,)
+
+
+def test_a_refused_record_leaves_the_check_unfinished() -> None:
+    hub, dataset = switched_on_hub({"releases.json": b"{}"})
+
+    outcome = run_all_checks(
+        reader_for(hub),
+        [dataset],
+        release_rules_loader=lambda: stand_in_release_rules(refuse=True),
+    )
+
+    assert [finding.code for finding in outcome.findings] == ["RECORD_INVALID"]
+    assert outcome.releases_record_completed == ()

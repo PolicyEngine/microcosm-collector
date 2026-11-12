@@ -149,3 +149,7 @@ def test_no_comment_or_runbook_still_describes_the_schedule_and_alerts() -> None
     for old_resource in ("Cloud Scheduler", "notification channel", "Cloud Monitoring"):
         assert old_resource not in check_item, old_resource
     assert "`huggingface-check` environment" in " ".join(check_item.split())
+    # Step 4.2 creates the deploy's provider without the environment clause,
+    # so the item gives the command that adds it.
+    assert DEPLOY_PROVIDER_CONDITION in " ".join(check_item.split())
+    assert "providers update-oidc" in check_item
