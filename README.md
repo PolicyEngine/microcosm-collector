@@ -1766,14 +1766,16 @@ secrets, GitHub hides their values in the workflow's public log:
 
 | Secret | Value |
 |---|---|
-| `TELEMETRY_GCP_WIF_PROVIDER` | the Workload Identity provider the workflow authenticates through, which must accept this repo's `main` in the `huggingface-check` environment |
+| `TELEMETRY_GCP_WIF_PROVIDER` | the provider of the check's own Workload Identity pool, which accepts only this repo's `main` in the `huggingface-check` environment |
 | `TELEMETRY_HF_CHECK_SERVICE_ACCOUNT` | the account the workflow acts as, which may only start the check job, follow its executions and read the project's logs |
 | `TELEMETRY_GCP_PROJECT_ID` | the collector's project |
 | `TELEMETRY_GCP_REGION` | the check job's region |
 | `TELEMETRY_HF_CHECK_JOB` | the check job's name, as in production's `TELEMETRY_HF_CHECK_JOB` |
 
-The environment, its secrets, the account and its access are created once by
-hand; the deploy does not change them. The workflow's `GITHUB_TOKEN` opens and
+The workflow's account trusts only that pool, and the deployment account
+does not trust it, so the deploy's access is unchanged ("Google Cloud access").
+The environment, its secrets, the pool, the account and its access are created
+once by hand; the deploy does not change them. The workflow's `GITHUB_TOKEN` opens and
 changes the issues, so it needs no other GitHub credential.
 
 **Switching on the `releases.json` check.** It is off for every dataset. For
@@ -1921,7 +1923,16 @@ assertion.repository=='PolicyEngine/microcosm-collector' && assertion.ref=='refs
 
 The deployment jobs run in those two environments, so they keep their access,
 and a token from a job in any other environment, or in none, is refused. From
-then on, every job that authenticates to Google Cloud must name one of the two.
+then on, every job that authenticates through this provider must name one of
+the two.
+
+The daily Hugging Face check's job also requests an OIDC token, in the
+`huggingface-check` environment. It authenticates through a Workload Identity
+pool and provider of its own, whose condition accepts only this repo's `main`
+in that environment, and acts as an account that trusts only that pool. This
+provider refuses its token, and the deployment account does not trust its
+pool, so it cannot act as the deployment account ("Daily Hugging Face
+check").
 
 Both deployment jobs also require
 `github.event_name == 'push' && github.ref == 'refs/heads/main'`. The Push
