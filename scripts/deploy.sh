@@ -358,6 +358,40 @@ configure_migration_job() {
     --quiet
 }
 
+configure_huggingface_check_job() {
+  require_variables \
+    PROJECT_ID \
+    REGION \
+    IMAGE_URI \
+    HF_CHECK_JOB \
+    WORKER_SERVICE_ACCOUNT \
+    HF_READ_SECRET_NAME
+
+  # The job mounts the collector's Hugging Face read token, so confirm its
+  # secret exists first. Only metadata is inspected; the deploy never reads it.
+  bash "$(dirname "$0")/check-secrets-exist.sh" "$HF_READ_SECRET_NAME"
+
+  # The daily check runs as the worker service account, the only identity
+  # allowed to read the token. The daily workflow
+  # (.github/workflows/huggingface-check.yaml) starts it and reads the
+  # execution's log entries; it is never retried, because a retried attempt's
+  # entries would share the execution and break the count of its problems.
+  gcloud run jobs deploy "$HF_CHECK_JOB" \
+    --project "$PROJECT_ID" \
+    --region "$REGION" \
+    --image "$IMAGE_URI" \
+    --service-account "$WORKER_SERVICE_ACCOUNT" \
+    --set-secrets "COLLECTOR_HF_READ_TOKEN=${HF_READ_SECRET_NAME}:latest" \
+    --command uv \
+    --args "run,--no-sync,python,-m,telemetry_collector.huggingface_check" \
+    --tasks 1 \
+    --max-retries 0 \
+    --task-timeout 30m \
+    --cpu 1 \
+    --memory 512Mi \
+    --quiet
+}
+
 # The worker job runs one submission job per execution, started by a Cloud
 # Task that sets COLLECTOR_WORKER_JOB_ID. Two task retries give the three
 # attempts the worker counts (MAX_JOB_ATTEMPTS), each within the worker's
@@ -844,6 +878,7 @@ Commands:
   resolve-and-verify-maintenance
   wait-for-cutover
   configure-migration-job
+  configure-huggingface-check-job
   apply-migrations
   configure-worker-job
   configure-recovery-job
@@ -872,6 +907,7 @@ main() {
     resolve-and-verify-maintenance) resolve_and_verify_maintenance ;;
     wait-for-cutover) wait_for_cutover ;;
     configure-migration-job) configure_migration_job ;;
+    configure-huggingface-check-job) configure_huggingface_check_job ;;
     apply-migrations) apply_migrations ;;
     configure-worker-job) configure_worker_job ;;
     configure-recovery-job) configure_recovery_job ;;

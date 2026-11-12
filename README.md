@@ -1208,7 +1208,8 @@ newer builds first among run IDs that share a prefix, such as
 `uk-frs-calibration-attempt-<UTC time>-<suffix>`.
 
 **Running it.** It needs `DATABASE_URL` and `COLLECTOR_HF_READ_TOKEN`, which
-only the worker job mounts, and stops with a message naming either variable
+only the worker job mounts together (production's daily Hugging Face check job
+mounts the token but not the database), and stops with a message naming either variable
 when it is missing. Run it as an execution of the worker job with its
 arguments overridden:
 
@@ -1668,6 +1669,173 @@ dataset is added here:
    its mounts, so any such command for these jobs must list this one too, as
    the deploy's does.
 
+## Daily Hugging Face check
+
+`python -m telemetry_collector.huggingface_check` runs in production as a
+Cloud Run job. Once a day at 06:17 UTC (`17 6 * * *`), the workflow
+`.github/workflows/huggingface-check.yaml` starts it and keeps a GitHub issue
+for each problem it finds, with `python -m telemetry_collector.huggingface_issues`.
+It reads Hugging Face with production's read token, the one production's
+worker job mounts, and runs two checks:
+
+1. **Token check.** It requests every dataset in `HUGGINGFACE_DATASETS` once.
+   Any answer but HTTP 200 is a problem, including a redirect or no answer.
+2. **`releases.json` check.** For each dataset whose entry sets
+   `checks_releases_record`, at that dataset's head commit:
+   - there is exactly one `releases.json`, at the root, and no `latest*.json`
+     file anywhere;
+   - the record passes the rules in `microcosm_emitter_interface.releases`,
+     the code the emitter's release writer runs before every write: `current`
+     names a listed build that is not withdrawn, `default` names a listed
+     release, and every listed build has its folder and a
+     `release_manifest.json` naming the same release and build;
+   - every file in a listed build's folder is in the `artifacts` map of that
+     build's `release_manifest.json` and has the SHA-256 the map records.
+     `manifest_file_digests` reads each entry's `path`, the file's bare name
+     in the build folder, and its `sha256`. Files stored with LFS are
+     compared by the SHA-256 Hugging Face records for their content, without
+     a download; other files are downloaded and hashed. Three files of a
+     build folder need no entry: the release manifest itself, and the
+     `build_manifest.json` and `sha256sums.txt` that Microcosm's publisher
+     writes beside it.
+
+   The rules that compare one write with the state before it (existing build
+   entries change only `withdrawn`; nothing inside an existing build folder
+   is added, changed or removed) need that earlier state, so only the release
+   writer applies them. The file check above finds any later change to a
+   build's files except a change to those three.
+
+**Problems and issues.** Each problem is one JSON log entry with severity
+`ERROR`, naming the check, the dataset and a code such as `HTTP_404`,
+`UNREACHABLE`, `POINTER_FILE_PRESENT` or `SHA256_MISMATCH`, followed by a
+summary entry. The job then exits 1, or 2 when the token setting itself is
+missing or unusable, so the execution fails. No log entry includes the token.
+
+The workflow starts an execution, waits for it to finish, and reads that
+execution's log entries. It keeps one GitHub issue per problem, keyed by its
+check, dataset and code, each with the `huggingface-check` label:
+
+- a run that finds a new problem opens its issue (at most 10 a run; the next
+  run opens the rest);
+- a run that finds it again updates the open issue with what it logged;
+- a run that finds a problem whose issue was closed reopens it, with a
+  comment, unless the issue was closed as not planned;
+- a completed run that no longer finds a problem closes its issue, with a
+  comment, but only if that run finished the check that found it: a
+  dataset's `releases.json` check that stopped (at a read error, a missing or
+  unreadable record, a failed token check, or without the rules package)
+  leaves its issues as they are, and so does a check that could not compare
+  a listed build's files with its manifest. The check's summary entry lists
+  the datasets whose `releases.json` check ran to its end. An issue for a
+  check that no longer runs (it was switched off for its dataset, or the
+  dataset is no longer checked), or for a dataset with a build whose files
+  can never be compared again (its manifest is gone, and build folders never
+  change), stays open until someone closes it.
+
+A run that reports no result opens or updates one issue titled "The check did
+not report a result" instead, and leaves the problem issues as they are,
+since what they report is then unknown. That covers a job that could not
+start, failed before writing its summary entry, did not finish within 45
+minutes or could not read its token setting, and entries that could not be
+read, or fewer problem entries than the summary counts. A run that fails
+before the command finishes (it could not authenticate, a setting is missing,
+or the command failed or ran out of time) is reported the same way by the
+workflow's last step, which needs only GitHub's own token; a failed checkout
+or dependency install leaves only GitHub's own failure email. This issue reopens
+even if someone closed it as not planned. The next run that reports a result
+closes it. GitHub notifies the repo's watchers of each new issue, and the
+workflow run's summary lists what each run did.
+
+A run by hand ("Run workflow" on the Actions tab) is a dry run unless its
+`dry_run` box is cleared: it runs the check and reports what it would change,
+without changing any issue. The repo is public, so no issue names the
+project, region, job, execution or account, and the workflow passes those as
+secrets, which GitHub hides in its log. (The production deploy's log already
+shows the project, region and job name, which are variables there.) If GitHub
+stops starting the schedule, nothing reports it: GitHub disables scheduled
+workflows in a public repo after 60 days without activity in it, and emails a
+failed scheduled run only to whoever last changed its schedule.
+
+**Deployment.** The production deploy runs
+`scripts/deploy.sh configure-huggingface-check-job` before it changes the
+service. It confirms the read token's secret exists, reading only its
+metadata, then deploys the job with the released image, one task, no retries
+and the token as its only secret. A missing secret or account therefore stops
+the deploy before production changes. The job's names come from three
+production environment variables:
+
+| Variable | Value |
+|---|---|
+| `TELEMETRY_HF_CHECK_JOB` | the check job's name |
+| `TELEMETRY_WORKER_SERVICE_ACCOUNT` | the worker service account, the only identity that may read the token |
+| `TELEMETRY_HF_READ_SECRET_NAME` | the read token's Secret Manager secret |
+
+Staging has no check job, so staging's own read token, which only staging's
+worker job mounts, is not checked; production's job checks production's
+token, once a day. The deployment service account needs metadata read access
+to the secret and permission to act as the worker service account.
+
+**The workflow's access.** The workflow runs in the
+`huggingface-check` environment, which only `main` may use, and reads five
+secrets from it. As
+secrets, GitHub hides their values in the workflow's public log:
+
+| Secret | Value |
+|---|---|
+| `TELEMETRY_GCP_WIF_PROVIDER` | the provider of the check's own Workload Identity pool, which accepts only this repo's `main` in the `huggingface-check` environment |
+| `TELEMETRY_HF_CHECK_SERVICE_ACCOUNT` | the account the workflow acts as, which may only start the check job, follow its executions and read the project's logs |
+| `TELEMETRY_GCP_PROJECT_ID` | the collector's project |
+| `TELEMETRY_GCP_REGION` | the check job's region |
+| `TELEMETRY_HF_CHECK_JOB` | the check job's name, as in production's `TELEMETRY_HF_CHECK_JOB` |
+
+The workflow's account trusts only that pool, and the deployment account
+does not trust it, so the deploy's access is unchanged ("Google Cloud access").
+The deploy's own provider must check the environment before the workflow
+first runs, with the condition
+`assertion.repository=='PolicyEngine/microcosm-collector' && assertion.ref=='refs/heads/main' && assertion.environment in ['staging', 'production']`.
+Without that clause, the check job's token would also pass the deploy's
+provider, and the deployment account trusts every token of this repo that it
+accepts.
+The environment, its secrets, the pool, the account and its access are created
+once by hand; the deploy does not change them. The workflow's `GITHUB_TOKEN` opens and
+changes the issues, so it needs no other GitHub credential.
+
+**Switching on the `releases.json` check.** It is off for every dataset. For
+a dataset, it can be switched on once:
+
+1. the microcosm-emitter-interface package, with
+   `microcosm_emitter_interface.releases` (PolicyEngine/microcosm-emitter#24),
+   is published and added to this collector's dependencies;
+2. Microcosm publishes the dataset's builds into their folders with the
+   release manifest decided on 2026-10-29 (H2c): today's `artifacts` map,
+   each entry with `kind`, `role`, `repo_id`, `sha256` and a bare `path`,
+   and no `revision`;
+3. the dataset publishes builds side by side with `releases.json`, and its
+   `latest*.json` files are deleted. Before that, the check would report them
+   every day;
+4. every file in each listed build's folder is in that build's `artifacts`
+   map, apart from the manifests and the checksum list. Otherwise the check
+   reports each other file as `FILE_NOT_IN_MANIFEST` every day, in an issue
+   that can't close, because build folders never change.
+
+`policyengine/populace-uk-private` and `policyengine/populace-us` meet the
+second and third since their switches on 2026-11-09 and 2026-11-11.
+`policyengine/populace-us` doesn't meet the fourth yet. Each of its three
+`microcosm-us-2024-local` builds holds six files that its checksum list
+records but its manifest doesn't declare, which the switch copied as they
+were. So either the check must also accept files a build's checksum list
+records, or those builds must stay unchecked.
+
+Then one change sets `checks_releases_record=True` on that dataset's entry.
+`tests/test_releases_record_check.py` tests the check against the real rules,
+and is skipped until the package is installed. To run it now against a
+checkout of PolicyEngine/microcosm-emitter:
+
+```bash
+uv run --with ../microcosm-emitter/packages/microcosm-emitter-interface \
+  python -m pytest tests/test_releases_record_check.py
+```
+
 ## Releases
 
 Every pull request needs a changelog fragment, `changelog.d/<name>.<type>.md`,
@@ -1786,7 +1954,17 @@ assertion.repository=='PolicyEngine/microcosm-collector' && assertion.ref=='refs
 
 The deployment jobs run in those two environments, so they keep their access,
 and a token from a job in any other environment, or in none, is refused. From
-then on, every job that authenticates to Google Cloud must name one of the two.
+then on, every job that authenticates through this provider must name one of
+the two.
+
+The daily Hugging Face check's job also requests an OIDC token, in the
+`huggingface-check` environment. It authenticates through a Workload Identity
+pool and provider of its own, whose condition accepts only this repo's `main`
+in that environment, and acts as an account that trusts only that pool. Once
+the deploy's provider checks the environment, as above, it refuses that token, and
+the deployment account does not trust the check's pool, so the check cannot
+act as the deployment account. That clause must be in place before the
+check's workflow first runs ("Daily Hugging Face check").
 
 Both deployment jobs also require
 `github.event_name == 'push' && github.ref == 'refs/heads/main'`. The Push
