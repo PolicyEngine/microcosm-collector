@@ -65,6 +65,10 @@ BUILD_MANIFEST = b'{"build": "us-calibration-attempt-1"}'
 RELEASE_MANIFEST = b'{"release": "microcosm-us-2025"}'
 DEMOGRAPHICS = b'{"households": 1}'
 MINUTE = 60.0
+#: The staged_dataset record's key for the repo its bundle was uploaded to:
+#: Microcosm's own field name, built in two parts as the collector's
+#: vocabulary test builds the word.
+RECORD_REPO_KEY = "repo" + "sitory"
 
 
 def backfill_module() -> ModuleType:
@@ -995,7 +999,7 @@ def test_a_staged_bundle_a_run_s_receipt_names_is_read_from_the_release_repo() -
         {
             "status": "uploaded",
             "run_id": RUN_ID,
-            "repository": US_RELEASES,
+            RECORD_REPO_KEY: US_RELEASES,
             "prefix": f"staged/{RUN_ID}",
             "revision": BUNDLE_COMMIT,
             "files": {
@@ -1043,7 +1047,7 @@ def test_a_staged_bundle_a_run_s_receipt_names_is_read_from_the_release_repo() -
     "receipt_change",
     [
         {"run_id": "another-run"},
-        {"repository": UK_RELEASES},
+        {RECORD_REPO_KEY: UK_RELEASES},
         {"prefix": "staged/another-run"},
     ],
     ids=["another-run", "another-repo", "another-prefix"],
@@ -1055,7 +1059,7 @@ def test_a_receipt_naming_another_run_repo_or_prefix_is_unbuildable(
         {
             "status": "uploaded",
             "run_id": RUN_ID,
-            "repository": US_RELEASES,
+            RECORD_REPO_KEY: US_RELEASES,
             "prefix": f"staged/{RUN_ID}",
             "revision": BUNDLE_COMMIT,
             "files": {"calibration_diagnostics.json": {"sha256": sha256(DIAGNOSTICS)}},

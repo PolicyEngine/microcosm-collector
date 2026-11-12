@@ -1572,10 +1572,12 @@ follows no redirect. `--country us|uk|be` (repeatable) and `--kind
 release|staging` limit what it backfills.
 
 **Checks.** For each country:
-- An answer that isn't HTTP 200, is larger than 16 MiB, isn't JSON, has
-  another `schemaVersion` than the tree manifest's 6 or another `country`, or
-  names a `latestReleaseBuildArtifactId` that isn't one of its release
-  builds, is one `error` for that country; the other countries continue.
+- An answer that isn't HTTP 200, is larger than 16 MiB, takes longer than 2
+  minutes to arrive in whole (checked as each chunk arrives; each connect and
+  each read also times out after 60 seconds), isn't JSON, has another
+  `schemaVersion` than the tree manifest's 6 or another `country`, or names a
+  `latestReleaseBuildArtifactId` that isn't one of its release builds, is one
+  `error` for that country; the other countries continue.
 - Each entry is checked before any of its values is used in a Hugging Face
   path, and one that fails is `invalid` while the rest of the country
   continues: its `kind`; its `hfRepo`, the country's release repo or, for a
@@ -1609,24 +1611,46 @@ release|staging` limit what it backfills.
   builds a staged bundle's.
 
 Each tree records the entry's release ID or run, label, repo, commit and
-`createdAt`, so a release build gets production's build ID and index. A
-staging build's build ID differs from production's: the worker hashes 4 of
-its source files, where the GitHub Actions publisher hashes 7. So links or
-stored comparisons that carry an old staging build ID don't carry over.
+`createdAt`, so a release build gets production's build ID and index. Two
+limits follow:
+- A staging build's build ID differs from production's: the worker hashes 4
+  of its source files, where the GitHub Actions publisher hashes 7. So links
+  or stored comparisons that carry an old staging build ID don't carry over.
+- A staging build whose diagnostics are in a staged bundle reached through
+  its run's `staged_dataset` receipt has them read from the country's release
+  repo at the receipt's revision, but its tree names the staging repo and
+  commit (production's entry's) for them, because the worker's request gives
+  each file only a path. Production's tree for the same run names their own
+  repo and commit, the release repo and the receipt's revision. So that
+  backfilled tree's provenance names a path that isn't in the repo and commit
+  it names.
 
 **The latest build.** Only the entry production's
 `latestReleaseBuildArtifactId` names asks to become its country's latest, and
 every country's latest is built before any other entry. The publication
 command still moves the latest only to a build at least as new as the
-store's current one. Production's latest when the store already holds it,
-but not as its latest, is built and published again under the same build ID
-with its stored `createdAt`: every part is kept, and only the latest moves.
+store's current one. When the store already holds production's latest under
+its release ID:
+- if that stored build is the store's latest, nothing is done, and it is
+  reported `already_stored` or `mismatch` with `made_latest: true`;
+- otherwise the stored build is published again exactly as stored: from its
+  files at the stored entry's commit, with the stored entry's repo and
+  `createdAt` (a tree built from a submission records the submission's
+  `accepted_at`), after the stored entry passes the checks production's
+  entries get. That reproduces the stored index, so the publication keeps
+  every part and moves only the latest: the entry is `built` with
+  `made_latest: true`, or `latest_not_moved` when the store's latest is
+  newer. A stored entry that fails the checks is `invalid`, and nothing is
+  published.
 
 **The store.** The command reads the store's manifest once, with the read-only
 `src/calibration-tree-manifest-read.ts`. An entry whose release ID or staging
-run the store already holds, with the same commit and `createdAt` (compared
-as instants), is `already_stored`; with another, `mismatch`. Neither
-downloads anything.
+run the store already holds, with the same commit and `createdAt`, is
+`already_stored`; with another, `mismatch`. Times are compared as instants to
+the millisecond, since the worker stores `createdAt` as `toISOString` writes
+it, keeping milliseconds and dropping finer digits. Neither outcome downloads
+anything, and its `made_latest` says whether the stored build is the store's
+latest, as the store's manifest records.
 
 **Building.** One build at a time, each in a new temporary directory that is
 removed afterwards. A file listed as larger than 256 MiB is `too_large`
@@ -1648,9 +1672,9 @@ outcome and reason, production's build ID, the build ID built or stored,
 | `built` | built and published | yes |
 | `already_stored` | the store holds it with the same commit and time | yes |
 | `mismatch` | the store holds it with another commit or time | yes |
-| `invalid` | the entry failed the checks | yes |
+| `invalid` | the entry failed the checks, or, for production's latest that the store holds but not as its latest, the stored entry did | yes |
 | `too_large` | a file is over 256 MiB | yes |
-| `unbuildable` | the worker refused the files (exit 2), or a file is absent or differs from the digest its run recorded | yes |
+| `unbuildable` | the worker refused the files (exit 2); a release folder's `calibration_diagnostics.json`, or a run's diagnostics, is not at the entry's commit; a run's `run_manifest.json` or `progress.json` isn't a valid JSON object, the two mix document versions, or one names another run; a structured run manifest's artifacts aren't a list, one isn't an object, has no safe name, path or SHA-256, or is listed twice, or they declare neither diagnostics nor a `staged_dataset` receipt; the receipt is absent, isn't a valid JSON object, differs from its declared SHA-256, records no landed bundle, or names another run, repo or folder, a revision that isn't a commit, or no diagnostics with a SHA-256; a staged bundle's folder holds no diagnostics; or a downloaded file differs from the SHA-256 its run or receipt declared | yes |
 | `refused` | the publication refused the build (exit 2) | yes |
 | `latest_not_moved` | published, but the store's latest is at least as new | yes |
 | `error` | a Bun exit 1 or 3, a timeout, a Hugging Face failure or a download that differs from its listing; the next build still runs | no |
@@ -1672,8 +1696,8 @@ Then it prints:
 - `release_builds_differing_from_production`: release builds built or stored
   whose build ID isn't production's. It should be 0.
 - `latest`: for each country, production's latest build and whether it is
-  the store's latest now (`null` in a dry run, or when production names
-  none).
+  the store's latest now (`null` when production names none, or in a dry run
+  for a latest that would be built).
 
 **Running it.** It needs `DATABASE_URL` (for the manifest lock),
 `COLLECTOR_HF_READ_TOKEN` and `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN`, which

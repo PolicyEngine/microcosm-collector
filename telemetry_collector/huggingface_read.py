@@ -24,7 +24,8 @@ served from. It streams the file to disk, so a file larger than
 A read Hugging Face answers with anything but HTTP 200 raises
 ``HuggingFaceReadError`` with the status and, for a 404, Hugging Face's
 ``X-Error-Code`` (``RepoNotFound``, ``RevisionNotFound``, ``EntryNotFound``),
-so a reader can tell a missing file from a missing repository or revision.
+so a reader can tell a missing file or folder from a missing repo or revision
+(``is_missing_path``).
 """
 
 from __future__ import annotations
@@ -178,6 +179,22 @@ class HuggingFaceReadError(RuntimeError):
         self.dataset = dataset
         self.status_code = status_code
         self.error_code = error_code
+
+
+#: Hugging Face's ``X-Error-Code`` values for a 404 about the repo or the
+#: revision, rather than the file or folder asked for.
+MISSING_REPO_OR_REVISION: Final = frozenset({"RepoNotFound", "RevisionNotFound"})
+
+
+def is_missing_path(error: HuggingFaceReadError) -> bool:
+    """Whether ``error`` says the file or folder asked for is not at its revision.
+
+    That is a 404 without ``RepoNotFound`` or ``RevisionNotFound``. A 404 with
+    either says the repo or the revision could not be found, and, like any
+    other failed read, is not a missing path.
+    """
+
+    return error.status_code == 404 and error.error_code not in MISSING_REPO_OR_REVISION
 
 
 @dataclass(frozen=True)

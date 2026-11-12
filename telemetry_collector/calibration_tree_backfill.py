@@ -8,9 +8,11 @@ requests without any credential and never through the Hugging Face reader,
 so the read token cannot reach it.
 
 **Checks.** An answer that is not HTTP 200, is larger than
-``MAX_PRODUCTION_MANIFEST_BYTES``, is not JSON, has another schema version or
-country, or names a latest build that is not one of its release builds, is
-an ``error`` for that country, and the other countries continue. Each entry
+``MAX_PRODUCTION_MANIFEST_BYTES``, takes longer than
+``PRODUCTION_MANIFEST_TIME_LIMIT_SECONDS`` to arrive, is not JSON, has
+another schema version or country, or names a latest build that is not one
+of its release builds, is an ``error`` for that country, and the other
+countries continue. Each entry
 is checked before any of its values is used in a Hugging Face path
 (``production_entry``): its kind, its repo (the country's release repo, or
 for a staging build its staging repo or its release repo), a commit of 40
@@ -41,22 +43,30 @@ the tree package's staging readers that locate its files:
   ``<dataset>.diagnostics.json``, diagnostics only.
 
 Each build's label, publication time, repo and commit come from production's
-entry, so its tree records what production's does.
+entry, so its tree records what production's does, except for a staged
+bundle reached through a ``staged_dataset`` receipt: the tree worker's
+request gives each file only a path, so that tree names the staging repo and
+commit for diagnostics read from the release repo at the receipt's revision.
 
 **The latest build.** Only the entry production's
 ``latestReleaseBuildArtifactId`` names asks to become its country's latest,
 and every country's latest is planned before any other build, so a time limit
 never leaves one out. The publication command still moves the latest only to
 a build at least as new as the store's current one; an entry it did not make
-the latest is ``latest_not_moved``. Production's latest when the store
-already holds it but it is not the store's latest is built and published
-again under the same build ID, with its stored publication time: every part
-is kept, and only the latest moves.
+the latest is ``latest_not_moved``. When the store already holds
+production's latest under its release ID and that stored build is the
+store's latest, nothing is done. When it holds it but not as its latest, the
+stored build is published again exactly as stored: from its files at the
+stored entry's commit, with the stored entry's repo and publication time,
+which the stored entry must pass production's entries' checks for. That
+reproduces the stored index, so every part is kept and only the latest moves.
 
 **The store.** The store's manifest is read once, with the tree package's
 read-only manifest read. An entry whose release ID or staging run the store
 already holds, with the same commit and publication time, is
-``already_stored``; with another, ``mismatch``. Neither downloads anything.
+``already_stored``; with another, ``mismatch``. Neither downloads anything,
+and whether each is the store's latest comes from the store's manifest.
+Times are compared to the millisecond, as the tree worker stores them.
 
 **Building.** One build at a time, in its own temporary directory, which is
 removed afterwards: each file is streamed to disk and checked against its
@@ -87,7 +97,7 @@ import tempfile
 import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Final, Literal
@@ -95,8 +105,6 @@ from typing import Any, Final, Literal
 import httpx
 
 from telemetry_collector.calibration_trees import (
-    MAX_MESSAGE_CHARACTERS,
-    MISSING_REPOSITORY_OR_REVISION,
     RELEASE_REPOS,
     SAFE_IDENTIFIER,
     STAGING_REPOS,
@@ -107,11 +115,13 @@ from telemetry_collector.calibration_trees import (
     TreeUnbuildableError,
     build_and_publish,
     read_store_manifest,
+    shortened_message,
 )
 from telemetry_collector.huggingface_read import (
     DatasetFile,
     HuggingFaceReader,
     HuggingFaceReadError,
+    is_missing_path,
 )
 
 BackfillOutcomeKind = Literal[
@@ -133,7 +143,11 @@ BuildKind = Literal["release", "staging"]
 MANIFEST_SCHEMA_VERSION: Final = 6
 #: The largest answer read from production's tree manifest, for one country.
 MAX_PRODUCTION_MANIFEST_BYTES: Final = 16 * 1024 * 1024
+#: The client's timeout for each connect and each read of production's manifest.
 PRODUCTION_MANIFEST_TIMEOUT_SECONDS: Final = 60.0
+#: The longest one country's answer may take to arrive in whole, checked as
+#: each chunk arrives; a chunk that never arrives is ended by the timeout.
+PRODUCTION_MANIFEST_TIME_LIMIT_SECONDS: Final = 2 * PRODUCTION_MANIFEST_TIMEOUT_SECONDS
 #: The largest file a tree is built from: the worker job's memory holds the
 #: downloaded file, the build (the largest known diagnostics, 128.7 MB, peaked
 #: at 3.5 GB) and the written parts.
@@ -193,8 +207,11 @@ class BackfillOutcome:
     matches_production: bool | None = None
     uploaded_parts: int | None = None
     kept_parts: int | None = None
-    #: Whether the store's latest is this build now; ``None`` when nothing
-    #: was published for it, as in a dry run.
+    #: Whether this build is the store's latest now: as its publication
+    #: reported, or, for an entry the store already holds and that was not
+    #: published again, as the store's manifest says. ``None`` when neither
+    #: tells, as for a dry run's ``would_build``; ``False`` for production's
+    #: latest when it ended any other way.
     made_latest: bool | None = None
     #: A later run should try it again: an ``error`` or ``deferred``.
     incomplete: bool = False
@@ -233,16 +250,8 @@ class SourceUnbuildableError(Exception):
     """A build's files can't be found or don't match what records them."""
 
 
-def _shortened(text: str) -> str:
-    return (
-        text
-        if len(text) <= MAX_MESSAGE_CHARACTERS
-        else text[: MAX_MESSAGE_CHARACTERS - 1] + "…"
-    )
-
-
 def _described(error: BaseException) -> str:
-    return _shortened(f"{type(error).__name__}: {error}")
+    return shortened_message(f"{type(error).__name__}: {error}")
 
 
 def _matches(pattern: re.Pattern[str], value: object) -> bool:
@@ -279,13 +288,26 @@ def _is_publication_time(value: object) -> bool:
     return True
 
 
+def _to_the_millisecond(time_text: str) -> datetime:
+    """The instant ``time_text`` names, with any digits past the millisecond dropped.
+
+    The tree worker stores ``createdAt`` as ``Date.prototype.toISOString``
+    writes it, which keeps milliseconds and drops finer digits.
+    """
+
+    instant = datetime.fromisoformat(time_text)
+    return instant.replace(microsecond=instant.microsecond - instant.microsecond % 1000)
+
+
 def _same_instant(stored: object, produced: str | None) -> bool:
+    """Whether a stored time and production's name the same millisecond."""
+
     if stored is None or produced is None:
         return stored is None and produced is None
     if not isinstance(stored, str):
         return False
     try:
-        return datetime.fromisoformat(stored) == datetime.fromisoformat(produced)
+        return _to_the_millisecond(stored) == _to_the_millisecond(produced)
     except ValueError:
         return stored == produced
 
@@ -294,15 +316,23 @@ def _same_instant(stored: object, produced: str | None) -> bool:
 
 
 def read_production_manifest(
-    client: httpx.Client, url: str, country: str
+    client: httpx.Client,
+    url: str,
+    country: str,
+    *,
+    clock: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
     """Production's tree manifest for ``country``, checked as a whole.
 
     Sent with no credential and no redirect followed, and read up to
-    ``MAX_PRODUCTION_MANIFEST_BYTES``. Raises ``ProductionManifestError``.
+    ``MAX_PRODUCTION_MANIFEST_BYTES`` within
+    ``PRODUCTION_MANIFEST_TIME_LIMIT_SECONDS`` by ``clock``, which is checked
+    as each chunk arrives; the client's own timeout ends a wait for a chunk.
+    Raises ``ProductionManifestError``.
     """
 
     description = f"Production's tree manifest for {country}"
+    started = clock()
     content = bytearray()
     try:
         with client.stream(
@@ -318,6 +348,11 @@ def read_production_manifest(
                     raise ProductionManifestError(
                         f"{description} is larger than "
                         f"{MAX_PRODUCTION_MANIFEST_BYTES} bytes."
+                    )
+                if clock() - started > PRODUCTION_MANIFEST_TIME_LIMIT_SECONDS:
+                    raise ProductionManifestError(
+                        f"{description} took longer than "
+                        f"{PRODUCTION_MANIFEST_TIME_LIMIT_SECONDS:g} seconds to read."
                     )
     except httpx.HTTPError as error:
         raise ProductionManifestError(
@@ -444,7 +479,11 @@ def _invalid_outcome(
         country=country,
         outcome="invalid",
         kind=kind if kind in BUILD_KINDS else None,
-        source_id=_shortened(alias) if isinstance(alias, str) else None,
+        source_id=(
+            shortened_message(alias)
+            if isinstance(alias, str) and alias.strip()
+            else None
+        ),
         reason=reason,
         make_latest=make_latest,
         made_latest=False if make_latest else None,
@@ -500,15 +539,6 @@ class BuildSource:
     files: Mapping[str, SourceFile]
 
 
-def _is_missing_entry(error: HuggingFaceReadError) -> bool:
-    """A 404 for the path itself, not for its repo or revision."""
-
-    return (
-        error.status_code == 404
-        and error.error_code not in MISSING_REPOSITORY_OR_REVISION
-    )
-
-
 class _Listings:
     """Each folder's files by name, listed once per dataset and revision."""
 
@@ -524,7 +554,7 @@ class _Listings:
             try:
                 listed = self._reader.list_folder(dataset, folder, revision)
             except HuggingFaceReadError as error:
-                if not _is_missing_entry(error):
+                if not is_missing_path(error):
                     raise
                 listed = []
             self._folders[key] = {
@@ -542,7 +572,7 @@ def _read_json(
     try:
         content = reader.read_file(dataset, path, revision)
     except HuggingFaceReadError as error:
-        if _is_missing_entry(error):
+        if is_missing_path(error):
             return None
         raise
     try:
@@ -749,7 +779,9 @@ def _receipt_source(
         raise SourceUnbuildableError(
             f"Run {run_id}'s staged dataset receipt names another run."
         )
-    # The token is only ever sent to the country's own release repo.
+    # The token is only ever sent to the country's own release repo. The key
+    # is Microcosm's own field name; the collector's vocabulary test allows the
+    # word only in this exact expression.
     if delivery.get("repository") != RELEASE_REPOS[entry.country]:
         raise SourceUnbuildableError(
             f"Run {run_id}'s staged dataset receipt names a repo that is not "
@@ -919,38 +951,64 @@ class _Backfill:
                 **fields,
             )
 
-        created_at = entry.created_at
-        republishing = False
+        # What is built: production's entry, or, for production's latest that
+        # the store holds but not as its latest, the stored entry.
+        source_entry = entry
+        republished: str | None = None
         stored_entry = self.stored.entry_for(entry)
         if stored_entry is not None:
             stored_build = stored_entry.get("buildArtifactId")
             stored_fields = {
                 "build_artifact_id": stored_build,
                 "matches_production": stored_build == entry.build_artifact_id,
+                # Nothing is published for it here, so the store's manifest
+                # says whether it is the latest.
+                "made_latest": (
+                    stored_build is not None
+                    and self.stored.latest(entry.country) == stored_build
+                ),
             }
             differences = []
             if stored_entry.get("hfCommitSha") != entry.hf_commit:
                 differences.append(f"commit {stored_entry.get('hfCommitSha')}")
             if not _same_instant(stored_entry.get("createdAt"), entry.created_at):
                 differences.append(f"publication time {stored_entry.get('createdAt')}")
-            if differences:
+            if not entry.make_latest or stored_fields["made_latest"]:
+                if differences:
+                    return outcome(
+                        "mismatch",
+                        reason=(
+                            f"The store already holds {entry.source_id} with "
+                            + " and ".join(differences)
+                            + "."
+                        ),
+                        **stored_fields,
+                    )
+                return outcome("already_stored", **stored_fields)
+            # Production's latest, stored but not as the store's latest: the
+            # stored build is published again exactly as stored, from its files
+            # at its own commit, with its own repo and publication time. That
+            # reproduces the stored index, so the publication keeps every part
+            # and moves only the latest. The stored entry is checked first, as
+            # production's entries are.
+            try:
+                source_entry = production_entry(
+                    stored_entry, entry.country, stored_build
+                )
+            except InvalidEntryError as error:
                 return outcome(
-                    "mismatch",
+                    "invalid",
                     reason=(
-                        f"The store already holds {entry.source_id} with "
-                        + " and ".join(differences)
-                        + "."
+                        f"The store's entry for {entry.source_id} can't be "
+                        f"published again: {error}"
                     ),
                     **stored_fields,
                 )
-            if not entry.make_latest:
-                return outcome("already_stored", **stored_fields)
-            if self.stored.latest(entry.country) == stored_build:
-                return outcome("already_stored", made_latest=True, **stored_fields)
-            # Production's latest, stored but not the store's latest: built and
-            # published again with its stored time, so only the latest moves.
-            created_at = stored_entry.get("createdAt")
-            republishing = True
+            republished = (
+                "The store holds it, but not as its latest: it is published again "
+                f"as stored, from commit {source_entry.hf_commit} with createdAt "
+                f"{source_entry.created_at}, to become the latest."
+            )
         if not self.dry_run and self.clock() - self.started >= self.time_limit_seconds:
             return outcome(
                 "deferred",
@@ -959,15 +1017,14 @@ class _Backfill:
             )
         try:
             source = (
-                _release_source(entry, self.listings)
-                if entry.kind == "release"
-                else _staging_source(entry, self.reader, self.listings)
+                _release_source(source_entry, self.listings)
+                if source_entry.kind == "release"
+                else _staging_source(source_entry, self.reader, self.listings)
             )
         except SourceUnbuildableError as error:
-            return outcome("unbuildable", reason=_shortened(str(error)))
+            return outcome("unbuildable", reason=shortened_message(str(error)))
         except Exception as error:
             return outcome("error", reason=_described(error), incomplete=True)
-        source = replace(source, plan=replace(source.plan, created_at=created_at))
         oversized = [
             source_file.listed
             for source_file in source.files.values()
@@ -981,20 +1038,14 @@ class _Backfill:
                     f"{MAX_SOURCE_FILE_BYTES}-byte limit."
                 ),
             )
-        republished = (
-            "The store holds it, but not as its latest: it is published again to "
-            "become the latest."
-            if republishing
-            else None
-        )
         if self.dry_run:
             return outcome("would_build", reason=republished)
         try:
             published = _build(source, self.reader, self.commands)
         except (SourceUnbuildableError, TreeUnbuildableError) as error:
-            return outcome("unbuildable", reason=_shortened(str(error)))
+            return outcome("unbuildable", reason=shortened_message(str(error)))
         except TreeRefusedError as error:
-            return outcome("refused", reason=_shortened(str(error)))
+            return outcome("refused", reason=shortened_message(str(error)))
         except Exception as error:
             return outcome("error", reason=_described(error), incomplete=True)
         not_moved = entry.make_latest and not published.made_latest
@@ -1048,7 +1099,7 @@ def backfill_calibration_trees(
     for country in countries:
         try:
             document = read_production_manifest(
-                production_client, production_manifest_url, country
+                production_client, production_manifest_url, country, clock=clock
             )
         except ProductionManifestError as error:
             yield BackfillOutcome(

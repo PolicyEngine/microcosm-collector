@@ -11,32 +11,17 @@ import type { CalibrationTreeBlobClient } from "./calibration-tree-blob";
 import {
   CALIBRATION_TREE_MANIFEST_PATH,
   CALIBRATION_TREE_MANIFEST_SCHEMA_VERSION,
+  type CalibrationTreeManifest,
   emptyCalibrationTreeManifest,
 } from "./calibration-tree-manifest";
+import * as manifestReadCommand from "./calibration-tree-manifest-read";
 
 const READ_COMMAND = join(import.meta.dir, "calibration-tree-manifest-read.ts");
 const TOKEN = "vercel_blob_rw_test_token";
 const TOKEN_VARIABLE = "CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN";
 const BUILD_ARTIFACT_ID = "a".repeat(64);
 
-interface ManifestReadModule {
-  CALIBRATION_TREE_MANIFEST_READ_EXIT_REQUEST_ERROR: number;
-  CALIBRATION_TREE_MANIFEST_READ_EXIT_STORE_ERROR: number;
-  readStoredCalibrationTreeManifest(options: { token: string; client?: CalibrationTreeBlobClient }): Promise<unknown>;
-  calibrationTreeManifestReadMain(
-    argv: string[],
-    environment?: Record<string, string | undefined>,
-    client?: CalibrationTreeBlobClient,
-  ): Promise<number>;
-}
-
-// Loaded by its path, so a missing command fails these tests on an assertion.
-async function manifestRead(): Promise<ManifestReadModule> {
-  expect(existsSync(READ_COMMAND)).toBe(true);
-  return (await import(READ_COMMAND)) as ManifestReadModule;
-}
-
-const STORED_MANIFEST = {
+const STORED_MANIFEST: CalibrationTreeManifest = {
   schemaVersion: CALIBRATION_TREE_MANIFEST_SCHEMA_VERSION,
   countries: {
     us: {
@@ -116,7 +101,7 @@ function capturedConsole() {
 }
 
 test("the stored manifest is read without the cache, as its parser reads it", async () => {
-  const { readStoredCalibrationTreeManifest } = await manifestRead();
+  const { readStoredCalibrationTreeManifest } = manifestReadCommand;
   const store = new InMemoryManifestStore();
   store.manifestText = JSON.stringify(STORED_MANIFEST);
 
@@ -128,7 +113,7 @@ test("the stored manifest is read without the cache, as its parser reads it", as
 });
 
 test("a store without a manifest yet reads as the empty manifest", async () => {
-  const { readStoredCalibrationTreeManifest } = await manifestRead();
+  const { readStoredCalibrationTreeManifest } = manifestReadCommand;
   const store = new InMemoryManifestStore();
 
   const manifest = await readStoredCalibrationTreeManifest({ token: TOKEN, client: store.client() });
@@ -138,7 +123,7 @@ test("a store without a manifest yet reads as the empty manifest", async () => {
 });
 
 test("the command prints the manifest as one JSON line and exits 0", async () => {
-  const { calibrationTreeManifestReadMain } = await manifestRead();
+  const { calibrationTreeManifestReadMain } = manifestReadCommand;
   const store = new InMemoryManifestStore();
   store.manifestText = JSON.stringify(STORED_MANIFEST);
   const output = capturedConsole();
@@ -153,38 +138,36 @@ test("the command prints the manifest as one JSON line and exits 0", async () =>
 });
 
 test("a manifest that breaks the manifest's rules, or a store that fails, exits 3", async () => {
-  const module = await manifestRead();
   const malformed = new InMemoryManifestStore();
   malformed.manifestText = JSON.stringify({ ...STORED_MANIFEST, schemaVersion: 5 });
   const failing = new InMemoryManifestStore();
   failing.failure = new Error("The store is unavailable.");
   const output = capturedConsole();
 
-  const malformedExit = await module.calibrationTreeManifestReadMain([], { [TOKEN_VARIABLE]: TOKEN }, malformed.client());
-  const failingExit = await module.calibrationTreeManifestReadMain([], { [TOKEN_VARIABLE]: TOKEN }, failing.client());
+  const malformedExit = await manifestReadCommand.calibrationTreeManifestReadMain([], { [TOKEN_VARIABLE]: TOKEN }, malformed.client());
+  const failingExit = await manifestReadCommand.calibrationTreeManifestReadMain([], { [TOKEN_VARIABLE]: TOKEN }, failing.client());
 
-  expect(malformedExit).toBe(module.CALIBRATION_TREE_MANIFEST_READ_EXIT_STORE_ERROR);
-  expect(failingExit).toBe(module.CALIBRATION_TREE_MANIFEST_READ_EXIT_STORE_ERROR);
-  expect(module.CALIBRATION_TREE_MANIFEST_READ_EXIT_STORE_ERROR).toBe(3);
+  expect(malformedExit).toBe(manifestReadCommand.CALIBRATION_TREE_MANIFEST_READ_EXIT_STORE_ERROR);
+  expect(failingExit).toBe(manifestReadCommand.CALIBRATION_TREE_MANIFEST_READ_EXIT_STORE_ERROR);
+  expect(manifestReadCommand.CALIBRATION_TREE_MANIFEST_READ_EXIT_STORE_ERROR).toBe(3);
   expect(output.printed).toEqual([]);
   expect(output.errors.join("\n")).not.toContain(TOKEN);
 });
 
 test("the command refuses to run without its token or with arguments", async () => {
-  const module = await manifestRead();
   const store = new InMemoryManifestStore();
   const output = capturedConsole();
 
-  const withoutToken = await module.calibrationTreeManifestReadMain([], {}, store.client());
-  const withArguments = await module.calibrationTreeManifestReadMain(
+  const withoutToken = await manifestReadCommand.calibrationTreeManifestReadMain([], {}, store.client());
+  const withArguments = await manifestReadCommand.calibrationTreeManifestReadMain(
     ["extra.json"],
     { [TOKEN_VARIABLE]: TOKEN },
     store.client(),
   );
 
-  expect(withoutToken).toBe(module.CALIBRATION_TREE_MANIFEST_READ_EXIT_REQUEST_ERROR);
-  expect(withArguments).toBe(module.CALIBRATION_TREE_MANIFEST_READ_EXIT_REQUEST_ERROR);
-  expect(module.CALIBRATION_TREE_MANIFEST_READ_EXIT_REQUEST_ERROR).toBe(1);
+  expect(withoutToken).toBe(manifestReadCommand.CALIBRATION_TREE_MANIFEST_READ_EXIT_REQUEST_ERROR);
+  expect(withArguments).toBe(manifestReadCommand.CALIBRATION_TREE_MANIFEST_READ_EXIT_REQUEST_ERROR);
+  expect(manifestReadCommand.CALIBRATION_TREE_MANIFEST_READ_EXIT_REQUEST_ERROR).toBe(1);
   expect(output.errors.join("\n")).toContain(TOKEN_VARIABLE);
   expect(store.gets).toEqual([]);
 });

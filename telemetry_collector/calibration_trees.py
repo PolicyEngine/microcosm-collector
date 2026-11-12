@@ -53,6 +53,7 @@ from telemetry_collector.huggingface_read import (
     HuggingFaceReader,
     HuggingFaceReadError,
     HuggingFaceReadSettings,
+    is_missing_path,
 )
 from telemetry_collector.submission_store import SubmissionRecord
 from telemetry_collector.submissions import INTAKE_ONLY_HANDLER
@@ -271,8 +272,6 @@ def worker_request(plan: TreeBuildPlan, files: Mapping[str, Path]) -> dict[str, 
 RELEASES_RECORD_PATH: Final = "releases.json"
 #: The largest releases.json the record's writer accepts.
 MAX_RELEASES_RECORD_BYTES: Final = 4 * 1024 * 1024
-#: Hugging Face's error codes for a 404 that is not about the file itself.
-MISSING_REPOSITORY_OR_REVISION: Final = frozenset({"RepoNotFound", "RevisionNotFound"})
 _ROLE_IDENTIFIER: Final = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _RECORD_KEYS: Final = frozenset({"default", "releases", "schema_version"})
 _RELEASE_KEYS: Final = frozenset({"builds", "current", "role"})
@@ -392,10 +391,7 @@ def release_latest(plan: TreeBuildPlan, reader: HuggingFaceReader) -> LatestDeci
     try:
         content = reader.read_file(plan.hf_repo, RELEASES_RECORD_PATH, head_commit)
     except HuggingFaceReadError as error:
-        if (
-            error.status_code == 404
-            and error.error_code not in MISSING_REPOSITORY_OR_REVISION
-        ):
+        if is_missing_path(error):
             return LatestDecision(make_latest=plan.make_latest)
         raise
     try:
@@ -404,7 +400,7 @@ def release_latest(plan: TreeBuildPlan, reader: HuggingFaceReader) -> LatestDeci
         return LatestDecision(
             make_latest=False,
             skipped="releases_record_refused",
-            skipped_reason=_shortened(str(error)),
+            skipped_reason=shortened_message(str(error)),
         )
     return LatestDecision(make_latest=current == plan.release_id)
 
@@ -448,7 +444,13 @@ def postgres_manifest_lock(engine: sa.Engine) -> ManifestLock:
     return lock
 
 
-def _shortened(text: str) -> str:
+def shortened_message(text: str) -> str:
+    """``text`` stripped and shortened to ``MAX_MESSAGE_CHARACTERS``.
+
+    An empty message becomes "(no message)". Used for the messages a job's
+    result and a backfill outcome record.
+    """
+
     text = text.strip() or "(no message)"
     return (
         text
@@ -575,10 +577,11 @@ def build_and_publish(
         BUILD_TIMEOUT_SECONDS,
     )
     if built.returncode == EXIT_UNBUILDABLE_INPUT:
-        raise TreeUnbuildableError(_shortened(built.stderr))
+        raise TreeUnbuildableError(shortened_message(built.stderr))
     if built.returncode != 0:
         raise CalibrationTreeCommandError(
-            f"The tree worker exited with {built.returncode}: {_shortened(built.stderr)}"
+            f"The tree worker exited with {built.returncode}: "
+            f"{shortened_message(built.stderr)}"
         )
     publication_path = directory / "publication.json"
     publication_path.write_text(
@@ -598,11 +601,11 @@ def build_and_publish(
             PUBLICATION_TIMEOUT_SECONDS,
         )
     if published.returncode == EXIT_ENTRY_REFUSED:
-        raise TreeRefusedError(_shortened(published.stderr))
+        raise TreeRefusedError(shortened_message(published.stderr))
     if published.returncode != 0:
         raise CalibrationTreeCommandError(
             f"The tree publication exited with {published.returncode}: "
-            f"{_shortened(published.stderr)}"
+            f"{shortened_message(published.stderr)}"
         )
     answer = _answer(published, "publication")
     return PublishedTree(
@@ -629,7 +632,7 @@ def read_store_manifest(commands: TreeCommands) -> dict[str, Any]:
     if completed.returncode != 0:
         raise CalibrationTreeCommandError(
             f"The tree manifest read exited with {completed.returncode}: "
-            f"{_shortened(completed.stderr)}"
+            f"{shortened_message(completed.stderr)}"
         )
     return _answer(completed, "manifest read")
 
@@ -641,16 +644,15 @@ def calibration_tree_handler(
     *,
     blob_token: str,
     manifest_lock: ManifestLock,
+    reader: HuggingFaceReader,
     bun: str = "bun",
     size_limits: Mapping[str, str] | None = None,
     run_command: CommandRunner = run_bun,
-    reader: HuggingFaceReader | None = None,
 ) -> JobHandler:
     """The ``calibration-diagnostics`` handler, writing with ``blob_token``.
 
     A release build reads its repo's releases.json with ``reader`` to decide
-    the latest (``release_latest``), so a handler without one fails each
-    release build's attempt.
+    the latest (``release_latest``).
     """
 
     commands = tree_commands(
@@ -671,11 +673,6 @@ def calibration_tree_handler(
             }
         latest = LatestDecision(make_latest=False)
         if plan.kind == "release":
-            if reader is None:
-                raise RuntimeError(
-                    "A release build's latest is decided from releases.json, "
-                    "which needs a Hugging Face reader."
-                )
             # Before anything is downloaded, so a failed read costs nothing.
             latest = release_latest(plan, reader)
             plan = replace(plan, make_latest=latest.make_latest)
