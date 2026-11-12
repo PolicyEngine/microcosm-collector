@@ -63,7 +63,7 @@ def test_the_workflow_runs_daily_off_the_hour_and_by_hand() -> None:
     assert dry_run["default"] == "true"
 
 
-def test_only_main_in_this_repository_runs_the_check() -> None:
+def test_only_main_in_this_repo_runs_the_check() -> None:
     job = check_job()
 
     assert "github.repository == 'PolicyEngine/microcosm-collector'" in job["if"]
@@ -118,6 +118,7 @@ def test_the_job_authenticates_as_the_check_account_then_runs_the_command() -> N
     assert command["run"] == RUN_COMMAND
     assert command["env"] == {
         "GITHUB_TOKEN": "${{ github.token }}",
+        "GITHUB_REPO": "${{ github.repository }}",
         "DRY_RUN": "${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}",
     }
     steps = job["steps"]

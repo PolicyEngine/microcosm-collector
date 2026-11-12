@@ -1672,9 +1672,11 @@ dataset is added here:
 ## Daily Hugging Face check
 
 `python -m telemetry_collector.huggingface_check` runs in production as a
-Cloud Run job, started by Cloud Scheduler at 06:00 and 18:00 UTC
-(`0 6,18 * * *`). It reads Hugging Face with production's read token, the one
-production's worker job mounts, and runs two checks:
+Cloud Run job. Once a day at 06:17 UTC (`17 6 * * *`), the workflow
+`.github/workflows/huggingface-check.yaml` starts it and keeps a GitHub issue
+for each problem it finds, with `python -m telemetry_collector.huggingface_issues`.
+It reads Hugging Face with production's read token, the one production's
+worker job mounts, and runs two checks:
 
 1. **Token check.** It requests every dataset in `HUGGINGFACE_DATASETS` once.
    Any answer but HTTP 200 is a problem, including a redirect or no answer.
@@ -1703,21 +1705,40 @@ production's worker job mounts, and runs two checks:
    writer applies them. The file check above finds any later change to a
    build's files except a change to those three.
 
-**Problems and alerts.** Each problem is one JSON log entry with severity
+**Problems and issues.** Each problem is one JSON log entry with severity
 `ERROR`, naming the check, the dataset and a code such as `HTTP_404`,
 `UNREACHABLE`, `POINTER_FILE_PRESENT` or `SHA256_MISMATCH`, followed by a
 summary entry. The job then exits 1, or 2 when the token setting itself is
-missing or unusable, so the execution fails. Two Cloud Monitoring alert
-policies email a person through a notification channel: one when an execution
-of the job fails, and one when no execution has succeeded for 23 hours, so a
-stopped schedule is noticed too. Cloud Monitoring allows a metric-absence
-condition to wait at most 23.5 hours, which is why the check runs twice a day:
-with one run a day, the gap between successful runs would exceed 23 hours and
-the second alert would fire before every run. With runs 12 hours apart, it
-fires 23 hours after the last successful run, so one scheduled run that did
-not succeed is enough: after a failed 18:00 run, the failure alert fires
-straight away and the absence alert at about 05:00 the next day. No log entry
-includes the token.
+missing or unusable, so the execution fails. No log entry includes the token.
+
+The workflow starts an execution, waits for it to finish, and reads that
+execution's log entries. It keeps one GitHub issue per problem, keyed by its
+check, dataset and code, each with the `huggingface-check` label:
+
+- a run that finds a new problem opens its issue (at most 10 a run; the next
+  run opens the rest);
+- a run that finds it again updates the open issue with what it logged;
+- a run that finds a problem whose issue was closed reopens it, with a
+  comment, unless the issue was closed as not planned;
+- a completed run that no longer finds a problem closes its issue, with a
+  comment.
+
+A run that reports no result opens or updates one issue titled "The check did
+not report a result" instead, and leaves the problem issues as they are,
+since what they report is then unknown. That covers a job that could not
+start, failed before writing its summary entry, did not finish within 45
+minutes or could not read its token setting, and entries that could not be
+read, or fewer problem entries than the summary counts. The next run that
+reports a result closes it. GitHub notifies the repo's watchers of each
+new issue, and the workflow run's summary lists what each run did.
+
+A run by hand ("Run workflow" on the Actions tab) is a dry run unless its
+`dry_run` box is cleared: it runs the check and reports what it would change,
+without changing any issue. The repo is public, so no issue names the
+project, region, job, execution or account, and the workflow passes those as
+secrets, which GitHub hides in its log. If GitHub stops starting the schedule,
+nothing reports it: GitHub disables scheduled workflows in a public
+repo after 60 days without activity in it.
 
 **Deployment.** The production deploy runs
 `scripts/deploy.sh configure-huggingface-check-job` before it changes the
@@ -1734,20 +1755,26 @@ production environment variables:
 | `TELEMETRY_HF_READ_SECRET_NAME` | the read token's Secret Manager secret |
 
 Staging has no check job, so staging's own read token, which only staging's
-worker job mounts, is not checked on a schedule; production's job checks
-production's token, with one schedule and one set of alerts. The deployment
-service account needs metadata read access to the secret and permission to
-act as the worker service account. The schedule, the account it starts the
-job with, and the alert policies are created once by hand; the deploy does not
-change them.
+worker job mounts, is not checked; production's job checks production's
+token, once a day. The deployment service account needs metadata read access
+to the secret and permission to act as the worker service account.
 
-Create the notification channel and both alert policies before the job's
-first execution, then create the schedule and run the job once by hand. A
-metric-absence condition is met only after the job writes at least one data
-point after the policy is created or changed. Policies created after the last
-successful run therefore never report a schedule that cannot start the job,
-and the same holds after either policy is edited until the next successful
-run.
+**The workflow's access.** The workflow runs in the
+`huggingface-check` environment, which only `main` may use, and reads five
+secrets from it. As
+secrets, GitHub hides their values in the workflow's public log:
+
+| Secret | Value |
+|---|---|
+| `TELEMETRY_GCP_WIF_PROVIDER` | the Workload Identity provider the workflow authenticates through, which must accept this repo's `main` in the `huggingface-check` environment |
+| `TELEMETRY_HF_CHECK_SERVICE_ACCOUNT` | the account the workflow acts as, which may only start the check job, follow its executions and read the project's logs |
+| `TELEMETRY_GCP_PROJECT_ID` | the collector's project |
+| `TELEMETRY_GCP_REGION` | the check job's region |
+| `TELEMETRY_HF_CHECK_JOB` | the check job's name, as in production's `TELEMETRY_HF_CHECK_JOB` |
+
+The environment, its secrets, the account and its access are created once by
+hand; the deploy does not change them. The workflow's `GITHUB_TOKEN` opens and
+changes the issues, so it needs no other GitHub credential.
 
 **Switching on the `releases.json` check.** It is off for every dataset. For
 a dataset, it can be switched on once:
@@ -1762,6 +1789,9 @@ a dataset, it can be switched on once:
 3. the dataset publishes builds side by side with `releases.json`, and its
    `latest*.json` files are deleted. Before that, the check would report them
    every day.
+
+`policyengine/populace-uk-private` and `policyengine/populace-us` meet the
+second and third since their switches on 2026-11-09 and 2026-11-11.
 
 Then one change sets `checks_releases_record=True` on that dataset's entry.
 `tests/test_releases_record_check.py` tests the check against the real rules,

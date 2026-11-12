@@ -605,7 +605,7 @@ def command_environment(tmp_path: Path, **overrides: str) -> dict[str, str]:
         "REGION": "example-region",
         "HF_CHECK_JOB": "example-job",
         "GITHUB_TOKEN": "github-token",
-        "GITHUB_REPOSITORY": "PolicyEngine/microcosm-collector",
+        "GITHUB_REPO": "PolicyEngine/microcosm-collector",
         "GITHUB_SERVER_URL": "https://github.com",
         "GITHUB_RUN_ID": "1",
         "GITHUB_STEP_SUMMARY": str(tmp_path / "summary.md"),

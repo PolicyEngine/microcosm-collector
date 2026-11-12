@@ -1,6 +1,7 @@
 """The collector's daily Hugging Face check, run as a Cloud Run job.
 
-Cloud Scheduler starts the job twice a day. It runs two checks:
+The workflow ``.github/workflows/huggingface-check.yaml`` starts the job once
+a day. It runs two checks:
 
 1. **The token check** requests every dataset in ``HUGGINGFACE_DATASETS``
    with the collector's read token and reports each one that answers with
@@ -32,9 +33,10 @@ Cloud Scheduler starts the job twice a day. It runs two checks:
 
 Each problem is printed as one JSON log entry with severity ``ERROR``, which
 Cloud Logging reads from a job's standard output, followed by one summary
-entry. The job then exits 1, so its execution fails and Cloud Monitoring
-alerts a person. A missing or unusable token setting exits 2 before any
-request. No entry includes the token.
+entry. The job then exits 1, so its execution fails; the workflow then keeps
+one GitHub issue per problem (``telemetry_collector.huggingface_issues``). A
+missing or unusable token setting exits 2 before any request. No entry
+includes the token.
 
 Run it with ``python -m telemetry_collector.huggingface_check``.
 """
