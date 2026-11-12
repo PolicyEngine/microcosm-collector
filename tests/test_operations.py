@@ -297,7 +297,8 @@ BACKFILL_MODULE = "telemetry_collector.calibration_tree_backfill"
 BACKFILL_COMMAND = "backfill-calibration-trees"
 PRODUCTION_URL = "https://dashboard.example.test/api/microcosm/tree-manifest"
 BACKFILL_ENVIRONMENT = {
-    "DATABASE_URL": "postgresql://user:password@127.0.0.1:1/none",
+    # Never connected to: the tests stand in for the database engine.
+    "DATABASE_URL": "postgresql://user:password@database.example.test:1/none",
     "COLLECTOR_HF_READ_TOKEN": "hf_collector_read_token",
     "COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN": "vercel_blob_rw_test_token",
 }
