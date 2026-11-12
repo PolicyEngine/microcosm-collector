@@ -143,7 +143,7 @@ class VercelOidcSettings:
 
 def _usable_keys(answer: Any) -> dict[str, jwt.PyJWK] | None:
     """The RS256 signing keys of a key set, by ``kid``; ``None`` if ``answer``
-    is not a key set."""
+    is not a key set. The result is empty for a set with no usable key."""
 
     if not isinstance(answer, dict) or not isinstance(answer.get("keys"), list):
         return None
@@ -169,12 +169,20 @@ def _usable_keys(answer: Any) -> dict[str, jwt.PyJWK] | None:
 class VercelOidcVerifier:
     """Checks Vercel OIDC tokens against the settings and Vercel's signing keys.
 
-    The keys are cached: a key from a successful fetch is used without fetching
-    again for 10 minutes. A stale set, or a ``kid`` the set doesn't list,
-    fetches again, at most once a minute. After a failed fetch, keys from the
-    last successful fetch stay usable for up to 24 hours from it. FastAPI runs
-    the routes' dependencies in a thread pool, so a lock keeps concurrent
-    requests to one fetch.
+    The keys are cached. A fetch is successful when Vercel answers 200 with a
+    key set holding at least one usable key; any other answer, an empty set or
+    a set whose keys are all skipped included, is a failed fetch and leaves the
+    cached keys as they are. A key from a successful fetch is used without
+    fetching again for 10 minutes. A stale set, or a ``kid`` the set doesn't
+    list, fetches again, at most once a minute. While fetches fail, keys from
+    the last successful fetch stay usable for up to 24 hours from it.
+
+    FastAPI runs the routes' dependencies in a thread pool. One lock is held
+    only to read or write the cache's state, never during a fetch; a second
+    lets one thread fetch at a time. A request whose key is cached, fresh or
+    stale within the 24 hours, never waits for another thread's fetch: a stale
+    key is used while that fetch runs. A request whose key isn't cached waits
+    for a fetch in progress, then looks again.
     """
 
     def __init__(
@@ -187,7 +195,10 @@ class VercelOidcVerifier:
         self.settings = settings
         self._http_get = httpx.get if http_get is None else http_get
         self._clock = time.monotonic if clock is None else clock
-        self._lock = threading.Lock()
+        # Held only while reading or writing the four attributes below.
+        self._state_lock = threading.Lock()
+        # Held by the one thread that is fetching the key set.
+        self._fetch_lock = threading.Lock()
         self._keys: dict[str, jwt.PyJWK] = {}
         self._fetched_at: float | None = None
         self._attempted_at: float | None = None
@@ -247,25 +258,30 @@ class VercelOidcVerifier:
         return reader
 
     def _signing_key(self, key_id: str) -> jwt.PyJWK:
-        with self._lock:
+        with self._state_lock:
             now = self._clock()
-            fresh = (
-                self._fetched_at is not None
-                and now - self._fetched_at < KEY_SET_FRESH_SECONDS
-            )
-            if fresh and key_id in self._keys:
-                return self._keys[key_id]
-            if (
-                self._attempted_at is None
-                or now - self._attempted_at >= MINIMUM_FETCH_INTERVAL_SECONDS
-            ):
-                self._fetch(now)
-            key = self._keys.get(key_id)
-            if (
-                key is not None
-                and self._fetched_at is not None
-                and now - self._fetched_at <= STALE_KEY_LIFETIME_SECONDS
-            ):
+            key = self._usable_cached_key(key_id, now)
+            if key is not None and self._is_fresh(now):
+                return key
+            fetch_due = self._fetch_is_due(now)
+        if key is not None:
+            # A stale key: fetch again if it's time and no other thread is
+            # fetching, and otherwise use it without waiting.
+            if not fetch_due or not self._fetch_lock.acquire(blocking=False):
+                return key
+            try:
+                self._fetch_if_due()
+            finally:
+                self._fetch_lock.release()
+        else:
+            # No usable key: wait for any fetch in progress, then fetch
+            # unless one was attempted within the minute.
+            with self._fetch_lock:
+                self._fetch_if_due()
+        with self._state_lock:
+            now = self._clock()
+            key = self._usable_cached_key(key_id, now)
+            if key is not None:
                 return key
             if self._last_fetch_failed:
                 raise VercelOidcKeysUnavailableError(
@@ -275,22 +291,67 @@ class VercelOidcVerifier:
                 "Vercel's key set does not list the token's key."
             )
 
-    def _fetch(self, now: float) -> None:
-        self._attempted_at = now
+    # The next three methods read the cache's state: call them holding
+    # ``_state_lock``.
+
+    def _usable_cached_key(self, key_id: str, now: float) -> jwt.PyJWK | None:
+        """The cached key with this ``kid``, unless the last successful fetch
+        was more than 24 hours ago."""
+
+        key = self._keys.get(key_id)
+        if (
+            key is None
+            or self._fetched_at is None
+            or now - self._fetched_at > STALE_KEY_LIFETIME_SECONDS
+        ):
+            return None
+        return key
+
+    def _is_fresh(self, now: float) -> bool:
+        return (
+            self._fetched_at is not None
+            and now - self._fetched_at < KEY_SET_FRESH_SECONDS
+        )
+
+    def _fetch_is_due(self, now: float) -> bool:
+        return (
+            self._attempted_at is None
+            or now - self._attempted_at >= MINIMUM_FETCH_INTERVAL_SECONDS
+        )
+
+    def _fetch_if_due(self) -> None:
+        """Fetches the key set unless an attempt was made within the minute.
+        Call it holding ``_fetch_lock``; it takes ``_state_lock`` only to read
+        and write the cache's state, not during the fetch."""
+
+        with self._state_lock:
+            now = self._clock()
+            if not self._fetch_is_due(now):
+                return
+            self._attempted_at = now
+        keys = self._fetch()
+        with self._state_lock:
+            if keys:
+                self._keys = keys
+                self._fetched_at = now
+                self._last_fetch_failed = False
+            else:
+                # Not a key set, or one with no usable key: the cached keys
+                # stay as they are.
+                self._last_fetch_failed = True
+
+    def _fetch(self) -> dict[str, jwt.PyJWK] | None:
+        """The usable keys of Vercel's key set, or ``None`` if Vercel's answer
+        is not a key set."""
+
         try:
             response = self._http_get(
                 KEY_SET_URL,
                 timeout=FETCH_TIMEOUT_SECONDS,
                 follow_redirects=False,
             )
-            keys = (
-                _usable_keys(response.json()) if response.status_code == 200 else None
-            )
+            if response.status_code != 200:
+                return None
+            return _usable_keys(response.json())
         except (httpx.HTTPError, RecursionError, ValueError):
-            keys = None
-        if keys is None:
-            self._last_fetch_failed = True
-            return
-        self._keys = keys
-        self._fetched_at = now
-        self._last_fetch_failed = False
+            return None

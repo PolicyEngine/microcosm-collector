@@ -319,16 +319,22 @@ for Python's JSON decoder, is invalid rather than a server error.
 **Signing keys.** The collector reads Vercel's key set from
 `https://oidc.vercel.com/.well-known/jwks`, the address Vercel's own
 `@vercel/oidc` verifier (`verifyVercelOidcToken`) uses for every issuer, team
-issuers included. It never follows a redirect, and an answer other than 200
-with a JSON object holding a `keys` list is a failed fetch. Only RSA keys with
-a `kid`, whose `use` is absent or `sig` and whose `alg` is absent or `RS256`,
-are kept. After a successful fetch, a listed key is used without fetching
-again for 10 minutes. After that, or for a `kid` the set doesn't list, the
-collector fetches again, at most once a minute whatever the requests. While
-fetches fail, keys from the last successful fetch stay usable for 24 hours
-after it; a token whose key the cache doesn't hold, or holds from longer ago,
-answers 503 while the last fetch failed, and 401 once a fetch succeeds
-without its key.
+issuers included. It never follows a redirect. Only RSA keys with a `kid`,
+whose `use` is absent or `sig` and whose `alg` is absent or `RS256`, are
+usable. A fetch succeeds when the answer is 200 with a JSON object holding a
+`keys` list with at least one usable key. Any other answer, an empty `keys`
+list or one whose keys are all skipped included, is a failed fetch, and leaves
+the cached keys as they are. After a successful fetch, a listed key is used
+without fetching again for 10 minutes. After that, or for a `kid` the set
+doesn't list, the collector fetches again, at most once a minute whatever the
+requests. While fetches fail, keys from the last successful fetch stay usable
+for 24 hours after it; a token whose key the cache doesn't hold, or holds from
+longer ago, answers 503 while the last fetch failed, and 401 once a fetch
+succeeds without its key. One request at a time fetches. A request whose key
+is cached, whether fetched within the 10 minutes or within the 24 hours,
+never waits for another request's fetch, and uses the older key while that
+fetch runs; a request whose key the cache doesn't hold waits for it and then
+looks again.
 
 **Where the settings come from.** Each is a GitHub environment variable of
 `staging` and `production`, which the deployment passes to the service
@@ -353,7 +359,12 @@ Identity provider, until it expires. The collector never logs, stores or
 returns a token, and no answer or error message includes one. Every preview
 deployment of an allowed project, from any branch, has `environment:
 preview`, so with that project's `preview` among its readers, each of them
-can read the staging collector.
+can read the staging collector. It is unverified whether
+`vercel env pull --environment=preview` or `--environment=production` gives a
+token whose `environment` is `preview` or `production`. If it does, anyone
+allowed to pull the project's variables for an environment can read that
+environment's collector from their own machine, as they can already read
+that environment's other settings.
 
 ### The TypeScript client
 
@@ -2033,7 +2044,10 @@ environment for the production collector (see "Vercel OIDC tokens"). Its
 collector reads then need neither `MICROCOSM_TELEMETRY_READ_SECRET_VERSION`
 nor Secret Manager. Locally, `vercel env pull` gives a development token,
 whose `environment` is `development`, which only a collector listing the
-project's `development` environment accepts.
+project's `development` environment accepts. Whether
+`vercel env pull --environment=preview` or `--environment=production` gives
+a token for that environment, which that environment's collector would
+accept, is unverified (see "Vercel OIDC tokens").
 
 Restrict the Cloud SQL instance to the Cloud Run connection and disable request
 access logs for the container so authorization headers cannot enter application

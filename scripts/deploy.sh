@@ -117,12 +117,21 @@ require_intake_resource_names() {
 
 # Prints the words of the named variable's value, separated by single spaces:
 # the value without surrounding whitespace and with each run of inner
-# whitespace, newlines included, as one space. The collector reads its
-# settings the same way. `read` splits the value without filename expansion,
-# and returns nonzero at the end of its input, which is expected here.
+# whitespace as one space. Whitespace here is the ASCII whitespace that
+# Python's str.split() and str.strip() use, as the collector reads its
+# settings: space, tab, newline, carriage return, vertical tab, form feed and
+# the file, group, record and unit separators (0x1C to 0x1F). Those after
+# newline become spaces before `read` splits the value at space, tab and
+# newline: in IFS, bash 3.2 (the version macOS ships) splits at each of them
+# separately and leaves empty words. `read` splits the value without filename
+# expansion, and returns nonzero at the end of its input, which is expected
+# here.
 vercel_oidc_words() {
+  local IFS=$' \t\n'
+  local value="${!1-}"
   local words=()
-  read -r -d '' -a words <<< "${!1-}" || true
+  value="${value//[$'\r\v\f\x1c\x1d\x1e\x1f']/ }"
+  read -r -d '' -a words <<< "$value" || true
   printf '%s' "${words[*]-}"
 }
 
@@ -157,7 +166,7 @@ check_vercel_oidc_configuration() {
     echo "VERCEL_OIDC_TEAM_ID is not a valid Vercel team ID." >&2
     return 1
   fi
-  read -r -a readers <<< "$(vercel_oidc_words VERCEL_OIDC_READERS)" || true
+  IFS=' ' read -r -a readers <<< "$(vercel_oidc_words VERCEL_OIDC_READERS)" || true
   for reader in "${readers[@]}"; do
     if [[ ! "$reader" =~ $VERCEL_OIDC_READER_PATTERN ]]; then
       echo "VERCEL_OIDC_READERS is not a whitespace-separated list of <project ID>:<environment> entries." >&2
