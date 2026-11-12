@@ -6,11 +6,12 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from threading import RLock
 from typing import Any
 
 from telemetry_collector.auth import HuggingFacePrincipal
-from telemetry_collector.google_cloud import cloud_task_id
+from telemetry_collector.google_cloud import StoredObjectConflictError, cloud_task_id
 from telemetry_collector.intake import (
     IntakeObjectMissingError,
     PlannedUpload,
@@ -493,6 +494,19 @@ class FakeIntakeObjectStore:
         generation = str(self._next_generation)
         self.objects[object_name] = (content, sha256, generation)
         return generation
+
+    def create_object(self, object_name: str, source: Path, *, sha256: str) -> bool:
+        """Create the object once, as ``GoogleCloudStorageIntake`` does."""
+
+        stored = self.objects.get(object_name)
+        if stored is not None:
+            if stored[1] != sha256:
+                raise StoredObjectConflictError(
+                    f"{object_name} is already stored without this file's SHA-256."
+                )
+            return False
+        self.upload(object_name, source.read_bytes(), sha256=sha256)
+        return True
 
     def sign_uploads(
         self, uploads: Sequence[PlannedUpload], *, lifetime_seconds: int

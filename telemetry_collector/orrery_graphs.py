@@ -33,7 +33,9 @@ with the same code, writes the same objects, and a reprocessing after the
 projection changes writes a new folder. Writes only ever create objects; an
 existing object with the same SHA-256 is kept. Each document is recorded in
 ``orrery_graph_files`` with its run and build, the projection's source, the
-collector's and Orrery's versions, and its visibility: ``private`` for a
+collector's and Orrery's versions, whether it was reconstructed (true only for
+a submission the collector made for a past build, ``COLLECTOR_OWNER_HF_ID``),
+and its visibility: ``private`` for a
 licensed build and ``public`` otherwise. The Orrery read service, a separate
 Cloud Run service whose IAM policy grants the Cloud Run Invoker role only to
 microcosm-runs' service account, serves both to microcosm-runs
@@ -81,7 +83,7 @@ from telemetry_collector.orrery.validation import (
     OrreryValidation,
     validate_orrery_document,
 )
-from telemetry_collector.submissions import upstream_file_sha256
+from telemetry_collector.submissions import COLLECTOR_OWNER_HF_ID, upstream_file_sha256
 from telemetry_collector.worker import (
     JobContext,
     JobHandler,
@@ -522,7 +524,8 @@ def orrery_graph_handler(
                 orrery_version=validation.orrery_version,
                 projection_source=MICROCOSM_COMMIT,
                 collector_version=version,
-                reconstructed=False,
+                # Rebuilt from a past build's staged inputs by the collector.
+                reconstructed=submission.owner_hf_id == COLLECTOR_OWNER_HF_ID,
                 visibility=visibility,
             )
         )

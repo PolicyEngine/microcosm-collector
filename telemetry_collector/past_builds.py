@@ -102,6 +102,9 @@ class CommitClassification:
     commit_class: CommitClass
     #: Why the class is ``unknown``; ``None`` otherwise.
     reason: str | None = None
+    #: True when the class is ``unknown`` only because GitHub stopped answering
+    #: (a rate limit or a failure), so a later run may class the commit.
+    retry_later: bool = False
 
 
 @dataclass(frozen=True)
@@ -121,6 +124,9 @@ class PastBuild:
     rebuild: Rebuild
     skipped: bool
     skip_reason: str | None
+    #: True when ``commit_class`` is ``unknown`` only because GitHub stopped
+    #: answering, so a later run may class the build.
+    class_retry_later: bool = False
 
 
 @dataclass(frozen=True)
@@ -181,7 +187,9 @@ class GitHubCommitClassifier:
         if commit in self._classifications:
             return self._classifications[commit]
         if self._stopped_reason is not None:
-            return CommitClassification("unknown", self._stopped_reason)
+            return CommitClassification(
+                "unknown", self._stopped_reason, retry_later=True
+            )
         try:
             if self._contains(commit, GRAPH_SCHEMA_MERGE):
                 classification = CommitClassification("after_1151")
@@ -195,7 +203,9 @@ class GitHubCommitClassifier:
             )
         except GitHubUnavailableError as error:
             self._stopped_reason = str(error)
-            return CommitClassification("unknown", self._stopped_reason)
+            return CommitClassification(
+                "unknown", self._stopped_reason, retry_later=True
+            )
         self._classifications[commit] = classification
         return classification
 
@@ -485,6 +495,7 @@ def list_past_builds(
                 rebuild=found.rebuild,
                 skipped=skip_reason is not None,
                 skip_reason=skip_reason,
+                class_retry_later=classification.retry_later,
             )
         )
 

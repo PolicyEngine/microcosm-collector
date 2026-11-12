@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import TracebackType
@@ -47,6 +47,7 @@ _DATASET_NAME: Final = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$"
 )
 _SHA256: Final = re.compile(r"^[0-9a-f]{64}$")
+_COMMIT: Final = re.compile(r"^[0-9a-f]{40}$")
 
 
 class HuggingFaceReadConfigurationError(RuntimeError):
@@ -167,6 +168,16 @@ class DatasetFile:
     lfs_sha256: str | None
 
 
+@dataclass(frozen=True)
+class LastCommit:
+    """The newest commit that changed a file or folder, as a listing gives it."""
+
+    commit: str
+    #: Hugging Face's ISO 8601 time of the commit, such as
+    #: ``2026-10-23T00:42:24.000Z``.
+    date: str
+
+
 def _check_dataset_name(dataset: str) -> None:
     if not _DATASET_NAME.fullmatch(dataset):
         raise ValueError("A Hugging Face dataset name is owner/name.")
@@ -229,7 +240,7 @@ class HuggingFaceReader:
         """The commit ``main`` points at, to pin later reads to one state."""
 
         commit = self.dataset_info(dataset).get("sha")
-        if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        if not isinstance(commit, str) or not _COMMIT.fullmatch(commit):
             raise _unusable(dataset, "dataset information")
         return commit
 
@@ -237,21 +248,68 @@ class HuggingFaceReader:
         """Every file in the dataset at ``revision``, read page by page."""
 
         _check_dataset_name(dataset)
-        page_url: httpx.URL | None = self._url(
-            f"/api/datasets/{dataset}/tree/{quote(revision, safe='')}"
-        )
-        parameters: dict[str, str] | None = {"recursive": "true"}
-        files: list[DatasetFile] = []
-        while page_url is not None:
-            response = self._get(dataset, page_url, "file list", parameters)
-            entries = _json(dataset, response, "file list")
-            if not isinstance(entries, list):
-                raise _unusable(dataset, "file list")
-            files.extend(
-                _dataset_file(dataset, entry)
-                for entry in entries
-                if isinstance(entry, dict) and entry.get("type") != "directory"
+        url = self._url(f"/api/datasets/{dataset}/tree/{quote(revision, safe='')}")
+        return [
+            _dataset_file(dataset, entry)
+            for entry in self._list_entries(
+                dataset, url, "file list", {"recursive": "true"}
             )
+            if entry.get("type") != "directory"
+        ]
+
+    def last_commits(
+        self, dataset: str, folder: str, revision: str
+    ) -> dict[str, LastCommit]:
+        """The last commit of each file and folder directly inside ``folder``.
+
+        Hugging Face's listing with ``expand=true`` gives each entry's
+        ``lastCommit`` at ``revision``: the newest commit that changed it. An
+        entry listed without one is left out, and one with an unusable one is
+        an error.
+        """
+
+        _check_dataset_name(dataset)
+        url = self._url(
+            f"/api/datasets/{dataset}/tree/{quote(revision, safe='')}/"
+            f"{quote(folder, safe='/')}"
+        )
+        commits: dict[str, LastCommit] = {}
+        for entry in self._list_entries(
+            dataset, url, "folder list", {"expand": "true"}
+        ):
+            last_commit = entry.get("lastCommit")
+            if last_commit is None:
+                continue
+            path = entry.get("path")
+            commit = last_commit.get("id") if isinstance(last_commit, dict) else None
+            date = last_commit.get("date") if isinstance(last_commit, dict) else None
+            if (
+                not isinstance(path, str)
+                or not isinstance(commit, str)
+                or not _COMMIT.fullmatch(commit)
+                or not isinstance(date, str)
+            ):
+                raise _unusable(dataset, "folder list")
+            commits[path] = LastCommit(commit=commit, date=date)
+        return commits
+
+    def _list_entries(
+        self,
+        dataset: str,
+        url: httpx.URL,
+        description: str,
+        parameters: dict[str, str],
+    ) -> Iterator[dict[str, Any]]:
+        """Each entry of a listing, read page by page on Hugging Face's host."""
+
+        page_url: httpx.URL | None = url
+        page_parameters: dict[str, str] | None = parameters
+        while page_url is not None:
+            response = self._get(dataset, page_url, description, page_parameters)
+            entries = _json(dataset, response, description)
+            if not isinstance(entries, list):
+                raise _unusable(dataset, description)
+            yield from (entry for entry in entries if isinstance(entry, dict))
             next_page = response.links.get("next", {}).get("url")
             page_url = None
             if next_page:
@@ -260,12 +318,11 @@ class HuggingFaceReader:
                     raise HuggingFaceReadError(
                         dataset,
                         response.status_code,
-                        f"The file list of {dataset} continues outside Hugging "
+                        f"The {description} of {dataset} continues outside Hugging "
                         "Face; the reader does not follow it.",
                     )
             # The next page's address carries its own query.
-            parameters = None
-        return files
+            page_parameters = None
 
     def read_file(self, dataset: str, path: str, revision: str) -> bytes:
         """One file's bytes at ``revision``, up to ``MAX_FILE_BYTES``."""
