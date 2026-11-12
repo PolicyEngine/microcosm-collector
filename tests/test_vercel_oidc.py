@@ -13,7 +13,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import Future, wait
 from types import ModuleType
 from typing import Any
 
@@ -75,6 +75,27 @@ STALE_KEY_LIFETIME_SECONDS = 24 * 60 * 60
 # How long a test waits for another thread, so that a regression fails the
 # test rather than holding it forever.
 THREAD_WAIT_SECONDS = 5
+# How long a held key set fetch waits for the test to release it: clearly
+# longer than any wait of the test's, so that a request that waits for the
+# fetch is still waiting when the test checks it.
+HELD_FETCH_SECONDS = 3 * THREAD_WAIT_SECONDS
+
+
+def in_background(function: Callable[..., Any], *arguments: Any) -> Future:
+    """Runs ``function`` in a daemon thread. Unlike a thread pool's, the
+    thread is never joined, so a regression that never returns fails the test
+    on its bounded waits without holding pytest at exit."""
+
+    future: Future = Future()
+
+    def run() -> None:
+        try:
+            future.set_result(function(*arguments))
+        except BaseException as error:  # noqa: BLE001 - handed to the test
+            future.set_exception(error)
+
+    threading.Thread(target=run, daemon=True).start()
+    return future
 
 
 def vercel_oidc() -> ModuleType:
@@ -670,8 +691,8 @@ def test_concurrent_requests_with_no_fresh_keys_share_one_fetch() -> None:
     # Long enough that every request arrives while the first fetch is waiting.
     address.before_answering = lambda: time.sleep(0.2)
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        readers = list(pool.map(lambda attempt: verifier.verify(token), range(8)))
+    requests = [in_background(verifier.verify, token) for _ in range(8)]
+    readers = [request.result(timeout=THREAD_WAIT_SECONDS) for request in requests]
 
     assert len(address.requests) == 1
     assert {reader.project_id for reader in readers} == {DASHBOARD_PROJECT_ID}
@@ -679,7 +700,7 @@ def test_concurrent_requests_with_no_fresh_keys_share_one_fetch() -> None:
 
 class HeldFetch:
     """Holds each key set fetch until the test releases it, after noting that
-    one started. It waits for the release at most ``THREAD_WAIT_SECONDS``."""
+    one started. It waits for the release at most ``HELD_FETCH_SECONDS``."""
 
     def __init__(self) -> None:
         self.started = threading.Event()
@@ -687,7 +708,7 @@ class HeldFetch:
 
     def __call__(self) -> None:
         self.started.set()
-        self.released.wait(timeout=THREAD_WAIT_SECONDS)
+        self.released.wait(timeout=HELD_FETCH_SECONDS)
 
 
 def test_a_fresh_cached_key_never_waits_for_another_thread_s_fetch() -> None:
@@ -699,21 +720,18 @@ def test_a_fresh_cached_key_never_waits_for_another_thread_s_fetch() -> None:
     address.before_answering = held_fetch
     clock.advance(ONE_MINUTE + 1)
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        # A token whose key the cache doesn't hold makes its thread fetch.
-        rotated = pool.submit(
-            verifier.verify, signed_token(ROTATED_KEY, ROTATED_KEY_ID)
-        )
-        try:
-            assert held_fetch.started.wait(timeout=THREAD_WAIT_SECONDS)
-            cached = pool.submit(verifier.verify, cached_token)
-            finished, _ = wait([cached], timeout=THREAD_WAIT_SECONDS)
-            # It returned while the other thread's fetch was still held.
-            assert cached in finished
-        finally:
-            held_fetch.released.set()
-        assert cached.result().project_id == DASHBOARD_PROJECT_ID
-        reader = rotated.result(timeout=THREAD_WAIT_SECONDS)
+    # A token whose key the cache doesn't hold makes its thread fetch.
+    rotated = in_background(verifier.verify, signed_token(ROTATED_KEY, ROTATED_KEY_ID))
+    try:
+        assert held_fetch.started.wait(timeout=THREAD_WAIT_SECONDS)
+        cached = in_background(verifier.verify, cached_token)
+        finished, _ = wait([cached], timeout=THREAD_WAIT_SECONDS)
+        # It returned while the other thread's fetch was still held.
+        assert cached in finished
+    finally:
+        held_fetch.released.set()
+    assert cached.result().project_id == DASHBOARD_PROJECT_ID
+    reader = rotated.result(timeout=THREAD_WAIT_SECONDS)
 
     assert reader.project_id == DASHBOARD_PROJECT_ID
     assert len(address.requests) == 2
@@ -728,27 +746,74 @@ def test_a_stale_cached_key_is_used_while_another_thread_fetches_again() -> None
     address.before_answering = held_fetch
     clock.advance(FRESH_SECONDS + 1)
 
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        # The first request to find the cached keys no longer fresh fetches.
-        refreshing = pool.submit(verifier.verify, cached_token)
-        try:
-            assert held_fetch.started.wait(timeout=THREAD_WAIT_SECONDS)
-            # Meanwhile a request with the same key uses it, still stale ...
-            stale = pool.submit(verifier.verify, cached_token)
-            # ... and one whose key the cache doesn't hold waits for the fetch.
-            rotated = pool.submit(
-                verifier.verify, signed_token(ROTATED_KEY, ROTATED_KEY_ID)
-            )
-            finished, _ = wait([stale], timeout=THREAD_WAIT_SECONDS)
-            assert stale in finished
-        finally:
-            held_fetch.released.set()
-        assert stale.result().project_id == DASHBOARD_PROJECT_ID
-        refreshed_reader = refreshing.result(timeout=THREAD_WAIT_SECONDS)
-        rotated_reader = rotated.result(timeout=THREAD_WAIT_SECONDS)
+    # The first request to find the cached keys no longer fresh fetches.
+    refreshing = in_background(verifier.verify, cached_token)
+    try:
+        assert held_fetch.started.wait(timeout=THREAD_WAIT_SECONDS)
+        # Meanwhile a request with the same key uses it, still stale ...
+        stale = in_background(verifier.verify, cached_token)
+        # ... and one whose key the cache doesn't hold waits for the fetch.
+        rotated = in_background(
+            verifier.verify, signed_token(ROTATED_KEY, ROTATED_KEY_ID)
+        )
+        finished, _ = wait([stale], timeout=THREAD_WAIT_SECONDS)
+        assert stale in finished
+    finally:
+        held_fetch.released.set()
+    assert stale.result().project_id == DASHBOARD_PROJECT_ID
+    refreshed_reader = refreshing.result(timeout=THREAD_WAIT_SECONDS)
+    rotated_reader = rotated.result(timeout=THREAD_WAIT_SECONDS)
 
     assert refreshed_reader.project_id == DASHBOARD_PROJECT_ID
     # The rotated key came from the first request's fetch: only one thread
     # fetched.
     assert rotated_reader.project_id == DASHBOARD_PROJECT_ID
     assert len(address.requests) == 2
+
+
+def test_a_stale_key_is_used_when_another_thread_holds_the_fetch_lock() -> None:
+    # A fetch is due, but another thread holds the fetch lock (here, the
+    # test), so the request uses its stale key instead of waiting for it.
+    verifier, address, clock = verifier_serving(key_set_answer(SIGNING_JWK))
+    cached_token = dashboard_token()
+    verifier.verify(cached_token)
+    clock.advance(FRESH_SECONDS + 1)
+
+    assert verifier._fetch_lock.acquire(timeout=THREAD_WAIT_SECONDS)
+    try:
+        stale = in_background(verifier.verify, cached_token)
+        finished, _ = wait([stale], timeout=THREAD_WAIT_SECONDS)
+        assert stale in finished
+    finally:
+        verifier._fetch_lock.release()
+    assert stale.result().project_id == DASHBOARD_PROJECT_ID
+    assert len(address.requests) == 1
+
+
+def test_an_unknown_key_waits_for_a_fetch_in_progress_only_so_long() -> None:
+    # A burst of tokens naming keys nobody lists must not hold every worker
+    # thread for as long as a slow fetch takes: past the wait, the answer is
+    # that the keys are unavailable.
+    module = vercel_oidc()
+    verifier, address, clock = verifier_serving(key_set_answer(SIGNING_JWK))
+    verifier._fetch_wait_seconds = 0.2
+    clock.advance(ONE_MINUTE + 1)
+
+    assert verifier._fetch_lock.acquire(timeout=THREAD_WAIT_SECONDS)
+    try:
+        unknown = in_background(
+            verifier.verify, signed_token(UNLISTED_KEY, "unlisted-key")
+        )
+        finished, _ = wait([unknown], timeout=THREAD_WAIT_SECONDS)
+        assert unknown in finished
+    finally:
+        verifier._fetch_lock.release()
+    with pytest.raises(module.VercelOidcKeysUnavailableError):
+        unknown.result()
+    assert address.requests == []
+
+
+def test_an_unknown_key_waits_for_a_fetch_up_to_ten_seconds() -> None:
+    verifier, _, _ = verifier_serving(key_set_answer(SIGNING_JWK))
+
+    assert getattr(verifier, "_fetch_wait_seconds", None) == 10
