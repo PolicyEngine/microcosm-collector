@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
 from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,7 +13,11 @@ from typing import Any
 import httpx
 import pytest
 
-from telemetry_collector.huggingface_check import CONFIGURATION_CHECK, TOKEN_CHECK
+from telemetry_collector.huggingface_check import (
+    CONFIGURATION_CHECK,
+    RELEASES_RECORD_CHECK,
+    TOKEN_CHECK,
+)
 from telemetry_collector.huggingface_issues import (
     BOT_LOGIN,
     EXECUTION_POLL_SECONDS,
@@ -25,6 +30,7 @@ from telemetry_collector.huggingface_issues import (
     SETTINGS_EXIT_CODE,
     STATE_PATTERN,
     TITLE_PREFIX,
+    WORKFLOW_FAILED_REASON,
     CheckJob,
     GcloudError,
     GitHubClient,
@@ -33,6 +39,7 @@ from telemetry_collector.huggingface_issues import (
     Problem,
     Report,
     RunContext,
+    gcloud_command,
     main,
     parse_report,
     run_check,
@@ -160,14 +167,20 @@ class FakeGitHub:
     def close(self, number: int, reason: str) -> None:
         self.issues[number].update(state="closed", state_reason=reason)
 
-    def list_issues(self, creator: str, label: str) -> list[dict[str, Any]]:
+    def list_issues(
+        self, creator: str, label: str | None = None
+    ) -> list[dict[str, Any]]:
         # GitHub filters by creator; the fake doesn't, so the sync's own check
-        # of who opened an issue is what these tests exercise.
+        # of who opened an issue is what these tests exercise. Asked for a
+        # label, it filters by it, as GitHub would.
         return [
             json.loads(json.dumps(issue))
             for issue in self.issues.values()
-            if label in {entry["name"] for entry in issue["labels"]}
+            if label is None or label in {entry["name"] for entry in issue["labels"]}
         ]
+
+    def remove_labels(self, number: int) -> None:
+        self.issues[number]["labels"] = []
 
     def list_labels(self) -> set[str]:
         return set(self.labels)
@@ -192,6 +205,14 @@ class FakeGitHub:
 
     def written_text(self) -> str:
         return json.dumps(self.writes)
+
+
+def ran(*datasets: str, record: Sequence[str] = ()) -> frozenset[tuple[str, str]]:
+    """The checks a completed run finished: the token check, and some records."""
+
+    return frozenset({(TOKEN_CHECK, dataset) for dataset in datasets}) | frozenset(
+        {(RELEASES_RECORD_CHECK, dataset) for dataset in record}
+    )
 
 
 def sync(github: FakeGitHub, report: Report, *, dry_run: bool = False) -> dict:
@@ -410,7 +431,7 @@ def test_a_problem_a_completed_run_no_longer_finds_is_closed_with_a_comment() ->
     github = FakeGitHub()
     sync(github, Report((problem(US, "HTTP_404"),)))
 
-    actions = sync(github, Report(()))
+    actions = sync(github, Report((), completed_checks=ran(US, UK)))
 
     assert actions == {f"{TOKEN_CHECK}/{US}/HTTP_404": ("closed", 1)}
     assert github.issues[1]["state"] == "closed"
@@ -492,7 +513,7 @@ def test_a_dry_run_reports_what_would_change_and_writes_nothing() -> None:
 
     actions = sync(
         github,
-        Report((problem(UK, "HTTP_401"),)),
+        Report((problem(UK, "HTTP_401"),), completed_checks=ran(US, UK)),
         dry_run=True,
     )
 
@@ -544,14 +565,16 @@ def test_listing_issues_reads_every_page_and_leaves_out_pull_requests() -> None:
         )
         return httpx.Response(200, json=issues)
 
-    issues = github_client(handler).list_issues(BOT_LOGIN, LABEL)
+    issues = github_client(handler).list_issues(BOT_LOGIN)
 
     assert [issue["number"] for issue in issues] == list(range(101))
     first = requests[0]
     assert first.url.path == "/repos/PolicyEngine/microcosm-collector/issues"
     assert first.url.params["state"] == "all"
     assert first.url.params["creator"] == BOT_LOGIN
-    assert first.url.params["labels"] == LABEL
+    # Issues are found by who opened them and their state comment, not by a
+    # label people can remove.
+    assert "labels" not in first.url.params
     assert first.url.params["per_page"] == "100"
     assert first.headers["authorization"] == "Bearer github-token"
     assert len(requests) == 2
@@ -616,11 +639,14 @@ def command_environment(tmp_path: Path, **overrides: str) -> dict[str, str]:
     return environment
 
 
-def run_main(environment: dict[str, str], gcloud, github) -> tuple[int, str, str]:
+def run_main(
+    environment: dict[str, str], gcloud, github, arguments: Sequence[str] = ()
+) -> tuple[int, str, str]:
     output, errors = io.StringIO(), io.StringIO()
     clock = FakeClock()
     exit_code = main(
         environment,
+        arguments=list(arguments),
         gcloud=gcloud,
         github=github,
         sleep=clock.sleep,
@@ -694,3 +720,206 @@ def test_a_dry_run_of_the_command_changes_no_issue(tmp_path: Path) -> None:
     assert exit_code == 0
     assert github.writes == []
     assert "dry run" in (tmp_path / "summary.md").read_text().lower()
+
+
+# -- Round 1 review ---------------------------------------------------------------
+
+
+def test_the_summary_says_which_checks_the_run_finished() -> None:
+    summary = summary_payload(0)
+    summary["releases_record_completed"] = [US]
+
+    report = parse_report([summary])
+
+    assert report.completed_checks == ran(US, UK, record=[US])
+
+
+def test_an_issue_for_a_check_the_run_did_not_finish_stays_open() -> None:
+    # A dataset's releases.json check stops at a read error, or never starts
+    # when its token check fails: its open issues are then not settled.
+    github = FakeGitHub()
+    stopped = Problem(RELEASES_RECORD_CHECK, US, "SHA256_MISMATCH", ("mismatch",))
+    sync(github, Report((stopped,)))
+    github.writes.clear()
+
+    actions = sync(
+        github, Report((problem(US, "HTTP_503"),), completed_checks=ran(US, UK))
+    )
+
+    assert actions[stopped.key] == ("not-checked", 1)
+    assert github.issues[1]["state"] == "open"
+    assert all(write[0] == "create_issue" for write in github.writes)
+
+
+def test_an_issue_for_a_finished_releases_json_check_closes() -> None:
+    github = FakeGitHub()
+    fixed = Problem(RELEASES_RECORD_CHECK, US, "SHA256_MISMATCH", ("mismatch",))
+    sync(github, Report((fixed,)))
+
+    actions = sync(github, Report((), completed_checks=ran(US, UK, record=[US])))
+
+    assert actions == {fixed.key: ("closed", 1)}
+
+
+def test_a_no_result_issue_closed_as_not_planned_is_reopened() -> None:
+    github = FakeGitHub()
+    sync(github, Report(None, "The check job could not be started."))
+    github.close(1, "not_planned")
+
+    actions = sync(github, Report(None, "The check job could not be started."))
+
+    assert actions == {NO_RESULT_KEY: ("reopened", 1)}
+    assert github.issues[1]["state"] == "open"
+
+
+def test_an_issue_whose_label_was_removed_is_still_found() -> None:
+    github = FakeGitHub()
+    sync(github, Report((problem(US, "HTTP_404"),)))
+    github.remove_labels(1)
+
+    actions = sync(github, Report((problem(US, "HTTP_404"),)))
+
+    assert actions == {f"{TOKEN_CHECK}/{US}/HTTP_404": ("updated", 1)}
+    assert len(github.issues) == 1
+
+
+def test_text_outside_the_marked_section_survives_an_update() -> None:
+    github = FakeGitHub()
+    sync(github, Report((problem(US, "HTTP_404", "first"),)))
+    github.issues[1]["body"] = "A maintainer's note.\n\n" + github.issues[1]["body"]
+
+    sync(github, Report((problem(US, "HTTP_404", "second"),)))
+
+    assert github.issues[1]["body"].startswith("A maintainer's note.\n\n")
+    assert "second" in github.issues[1]["body"]
+
+
+def test_a_dry_run_neither_updates_nor_reopens() -> None:
+    github = FakeGitHub()
+    sync(github, Report((problem(US, "HTTP_404"), problem(UK, "HTTP_401"))))
+    uk_issue = next(
+        number for number, issue in github.issues.items() if UK in issue["title"]
+    )
+    github.close(uk_issue, "completed")
+    github.writes.clear()
+
+    actions = sync(
+        github,
+        Report((problem(US, "HTTP_404"), problem(UK, "HTTP_401"))),
+        dry_run=True,
+    )
+
+    assert actions[f"{TOKEN_CHECK}/{UK}/HTTP_401"] == ("reopened", uk_issue)
+    assert actions[f"{TOKEN_CHECK}/{US}/HTTP_404"][0] == "updated"
+    assert github.writes == []
+    assert github.issues[uk_issue]["state"] == "closed"
+
+
+def test_the_next_run_without_a_result_updates_the_no_result_issue() -> None:
+    github = FakeGitHub()
+    sync(github, Report(None, "first reason"))
+
+    actions = sync(github, Report(None, "second reason"))
+
+    assert actions == {NO_RESULT_KEY: ("updated", 1)}
+    assert "second reason" in github.issues[1]["body"]
+    assert "first reason" not in github.issues[1]["body"]
+
+
+def test_the_log_is_read_newest_first_from_the_last_day() -> None:
+    # gcloud applies --freshness only to descending reads.
+    gcloud = FakeGcloud(
+        log_reads=[
+            [
+                summary_payload(2),
+                finding_payload(US, "HTTP_404", "second"),
+                finding_payload(US, "HTTP_404", "first"),
+            ]
+        ]
+    )
+    clock = FakeClock()
+
+    report = run_check(gcloud, JOB, sleep=clock.sleep, clock=clock)
+
+    read = next(call for call in gcloud.calls if call[:2] == ["logging", "read"])
+    assert "--order=desc" in read and "--freshness=1d" in read
+    assert report.problems[0].messages == ("first", "second")
+
+
+def test_the_log_is_read_again_until_every_counted_problem_is_there() -> None:
+    gcloud = FakeGcloud(
+        log_reads=[
+            [finding_payload(US, "HTTP_404"), summary_payload(2)],
+            [
+                finding_payload(US, "HTTP_404"),
+                finding_payload(UK, "HTTP_401"),
+                summary_payload(2),
+            ],
+        ]
+    )
+    clock = FakeClock()
+
+    report = run_check(gcloud, JOB, sleep=clock.sleep, clock=clock)
+
+    assert report.completed
+    assert len(report.problems) == 2
+
+
+def test_a_gcloud_call_that_hangs_is_stopped(monkeypatch: pytest.MonkeyPatch) -> None:
+    timeouts: list[object] = []
+
+    def hangs(*arguments: object, **options: object):
+        timeouts.append(options.get("timeout"))
+        raise subprocess.TimeoutExpired(cmd="gcloud", timeout=1)
+
+    monkeypatch.setattr(subprocess, "run", hangs)
+
+    with pytest.raises(GcloudError):
+        gcloud_command(["run", "jobs", "execute", "example-job"])
+    assert timeouts and isinstance(timeouts[0], (int, float))
+
+
+def test_a_rate_limit_with_no_requests_left_waits_until_the_reset() -> None:
+    answers = iter(
+        [
+            httpx.Response(
+                403,
+                headers={
+                    "x-ratelimit-remaining": "0",
+                    "x-ratelimit-reset": "1762956040",
+                    "date": "Wed, 12 Nov 2025 14:00:00 GMT",
+                },
+            ),
+            httpx.Response(200, json=[]),
+        ]
+    )
+    clock = FakeClock()
+
+    github_client(lambda request: next(answers), clock).list_labels()
+
+    assert clock.sleeps == [40]
+
+
+def test_a_workflow_that_failed_before_the_check_reported_opens_the_no_result_issue(
+    tmp_path: Path,
+) -> None:
+    # A failed authentication or a missing setting stops the run before the
+    # check reports; the workflow's last step then runs this with only GitHub's
+    # own settings.
+    environment = {
+        name: value
+        for name, value in command_environment(tmp_path).items()
+        if name not in {"PROJECT_ID", "REGION", "HF_CHECK_JOB"}
+    }
+    gcloud = FakeGcloud()
+    github = FakeGitHub()
+
+    exit_code, _, _ = run_main(
+        environment, gcloud, github, arguments=["--workflow-failed"]
+    )
+
+    assert exit_code == 0
+    assert gcloud.calls == []
+    assert github.issues[1]["title"] == NO_RESULT_TITLE
+    assert WORKFLOW_FAILED_REASON in github.issues[1]["body"]
+    assert "actions/runs/1" in github.issues[1]["body"]

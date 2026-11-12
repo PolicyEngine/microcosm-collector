@@ -9,6 +9,7 @@ import sys
 import tomllib
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -24,6 +25,7 @@ from telemetry_collector.huggingface_check import (
     load_release_rules,
     main,
     manifest_file_digests,
+    run_all_checks,
     run_checks,
 )
 from telemetry_collector.huggingface_read import (
@@ -275,7 +277,107 @@ def test_the_summary_says_the_releases_json_check_is_switched_off() -> None:
 
     summary = log_entries[-1]
     assert summary["releases_record_checked"] == []
+    assert summary["releases_record_completed"] == []
     assert "releases.json check is switched off" in summary["message"]
+
+
+class StandInRecordError(Exception):
+    violations: tuple = ()
+
+
+def stand_in_release_rules(check_repository=None) -> SimpleNamespace:
+    """Rules that find nothing wrong with a releases.json listing no releases.
+
+    The real rules come from the interface package, which CI doesn't install;
+    these let a releases.json check run to its end without it.
+    """
+
+    return SimpleNamespace(
+        RELEASES_RECORD_PATH="releases.json",
+        RELEASE_MANIFEST_NAME="release_manifest.json",
+        ReleaseRecordError=StandInRecordError,
+        ReleasesRecord=SimpleNamespace(
+            parse=lambda content: SimpleNamespace(releases={})
+        ),
+        is_pointer_file=lambda path: path.rsplit("/", 1)[-1].startswith("latest"),
+        check_repository=check_repository or (lambda record, files, read: []),
+        build_folder=lambda release, build: f"releases/{release}/{build}",
+    )
+
+
+def switched_on_hub(files: dict[str, bytes] | None) -> tuple[FakeHuggingFace, object]:
+    hub = FakeHuggingFace(token=EXAMPLE_TOKEN)
+    dataset = replace(HUGGINGFACE_DATASETS[1], checks_releases_record=True)
+    hub.add_dataset(dataset.name, files, private=not dataset.public)
+    return hub, dataset
+
+
+def test_a_releases_json_check_that_ran_to_its_end_is_listed_as_completed() -> None:
+    hub, dataset = switched_on_hub({"releases.json": b"{}"})
+
+    outcome = run_all_checks(
+        reader_for(hub), [dataset], release_rules_loader=stand_in_release_rules
+    )
+
+    assert outcome.findings == []
+    assert outcome.releases_record_completed == (dataset.name,)
+
+
+def test_a_releases_json_check_stopped_by_a_read_error_is_not_completed() -> None:
+    hub, dataset = switched_on_hub({"releases.json": b"{}"})
+
+    def reads_a_missing_manifest(record, files, read):
+        read("releases/missing/build/release_manifest.json")
+        return []
+
+    outcome = run_all_checks(
+        reader_for(hub),
+        [dataset],
+        release_rules_loader=lambda: stand_in_release_rules(reads_a_missing_manifest),
+    )
+
+    assert [finding.code for finding in outcome.findings] == ["HTTP_404"]
+    assert outcome.releases_record_completed == ()
+
+
+def test_a_missing_releases_json_is_not_a_completed_check() -> None:
+    hub, dataset = switched_on_hub({})
+
+    outcome = run_all_checks(
+        reader_for(hub), [dataset], release_rules_loader=stand_in_release_rules
+    )
+
+    assert [finding.code for finding in outcome.findings] == ["RECORD_MISSING"]
+    assert outcome.releases_record_completed == ()
+
+
+def test_a_dataset_whose_token_check_failed_has_no_completed_releases_json_check() -> (
+    None
+):
+    hub, dataset = switched_on_hub({"releases.json": b"{}"})
+    hub.datasets[dataset.name].forced_status = 503
+
+    outcome = run_all_checks(
+        reader_for(hub), [dataset], release_rules_loader=stand_in_release_rules
+    )
+
+    assert [(finding.check, finding.code) for finding in outcome.findings] == [
+        (TOKEN_CHECK, "HTTP_503")
+    ]
+    assert outcome.releases_record_completed == ()
+
+
+def test_without_the_interface_package_no_releases_json_check_completes() -> None:
+    hub, dataset = switched_on_hub({"releases.json": b"{}"})
+
+    def interface_missing():
+        raise ReleaseRulesUnavailableError("microcosm-emitter-interface is missing.")
+
+    outcome = run_all_checks(
+        reader_for(hub), [dataset], release_rules_loader=interface_missing
+    )
+
+    assert outcome.releases_record_completed == ()
 
 
 def test_a_dataset_switched_on_without_the_interface_package_fails_the_check() -> None:

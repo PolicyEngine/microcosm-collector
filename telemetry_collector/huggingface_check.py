@@ -355,6 +355,26 @@ def run_checks(
     return findings
 
 
+@dataclass(frozen=True)
+class CheckOutcome:
+    """Every finding, and the datasets whose releases.json check finished."""
+
+    findings: list[Finding]
+    releases_record_completed: tuple[str, ...]
+
+
+def run_all_checks(
+    reader: HuggingFaceReader,
+    datasets: Sequence[HuggingFaceDataset] = HUGGINGFACE_DATASETS,
+    *,
+    release_rules_loader: Callable[[], ModuleType] = load_release_rules,
+) -> CheckOutcome:
+    """Not implemented yet: reports no releases.json check as finished."""
+
+    findings = run_checks(reader, datasets, release_rules_loader=release_rules_loader)
+    return CheckOutcome(findings, ())
+
+
 def _write(output: IO[str], entry: Mapping[str, Any]) -> None:
     output.write(json.dumps(entry) + "\n")
     output.flush()

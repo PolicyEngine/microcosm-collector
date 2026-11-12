@@ -121,7 +121,7 @@ def test_deployment_runs_only_when_collector_deploy_is_enabled() -> None:
     }
 
 
-def test_google_cloud_authentication_runs_only_on_pushes_to_main() -> None:
+def test_google_cloud_authentication_runs_only_from_main() -> None:
     def jobs_where(condition) -> dict:
         return {
             (workflow_path.name, job_name): (workflow, job)

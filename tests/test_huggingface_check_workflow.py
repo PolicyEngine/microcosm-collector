@@ -14,8 +14,8 @@ PUSH_WORKFLOW = WORKFLOWS / "push.yaml"
 CHECK_ENVIRONMENT = "huggingface-check"
 #: Everything the job reads from its environment is a secret, so that GitHub
 #: hides each value in the public workflow log: the Workload Identity provider,
-#: the account that may only start the check job and read its logs, and the
-#: project, region and job names.
+#: the account that may only start and follow the check job and read the
+#: project's logs, and the project, region and job names.
 CHECK_SECRETS = {
     "TELEMETRY_GCP_WIF_PROVIDER",
     "TELEMETRY_HF_CHECK_SERVICE_ACCOUNT",
@@ -66,8 +66,10 @@ def test_the_workflow_runs_daily_off_the_hour_and_by_hand() -> None:
 def test_only_main_in_this_repo_runs_the_check() -> None:
     job = check_job()
 
-    assert "github.repository == 'PolicyEngine/microcosm-collector'" in job["if"]
-    assert "github.ref == 'refs/heads/main'" in job["if"]
+    assert job["if"] == (
+        "github.repository == 'PolicyEngine/microcosm-collector'"
+        " && github.ref == 'refs/heads/main'"
+    )
     assert job["environment"] == CHECK_ENVIRONMENT
 
 
@@ -113,9 +115,8 @@ def test_the_job_authenticates_as_the_check_account_then_runs_the_command() -> N
         "workload_identity_provider": "${{ secrets.TELEMETRY_GCP_WIF_PROVIDER }}",
         "service_account": "${{ secrets.TELEMETRY_HF_CHECK_SERVICE_ACCOUNT }}",
     }
-    assert len(run_steps) == 1
-    command = run_steps[0]
-    assert command["run"] == RUN_COMMAND
+    assert len(run_steps) == 2
+    command = next(step for step in run_steps if step["run"] == RUN_COMMAND)
     assert command["env"] == {
         "GITHUB_TOKEN": "${{ github.token }}",
         "GITHUB_REPO": "${{ github.repository }}",
@@ -128,7 +129,26 @@ def test_the_job_authenticates_as_the_check_account_then_runs_the_command() -> N
     assert steps.index(
         step_using(job, "google-github-actions/setup-gcloud")
     ) < steps.index(command)
-    assert int(job["timeout-minutes"]) >= 45
+    # The command waits up to 45 minutes for the execution, then reads its log
+    # up to ten times, 30 seconds apart. The step's own limit stops a hang
+    # early enough for the last step to report it within the job's limit.
+    assert int(command["timeout-minutes"]) == 55
+    assert int(job["timeout-minutes"]) == 60
+
+
+def test_a_run_that_fails_before_the_check_reports_opens_the_no_result_issue() -> None:
+    job = check_job()
+    last = job["steps"][-1]
+
+    # A failed authentication, a missing setting or a hang stops the command
+    # before it writes any issue; this step needs only GitHub's own token.
+    assert last["if"] == "failure()"
+    assert last["run"] == f"{RUN_COMMAND} --workflow-failed"
+    assert last["env"] == {
+        "GITHUB_TOKEN": "${{ github.token }}",
+        "GITHUB_REPO": "${{ github.repository }}",
+        "DRY_RUN": "${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}",
+    }
 
 
 def test_the_workflow_pins_the_actions_the_deploy_pins() -> None:

@@ -1,4 +1,4 @@
-"""The README says how the daily check runs, alerts and is switched on."""
+"""The README says how the daily check runs, opens issues and is switched on."""
 
 import re
 from pathlib import Path
@@ -111,3 +111,41 @@ def test_the_readme_names_the_check_environment_and_its_secrets() -> None:
         "TELEMETRY_HF_CHECK_JOB",
     ):
         assert f"`{secret}`" in section, secret
+
+
+#: The deploy's Workload Identity provider must check the environment before
+#: the check's job first runs: without the clause, that job's token passes the
+#: deploy's provider too, and the deployment account trusts the whole repo.
+DEPLOY_PROVIDER_CONDITION = (
+    "assertion.repository=='PolicyEngine/microcosm-collector'"
+    " && assertion.ref=='refs/heads/main'"
+    " && assertion.environment in ['staging', 'production']"
+)
+
+
+def test_the_readme_says_the_deploy_provider_must_check_the_environment_first() -> None:
+    section = " ".join(readme_section().split())
+
+    assert DEPLOY_PROVIDER_CONDITION in section
+    assert "before the workflow first runs" in section
+
+
+def test_no_comment_or_runbook_still_describes_the_schedule_and_alerts() -> None:
+    deploy_script = (ROOT / "scripts" / "deploy.sh").read_text(encoding="utf-8")
+    function = deploy_script.split("configure_huggingface_check_job() {", 1)[1]
+    function = function.split("\n}\n", 1)[0]
+    push_workflow = (ROOT / ".github" / "workflows" / "push.yaml").read_text()
+    check_variable = push_workflow.index(
+        "HF_CHECK_JOB: ${{ vars.TELEMETRY_HF_CHECK_JOB }}"
+    )
+    comment_start = push_workflow.rindex("\n      # Only production", 0, check_variable)
+    comment_above = push_workflow[comment_start:check_variable]
+    runbook = (ROOT / "docs" / "project-move-runbook.md").read_text(encoding="utf-8")
+    check_item = runbook.split("1. **The collector's own Hugging Face token", 1)[1]
+    check_item = check_item.split("\n2. ", 1)[0]
+
+    assert "Cloud Scheduler" not in function and "alert" not in function
+    assert "alerts" not in comment_above
+    for old_resource in ("Cloud Scheduler", "notification channel", "Cloud Monitoring"):
+        assert old_resource not in check_item, old_resource
+    assert "`huggingface-check` environment" in " ".join(check_item.split())

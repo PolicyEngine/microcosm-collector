@@ -59,6 +59,9 @@ TITLE_PREFIX: Final = "[huggingface-check]"
 BOT_LOGIN: Final = "github-actions[bot]"
 NO_RESULT_KEY: Final = "no-result"
 NO_RESULT_TITLE: Final = f"{TITLE_PREFIX} The check did not report a result"
+WORKFLOW_FAILED_REASON: Final = (
+    "The workflow failed before the check reported a result."
+)
 STATE_PATTERN: Final = re.compile(r"<!-- huggingface-check:state (\{[^\n]*?\}) -->")
 SECTION_START: Final = "<!-- huggingface-check:start -->"
 SECTION_END: Final = "<!-- huggingface-check:end -->"
@@ -137,6 +140,7 @@ class Report:
 
     problems: tuple[Problem, ...] | None
     reason: str = ""
+    completed_checks: frozenset[tuple[str, str]] = frozenset()
 
     @property
     def completed(self) -> bool:
@@ -457,7 +461,9 @@ class GitHubClient:
         self._clock = clock
         self._last_write: float | None = None
 
-    def list_issues(self, creator: str, label: str) -> list[dict[str, Any]]:
+    def list_issues(
+        self, creator: str, label: str | None = None
+    ) -> list[dict[str, Any]]:
         """Return the open and closed issues ``creator`` opened with ``label``."""
 
         issues: list[dict[str, Any]] = []
@@ -469,7 +475,7 @@ class GitHubClient:
                 params={
                     "state": "all",
                     "creator": creator,
-                    "labels": label,
+                    **({"labels": label} if label else {}),
                     "per_page": GITHUB_PAGE_SIZE,
                     "page": page,
                 },
@@ -804,6 +810,7 @@ def _settings(environment: Mapping[str, str]) -> dict[str, str]:
 def main(
     environment: Mapping[str, str] | None = None,
     *,
+    arguments: Sequence[str] | None = None,
     gcloud: Gcloud | None = None,
     github: Any = None,
     sleep: Callable[[float], None] = time.sleep,
