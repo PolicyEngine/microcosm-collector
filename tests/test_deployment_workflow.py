@@ -470,7 +470,9 @@ def test_both_deploy_jobs_read_their_orrery_reader_service_account() -> None:
     assert PUSH_WORKFLOW.read_text(encoding="utf-8").count(mapping) == 2
 
 
-@pytest.mark.parametrize("setting", ["TEAM_SLUG", "TEAM_ID", "READERS"])
+@pytest.mark.parametrize(
+    "setting", ["TEAM_SLUG", "TEAM_ID", "READERS", "TREE_BUILD_CALLERS"]
+)
 def test_both_deploy_jobs_pass_their_vercel_oidc_settings(setting: str) -> None:
     jobs = load_workflow(PUSH_WORKFLOW)["jobs"]
     variable = f"VERCEL_OIDC_{setting}"

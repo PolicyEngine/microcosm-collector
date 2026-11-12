@@ -21,13 +21,14 @@ from telemetry_collector.migrate import (
     verify_database,
 )
 
-HEAD_REVISION = "0003_orrery_graph_files"
+HEAD_REVISION = "0004_calibration_tree_build_requests"
 TELEMETRY_TABLES = {"telemetry_runs", "telemetry_producers", "telemetry_events"}
 ARTIFACT_TABLES = {"artifact_submissions", "artifact_jobs"}
 ORRERY_GRAPH_TABLES = {"orrery_graph_files"}
+BUILD_REQUEST_TABLES = {"calibration_tree_build_requests"}
 # Every table created after the telemetry tables, which the runtime user gets
 # through the migration user's default privileges.
-TABLES_SINCE_TELEMETRY = ARTIFACT_TABLES | ORRERY_GRAPH_TABLES
+TABLES_SINCE_TELEMETRY = ARTIFACT_TABLES | ORRERY_GRAPH_TABLES | BUILD_REQUEST_TABLES
 
 
 def _current_revision(database_url: str) -> tuple[str | None, str | None]:
@@ -122,6 +123,7 @@ def test_upgrades_empty_postgres_database_to_head(postgres_url: str) -> None:
             *TELEMETRY_TABLES,
             *ARTIFACT_TABLES,
             *ORRERY_GRAPH_TABLES,
+            *BUILD_REQUEST_TABLES,
         }
         assert _current_revision(postgres_url) == (HEAD_REVISION, HEAD_REVISION)
     finally:
@@ -199,6 +201,7 @@ def test_hard_cutover_replaces_populated_unversioned_database(
             *TELEMETRY_TABLES,
             *ARTIFACT_TABLES,
             *ORRERY_GRAPH_TABLES,
+            *BUILD_REQUEST_TABLES,
         }
         metadata = sa.MetaData()
         runs = sa.Table("telemetry_runs", metadata, autoload_with=engine)
@@ -244,6 +247,30 @@ def test_verification_rejects_schema_drift_at_alembic_head(
 
     with pytest.raises(RuntimeError, match="differs from SQLAlchemy metadata"):
         verify_database(postgres_url)
+
+
+def test_downgrading_the_build_request_table_keeps_the_orrery_graph_schema(
+    postgres_url: str,
+) -> None:
+    upgrade_database(postgres_url)
+    engine = create_database_engine(postgres_url)
+    config = alembic_config()
+    try:
+        with engine.begin() as connection:
+            config.attributes["connection"] = connection
+            command.downgrade(config, "0003_orrery_graph_files")
+        assert set(inspect(engine).get_table_names()) == {
+            "alembic_version",
+            *TELEMETRY_TABLES,
+            *ARTIFACT_TABLES,
+            *ORRERY_GRAPH_TABLES,
+        }
+        assert _current_revision(postgres_url) == (
+            "0003_orrery_graph_files",
+            HEAD_REVISION,
+        )
+    finally:
+        engine.dispose()
 
 
 def test_downgrading_orrery_graph_files_keeps_the_intake_schema(
@@ -325,11 +352,16 @@ def _drop_test_roles(connection: sa.Connection) -> None:
 
 
 def _table_privileges(connection: sa.Connection, role: str) -> dict[str, set[str]]:
+    """Each table's privileges for ``role``; none for a table that doesn't exist."""
+
     return {
         table: {
             privilege
             for privilege in TABLE_PRIVILEGES
             if connection.scalar(
+                sa.text("SELECT to_regclass(:table) IS NOT NULL"), {"table": table}
+            )
+            and connection.scalar(
                 sa.text("SELECT has_table_privilege(:role, :table, :privilege)"),
                 {"role": role, "table": table, "privilege": privilege},
             )
@@ -339,7 +371,7 @@ def _table_privileges(connection: sa.Connection, role: str) -> dict[str, set[str
 
 
 def _upgrade_to_intake_with_default_privileges(postgres_url: str) -> IntakeUpgrade:
-    """Upgrade as a deployed database is upgraded, recording what 0002 and 0003 run.
+    """Upgrade as a deployed database is upgraded, recording what 0002 to 0004 run.
 
     The migration role owns the tables, as the migration user does. The
     telemetry tables are granted by hand, as the deployments' were, to the
@@ -406,6 +438,10 @@ def test_artifact_intake_migration_issues_no_grant(postgres_url: str) -> None:
 
     assert any("CREATE TABLE artifact_jobs" in sql for sql in upgrade.statements)
     assert any("CREATE TABLE orrery_graph_files" in sql for sql in upgrade.statements)
+    assert any(
+        "CREATE TABLE calibration_tree_build_requests" in sql
+        for sql in upgrade.statements
+    )
     assert [sql for sql in upgrade.statements if GRANT_STATEMENT.match(sql)] == []
 
 

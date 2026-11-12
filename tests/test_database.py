@@ -28,6 +28,7 @@ def test_orm_metadata_defines_telemetry_and_artifact_intake_tables() -> None:
         "artifact_submissions",
         "artifact_jobs",
         "orrery_graph_files",
+        "calibration_tree_build_requests",
     }
     assert set(inspect(ArtifactSubmission).relationships.keys()) == {"jobs"}
     assert set(inspect(ArtifactJob).relationships.keys()) == {"submission"}
@@ -139,3 +140,16 @@ def test_the_orrery_graph_migration_keeps_the_models_visibilities() -> None:
     for licensed_data in (True, False):
         visibility = output_visibility("orrery_artifact", licensed_data=licensed_data)
         assert f"'{visibility}'" in migration.VISIBILITIES
+
+
+def test_the_build_request_migration_keeps_the_model_s_kinds() -> None:
+    import importlib
+
+    database = importlib.import_module("telemetry_collector.database")
+    model = getattr(database, "CalibrationTreeBuildRequest", None)
+    assert model is not None, "telemetry_collector.database has no build request model."
+    migration = _migration("0004_calibration_tree_build_requests.py")
+
+    assert migration.down_revision == "0003_orrery_graph_files"
+    assert migration.KINDS == _status_constraint(model.__table__)
+    assert migration.KINDS == "kind IN ('release', 'staging')"
