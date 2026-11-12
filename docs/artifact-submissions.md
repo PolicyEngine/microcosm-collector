@@ -4,7 +4,9 @@ Contract version 1. The collector implements it in its intake endpoints and
 worker framework; the emitter implements it in its submission module.
 
 A build hands files to the collector as one **submission**: a kind, the build's
-provenance, and an inventory of files. The file bytes never pass through the
+provenance, and an inventory of files. A `releases-record` submission hands it
+a release repo's `releases.json` after a change made a build current, with
+that build's provenance. The file bytes never pass through the
 collector API. They go straight to a private intake bucket through signed
 upload URLs, because the API accepts request bodies of at most 1 MiB and runs
 with 512 MiB of memory and a 30 s request timeout. Work on the files runs later
@@ -169,7 +171,11 @@ A `releases-record` submission is what Microcosm sends after a change to a
 release repo's `releases.json` made a published build current without a new
 build (`microcosm-publish-release-build --promote`): its one file is the
 `releases.json` that change wrote, at most 4 MiB, the largest the record's
-writer accepts.
+writer accepts, named `releases.json`. Its `build_id`, `release` and
+`licensed_data` are those of the build made current, and its `run_id` is the
+run that made the change (the collector doesn't read it). Its `commit` makes
+each change its own submission, so a later change back to the same build is
+processed again.
 
 ### The roles the emitter sends
 

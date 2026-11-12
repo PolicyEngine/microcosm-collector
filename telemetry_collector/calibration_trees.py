@@ -347,7 +347,8 @@ def releases_record_currents(content: bytes) -> ReleasesRecordCurrents:
         document = json.loads(
             content.decode("utf-8-sig"), parse_constant=_reject_constant
         )
-    except ValueError:
+    except (ValueError, RecursionError):
+        # RecursionError: nested more deeply than the decoder goes.
         raise _refuse_record("not a readable JSON document.") from None
     if not isinstance(document, dict) or set(document) != _RECORD_KEYS:
         raise _refuse_record("must have exactly default, releases, schema_version.")
@@ -411,7 +412,7 @@ class LatestDecision:
 
     make_latest: bool
     #: Set when releases.json could not decide: ``releases_record_refused``.
-    skipped: str | None = None
+    skipped: Literal["releases_record_refused"] | None = None
     skipped_reason: str | None = None
 
 
@@ -777,10 +778,13 @@ def follow_releases_record(
     collector job, such as one that has just built or backfilled trees.
 
     Raises ``ValueError`` for a country the collector does not list, before
-    reading anything. A failed read raises ``HuggingFaceReadError``, and a
-    latest command that fails, runs out of time or cannot start raises
-    ``CalibrationTreeCommandError``; calling again may succeed. Everything else is in the answer: what moved, or why the latest
-    stayed.
+    reading anything; calling again cannot help. Any other exception is a
+    failure calling again may get past: a failed read raises
+    ``HuggingFaceReadError``, a latest command that fails, runs out of time or
+    cannot start raises ``CalibrationTreeCommandError``, and the manifest lock
+    or the temporary request file raise their own errors (such as SQLAlchemy's
+    ``OperationalError`` or ``OSError``). Everything else is in the answer:
+    what moved, or why the latest stayed.
     """
 
     if country not in RELEASE_REPOS:
@@ -876,8 +880,9 @@ def calibration_tree_latest_handler(
     The latest is left as it is, and the result says why
     (``latest_unchanged``), when the head has no releases.json, one the rules
     refuse, no current build of its default release, or a current build
-    without a recorded tree, which its own submission's publication makes the
-    latest once it reads this change. A failed read or a failed latest command
+    without a recorded tree. Such a tree's own publication reads this change
+    and makes it the latest, unless the latest is newer, as after a rollback to
+    it (reprocessing this submission then moves the latest). Any failure
     fails the attempt, so it runs again.
     """
 

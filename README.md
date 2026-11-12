@@ -336,7 +336,7 @@ workflow, revoke the configuration in the same way.
 ## Artifact intake
 
 Builds hand calibration diagnostics and Orrery inputs to the collector as
-submissions. [`docs/artifact-submissions.md`](docs/artifact-submissions.md) is
+submissions, and Microcosm hands it the `releases.json` a promotion wrote. [`docs/artifact-submissions.md`](docs/artifact-submissions.md) is
 the contract: kinds, file roles, provenance, identifiers, statuses, answers,
 receipts and limits. File bytes go straight to a private bucket through signed
 upload URLs; `POST /v1/submissions/{id}/complete` checks the stored objects'
@@ -1585,9 +1585,11 @@ Step 2 is `calibration_trees.follow_releases_record(country, ...)`, which
 builds nothing and takes the lock itself, so another collector job can call
 it too, for example to set each country's latest to its `releases.json` once
 it has built or backfilled trees. It returns the same fields as the result,
-refuses a country the collector does not list, and raises a failed read or a
-failed latest command for its caller to try again. It must not be called
-while the caller holds the manifest lock.
+refuses a country the collector does not list with `ValueError`, and raises
+any other failure (a failed read, `HuggingFaceReadError`; a failed latest
+command, `CalibrationTreeCommandError`; or the lock's or the request file's
+own errors) for its caller to try again. It must not be called while the
+caller holds the manifest lock.
 
 Both handlers read `releases.json` and write the manifest under the one lock,
 so a build made current while its tree is still being built becomes the
