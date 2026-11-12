@@ -1160,8 +1160,15 @@ resources once, in the new project, and needs nothing in the current project.
    it, the `huggingface-check` environment and its five secrets, the check's
    own Workload Identity pool and provider, and the account the workflow acts
    as, with its access to the job and the project's logs (the README's "Daily
-   Hugging Face check"). The deploy's provider must check the environment
-   first (step 4.2).
+   Hugging Face check"). Before the workflow first runs, the deploy's
+   provider must check the environment; step 4.2 creates it without that
+   clause, so add it first:
+
+   ```bash
+   gcloud iam workload-identity-pools providers update-oidc microcosm-collector \
+     --project "$NEW_PROJECT_ID" --location global --workload-identity-pool github \
+     --attribute-condition "assertion.repository=='PolicyEngine/microcosm-collector' && assertion.ref=='refs/heads/main' && assertion.environment in ['staging', 'production']"
+   ```
 2. **Switching intake on.** Everything in the README's "Artifact intake"
    section: the bucket, the Cloud Tasks queue, the worker and recovery jobs,
    the recovery job's schedule, the accounts and permissions, and the

@@ -264,9 +264,12 @@ def _check_releases_record(
         record, list(files), read_record_or_manifest
     ):
         report(violation.code, violation.message)
+    # Every listed build is checked, but the check finishes only if each
+    # build's files could be compared with its manifest.
+    every_build_compared = True
     for release, entry in sorted(record.releases.items()):
         for build in sorted(entry.builds):
-            _check_build_files(
+            every_build_compared &= _check_build_files(
                 reader,
                 dataset,
                 revision,
@@ -276,7 +279,7 @@ def _check_releases_record(
                 read_record_or_manifest,
                 report,
             )
-    return True
+    return every_build_compared
 
 
 def _check_build_files(
@@ -288,11 +291,13 @@ def _check_build_files(
     manifest_name: str,
     read_manifest: Callable[[str], bytes],
     report: Callable[[str, str], None],
-) -> None:
+) -> bool:
+    """Report every file problem; True only when the build's files were compared."""
+
     manifest_path = f"{folder}/{manifest_name}"
     if manifest_path not in files:
         # The interface's folder and manifest rule already reported this.
-        return
+        return False
     try:
         digests = manifest_file_digests(json.loads(read_manifest(manifest_path)))
     # json.loads raises RecursionError for nesting too deep to decode.
@@ -302,7 +307,7 @@ def _check_build_files(
             f"{manifest_path} does not list its build's files with their "
             f"SHA-256 in its artifacts map: {error}",
         )
-        return
+        return False
     for name, expected_sha256 in sorted(digests.items()):
         if name == manifest_name:
             continue
@@ -330,6 +335,7 @@ def _check_build_files(
             and name not in digests
         ):
             report("FILE_NOT_IN_MANIFEST", f"{path} is not listed in {manifest_path}.")
+    return True
 
 
 # Running the checks ---------------------------------------------------------------

@@ -15,7 +15,8 @@ project's logs. It:
    labelled ``huggingface-check``. It opens an issue for a new problem,
    updates the open one for a problem found again, reopens a closed one for a
    problem that returns (unless it was closed as not planned), and closes the
-   open one, with a comment, for a problem a completed run no longer finds.
+   open one, with a comment, for a problem a completed run no longer finds,
+   but only if that run finished the check that found it.
 
 A run that reports no result (the job couldn't start, failed before writing its
 summary, didn't finish in time, couldn't read its token setting, or its entries
@@ -67,8 +68,9 @@ BOT_LOGIN: Final = "github-actions[bot]"
 NO_RESULT_KEY: Final = "no-result"
 NO_RESULT_TITLE: Final = f"{TITLE_PREFIX} The check did not report a result"
 WORKFLOW_FAILED_REASON: Final = (
-    "The workflow failed before the check reported a result: it could not "
-    "authenticate, a setting was missing, or a step failed or ran out of time."
+    "The workflow failed before it finished keeping the issues: it could not "
+    "authenticate, a setting was missing, or the command failed or ran out of "
+    "time. Issues this run had already changed stay as they are."
 )
 STATE_PATTERN: Final = re.compile(r"<!-- huggingface-check:state (\{[^\n]*?\}) -->")
 SECTION_START: Final = "<!-- huggingface-check:start -->"
@@ -664,8 +666,10 @@ def problem_section(problem: Problem, context: RunContext) -> str:
 def problem_body(problem: Problem, context: RunContext) -> str:
     return (
         "The daily Hugging Face check found this problem. Each run that finds it "
-        "again updates this issue, and the next completed run that no longer "
-        "finds it closes it.\n\n" + problem_section(problem, context) + "\n"
+        "again updates this issue, and the next run that finishes this check "
+        "without finding it closes it. If the check is switched off for this "
+        "dataset, or the dataset is no longer checked, close this issue by "
+        "hand.\n\n" + problem_section(problem, context) + "\n"
     )
 
 
@@ -682,10 +686,12 @@ def no_result_section(reason: str, context: RunContext) -> str:
 
 def no_result_body(reason: str, context: RunContext) -> str:
     return (
-        "The daily Hugging Face check ran without reporting a result, so the "
-        "issues for the problems it found before are left as they were. The "
-        "workflow run's log has the details. The next run that reports a "
-        "result closes this issue.\n\n" + no_result_section(reason, context) + "\n"
+        "A run of the daily Hugging Face check did not report a result, or the "
+        "workflow failed before it finished keeping the issues. Such a run "
+        "closes no problem issue. The workflow run's log has the details. The "
+        "next run that reports a result closes this issue.\n\n"
+        + no_result_section(reason, context)
+        + "\n"
     )
 
 

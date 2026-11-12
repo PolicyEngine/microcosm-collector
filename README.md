@@ -1724,8 +1724,11 @@ check, dataset and code, each with the `huggingface-check` label:
   comment, but only if that run finished the check that found it: a
   dataset's `releases.json` check that stopped (at a read error, a missing or
   unreadable record, a failed token check, or without the rules package)
-  leaves its issues as they are. The check's summary entry lists the datasets
-  whose `releases.json` check ran to its end.
+  leaves its issues as they are, and so does a check that could not compare
+  a listed build's files with its manifest. The check's summary entry lists
+  the datasets whose `releases.json` check ran to its end. An issue for a
+  check that no longer runs (it was switched off for its dataset, or the
+  dataset is no longer checked) stays open until someone closes it.
 
 A run that reports no result opens or updates one issue titled "The check did
 not report a result" instead, and leaves the problem issues as they are,
@@ -1733,9 +1736,10 @@ since what they report is then unknown. That covers a job that could not
 start, failed before writing its summary entry, did not finish within 45
 minutes or could not read its token setting, and entries that could not be
 read, or fewer problem entries than the summary counts. A run that fails
-before the command reports (it could not authenticate, a setting is missing,
-or a step failed or ran out of time) is reported the same way by the
-workflow's last step, which needs only GitHub's own token. This issue reopens
+before the command finishes (it could not authenticate, a setting is missing,
+or the command failed or ran out of time) is reported the same way by the
+workflow's last step, which needs only GitHub's own token; a failed checkout
+or dependency install leaves only GitHub's own failure email. This issue reopens
 even if someone closed it as not planned. The next run that reports a result
 closes it. GitHub notifies the repo's watchers of each new issue, and the
 workflow run's summary lists what each run did.
@@ -1946,7 +1950,7 @@ The daily Hugging Face check's job also requests an OIDC token, in the
 `huggingface-check` environment. It authenticates through a Workload Identity
 pool and provider of its own, whose condition accepts only this repo's `main`
 in that environment, and acts as an account that trusts only that pool. Once
-this provider checks the environment, as above, it refuses that token, and
+the deploy's provider checks the environment, as above, it refuses that token, and
 the deployment account does not trust the check's pool, so the check cannot
 act as the deployment account. That clause must be in place before the
 check's workflow first runs ("Daily Hugging Face check").
