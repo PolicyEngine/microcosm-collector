@@ -1556,6 +1556,33 @@ def test_a_latest_command_that_cannot_finish_raises_the_documented_error(
     assert caught.value.__cause__ is raised
 
 
+# Deeper than Python's JSON decoder goes; the package's parser refuses it too.
+DEEPLY_NESTED_RECORD = b"[" * 100_000 + b"]" * 100_000
+
+
+def test_a_head_record_nested_too_deeply_publishes_without_moving_the_latest() -> None:
+    runner = RecordingRunner()
+    submission = accepted(RELEASED)
+
+    submission.run(
+        handler_with(runner, hugging_face=uk_release_repo(DEEPLY_NESTED_RECORD))
+    )
+
+    assert submission.record().status == "succeeded"
+    assert published_make_latest(runner) is False
+    assert submission.record().result["latest_skipped"] == "releases_record_refused"
+
+
+def test_a_submitted_record_nested_too_deeply_is_rejected() -> None:
+    runner = RecordingRunner()
+    submission = accepted_releases_record(DEEPLY_NESTED_RECORD)
+
+    submission.run(latest_handler_with(runner, uk_release_repo(releases_record())))
+
+    assert submission.record().status == "rejected"
+    assert submission.record().rejection["code"] == "releases_record_refused"
+
+
 def test_the_manifest_lock_lets_one_writer_in_at_a_time(postgres_url: str) -> None:
     trees_module = trees()
     engine = create_database_engine(postgres_url)
