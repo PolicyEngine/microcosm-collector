@@ -54,6 +54,10 @@ CLOCK_LEEWAY_SECONDS = 30
 REQUIRED_CLAIMS = ["exp", "iat", "iss", "aud", "sub"]
 
 FETCH_TIMEOUT_SECONDS = 5
+# How long a request whose key isn't cached waits for another thread's fetch
+# before answering that the keys are unavailable, so a burst of tokens naming
+# keys nobody lists cannot hold every worker thread through a slow fetch.
+FETCH_WAIT_SECONDS = 10
 # After a successful fetch, a key the set lists is used without fetching again
 # for this long.
 KEY_SET_FRESH_SECONDS = 10 * 60
@@ -182,7 +186,8 @@ class VercelOidcVerifier:
     lets one thread fetch at a time. A request whose key is cached, fresh or
     stale within the 24 hours, never waits for another thread's fetch: a stale
     key is used while that fetch runs. A request whose key isn't cached waits
-    for a fetch in progress, then looks again.
+    for a fetch in progress, for at most ``FETCH_WAIT_SECONDS``, then looks
+    again; past that wait it gets ``VercelOidcKeysUnavailableError``.
     """
 
     def __init__(
@@ -199,6 +204,7 @@ class VercelOidcVerifier:
         self._state_lock = threading.Lock()
         # Held by the one thread that is fetching the key set.
         self._fetch_lock = threading.Lock()
+        self._fetch_wait_seconds: float = FETCH_WAIT_SECONDS
         self._keys: dict[str, jwt.PyJWK] = {}
         self._fetched_at: float | None = None
         self._attempted_at: float | None = None
@@ -274,10 +280,17 @@ class VercelOidcVerifier:
             finally:
                 self._fetch_lock.release()
         else:
-            # No usable key: wait for any fetch in progress, then fetch
-            # unless one was attempted within the minute.
-            with self._fetch_lock:
+            # No usable key: wait for any fetch in progress, for at most
+            # FETCH_WAIT_SECONDS, then fetch unless one was attempted within
+            # the minute.
+            if not self._fetch_lock.acquire(timeout=self._fetch_wait_seconds):
+                raise VercelOidcKeysUnavailableError(
+                    "Vercel's signing keys could not be read in time."
+                )
+            try:
                 self._fetch_if_due()
+            finally:
+                self._fetch_lock.release()
         with self._state_lock:
             now = self._clock()
             key = self._usable_cached_key(key_id, now)

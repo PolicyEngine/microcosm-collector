@@ -333,8 +333,10 @@ longer ago, answers 503 while the last fetch failed, and 401 once a fetch
 succeeds without its key. One request at a time fetches. A request whose key
 is cached, whether fetched within the 10 minutes or within the 24 hours,
 never waits for another request's fetch, and uses the older key while that
-fetch runs; a request whose key the cache doesn't hold waits for it and then
-looks again.
+fetch runs; a request whose key the cache doesn't hold waits for it, for at
+most 10 seconds, and then looks again, or answers 503 once the 10 seconds
+have passed. So a burst of tokens naming keys nobody lists holds a worker
+thread for at most that long each.
 
 **Where the settings come from.** Each is a GitHub environment variable of
 `staging` and `production`, which the deployment passes to the service
