@@ -687,9 +687,10 @@ def no_result_section(reason: str, context: RunContext) -> str:
 def no_result_body(reason: str, context: RunContext) -> str:
     return (
         "A run of the daily Hugging Face check did not report a result, or the "
-        "workflow failed before it finished keeping the issues. Such a run "
-        "closes no problem issue. The workflow run's log has the details. The "
-        "next run that reports a result closes this issue.\n\n"
+        "workflow failed before it finished keeping the issues. A run without a "
+        "result leaves the problem issues open; a workflow that failed may have "
+        "changed some issues before it stopped. The workflow run's log has the "
+        "details. The next run that reports a result closes this issue.\n\n"
         + no_result_section(reason, context)
         + "\n"
     )

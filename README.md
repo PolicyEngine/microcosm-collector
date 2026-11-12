@@ -1728,7 +1728,9 @@ check, dataset and code, each with the `huggingface-check` label:
   a listed build's files with its manifest. The check's summary entry lists
   the datasets whose `releases.json` check ran to its end. An issue for a
   check that no longer runs (it was switched off for its dataset, or the
-  dataset is no longer checked) stays open until someone closes it.
+  dataset is no longer checked), or for a dataset with a build whose files
+  can never be compared again (its manifest is gone, and build folders never
+  change), stays open until someone closes it.
 
 A run that reports no result opens or updates one issue titled "The check did
 not report a result" instead, and leaves the problem issues as they are,
@@ -1810,10 +1812,19 @@ a dataset, it can be switched on once:
    and no `revision`;
 3. the dataset publishes builds side by side with `releases.json`, and its
    `latest*.json` files are deleted. Before that, the check would report them
-   every day.
+   every day;
+4. every file in each listed build's folder is in that build's `artifacts`
+   map, apart from the manifests and the checksum list. Otherwise the check
+   reports each other file as `FILE_NOT_IN_MANIFEST` every day, in an issue
+   that can't close, because build folders never change.
 
 `policyengine/populace-uk-private` and `policyengine/populace-us` meet the
 second and third since their switches on 2026-11-09 and 2026-11-11.
+`policyengine/populace-us` doesn't meet the fourth yet. Each of its three
+`microcosm-us-2024-local` builds holds six files that its checksum list
+records but its manifest doesn't declare, which the switch copied as they
+were. So either the check must also accept files a build's checksum list
+records, or those builds must stay unchecked.
 
 Then one change sets `checks_releases_record=True` on that dataset's entry.
 `tests/test_releases_record_check.py` tests the check against the real rules,

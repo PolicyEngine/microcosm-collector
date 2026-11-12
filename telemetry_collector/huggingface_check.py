@@ -372,8 +372,9 @@ def run_all_checks(
 
     A dataset's releases.json check finishes when it runs to its end. It
     doesn't when the dataset's token check failed, the rules package is
-    missing, a read failed, or the record is missing or unreadable: then the
-    problems it found before are neither confirmed nor ruled out.
+    missing, a read failed, the record is missing or unreadable, or a listed
+    build's files could not be compared with its manifest: then the problems
+    it found before are neither confirmed nor ruled out.
     """
 
     findings, head_commits = check_token_access(reader, datasets)
