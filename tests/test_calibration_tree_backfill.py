@@ -178,6 +178,8 @@ class Production:
     clock: ManualClock | None = None
     seconds_per_chunk: float = 0.0
     requests: list[httpx.Request] = field(default_factory=list)
+    #: How many of each chunked answer's chunks were read.
+    chunks_read: dict[str, int] = field(default_factory=dict)
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -194,16 +196,18 @@ class Production:
             return httpx.Response(200, content=self.bodies[country])
         if country in self.chunked_bodies:
             return httpx.Response(
-                200, content=self._arriving(self.chunked_bodies[country])
+                200, content=self._arriving(country, self.chunked_bodies[country])
             )
         return httpx.Response(
             200, json=self.manifests.get(country, production_manifest(country, []))
         )
 
-    def _arriving(self, chunks: Sequence[bytes]) -> Iterator[bytes]:
+    def _arriving(self, country: str, chunks: Sequence[bytes]) -> Iterator[bytes]:
+        self.chunks_read[country] = 0
         for chunk in chunks:
             if self.clock is not None:
                 self.clock.now += self.seconds_per_chunk
+            self.chunks_read[country] += 1
             yield chunk
 
     def client(self) -> httpx.Client:
@@ -692,6 +696,9 @@ def test_an_answer_that_takes_too_long_to_arrive_is_an_error_for_that_country_on
     ]
     assert "took longer than" in outcomes[0].reason
     assert outcomes[0].incomplete is True
+    # The clock is checked as each chunk arrives, so reading stops early
+    # rather than after the whole answer.
+    assert production.chunks_read["us"] < len(production.chunked_bodies["us"])
 
 
 @pytest.mark.parametrize(
@@ -1327,6 +1334,35 @@ def test_a_latest_the_publication_does_not_move_is_reported_and_incomplete() -> 
         "made_latest": False,
     }
     assert summary["incomplete"] is True
+
+
+def test_a_stored_build_reports_the_latest_this_run_made_not_the_one_it_read() -> None:
+    # The store's latest is an older build that production also lists;
+    # production's latest is not stored yet, so this run builds it first and
+    # makes it the latest before it reports the older build.
+    previous_store_latest = release_entry("microcosm-us-2024", created_at=EARLIER)
+    latest = release_entry(US_RELEASE, created_at=CREATED_AT)
+    backfill = us_backfill(
+        [previous_store_latest, latest],
+        latest=latest["buildArtifactId"],
+        files={(US_RELEASES, RELEASE_COMMIT): release_folder(US_RELEASE)},
+    )
+    backfill.bun.store = store_manifest(
+        "us",
+        [previous_store_latest],
+        latest=previous_store_latest["buildArtifactId"],
+    )
+
+    outcomes = backfill.run()
+
+    assert outcome_of(outcomes, US_RELEASE).outcome == "built"
+    assert outcome_of(outcomes, US_RELEASE).made_latest is True
+    previous = outcome_of(outcomes, "microcosm-us-2024")
+    assert previous.outcome == "already_stored"
+    # The store's latest is now production's latest, so only one build of the
+    # country says it is the latest.
+    assert previous.made_latest is False
+    assert [outcome.made_latest for outcome in outcomes].count(True) == 1
 
 
 # Comparing with the collector's store -----------------------------------------
