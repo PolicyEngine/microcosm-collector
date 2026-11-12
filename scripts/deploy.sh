@@ -372,8 +372,10 @@ configure_huggingface_check_job() {
   bash "$(dirname "$0")/check-secrets-exist.sh" "$HF_READ_SECRET_NAME"
 
   # The daily check runs as the worker service account, the only identity
-  # allowed to read the token. Cloud Scheduler starts it; a failed execution
-  # is what alerts a person, so it is never retried.
+  # allowed to read the token. The daily workflow
+  # (.github/workflows/huggingface-check.yaml) starts it and reads the
+  # execution's log entries; it is never retried, because a retried attempt's
+  # entries would share the execution and break the count of its problems.
   gcloud run jobs deploy "$HF_CHECK_JOB" \
     --project "$PROJECT_ID" \
     --region "$REGION" \

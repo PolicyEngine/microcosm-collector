@@ -285,14 +285,15 @@ class StandInRecordError(Exception):
     violations: tuple = ()
 
 
-def stand_in_release_rules(check_repository=None) -> SimpleNamespace:
+def stand_in_release_rules(folder_check=None) -> SimpleNamespace:
     """Rules that find nothing wrong with a releases.json listing no releases.
 
     The real rules come from the interface package, which CI doesn't install;
-    these let a releases.json check run to its end without it.
+    these let a releases.json check run to its end without it. ``folder_check``
+    stands in for the interface's check of every listed build's folder.
     """
 
-    return SimpleNamespace(
+    release_rules = SimpleNamespace(
         RELEASES_RECORD_PATH="releases.json",
         RELEASE_MANIFEST_NAME="release_manifest.json",
         ReleaseRecordError=StandInRecordError,
@@ -300,9 +301,10 @@ def stand_in_release_rules(check_repository=None) -> SimpleNamespace:
             parse=lambda content: SimpleNamespace(releases={})
         ),
         is_pointer_file=lambda path: path.rsplit("/", 1)[-1].startswith("latest"),
-        check_repository=check_repository or (lambda record, files, read: []),
         build_folder=lambda release, build: f"releases/{release}/{build}",
     )
+    release_rules.check_repository = folder_check or (lambda record, files, read: [])
+    return release_rules
 
 
 def switched_on_hub(files: dict[str, bytes] | None) -> tuple[FakeHuggingFace, object]:

@@ -1721,24 +1721,34 @@ check, dataset and code, each with the `huggingface-check` label:
 - a run that finds a problem whose issue was closed reopens it, with a
   comment, unless the issue was closed as not planned;
 - a completed run that no longer finds a problem closes its issue, with a
-  comment.
+  comment, but only if that run finished the check that found it: a
+  dataset's `releases.json` check that stopped (at a read error, a missing or
+  unreadable record, a failed token check, or without the rules package)
+  leaves its issues as they are. The check's summary entry lists the datasets
+  whose `releases.json` check ran to its end.
 
 A run that reports no result opens or updates one issue titled "The check did
 not report a result" instead, and leaves the problem issues as they are,
 since what they report is then unknown. That covers a job that could not
 start, failed before writing its summary entry, did not finish within 45
 minutes or could not read its token setting, and entries that could not be
-read, or fewer problem entries than the summary counts. The next run that
-reports a result closes it. GitHub notifies the repo's watchers of each
-new issue, and the workflow run's summary lists what each run did.
+read, or fewer problem entries than the summary counts. A run that fails
+before the command reports (it could not authenticate, a setting is missing,
+or a step failed or ran out of time) is reported the same way by the
+workflow's last step, which needs only GitHub's own token. This issue reopens
+even if someone closed it as not planned. The next run that reports a result
+closes it. GitHub notifies the repo's watchers of each new issue, and the
+workflow run's summary lists what each run did.
 
 A run by hand ("Run workflow" on the Actions tab) is a dry run unless its
 `dry_run` box is cleared: it runs the check and reports what it would change,
 without changing any issue. The repo is public, so no issue names the
 project, region, job, execution or account, and the workflow passes those as
-secrets, which GitHub hides in its log. If GitHub stops starting the schedule,
-nothing reports it: GitHub disables scheduled workflows in a public
-repo after 60 days without activity in it.
+secrets, which GitHub hides in its log. (The production deploy's log already
+shows the project, region and job name, which are variables there.) If GitHub
+stops starting the schedule, nothing reports it: GitHub disables scheduled
+workflows in a public repo after 60 days without activity in it, and emails a
+failed scheduled run only to whoever last changed its schedule.
 
 **Deployment.** The production deploy runs
 `scripts/deploy.sh configure-huggingface-check-job` before it changes the
@@ -1774,6 +1784,12 @@ secrets, GitHub hides their values in the workflow's public log:
 
 The workflow's account trusts only that pool, and the deployment account
 does not trust it, so the deploy's access is unchanged ("Google Cloud access").
+The deploy's own provider must check the environment before the workflow
+first runs, with the condition
+`assertion.repository=='PolicyEngine/microcosm-collector' && assertion.ref=='refs/heads/main' && assertion.environment in ['staging', 'production']`.
+Without that clause, the check job's token would also pass the deploy's
+provider, and the deployment account trusts every token of this repo that it
+accepts.
 The environment, its secrets, the pool, the account and its access are created
 once by hand; the deploy does not change them. The workflow's `GITHUB_TOKEN` opens and
 changes the issues, so it needs no other GitHub credential.
@@ -1929,10 +1945,11 @@ the two.
 The daily Hugging Face check's job also requests an OIDC token, in the
 `huggingface-check` environment. It authenticates through a Workload Identity
 pool and provider of its own, whose condition accepts only this repo's `main`
-in that environment, and acts as an account that trusts only that pool. This
-provider refuses its token, and the deployment account does not trust its
-pool, so it cannot act as the deployment account ("Daily Hugging Face
-check").
+in that environment, and acts as an account that trusts only that pool. Once
+this provider checks the environment, as above, it refuses that token, and
+the deployment account does not trust the check's pool, so the check cannot
+act as the deployment account. That clause must be in place before the
+check's workflow first runs ("Daily Hugging Face check").
 
 Both deployment jobs also require
 `github.event_name == 'push' && github.ref == 'refs/heads/main'`. The Push

@@ -1154,11 +1154,14 @@ resources once, in the new project, and needs nothing in the current project.
    holding that environment's own token and readable only by the account
    that environment's worker job runs as, which reads it as
    `COLLECTOR_HF_READ_TOKEN`. For
-   S2: production's check job, its Cloud Scheduler job and the account it
-   starts the job as, a notification channel and two Cloud Monitoring alert
-   policies, and its production variables (`TELEMETRY_WORKER_SERVICE_ACCOUNT`,
-   `TELEMETRY_HF_CHECK_JOB`, `TELEMETRY_HF_READ_SECRET_NAME`). Enable
-   `cloudscheduler.googleapis.com` and `monitoring.googleapis.com`.
+   S2: production's check job and its production variables
+   (`TELEMETRY_WORKER_SERVICE_ACCOUNT`, `TELEMETRY_HF_CHECK_JOB`,
+   `TELEMETRY_HF_READ_SECRET_NAME`); and for the daily workflow that starts
+   it, the `huggingface-check` environment and its five secrets, the check's
+   own Workload Identity pool and provider, and the account the workflow acts
+   as, with its access to the job and the project's logs (the README's "Daily
+   Hugging Face check"). The deploy's provider must check the environment
+   first (step 4.2).
 2. **Switching intake on.** Everything in the README's "Artifact intake"
    section: the bucket, the Cloud Tasks queue, the worker and recovery jobs,
    the recovery job's schedule, the accounts and permissions, and the

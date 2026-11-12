@@ -285,8 +285,8 @@ jobs:
       # deployments act as: the deploy grants it the Cloud Run Invoker role
       # on the Orrery read service, and no revision or job gets it.
       ORRERY_READER_SERVICE_ACCOUNT: ${{ vars.TELEMETRY_ORRERY_READER_SERVICE_ACCOUNT }}
-      # Only production runs the daily Hugging Face check: one schedule, and
-      # one set of alerts.
+      # Only production has the daily Hugging Face check job, which the daily
+      # workflow starts (.github/workflows/huggingface-check.yaml).
       HF_CHECK_JOB: ${{ vars.TELEMETRY_HF_CHECK_JOB }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

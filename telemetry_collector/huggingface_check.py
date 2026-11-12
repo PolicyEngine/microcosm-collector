@@ -190,16 +190,31 @@ def check_releases_record(
 ) -> list[Finding]:
     """Every releases.json rule for one dataset, read at ``revision``."""
 
+    findings, _ = _releases_record_outcome(reader, dataset, revision, release_rules)
+    return findings
+
+
+def _releases_record_outcome(
+    reader: HuggingFaceReader,
+    dataset: str,
+    revision: str,
+    release_rules: ModuleType,
+) -> tuple[list[Finding], bool]:
+    """The check's findings, and whether it ran to its end without stopping."""
+
     findings: list[Finding] = []
 
     def report(code: str, message: str) -> None:
         findings.append(Finding(dataset, RELEASES_RECORD_CHECK, code, message))
 
     try:
-        _check_releases_record(reader, dataset, revision, release_rules, report)
+        finished = _check_releases_record(
+            reader, dataset, revision, release_rules, report
+        )
     except HuggingFaceReadError as error:
         report(_read_error_code(error), str(error))
-    return findings
+        finished = False
+    return findings, finished
 
 
 def _check_releases_record(
@@ -208,7 +223,9 @@ def _check_releases_record(
     revision: str,
     release_rules: ModuleType,
     report: Callable[[str, str], None],
-) -> None:
+) -> bool:
+    """Report every violation; True only when the check ran to its end."""
+
     files = {listed.path: listed for listed in reader.list_files(dataset, revision)}
     record_path = release_rules.RELEASES_RECORD_PATH
     for path in sorted(files):
@@ -226,7 +243,7 @@ def _check_releases_record(
             )
     if record_path not in files:
         report("RECORD_MISSING", f"{dataset} has no {record_path} at its root.")
-        return
+        return False
 
     manifests: dict[str, bytes] = {}
 
@@ -242,7 +259,7 @@ def _check_releases_record(
     except release_rules.ReleaseRecordError as error:
         for violation in error.violations:
             report(violation.code, violation.message)
-        return
+        return False
     for violation in release_rules.check_repository(
         record, list(files), read_record_or_manifest
     ):
@@ -259,6 +276,7 @@ def _check_releases_record(
                 read_record_or_manifest,
                 report,
             )
+    return True
 
 
 def _check_build_files(
@@ -325,34 +343,9 @@ def run_checks(
 ) -> list[Finding]:
     """Every check, for every dataset; an empty list means all passed."""
 
-    findings, head_commits = check_token_access(reader, datasets)
-    record_datasets = [
-        dataset for dataset in datasets if dataset.checks_releases_record
-    ]
-    if not record_datasets:
-        return findings
-    try:
-        release_rules = release_rules_loader()
-    except ReleaseRulesUnavailableError as error:
-        findings.extend(
-            Finding(
-                dataset.name,
-                RELEASES_RECORD_CHECK,
-                "RELEASE_RULES_UNAVAILABLE",
-                str(error),
-            )
-            for dataset in record_datasets
-        )
-        return findings
-    for dataset in record_datasets:
-        # The token check has already reported a dataset that did not answer.
-        if dataset.name in head_commits:
-            findings.extend(
-                check_releases_record(
-                    reader, dataset.name, head_commits[dataset.name], release_rules
-                )
-            )
-    return findings
+    return run_all_checks(
+        reader, datasets, release_rules_loader=release_rules_loader
+    ).findings
 
 
 @dataclass(frozen=True)
@@ -369,10 +362,45 @@ def run_all_checks(
     *,
     release_rules_loader: Callable[[], ModuleType] = load_release_rules,
 ) -> CheckOutcome:
-    """Not implemented yet: reports no releases.json check as finished."""
+    """Every check for every dataset, and which releases.json checks finished.
 
-    findings = run_checks(reader, datasets, release_rules_loader=release_rules_loader)
-    return CheckOutcome(findings, ())
+    A dataset's releases.json check finishes when it runs to its end. It
+    doesn't when the dataset's token check failed, the rules package is
+    missing, a read failed, or the record is missing or unreadable: then the
+    problems it found before are neither confirmed nor ruled out.
+    """
+
+    findings, head_commits = check_token_access(reader, datasets)
+    record_datasets = [
+        dataset for dataset in datasets if dataset.checks_releases_record
+    ]
+    if not record_datasets:
+        return CheckOutcome(findings, ())
+    try:
+        release_rules = release_rules_loader()
+    except ReleaseRulesUnavailableError as error:
+        findings.extend(
+            Finding(
+                dataset.name,
+                RELEASES_RECORD_CHECK,
+                "RELEASE_RULES_UNAVAILABLE",
+                str(error),
+            )
+            for dataset in record_datasets
+        )
+        return CheckOutcome(findings, ())
+    completed: list[str] = []
+    for dataset in record_datasets:
+        # The token check has already reported a dataset that did not answer.
+        if dataset.name not in head_commits:
+            continue
+        record_findings, finished = _releases_record_outcome(
+            reader, dataset.name, head_commits[dataset.name], release_rules
+        )
+        findings.extend(record_findings)
+        if finished:
+            completed.append(dataset.name)
+    return CheckOutcome(findings, tuple(completed))
 
 
 def _write(output: IO[str], entry: Mapping[str, Any]) -> None:
@@ -399,7 +427,8 @@ def main(
         )
         return CONFIGURATION_EXIT_CODE
     with reader:
-        findings = run_checks(reader, datasets)
+        outcome = run_all_checks(reader, datasets)
+    findings = outcome.findings
     for finding in findings:
         _write(log, finding.log_entry())
     record_datasets = [
@@ -419,6 +448,9 @@ def main(
             "message": message,
             "checked_datasets": [dataset.name for dataset in datasets],
             "releases_record_checked": record_datasets,
+            # The datasets whose releases.json check ran to its end, so that
+            # a problem it no longer reports is known to be gone.
+            "releases_record_completed": list(outcome.releases_record_completed),
             "problems": len(findings),
         },
     )

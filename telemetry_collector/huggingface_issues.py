@@ -2,7 +2,8 @@
 
 ``.github/workflows/huggingface-check.yaml`` runs this once a day, and by hand,
 in the ``huggingface-check`` environment, after authenticating to Google Cloud
-as an account that may only start the check job and read its logs. It:
+as an account that may only start and follow the check job and read the
+project's logs. It:
 
 1. starts an execution of the check job, which runs
    ``python -m telemetry_collector.huggingface_check`` and which the production
@@ -20,7 +21,8 @@ A run that reports no result (the job couldn't start, failed before writing its
 summary, didn't finish in time, couldn't read its token setting, or its entries
 couldn't be read) opens or updates one "did not report a result" issue and
 leaves the problem issues as they are, since what they report is then unknown.
-The next run that reports a result closes it.
+The next run that reports a result closes it. The workflow's last step
+reports a run that failed before this command could, with ``--workflow-failed``.
 
 The repo is public, so no issue names the project, region, job, execution
 or account, and the workflow's log hides them: the workflow passes them as
@@ -34,6 +36,7 @@ without changing any.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -45,11 +48,15 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from http import HTTPStatus
-from typing import IO, Any, Final
+from typing import IO, Any, Final, Protocol
 
 import httpx
 
-from telemetry_collector.huggingface_check import CONFIGURATION_CHECK
+from telemetry_collector.huggingface_check import (
+    CONFIGURATION_CHECK,
+    RELEASES_RECORD_CHECK,
+    TOKEN_CHECK,
+)
 
 LABEL: Final = "huggingface-check"
 LABEL_COLOR: Final = "d93f0b"
@@ -60,7 +67,8 @@ BOT_LOGIN: Final = "github-actions[bot]"
 NO_RESULT_KEY: Final = "no-result"
 NO_RESULT_TITLE: Final = f"{TITLE_PREFIX} The check did not report a result"
 WORKFLOW_FAILED_REASON: Final = (
-    "The workflow failed before the check reported a result."
+    "The workflow failed before the check reported a result: it could not "
+    "authenticate, a setting was missing, or a step failed or ran out of time."
 )
 STATE_PATTERN: Final = re.compile(r"<!-- huggingface-check:state (\{[^\n]*?\}) -->")
 SECTION_START: Final = "<!-- huggingface-check:start -->"
@@ -74,6 +82,8 @@ MAX_MESSAGE_LENGTH: Final = 500
 #: start and for Cloud Run to record the result.
 EXECUTION_TIMEOUT_SECONDS: Final = 45 * 60
 EXECUTION_POLL_SECONDS: Final = 30
+#: Each gcloud call gets this long before it counts as failed.
+GCLOUD_TIMEOUT_SECONDS: Final = 5 * 60
 #: Cloud Logging can show an execution's entries a little after it finishes.
 LOG_READ_ATTEMPTS: Final = 10
 LOG_READ_INTERVAL_SECONDS: Final = 30
@@ -85,6 +95,8 @@ REQUIRED_SETTINGS: Final = (
     "GITHUB_TOKEN",
     "GITHUB_REPO",
 )
+#: What the workflow's last step needs to report a run that failed early.
+REQUIRED_FAILURE_SETTINGS: Final = ("GITHUB_TOKEN", "GITHUB_REPO")
 REOPENABLE_CLOSE_REASONS: Final = frozenset({None, "completed"})
 
 GITHUB_API: Final = "https://api.github.com"
@@ -187,10 +199,16 @@ def _is_configuration_failure(entry: Mapping[str, Any]) -> bool:
     return entry.get("check") == CONFIGURATION_CHECK
 
 
-def _has_result(entries: Iterable[Mapping[str, Any]]) -> bool:
-    return any(
-        _is_summary(entry) or _is_configuration_failure(entry) for entry in entries
-    )
+def _settled(entries: Sequence[Mapping[str, Any]]) -> bool:
+    """Whether the entries read so far are the execution's final answer.
+
+    Problem entries can show up after the summary, so a count that doesn't
+    match yet is read again.
+    """
+
+    if any(_is_configuration_failure(entry) for entry in entries):
+        return True
+    return parse_report(entries).completed
 
 
 def parse_report(entries: Iterable[Mapping[str, Any]]) -> Report:
@@ -234,11 +252,21 @@ def parse_report(entries: Iterable[Mapping[str, Any]]) -> Report:
             f"The check counted {counted} problems, but {problem_entries} problem "
             "entries could be read.",
         )
+    completed_checks = {
+        (TOKEN_CHECK, dataset)
+        for dataset in summary.get("checked_datasets") or ()
+        if isinstance(dataset, str)
+    } | {
+        (RELEASES_RECORD_CHECK, dataset)
+        for dataset in summary.get("releases_record_completed") or ()
+        if isinstance(dataset, str)
+    }
     return Report(
         tuple(
             Problem(check, dataset, code, tuple(found))
             for (check, dataset, code), found in sorted(messages.items())
-        )
+        ),
+        completed_checks=frozenset(completed_checks),
     )
 
 
@@ -248,9 +276,17 @@ def parse_report(entries: Iterable[Mapping[str, Any]]) -> Report:
 def gcloud_command(arguments: Sequence[str]) -> str:
     """Run gcloud and return its output; its errors go to the masked log."""
 
-    completed = subprocess.run(
-        ["gcloud", *arguments], capture_output=True, text=True, check=False
-    )
+    try:
+        completed = subprocess.run(
+            ["gcloud", *arguments],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=GCLOUD_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        msg = f"gcloud {' '.join(arguments[:3])} did not finish in time"
+        raise GcloudError(msg) from error
     if completed.returncode != 0:
         sys.stderr.write(completed.stderr)
         msg = f"gcloud {' '.join(arguments[:3])} exited with {completed.returncode}"
@@ -350,7 +386,8 @@ def _read_entries(
                         "--project",
                         job.project,
                         "--format=json",
-                        "--order=asc",
+                        # gcloud applies --freshness only to descending reads.
+                        "--order=desc",
                         "--freshness=1d",
                     ]
                 )
@@ -362,10 +399,10 @@ def _read_entries(
         # Cloud Logging lifts a JSON line's severity out of its payload.
         payloads = [
             {**entry["jsonPayload"], "severity": entry.get("severity")}
-            for entry in entries
+            for entry in reversed(entries)
             if isinstance(entry, dict) and isinstance(entry.get("jsonPayload"), dict)
         ]
-        if _has_result(payloads):
+        if _settled(payloads):
             return payloads
         if attempt + 1 < LOG_READ_ATTEMPTS:
             sleep(LOG_READ_INTERVAL_SECONDS)
@@ -461,10 +498,12 @@ class GitHubClient:
         self._clock = clock
         self._last_write: float | None = None
 
-    def list_issues(
-        self, creator: str, label: str | None = None
-    ) -> list[dict[str, Any]]:
-        """Return the open and closed issues ``creator`` opened with ``label``."""
+    def list_issues(self, creator: str) -> list[dict[str, Any]]:
+        """Return the open and closed issues ``creator`` opened.
+
+        Not filtered by label: someone may remove it, and the state comment in
+        each body is what identifies an issue.
+        """
 
         issues: list[dict[str, Any]] = []
         page = 1
@@ -475,7 +514,6 @@ class GitHubClient:
                 params={
                     "state": "all",
                     "creator": creator,
-                    **({"labels": label} if label else {}),
                     "per_page": GITHUB_PAGE_SIZE,
                     "page": page,
                 },
@@ -569,8 +607,13 @@ def _run_reference(context: RunContext) -> str:
     return f"{when} ([workflow run]({context.run_url}))" if context.run_url else when
 
 
-def _state(key: str, context: RunContext) -> str:
-    state = {"key": key, "seen_at": context.started_at.astimezone(UTC).isoformat()}
+def _state(key: str, context: RunContext, problem: Problem | None = None) -> str:
+    state: dict[str, str] = {
+        "key": key,
+        "seen_at": context.started_at.astimezone(UTC).isoformat(),
+    }
+    if problem is not None:
+        state.update(check=problem.check, dataset=problem.dataset)
     return f"<!-- huggingface-check:state {json.dumps(state, sort_keys=True)} -->"
 
 
@@ -612,7 +655,7 @@ def problem_section(problem: Problem, context: RunContext) -> str:
         "What the check logged:",
         "",
         *_quoted(problem.messages),
-        _state(problem.key, context),
+        _state(problem.key, context, problem),
         SECTION_END,
     ]
     return "\n".join(lines)
@@ -657,10 +700,43 @@ def replace_section(body: str, section: str) -> str:
     return f"{kept}\n\n{section}\n" if kept else f"{section}\n"
 
 
+class IssueStore(Protocol):
+    """What the sync needs from GitHub: ``GitHubClient``, or a test's stand-in."""
+
+    def list_issues(self, creator: str) -> list[dict[str, Any]]: ...
+
+    def list_labels(self) -> set[str]: ...
+
+    def create_label(self, name: str, color: str, description: str) -> None: ...
+
+    def create_issue(
+        self, title: str, body: str, labels: list[str]
+    ) -> dict[str, Any]: ...
+
+    def update_issue(self, number: int, fields: Mapping[str, object]) -> None: ...
+
+    def add_comment(self, number: int, body: str) -> None: ...
+
+
+def _checked_pair(key: str, issue: Mapping[str, Any]) -> tuple[str, str] | None:
+    """The check and dataset an issue is about, from its state comment."""
+
+    state = _issue_state(issue) or {}
+    check, dataset = state.get("check"), state.get("dataset")
+    if isinstance(check, str) and isinstance(dataset, str):
+        return check, dataset
+    # A key is check/dataset/code, and a dataset name has a slash of its own.
+    head, _, _ = key.rpartition("/")
+    check, _, dataset = head.partition("/")
+    return (check, dataset) if check and dataset else None
+
+
 class IssueSync:
     """Keeps one issue per problem, and one for a run with no result."""
 
-    def __init__(self, github: Any, context: RunContext, *, dry_run: bool) -> None:
+    def __init__(
+        self, github: IssueStore, context: RunContext, *, dry_run: bool
+    ) -> None:
         self._github = github
         self._context = context
         self._dry_run = dry_run
@@ -690,16 +766,24 @@ class IssueSync:
                     self._keep(issue, key, section, "found this problem again")
                 )
         for key, issue in sorted(issues.items()):
-            if key not in found and issue.get("state") == "open":
-                self._close(issue["number"])
-                actions.append(SyncAction(key, "closed", issue["number"]))
+            if key in found or issue.get("state") != "open":
+                continue
+            # A problem is gone only if this run finished the check that
+            # found it: a stopped releases.json check settles nothing.
+            if key != NO_RESULT_KEY and (
+                _checked_pair(key, issue) not in report.completed_checks
+            ):
+                actions.append(SyncAction(key, "not-checked", issue["number"]))
+                continue
+            self._close(issue["number"])
+            actions.append(SyncAction(key, "closed", issue["number"]))
         return actions
 
     def _issues_by_key(self) -> dict[str, Mapping[str, Any]]:
         """Index the workflow's issues by key, preferring open, then newest."""
 
         index: dict[str, Mapping[str, Any]] = {}
-        for issue in self._github.list_issues(BOT_LOGIN, LABEL):
+        for issue in self._github.list_issues(BOT_LOGIN):
             if (issue.get("user") or {}).get("login") != BOT_LOGIN:
                 continue
             state = _issue_state(issue)
@@ -722,10 +806,24 @@ class IssueSync:
             number = self._open(NO_RESULT_TITLE, no_result_body(reason, self._context))
             return SyncAction(NO_RESULT_KEY, "opened", number)
         section = no_result_section(reason, self._context)
-        return self._keep(issue, NO_RESULT_KEY, section, "reported no result again")
+        # Unlike a problem, a run without a result is always worth knowing
+        # about, so this issue reopens even if it was closed as not planned.
+        return self._keep(
+            issue,
+            NO_RESULT_KEY,
+            section,
+            "reported no result again",
+            any_close_reason=True,
+        )
 
     def _keep(
-        self, issue: Mapping[str, Any], key: str, section: str, again: str
+        self,
+        issue: Mapping[str, Any],
+        key: str,
+        section: str,
+        again: str,
+        *,
+        any_close_reason: bool = False,
     ) -> SyncAction:
         number = issue["number"]
         body = replace_section(issue.get("body") or "", section)
@@ -733,7 +831,10 @@ class IssueSync:
             if not self._dry_run:
                 self._github.update_issue(number, {"body": body})
             return SyncAction(key, "updated", number)
-        if issue.get("state_reason") not in REOPENABLE_CLOSE_REASONS:
+        if (
+            not any_close_reason
+            and issue.get("state_reason") not in REOPENABLE_CLOSE_REASONS
+        ):
             return SyncAction(key, "kept-closed", number)
         if not self._dry_run:
             self._github.update_issue(
@@ -799,12 +900,30 @@ def render_summary(
     return "\n".join(lines) + "\n"
 
 
-def _settings(environment: Mapping[str, str]) -> dict[str, str]:
-    missing = [name for name in REQUIRED_SETTINGS if not environment.get(name)]
+def _settings(
+    environment: Mapping[str, str], required: Sequence[str]
+) -> dict[str, str]:
+    missing = [name for name in required if not environment.get(name)]
     if missing:
         msg = f"Missing settings: {' '.join(missing)}"
         raise SettingsError(msg)
-    return {name: environment[name] for name in REQUIRED_SETTINGS}
+    return {name: environment[name] for name in required}
+
+
+def _parse_arguments(arguments: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="python -m telemetry_collector.huggingface_issues",
+        description="Run the daily Hugging Face check and keep its issues.",
+    )
+    parser.add_argument(
+        "--workflow-failed",
+        action="store_true",
+        help=(
+            "Report, as a run without a result, that an earlier step of the "
+            "workflow failed; needs only GITHUB_TOKEN and GITHUB_REPO."
+        ),
+    )
+    return parser.parse_args(list(arguments))
 
 
 def main(
@@ -812,7 +931,7 @@ def main(
     *,
     arguments: Sequence[str] | None = None,
     gcloud: Gcloud | None = None,
-    github: Any = None,
+    github: IssueStore | None = None,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
     now: Callable[[], datetime] | None = None,
@@ -824,16 +943,20 @@ def main(
     environment = os.environ if environment is None else environment
     output = output or sys.stdout
     errors = errors or sys.stderr
+    options = _parse_arguments(sys.argv[1:] if arguments is None else arguments)
+    required = (
+        REQUIRED_FAILURE_SETTINGS if options.workflow_failed else REQUIRED_SETTINGS
+    )
+    if environment.get("GITHUB_ACTIONS") == "true":
+        for name in ("PROJECT_ID", "REGION", "HF_CHECK_JOB"):
+            if environment.get(name):
+                print(f"::add-mask::{environment[name]}", file=output)
+        output.flush()
     try:
-        settings = _settings(environment)
+        settings = _settings(environment, required)
     except SettingsError as error:
         print(error, file=errors)
         return SETTINGS_EXIT_CODE
-    job = CheckJob(settings["PROJECT_ID"], settings["REGION"], settings["HF_CHECK_JOB"])
-    if environment.get("GITHUB_ACTIONS") == "true":
-        for value in (job.project, job.region, job.name):
-            print(f"::add-mask::{value}", file=output)
-        output.flush()
     run_url = None
     if environment.get("GITHUB_SERVER_URL") and environment.get("GITHUB_RUN_ID"):
         run_url = (
@@ -843,7 +966,13 @@ def main(
     context = RunContext((now or (lambda: datetime.now(UTC)))(), run_url)
     dry_run = environment.get("DRY_RUN") == "true"
 
-    report = run_check(gcloud or gcloud_command, job, sleep=sleep, clock=clock)
+    if options.workflow_failed:
+        report = Report(None, WORKFLOW_FAILED_REASON)
+    else:
+        job = CheckJob(
+            settings["PROJECT_ID"], settings["REGION"], settings["HF_CHECK_JOB"]
+        )
+        report = run_check(gcloud or gcloud_command, job, sleep=sleep, clock=clock)
     client = github or GitHubClient(
         settings["GITHUB_REPO"], settings["GITHUB_TOKEN"], sleep=sleep
     )

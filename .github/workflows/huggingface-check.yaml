@@ -25,11 +25,14 @@ jobs:
     if: github.repository == 'PolicyEngine/microcosm-collector' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     # Deployments to this environment are limited to main. Its secrets name the
-    # Workload Identity provider, the account that may only start the check job
-    # and read its logs, and the job's project, region and name: as secrets,
-    # GitHub hides each of them in this public log.
+    # provider of the check's own Workload Identity pool, the account that may
+    # only start and follow the check job and read the project's logs, and the
+    # job's project, region and name: as secrets, GitHub hides each of them in
+    # this public log.
     environment: huggingface-check
-    # The check job's task times out after 30 minutes.
+    # The command waits up to 45 minutes for the execution, then reads its log
+    # up to ten times, 30 seconds apart; its step stops at 55 minutes, which
+    # leaves the last step time to report a hang.
     timeout-minutes: 60
     permissions:
       contents: read
@@ -55,6 +58,18 @@ jobs:
 
       - name: Run the check and sync its issues
         run: uv run --frozen --no-dev python -m telemetry_collector.huggingface_issues
+        timeout-minutes: 55
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPO: ${{ github.repository }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+
+      # A failed authentication, a missing setting or a hang stops the run
+      # before the check reports: open or update the issue for a run without
+      # a result, with only GitHub's own token.
+      - name: Report a run that failed before the check reported
+        if: failure()
+        run: uv run --frozen --no-dev python -m telemetry_collector.huggingface_issues --workflow-failed
         env:
           GITHUB_TOKEN: ${{ github.token }}
           GITHUB_REPO: ${{ github.repository }}
