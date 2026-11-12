@@ -713,20 +713,133 @@ def check_submitted_record(plan: LatestMovePlan, content: bytes) -> None:
         )
 
 
-def _latest_unchanged(
-    current_build: str | None, reason: str, message: str | None = None
-) -> dict[str, Any]:
-    result: dict[str, Any] = {
-        "processed_by": LATEST_HANDLER,
-        "current_build": current_build,
-        "build_artifact_id": None,
-        "made_latest": False,
-        "latest_moved": False,
-        "latest_unchanged": reason,
-    }
-    if message is not None:
-        result["latest_unchanged_reason"] = message
-    return result
+@dataclass(frozen=True)
+class FollowedLatest:
+    """What following a country's ``releases.json`` did to its latest tree."""
+
+    country: str
+    #: The default release's current build at the repo's head, as
+    #: ``<release>/<build>``, or ``None`` when releases.json named none.
+    current_build: str | None
+    #: The tree recorded for ``current_build``, when there is one.
+    build_artifact_id: str | None
+    #: Whether the country's latest is now ``current_build``'s tree.
+    made_latest: bool
+    #: Whether this changed the latest.
+    latest_moved: bool
+    #: Why the latest was left as it was: ``no_releases_record``,
+    #: ``releases_record_refused``, ``no_current_build`` or ``no_recorded_tree``.
+    unchanged: str | None = None
+    #: The refusal or the latest command's message, for the last two.
+    unchanged_reason: str | None = None
+
+    def result(self) -> dict[str, Any]:
+        """The fields a job's result records."""
+
+        result: dict[str, Any] = {
+            "current_build": self.current_build,
+            "build_artifact_id": self.build_artifact_id,
+            "made_latest": self.made_latest,
+            "latest_moved": self.latest_moved,
+        }
+        if self.unchanged is not None:
+            result["latest_unchanged"] = self.unchanged
+        if self.unchanged_reason is not None:
+            result["latest_unchanged_reason"] = self.unchanged_reason
+        return result
+
+
+def follow_releases_record(
+    country: str,
+    *,
+    blob_token: str,
+    manifest_lock: ManifestLock,
+    reader: HuggingFaceReader,
+    bun: str = "bun",
+    run_command: CommandRunner = run_bun,
+) -> FollowedLatest:
+    """Point ``country``'s latest tree at its releases.json's current build.
+
+    Nothing is built. Under the manifest lock, which this takes itself (so its
+    caller must not hold it), it reads releases.json at the head of the
+    country's release repo and runs the package's latest command for the
+    default release's current build there, newer or older than the current
+    latest. The ``releases-record`` handler calls it, and so can any other
+    collector job, such as one that has just built or backfilled trees.
+
+    Raises ``ValueError`` for a country the collector does not list, before
+    reading anything. A failed read raises ``HuggingFaceReadError`` and a
+    failed latest command ``CalibrationTreeCommandError``; calling again may
+    succeed. Everything else is in the answer: what moved, or why the latest
+    stayed.
+    """
+
+    if country not in RELEASE_REPOS:
+        raise ValueError(f"{country} is not a country the collector lists.")
+
+    def unchanged(
+        reason: str, *, current_build: str | None = None, message: str | None = None
+    ) -> FollowedLatest:
+        return FollowedLatest(
+            country=country,
+            current_build=current_build,
+            build_artifact_id=None,
+            made_latest=False,
+            latest_moved=False,
+            unchanged=reason,
+            unchanged_reason=message,
+        )
+
+    with tempfile.TemporaryDirectory(prefix="calibration-tree-latest-") as directory:
+        request_path = Path(directory) / "latest.json"
+        with manifest_lock():
+            head_record = read_head_releases_record(reader, RELEASE_REPOS[country])
+            if head_record is None:
+                return unchanged("no_releases_record")
+            try:
+                current_build = current_default_build(head_record)
+            except ReleasesRecordRefusedError as error:
+                return unchanged(
+                    "releases_record_refused", message=shortened_message(str(error))
+                )
+            if current_build is None:
+                return unchanged("no_current_build")
+            request_path.write_text(
+                json.dumps({"country": country, "releaseId": current_build}),
+                encoding="utf-8",
+            )
+            moved = run_command(
+                [bun, "run", str(LATEST_SCRIPT), str(request_path)],
+                _publication_environment(blob_token),
+                LATEST_TIMEOUT_SECONDS,
+            )
+        if moved.returncode == EXIT_NOT_RECORDED:
+            return unchanged(
+                "no_recorded_tree",
+                current_build=current_build,
+                message=shortened_message(moved.stderr),
+            )
+        if moved.returncode != 0:
+            raise CalibrationTreeCommandError(
+                f"The tree latest command exited with {moved.returncode}: "
+                f"{shortened_message(moved.stderr)}"
+            )
+        answer = _answer(moved, "latest command")
+    if (
+        answer.get("releaseId") != current_build
+        or not isinstance(answer.get("buildArtifactId"), str)
+        or not isinstance(answer.get("moved"), bool)
+    ):
+        raise CalibrationTreeCommandError(
+            f"The tree latest command's answer does not describe {current_build}."
+        )
+    return FollowedLatest(
+        country=country,
+        current_build=current_build,
+        build_artifact_id=answer["buildArtifactId"],
+        made_latest=True,
+        latest_moved=answer["moved"],
+    )
 
 
 def calibration_tree_latest_handler(
@@ -739,17 +852,17 @@ def calibration_tree_latest_handler(
 ) -> JobHandler:
     """The ``releases-record`` handler, writing the manifest with ``blob_token``.
 
-    It acts on ``releases.json`` at the repo's head, read under the manifest
-    lock, not on the submitted copy, so a later change is never undone by an
-    earlier one's submission. The latest is left as it is, and the result
-    says why (``latest_unchanged``), when the head has no ``releases.json``,
-    one the rules refuse, no current build of its default release, or a
-    current build without a recorded tree, which its own submission's
-    publication makes the latest once it reads this change. A failed read or
-    a failed latest command fails the attempt, so it runs again.
+    After checking the submission (``plan_latest_move``,
+    ``check_submitted_record``) it follows releases.json at the repo's head,
+    read under the manifest lock, not the submitted copy, so a later change is
+    never undone by an earlier one's submission (``follow_releases_record``).
+    The latest is left as it is, and the result says why
+    (``latest_unchanged``), when the head has no releases.json, one the rules
+    refuse, no current build of its default release, or a current build
+    without a recorded tree, which its own submission's publication makes the
+    latest once it reads this change. A failed read or a failed latest command
+    fails the attempt, so it runs again.
     """
-
-    publication_environment = _publication_environment(blob_token)
 
     def move_latest(context: JobContext) -> dict[str, Any]:
         plan = plan_latest_move(context.submission)
@@ -761,54 +874,15 @@ def calibration_tree_latest_handler(
             }
         [record_file] = context.files("releases_record")
         check_submitted_record(plan, b"".join(context.read_chunks(record_file["name"])))
-        with tempfile.TemporaryDirectory(
-            prefix="calibration-tree-latest-"
-        ) as directory:
-            request_path = Path(directory) / "latest.json"
-            with manifest_lock():
-                head_record = read_head_releases_record(reader, plan.hf_repo)
-                if head_record is None:
-                    return _latest_unchanged(None, "no_releases_record")
-                try:
-                    current_build = current_default_build(head_record)
-                except ReleasesRecordRefusedError as error:
-                    return _latest_unchanged(
-                        None, "releases_record_refused", shortened_message(str(error))
-                    )
-                if current_build is None:
-                    return _latest_unchanged(None, "no_current_build")
-                request_path.write_text(
-                    json.dumps({"country": plan.country, "releaseId": current_build}),
-                    encoding="utf-8",
-                )
-                moved = run_command(
-                    [bun, "run", str(LATEST_SCRIPT), str(request_path)],
-                    publication_environment,
-                    LATEST_TIMEOUT_SECONDS,
-                )
-            if moved.returncode == EXIT_NOT_RECORDED:
-                return _latest_unchanged(
-                    current_build, "no_recorded_tree", shortened_message(moved.stderr)
-                )
-            if moved.returncode != 0:
-                raise CalibrationTreeCommandError(
-                    f"The tree latest command exited with {moved.returncode}: "
-                    f"{shortened_message(moved.stderr)}"
-                )
-            answer = _answer(moved, "latest command")
-        if answer.get("releaseId") != current_build or not isinstance(
-            answer.get("moved"), bool
-        ):
-            raise CalibrationTreeCommandError(
-                f"The tree latest command's answer does not describe {current_build}."
-            )
-        return {
-            "processed_by": LATEST_HANDLER,
-            "current_build": current_build,
-            "build_artifact_id": answer["buildArtifactId"],
-            "made_latest": True,
-            "latest_moved": answer["moved"],
-        }
+        followed = follow_releases_record(
+            plan.country,
+            blob_token=blob_token,
+            manifest_lock=manifest_lock,
+            reader=reader,
+            bun=bun,
+            run_command=run_command,
+        )
+        return {"processed_by": LATEST_HANDLER, **followed.result()}
 
     return move_latest
 

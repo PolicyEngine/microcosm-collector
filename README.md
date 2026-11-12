@@ -1579,6 +1579,14 @@ for every country the collector lists:
    (`no_recorded_tree`). A failed read or any other failure of the latest
    command fails the attempt, so it runs again.
 
+Step 2 is `calibration_trees.follow_releases_record(country, ...)`, which
+builds nothing and takes the lock itself, so another collector job can call
+it too, for example to set each country's latest to its `releases.json` once
+it has built or backfilled trees. It returns the same fields as the result,
+refuses a country the collector does not list, and raises a failed read or a
+failed latest command for its caller to try again. It must not be called
+while the caller holds the manifest lock.
+
 Both handlers read `releases.json` and write the manifest under the one lock,
 so a build made current while its tree is still being built becomes the
 latest either way: its publication reads the change, or the change's handler
