@@ -44,6 +44,7 @@ from telemetry_collector.huggingface_read import (
     TOKEN_VARIABLE,
     HuggingFaceReadConfigurationError,
     HuggingFaceReader,
+    HuggingFaceReadError,
     HuggingFaceReadSettings,
 )
 from telemetry_collector.submissions import (
@@ -1427,6 +1428,109 @@ def test_a_be_releases_record_without_releases_json_at_the_head_leaves_the_lates
     assert submission.record().status == "succeeded"
     assert submission.record().result["latest_unchanged"] == "no_releases_record"
     assert "latest" not in runner.events
+
+
+# Following releases.json without a submission -----------------------------------
+
+
+def follow_with(
+    runner: RecordingRunner, hugging_face: FakeHuggingFace, country: str
+) -> Any:
+    """``follow_releases_record`` for ``country``, as another collector job calls it.
+
+    Every read and the lock are recorded in ``runner.events``.
+    """
+
+    module = trees()
+    assert hasattr(module, "follow_releases_record")
+
+    @contextmanager
+    def recorded_lock() -> Iterator[None]:
+        runner.events.append("lock taken")
+        yield
+        runner.events.append("lock released")
+
+    record_reads_in(runner.events, hugging_face)
+    return module.follow_releases_record(
+        country,
+        blob_token=BLOB_TOKEN,
+        manifest_lock=recorded_lock,
+        bun="/usr/local/bin/bun",
+        run_command=runner,
+        reader=HuggingFaceReader(
+            HuggingFaceReadSettings(token=READ_TOKEN), client=hugging_face.client()
+        ),
+    )
+
+
+def test_a_country_s_latest_can_follow_releases_json_without_a_submission() -> None:
+    # As a backfill or switch-over job does at its end: nothing is built.
+    runner = RecordingRunner()
+
+    followed = follow_with(runner, release_repo(US_RELEASE_REPO, US_RECORD), "us")
+
+    assert runner.events == [
+        "lock taken",
+        f"read /api/datasets/{US_RELEASE_REPO}",
+        f"read /datasets/{US_RELEASE_REPO}/resolve/{'c' * 40}/releases.json",
+        "latest",
+        "lock released",
+    ]
+    assert runner.call("latest")["inputs"]["latest.json"] == {
+        "country": "us",
+        "releaseId": f"{US_DEFAULT_RELEASE}/{US_BUILD}",
+    }
+    assert followed == trees().FollowedLatest(
+        country="us",
+        current_build=f"{US_DEFAULT_RELEASE}/{US_BUILD}",
+        build_artifact_id="b" * 64,
+        made_latest=True,
+        latest_moved=True,
+    )
+
+
+def test_following_releases_json_says_why_the_latest_stayed() -> None:
+    runner = RecordingRunner()
+
+    followed = follow_with(runner, release_repo(BE_RELEASE_REPO, None), "be")
+
+    assert followed == trees().FollowedLatest(
+        country="be",
+        current_build=None,
+        build_artifact_id=None,
+        made_latest=False,
+        latest_moved=False,
+        unchanged="no_releases_record",
+    )
+    assert "latest" not in runner.events
+
+
+def test_following_releases_json_of_a_country_the_collector_does_not_list_is_refused() -> (
+    None
+):
+    runner = RecordingRunner()
+    hugging_face = uk_release_repo(releases_record())
+
+    with pytest.raises(ValueError, match="fr is not a country the collector lists"):
+        follow_with(runner, hugging_face, "fr")
+
+    assert hugging_face.requests == []
+    assert runner.events == []
+
+
+@pytest.mark.parametrize("failure", ["read", "command"])
+def test_a_failed_follow_raises_for_the_caller_to_try_again(failure: str) -> None:
+    hugging_face = uk_release_repo(releases_record())
+    runner = RecordingRunner()
+    if failure == "read":
+        hugging_face.datasets[UK_RELEASE_REPO].forced_status = 503
+        expected: type[Exception] = HuggingFaceReadError
+    else:
+        runner.latest_exit = 3
+        expected = trees().CalibrationTreeCommandError
+
+    with pytest.raises(expected):
+        follow_with(runner, hugging_face, "uk")
 
 
 def test_the_manifest_lock_lets_one_writer_in_at_a_time(postgres_url: str) -> None:
