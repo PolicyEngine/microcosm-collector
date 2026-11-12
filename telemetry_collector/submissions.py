@@ -117,7 +117,8 @@ class HuggingFaceLocation(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     repo: str = Field(pattern=HUGGINGFACE_REPO_PATTERN)
-    # The commit that added the folder, never a later commit, branch or tag.
+    # The commit that added the folder, never a later commit, branch or tag;
+    # for releases-record, the commit that wrote the submitted releases.json.
     commit: str = Field(pattern=GIT_COMMIT_PATTERN)
     # Each segment starts with a letter or digit, so "." and ".." cannot occur.
     folder: str = Field(

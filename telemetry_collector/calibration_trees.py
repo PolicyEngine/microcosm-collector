@@ -713,6 +713,15 @@ def check_submitted_record(plan: LatestMovePlan, content: bytes) -> None:
         )
 
 
+#: Why following releases.json left a country's latest as it was.
+LatestUnchangedReason = Literal[
+    "no_releases_record",
+    "releases_record_refused",
+    "no_current_build",
+    "no_recorded_tree",
+]
+
+
 @dataclass(frozen=True)
 class FollowedLatest:
     """What following a country's ``releases.json`` did to its latest tree."""
@@ -729,7 +738,7 @@ class FollowedLatest:
     latest_moved: bool
     #: Why the latest was left as it was: ``no_releases_record``,
     #: ``releases_record_refused``, ``no_current_build`` or ``no_recorded_tree``.
-    unchanged: str | None = None
+    unchanged: LatestUnchangedReason | None = None
     #: The refusal or the latest command's message, for the last two.
     unchanged_reason: str | None = None
 
@@ -768,9 +777,9 @@ def follow_releases_record(
     collector job, such as one that has just built or backfilled trees.
 
     Raises ``ValueError`` for a country the collector does not list, before
-    reading anything. A failed read raises ``HuggingFaceReadError`` and a
-    failed latest command ``CalibrationTreeCommandError``; calling again may
-    succeed. Everything else is in the answer: what moved, or why the latest
+    reading anything. A failed read raises ``HuggingFaceReadError``, and a
+    latest command that fails, runs out of time or cannot start raises
+    ``CalibrationTreeCommandError``; calling again may succeed. Everything else is in the answer: what moved, or why the latest
     stayed.
     """
 
@@ -778,7 +787,10 @@ def follow_releases_record(
         raise ValueError(f"{country} is not a country the collector lists.")
 
     def unchanged(
-        reason: str, *, current_build: str | None = None, message: str | None = None
+        reason: LatestUnchangedReason,
+        *,
+        current_build: str | None = None,
+        message: str | None = None,
     ) -> FollowedLatest:
         return FollowedLatest(
             country=country,
@@ -808,11 +820,16 @@ def follow_releases_record(
                 json.dumps({"country": country, "releaseId": current_build}),
                 encoding="utf-8",
             )
-            moved = run_command(
-                [bun, "run", str(LATEST_SCRIPT), str(request_path)],
-                _publication_environment(blob_token),
-                LATEST_TIMEOUT_SECONDS,
-            )
+            try:
+                moved = run_command(
+                    [bun, "run", str(LATEST_SCRIPT), str(request_path)],
+                    _publication_environment(blob_token),
+                    LATEST_TIMEOUT_SECONDS,
+                )
+            except (subprocess.TimeoutExpired, OSError) as error:
+                raise CalibrationTreeCommandError(
+                    f"The tree latest command did not finish: {error}"
+                ) from error
         if moved.returncode == EXIT_NOT_RECORDED:
             return unchanged(
                 "no_recorded_tree",

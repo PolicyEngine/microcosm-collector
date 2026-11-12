@@ -345,10 +345,12 @@ worker, a Cloud Run Job running
 `uv run --no-sync python -m telemetry_collector.worker`, recomputes every
 file's SHA-256 and runs the handler registered for the kind. Where the
 worker job has its calibration tree Blob token, `calibration-diagnostics`
-submissions build calibration trees ("Building trees from submissions"), and
-where it has its private Orrery bucket, `orrery-inputs` submissions publish
-Orrery graph files ("Publishing Orrery graph files"). Otherwise a kind's
-submissions are only checked and kept in intake storage.
+submissions build calibration trees ("Building trees from submissions") and
+`releases-record` submissions move a country's latest tree ("Moving the
+latest when releases.json changes"), and where it has its private Orrery
+bucket, `orrery-inputs` submissions publish Orrery graph files ("Publishing
+Orrery graph files"). Otherwise a kind's submissions are only checked and
+kept in intake storage.
 
 Intake is off unless `COLLECTOR_INTAKE_ENABLED` is exactly `1`. While it is
 off, the collector reads no other intake setting, and the token exchange for
@@ -385,7 +387,7 @@ bucket.
 | `COLLECTOR_WORKER_INVOKER_SERVICE_ACCOUNT` | service, operations | the account whose OAuth token each Cloud Task uses to run the worker job | `TELEMETRY_WORKER_INVOKER_SERVICE_ACCOUNT` |
 | `COLLECTOR_WORKER_JOB_ID` | worker | set on each execution by its Cloud Task | not set by the deploy |
 | `DATABASE_URL` | worker, operations, Orrery read service | the runtime database secret, as for the service | `TELEMETRY_DATABASE_SECRET_NAME` |
-| `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN` | worker | the read-write token of the environment's own calibration tree Vercel Blob store, a Secret Manager secret; without it, `calibration-diagnostics` submissions stay in intake storage (see "Building trees from submissions") | `TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME`, the secret's name |
+| `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN` | worker | the read-write token of the environment's own calibration tree Vercel Blob store, a Secret Manager secret; without it, `calibration-diagnostics` and `releases-record` submissions stay in intake storage (see "Building trees from submissions" and "Moving the latest when releases.json changes") | `TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME`, the secret's name |
 | `COLLECTOR_ORRERY_BUCKET` | worker, Orrery read service | the name of the environment's private Orrery bucket. For the worker, the bucket it publishes Orrery graph files to; without it, `orrery-inputs` submissions stay in intake storage (see "Publishing Orrery graph files"). For the Orrery read service, the bucket it serves them from; it refuses to start without it (see "Serving Orrery graph files"). The service doesn't get it | `TELEMETRY_ORRERY_BUCKET` |
 
 The `TELEMETRY_*` names are GitHub `staging` and `production` environment
@@ -1540,8 +1542,8 @@ from the submission; only the latest build is decided from Hugging Face.
 The image holds Bun 1.4.2, copied from the official image by digest, and the
 package's production install, without its tests, fixtures and test support.
 CI checks the built image with `tools/check-calibration-tree-image.sh`, which
-builds a small staged run's tree inside it and runs the publication command
-without a token, which must refuse to run.
+builds a small staged run's tree inside it and runs the publication and latest
+commands without a token, which must each refuse to run.
 
 ### Moving the latest when releases.json changes
 

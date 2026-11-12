@@ -5,7 +5,8 @@ set. The worker leases that job, recomputes the SHA-256 of every file at the
 generation recorded at completion, then calls the handler registered for the
 submission's kind (``telemetry_collector.handlers``). Where the worker job has
 a calibration tree Blob token, ``calibration-diagnostics`` submissions build
-calibration trees (``telemetry_collector.calibration_trees``), and where it has
+calibration trees and ``releases-record`` submissions move a country's latest
+tree (``telemetry_collector.calibration_trees``), and where it has
 an Orrery bucket, ``orrery-inputs`` submissions publish Orrery graph files
 (``telemetry_collector.orrery_graphs``). Otherwise they only have their bytes
 checked.

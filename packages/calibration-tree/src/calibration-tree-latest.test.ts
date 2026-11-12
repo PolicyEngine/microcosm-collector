@@ -209,8 +209,11 @@ test("an older recorded release build becomes the latest, as releases.json says"
   expect(store.puts).toEqual([
     { pathname: CALIBRATION_TREE_MANIFEST_PATH, allowOverwrite: true, ifMatch: readEtag, token: TOKEN },
   ]);
+  // The same builds, which the manifest's serializer stores sorted by build
+  // ID; only the latest changed.
   const written = ukManifest(NEWER_BUILD_ID);
   written.countries.uk!.latestReleaseBuildArtifactId = OLDER_BUILD_ID;
+  written.countries.uk!.builds.sort((left, right) => left.buildArtifactId.localeCompare(right.buildArtifactId));
   expect(store.manifest()).toEqual(written);
 });
 
