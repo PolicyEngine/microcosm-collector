@@ -674,6 +674,21 @@ describe("a Vercel OIDC token", () => {
     );
   });
 
+  test("and the read credential together do not compile", () => {
+    // `npm run typecheck` checks the test files too, so it fails if the
+    // options' types ever accept both credentials.
+    const bothCredentials = {
+      baseUrl: BASE_URL,
+      readToken: READ_TOKEN,
+      vercelOidcToken: VERCEL_OIDC_TOKEN,
+    };
+    assert.throws(
+      // @ts-expect-error A client takes exactly one of readToken and vercelOidcToken.
+      () => createCollectorClient(bothCredentials),
+      TypeError,
+    );
+  });
+
   test("or the read credential is required", () => {
     for (const options of [
       { baseUrl: BASE_URL },

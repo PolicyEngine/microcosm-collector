@@ -7,6 +7,8 @@ the network. The team, project and environment values are placeholders.
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import json
 import threading
 import time
@@ -113,6 +115,19 @@ def unsigned_token(header_json: str, claims: dict[str, Any] | None = None) -> st
 
     payload = json.dumps(token_claims() if claims is None else claims)
     return f"{_base64url(header_json.encode())}.{_base64url(payload.encode())}."
+
+
+def hmac_signed_token(
+    secret: bytes, key_id: str, claims: dict[str, Any] | None = None
+) -> str:
+    """An HS256 token signed with ``secret``, built without PyJWT, which
+    refuses to use a PEM public key as an HMAC secret."""
+
+    header = json.dumps({"alg": "HS256", "typ": "JWT", "kid": key_id})
+    payload = json.dumps(token_claims() if claims is None else claims)
+    signing_input = f"{_base64url(header.encode())}.{_base64url(payload.encode())}"
+    signature = hmac.new(secret, signing_input.encode("ascii"), hashlib.sha256)
+    return f"{signing_input}.{_base64url(signature.digest())}"
 
 
 def key_set_answer(*jwks: Any) -> httpx.Response:

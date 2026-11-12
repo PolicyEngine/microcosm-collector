@@ -726,7 +726,9 @@ def test_require_configuration_accepts_all_or_none_of_the_vercel_oidc_settings(
         ["VERCEL_OIDC_TEAM_ID", "VERCEL_OIDC_READERS"],
     ],
 )
-@pytest.mark.parametrize("missing_value", [None, "", " "])
+# Blank as the collector reads its settings: only the ASCII whitespace that
+# Python's str.strip() removes.
+@pytest.mark.parametrize("missing_value", [None, "", " ", "\r\n", "\t\v\f\r\x1f"])
 def test_require_configuration_names_the_missing_vercel_oidc_settings(
     missing_variables: list[str], missing_value: str | None
 ) -> None:
@@ -783,6 +785,23 @@ VERCEL_OIDC_REFUSALS = {
         ("VERCEL_OIDC_READERS", "prj_dashboard:*"),
         ("VERCEL_OIDC_READERS", "*"),
         ("VERCEL_OIDC_READERS", "team_example:preview"),
+        # The collector splits and trims on all the ASCII whitespace that
+        # Python's str.split() and str.strip() use, not only spaces, tabs and
+        # newlines: one reader per line with Windows line endings, carriage
+        # returns, vertical tabs, form feeds and the unit separator.
+        ("VERCEL_OIDC_READERS", "prj_dashboard:preview\r\nprj_other:production\r\n"),
+        ("VERCEL_OIDC_READERS", "prj_dashboard:preview\r\n\r\nprj_other:production"),
+        ("VERCEL_OIDC_READERS", "prj_dashboard:preview\rprj_other:production\r"),
+        ("VERCEL_OIDC_READERS", "prj_dashboard:preview\vprj_other:production"),
+        ("VERCEL_OIDC_READERS", "\fprj_dashboard:preview\fprj_other:production\f"),
+        ("VERCEL_OIDC_READERS", "prj_dashboard:preview\x1fprj_other:production"),
+        ("VERCEL_OIDC_READERS", "prj_dashboard:preview\r\nprj_other\r\n"),
+        ("VERCEL_OIDC_TEAM_SLUG", "example-team\r\n"),
+        ("VERCEL_OIDC_TEAM_SLUG", "\vexample-team\f"),
+        ("VERCEL_OIDC_TEAM_SLUG", "example\rteam"),
+        ("VERCEL_OIDC_TEAM_ID", "team_example\r"),
+        ("VERCEL_OIDC_TEAM_ID", "\fteam_example\v\r\n"),
+        ("VERCEL_OIDC_TEAM_ID", "team_\rexample"),
     ],
 )
 def test_require_configuration_refuses_exactly_the_vercel_oidc_settings_the_collector_refuses(
@@ -1234,27 +1253,37 @@ def test_service_revisions_get_the_vercel_oidc_settings_only_when_they_are_set(
         assert "VERCEL" not in command
 
 
+# A GitHub variable may hold its readers on several lines, with Unix or
+# Windows line endings, and a value may end with a line ending.
+@pytest.mark.parametrize("line_ending", ["\n", "\r\n"], ids=["unix", "windows"])
 def test_the_vercel_oidc_settings_the_revisions_get_are_ones_the_collector_accepts(
-    tmp_path: Path,
+    tmp_path: Path, line_ending: str
 ) -> None:
     module = vercel_oidc()
     command_log = tmp_path / "commands.log"
     install_command_stub(tmp_path, "gcloud", LOGGING_GCLOUD)
     environment = {
         **service_deploy_environment(tmp_path, command_log, "production"),
-        **VERCEL_OIDC_SETTINGS,
-        # A GitHub variable may hold its readers on several lines.
-        "VERCEL_OIDC_READERS": "prj_dashboard:production\n  prj_other:preview\n",
+        "VERCEL_OIDC_TEAM_SLUG": f"example-team{line_ending}",
+        "VERCEL_OIDC_TEAM_ID": f"team_example{line_ending}",
+        "VERCEL_OIDC_READERS": (
+            f"prj_dashboard:production{line_ending}  prj_other:preview{line_ending}"
+        ),
     }
 
     result = run_deploy("deploy-candidate", environment=environment)
 
     assert result.returncode == 0, result.stderr
     settings = logged_setting_values(command_log.read_text())
-    # One line per setting: the readers are passed separated by single spaces.
-    assert settings["TELEMETRY_VERCEL_OIDC_READERS"] == (
-        "prj_dashboard:production prj_other:preview"
-    )
+    # One line per setting, with no line ending left: the readers are passed
+    # separated by single spaces.
+    assert {
+        name: value for name, value in settings.items() if "VERCEL_OIDC" in name
+    } == {
+        "TELEMETRY_VERCEL_OIDC_TEAM_SLUG": "example-team",
+        "TELEMETRY_VERCEL_OIDC_TEAM_ID": "team_example",
+        "TELEMETRY_VERCEL_OIDC_READERS": "prj_dashboard:production prj_other:preview",
+    }
     assert module.VercelOidcSettings.from_environment(settings) == (
         module.VercelOidcSettings(
             team_slug="example-team",

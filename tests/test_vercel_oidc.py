@@ -10,15 +10,17 @@ import importlib
 import importlib.util
 import json
 import logging
+import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from types import ModuleType
 from typing import Any
 
 import httpx
 import jwt
 import pytest
+from cryptography.hazmat.primitives import serialization
 
 from telemetry_collector.app import CollectorSettings
 from telemetry_collector.intake import INTAKE_SWITCH
@@ -35,6 +37,7 @@ from tests.vercel_oidc_fakes import (
     FakeClock,
     FakeKeySetAddress,
     ec_public_jwk,
+    hmac_signed_token,
     key_set_answer,
     rsa_private_key,
     rsa_public_jwk,
@@ -51,6 +54,11 @@ READERS_SETTING = "TELEMETRY_VERCEL_OIDC_READERS"
 SIGNING_KEY = rsa_private_key()
 SIGNING_KEY_ID = "signing-key-1"
 SIGNING_JWK = rsa_public_jwk(SIGNING_KEY, SIGNING_KEY_ID)
+# The listed public key as PEM text, which an attacker can use as an HS256
+# secret, hoping the verifier passes it to HMAC.
+SIGNING_PUBLIC_KEY_PEM = SIGNING_KEY.public_key().public_bytes(
+    serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+)
 # The key Vercel signs with after rotating its keys.
 ROTATED_KEY = rsa_private_key()
 ROTATED_KEY_ID = "signing-key-2"
@@ -64,6 +72,9 @@ RS512_KEY = rsa_private_key()
 ONE_MINUTE = 60
 FRESH_SECONDS = 10 * 60
 STALE_KEY_LIFETIME_SECONDS = 24 * 60 * 60
+# How long a test waits for another thread, so that a regression fails the
+# test rather than holding it forever.
+THREAD_WAIT_SECONDS = 5
 
 
 def vercel_oidc() -> ModuleType:
@@ -262,6 +273,9 @@ INVALID_TOKENS: dict[str, Callable[[], str]] = {
     "HS256": lambda: jwt.encode(
         token_claims(), "s" * 32, algorithm="HS256", headers={"kid": SIGNING_KEY_ID}
     ),
+    "HS256 with the listed RSA public key's PEM as its secret": lambda: (
+        hmac_signed_token(SIGNING_PUBLIC_KEY_PEM, SIGNING_KEY_ID)
+    ),
     "RS512": lambda: jwt.encode(
         token_claims(), SIGNING_KEY, algorithm="RS512", headers={"kid": SIGNING_KEY_ID}
     ),
@@ -275,7 +289,10 @@ INVALID_TOKENS: dict[str, Callable[[], str]] = {
     "an unknown kid": lambda: signed_token(UNLISTED_KEY, "unlisted-key"),
     "another key's signature": lambda: signed_token(UNLISTED_KEY, SIGNING_KEY_ID),
     "longer than 8,192 characters": lambda: dashboard_token(padding="p" * 8192),
-    "a header nested too deeply to parse": lambda: unsigned_token(
+    # Refused by the length check before any parsing; the RecursionError a
+    # header nested too deeply raises is tested by
+    # test_an_error_while_parsing_a_token_refuses_it_as_invalid.
+    "a deeply nested header, refused for its length": lambda: unsigned_token(
         '{"alg":"RS256","kid":"signing-key-1","nested":'
         + "[" * 100_000
         + "]" * 100_000
@@ -526,6 +543,18 @@ def test_once_a_fetch_succeeds_without_a_key_id_its_tokens_are_invalid() -> None
     assert len(address.requests) == 2
 
 
+# Key sets that list keys, none of which the collector can verify RS256 tokens
+# with: a successful fetch needs at least one usable key.
+KEY_SETS_WITHOUT_A_USABLE_KEY = {
+    "an empty key set": lambda: key_set_answer(),
+    "a key set without a usable key": lambda: key_set_answer(
+        ec_public_jwk("ec-key"),
+        rsa_public_jwk(ENCRYPTION_KEY, "encryption-key", use="enc"),
+        {"kty": "RSA", "kid": "broken-key", "e": "AQAB"},
+    ),
+}
+
+
 @pytest.mark.parametrize(
     "answer",
     [
@@ -541,6 +570,7 @@ def test_once_a_fetch_succeeds_without_a_key_id_its_tokens_are_invalid() -> None
         httpx.Response(200, content=b"[" * 100_000 + b"]" * 100_000),
         httpx.ConnectError("Vercel cannot be reached."),
         httpx.ReadTimeout("Vercel did not answer in time."),
+        *(answer() for answer in KEY_SETS_WITHOUT_A_USABLE_KEY.values()),
     ],
     ids=[
         "a server error",
@@ -553,9 +583,10 @@ def test_once_a_fetch_succeeds_without_a_key_id_its_tokens_are_invalid() -> None
         "JSON nested too deeply to parse",
         "no connection",
         "a timeout",
+        *KEY_SETS_WITHOUT_A_USABLE_KEY,
     ],
 )
-def test_an_answer_that_is_not_a_key_set_is_a_failed_fetch(
+def test_an_answer_without_a_usable_key_is_a_failed_fetch(
     answer: httpx.Response | Exception,
 ) -> None:
     module = vercel_oidc()
@@ -563,6 +594,39 @@ def test_an_answer_that_is_not_a_key_set_is_a_failed_fetch(
 
     with pytest.raises(module.VercelOidcKeysUnavailableError):
         verifier.verify(dashboard_token())
+
+
+@pytest.mark.parametrize("answer_name", sorted(KEY_SETS_WITHOUT_A_USABLE_KEY))
+def test_a_key_set_without_a_usable_key_keeps_the_cached_keys(
+    answer_name: str,
+) -> None:
+    module = vercel_oidc()
+    verifier, address, clock = verifier_serving(key_set_answer(SIGNING_JWK))
+    token = dashboard_token()
+    rotated_token = signed_token(ROTATED_KEY, ROTATED_KEY_ID)
+    verifier.verify(token)
+    address.answer = KEY_SETS_WITHOUT_A_USABLE_KEY[answer_name]()
+
+    # The cached key, no longer fresh, still verifies after such an answer.
+    clock.advance(FRESH_SECONDS + 1)
+    assert verifier.verify(token).project_id == DASHBOARD_PROJECT_ID
+    assert len(address.requests) == 2
+
+    # A key the cache doesn't hold is unavailable, not invalid, while the last
+    # fetch failed.
+    clock.advance(ONE_MINUTE)
+    with pytest.raises(module.VercelOidcKeysUnavailableError):
+        verifier.verify(rotated_token)
+    assert len(address.requests) == 3
+
+    # The cached key stays usable for 24 hours after the last successful
+    # fetch, and no longer.
+    clock.advance(STALE_KEY_LIFETIME_SECONDS - FRESH_SECONDS - 1 - ONE_MINUTE)
+    assert verifier.verify(token).project_id == DASHBOARD_PROJECT_ID
+    assert len(address.requests) == 4
+    clock.advance(1)
+    with pytest.raises(module.VercelOidcKeysUnavailableError):
+        verifier.verify(token)
 
 
 def test_keys_the_collector_cannot_verify_rs256_tokens_with_are_skipped() -> None:
@@ -611,3 +675,80 @@ def test_concurrent_requests_with_no_fresh_keys_share_one_fetch() -> None:
 
     assert len(address.requests) == 1
     assert {reader.project_id for reader in readers} == {DASHBOARD_PROJECT_ID}
+
+
+class HeldFetch:
+    """Holds each key set fetch until the test releases it, after noting that
+    one started. It waits for the release at most ``THREAD_WAIT_SECONDS``."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.released = threading.Event()
+
+    def __call__(self) -> None:
+        self.started.set()
+        self.released.wait(timeout=THREAD_WAIT_SECONDS)
+
+
+def test_a_fresh_cached_key_never_waits_for_another_thread_s_fetch() -> None:
+    verifier, address, clock = verifier_serving(key_set_answer(SIGNING_JWK))
+    cached_token = dashboard_token()
+    verifier.verify(cached_token)
+    address.answer = key_set_answer(SIGNING_JWK, ROTATED_JWK)
+    held_fetch = HeldFetch()
+    address.before_answering = held_fetch
+    clock.advance(ONE_MINUTE + 1)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        # A token whose key the cache doesn't hold makes its thread fetch.
+        rotated = pool.submit(
+            verifier.verify, signed_token(ROTATED_KEY, ROTATED_KEY_ID)
+        )
+        try:
+            assert held_fetch.started.wait(timeout=THREAD_WAIT_SECONDS)
+            cached = pool.submit(verifier.verify, cached_token)
+            finished, _ = wait([cached], timeout=THREAD_WAIT_SECONDS)
+            # It returned while the other thread's fetch was still held.
+            assert cached in finished
+        finally:
+            held_fetch.released.set()
+        assert cached.result().project_id == DASHBOARD_PROJECT_ID
+        reader = rotated.result(timeout=THREAD_WAIT_SECONDS)
+
+    assert reader.project_id == DASHBOARD_PROJECT_ID
+    assert len(address.requests) == 2
+
+
+def test_a_stale_cached_key_is_used_while_another_thread_fetches_again() -> None:
+    verifier, address, clock = verifier_serving(key_set_answer(SIGNING_JWK))
+    cached_token = dashboard_token()
+    verifier.verify(cached_token)
+    address.answer = key_set_answer(SIGNING_JWK, ROTATED_JWK)
+    held_fetch = HeldFetch()
+    address.before_answering = held_fetch
+    clock.advance(FRESH_SECONDS + 1)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        # The first request to find the cached keys no longer fresh fetches.
+        refreshing = pool.submit(verifier.verify, cached_token)
+        try:
+            assert held_fetch.started.wait(timeout=THREAD_WAIT_SECONDS)
+            # Meanwhile a request with the same key uses it, still stale ...
+            stale = pool.submit(verifier.verify, cached_token)
+            # ... and one whose key the cache doesn't hold waits for the fetch.
+            rotated = pool.submit(
+                verifier.verify, signed_token(ROTATED_KEY, ROTATED_KEY_ID)
+            )
+            finished, _ = wait([stale], timeout=THREAD_WAIT_SECONDS)
+            assert stale in finished
+        finally:
+            held_fetch.released.set()
+        assert stale.result().project_id == DASHBOARD_PROJECT_ID
+        refreshed_reader = refreshing.result(timeout=THREAD_WAIT_SECONDS)
+        rotated_reader = rotated.result(timeout=THREAD_WAIT_SECONDS)
+
+    assert refreshed_reader.project_id == DASHBOARD_PROJECT_ID
+    # The rotated key came from the first request's fetch: only one thread
+    # fetched.
+    assert rotated_reader.project_id == DASHBOARD_PROJECT_ID
+    assert len(address.requests) == 2
