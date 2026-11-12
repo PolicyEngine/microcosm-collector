@@ -53,10 +53,14 @@ returned JWT to the build.
 Without `lifetime_seconds`, the exchange is unchanged: the same lifetime, claims
 and response.
 
-The dashboard query endpoints require `X-Telemetry-Read-Token`. The dashboard
-server retrieves this credential from Google Secret Manager at runtime. Vercel
-authenticates using its OIDC identity; the credential is never returned to the
-browser or passed through GitHub Actions.
+The dashboard query endpoints require the dashboard read credential in
+`X-Telemetry-Read-Token`. The dashboard server retrieves this credential from
+Google Secret Manager at runtime, authenticating to Google Cloud with its
+Vercel OIDC identity; the credential is never returned to the browser or
+passed through GitHub Actions. Read API v2 also accepts, instead of the read
+credential, a consumer app's Vercel OIDC token itself, from the Vercel
+projects and environments the collector is configured for (see "Vercel OIDC
+tokens"). Such an app then needs no copy of the read credential.
 
 ### Session tokens
 
@@ -226,6 +230,8 @@ costs one check.
 ## Read API
 
 Both versions take the dashboard read credential in `X-Telemetry-Read-Token`.
+Version 2 also takes a consumer app's Vercel OIDC token in
+`Authorization: Bearer` ("Vercel OIDC tokens", below); version 1 refuses it.
 
 - **Version 1**, `GET /v1/runs` and `GET /v1/runs/{run_id}`, is what the
   dashboard reads today. A run comes back as the documents the dashboard used
@@ -261,6 +267,107 @@ that each answer matches the document's schema. After an intended change to
 either version, run `uv run python tools/update-read-api-contract.py`, review
 the changed files, and regenerate the client's types (below).
 
+### Vercel OIDC tokens
+
+A Vercel deployment holds an OIDC token that Vercel signs for its team (team
+issuer mode, which the dashboard and microcosm-runs use): issuer
+`https://oidc.vercel.com/<team slug>`, audience `https://vercel.com/<team slug>`,
+RS256, with the claims `owner_id` (the team's ID, `team_…`), `project_id`
+(`prj_…`) and `environment` (`production`, `preview` or `development`). A
+function receives it in the `x-vercel-oidc-token` request header, and
+`getVercelOidcToken()` from `@vercel/oidc` returns it; a development token from
+`vercel env pull` lasts 12 hours. Read API v2 accepts it in
+`Authorization: Bearer <token>` from the projects and environments listed as
+readers. Version 1 never does.
+
+Three settings, all optional, switch it on together
+(`telemetry_collector/vercel_oidc.py`):
+
+| Setting | Value |
+|---|---|
+| `TELEMETRY_VERCEL_OIDC_TEAM_SLUG` | the Vercel team's slug, from which the issuer and audience above derive |
+| `TELEMETRY_VERCEL_OIDC_TEAM_ID` | the team's ID, which a token's `owner_id` must equal |
+| `TELEMETRY_VERCEL_OIDC_READERS` | the `<project ID>:<environment>` entries that may read, separated by whitespace (not commas, which `gcloud run deploy --set-env-vars` splits at) |
+
+With none set (unset or blank), the collector refuses every Vercel OIDC
+token. With only some set, or a malformed value, it refuses to start, with a
+message naming the setting but not its value. The staging collector is to
+list the dashboard's `preview` environment, and the production collector its
+`production` environment. The values are not repeated in documentation.
+
+What a v2 request gets:
+
+| Credential | Answer |
+|---|---|
+| The read credential, with or without a bearer token | as today |
+| A bearer token, while the settings are unset | 401 `This collector accepts no Vercel OIDC tokens.` |
+| A token that is malformed, expired, not yet valid, or not signed by Vercel for the team | 401 `The Vercel OIDC token is invalid or expired.` |
+| A valid token whose `owner_id` is not the team, or whose project and environment are not a reader | 403 `This Vercel project and environment may not read this collector.` |
+| A token while Vercel's signing keys can't be read and none usable is cached | 503 `Vercel's token signing keys could not be read.`, without `Retry-After` |
+| A valid token from a reader | the same answer as for the read credential |
+| Neither | 401 `A valid dashboard read credential is required.`, as today |
+
+A token is checked in this order: at most 8,192 characters; a header that
+parses, with `alg` `RS256` and a non-empty `kid`; a signature by the key with
+that `kid`; the team's issuer and audience; `exp`, `iat` and `sub` present;
+`exp` passed by no more than 30 seconds, and `iat` and (when present) `nbf`
+no more than 30 seconds ahead of the collector's clock; `owner_id`,
+`project_id` and `environment` non-empty strings. A token
+that cannot be parsed at all, such as one whose header is nested too deeply
+for Python's JSON decoder, is invalid rather than a server error.
+
+**Signing keys.** The collector reads Vercel's key set from
+`https://oidc.vercel.com/.well-known/jwks`, the address Vercel's own
+`@vercel/oidc` verifier (`verifyVercelOidcToken`) uses for every issuer, team
+issuers included. It never follows a redirect. Only RSA keys with a `kid`,
+whose `use` is absent or `sig` and whose `alg` is absent or `RS256`, are
+usable. A fetch succeeds when the answer is 200 with a JSON object holding a
+`keys` list with at least one usable key. Any other answer, an empty `keys`
+list or one whose keys are all skipped included, is a failed fetch, and leaves
+the cached keys as they are. After a successful fetch, a listed key is used
+without fetching again for 10 minutes. After that, or for a `kid` the set
+doesn't list, the collector fetches again, at most once a minute whatever the
+requests. While fetches fail, keys from the last successful fetch stay usable
+for 24 hours after it; a token whose key the cache doesn't hold, or holds from
+longer ago, answers 503 while the last fetch failed, and 401 once a fetch
+succeeds without its key. One request at a time fetches. A request whose key
+is cached, whether fetched within the 10 minutes or within the 24 hours,
+never waits for another request's fetch, and uses the older key while that
+fetch runs; a request whose key the cache doesn't hold waits for it, for at
+most 10 seconds, and then looks again, or answers 503 once the 10 seconds
+have passed. So a burst of tokens naming keys nobody lists holds a worker
+thread for at most that long each.
+
+**Where the settings come from.** Each is a GitHub environment variable of
+`staging` and `production`, which the deployment passes to the service
+revisions only:
+
+| Setting | Provider | Path to the collector |
+|---|---|---|
+| `TELEMETRY_VERCEL_OIDC_TEAM_SLUG` | GitHub environment variable | `vars.TELEMETRY_VERCEL_OIDC_TEAM_SLUG` → `deploy-staging`'s and `deploy-production`'s `env:` as `VERCEL_OIDC_TEAM_SLUG` → `scripts/deploy.sh deploy-maintenance` and `deploy-candidate` → `--set-env-vars` → the revision's environment → `VercelOidcSettings.from_environment` |
+| `TELEMETRY_VERCEL_OIDC_TEAM_ID` | GitHub environment variable | the same, as `VERCEL_OIDC_TEAM_ID` |
+| `TELEMETRY_VERCEL_OIDC_READERS` | GitHub environment variable | the same, as `VERCEL_OIDC_READERS`; the deploy passes the entries separated by single spaces |
+
+`scripts/deploy.sh require-configuration` checks them with the collector's
+patterns, all three or none, before the deployment authenticates. The
+worker, recovery and migration jobs and the Orrery read service never get
+them. None is set yet: setting the three variables in both environments is a
+manual step, and the next release deploys them.
+
+**Security.** A Vercel OIDC token's audience is the team, not the
+collector: whoever receives one can present it to any other party that
+trusts the same issuer and audience, such as the dashboard's Google Workload
+Identity provider, until it expires. The collector never logs, stores or
+returns a token, and no answer or error message includes one. Every preview
+deployment of an allowed project, from any branch, has `environment:
+preview`, so with that project's `preview` among its readers, each of them
+can read the staging collector. It is unverified whether
+`vercel env pull --environment=preview` or `--environment=production` gives a
+token whose `environment` is `preview` or `production`. If it does, anyone
+allowed to pull the project's variables for an environment can read that
+environment's collector from their own machine, as they can already read
+that environment's other settings.
+
 ### The TypeScript client
 
 `packages/collector-client` is `@policyengine/microcosm-collector-client`, a
@@ -269,6 +376,12 @@ typed client for version 2. Its types are generated from `openapi.json`
 CI fails if the generated types are out of date. Each release gives the client
 the collector's version (`tools/set-client-version.py`, run by
 `tools/update-version.sh`).
+
+A client sends exactly one credential: the read credential (`readToken`), or
+a consumer app's Vercel OIDC token (`vercelOidcToken`, such as
+`getVercelOidcToken` from `@vercel/oidc`), as `Authorization: Bearer`.
+Either may be a function, called before each request. The client does not
+depend on `@vercel/oidc`.
 
 Once production runs a release, and if the repo variable
 `COLLECTOR_CLIENT_PUBLISH_ENABLED` is `true`, the Push workflow publishes that
@@ -607,7 +720,9 @@ runtime environment variables. Generate a P-256 key for local use with
 `openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256` and pass the
 PEM text as `TELEMETRY_JWT_SIGNING_KEY`. `TELEMETRY_JWT_SECRET`, at least 32
 random characters, is needed only to issue or accept HS256 tokens. Use at
-least 24 random characters for the dashboard read credential. Use Microcosm's
+least 24 random characters for the dashboard read credential. Vercel OIDC
+tokens stay refused unless the three `TELEMETRY_VERCEL_OIDC_*` settings are
+given (see "Vercel OIDC tokens"). Use Microcosm's
 loopback-only development option when testing ingestion. Production Microcosm
 builds use the fixed collector origin shipped by the package and do not accept
 a destination environment variable.
@@ -2234,6 +2349,11 @@ The deployment's access and configuration are provisioned:
   Orrery graph files").
   `scripts/deploy.sh require-configuration` names any that is missing, and
   the deployment stops before it authenticates.
+- Optionally, each environment holds the three `TELEMETRY_VERCEL_OIDC_*`
+  variables that let read API v2 accept consumer apps' Vercel OIDC tokens
+  (see "Vercel OIDC tokens"). They are not set yet. With only some of them
+  set, `require-configuration` stops the deployment naming the missing ones,
+  and with a malformed one, naming it.
 
 The move from calibration-diagnostics is complete:
 
@@ -2323,6 +2443,19 @@ token or service-account key is required. The runtime caches a retrieved value
 for up to one minute and retries failed retrievals on subsequent requests.
 Configuration checks during deployment only confirm secret existence; they do
 not establish that credentials work or that runtime permissions are correct.
+
+Instead of the read credential, the dashboard can read version 2 through the
+typed client with its own Vercel OIDC token (`vercelOidcToken`), once the
+collector's `TELEMETRY_VERCEL_OIDC_READERS` lists its project and environment:
+its `preview` environment for the staging collector, and its `production`
+environment for the production collector (see "Vercel OIDC tokens"). Its
+collector reads then need neither `MICROCOSM_TELEMETRY_READ_SECRET_VERSION`
+nor Secret Manager. Locally, `vercel env pull` gives a development token,
+whose `environment` is `development`, which only a collector listing the
+project's `development` environment accepts. Whether
+`vercel env pull --environment=preview` or `--environment=production` gives
+a token for that environment, which that environment's collector would
+accept, is unverified (see "Vercel OIDC tokens").
 
 Restrict the Cloud SQL instance to the Cloud Run connection and disable request
 access logs for the container so authorization headers cannot enter application
