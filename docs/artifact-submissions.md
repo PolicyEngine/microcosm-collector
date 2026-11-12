@@ -120,17 +120,17 @@ because of it.
 | Field | Rule |
 |---|---|
 | `contract_version` | The integer `1`. |
-| `kind` | `calibration-diagnostics` or `orrery-inputs`. |
+| `kind` | `calibration-diagnostics`, `orrery-inputs` or `releases-record`. |
 | `licensed_data` | Required boolean: whether the build used licensed microdata. See "Disclosure". |
 | `provenance` | An object with exactly the five keys below. Every key is required: `release` and `huggingface` may be `null`, but are never left out. |
 | `provenance.run_id` | The telemetry run ID: 1–192 characters from `A-Z`, `a-z`, `0-9`, `.`, `_`, `:` and `-`, starting with a letter or digit (`[A-Za-z0-9][A-Za-z0-9._:-]{0,191}`), as for `POST /v1/runs`. The run does not have to be registered with the collector. |
 | `provenance.build_id` | The build: the attempt ID Microcosm assigns, the same from staging through release. 1–128 characters from `A-Z`, `a-z`, `0-9`, `.`, `_` and `-`, starting with a letter or digit (`[A-Za-z0-9][A-Za-z0-9._-]{0,127}`). This is the emitter interface's `safe_identifier` rule. |
 | `provenance.country_code` | Two upper-case letters, as in run registration. |
-| `provenance.release` | The release ID, with the `build_id` syntax. For a staged build, the candidate release it was staged for, or `null` when it names none; a staging calibration tree is labelled with it, or with the run ID. |
-| `provenance.huggingface` | Where the same bytes live on Hugging Face: an object with exactly `repo`, `commit` and `folder`, or `null`. Required (not `null`) for `calibration-diagnostics`. For `orrery-inputs` it may be `null`, for a build that exists only on the build machine. |
+| `provenance.release` | The release ID, with the `build_id` syntax. For a staged build, the candidate release it was staged for, or `null` when it names none; a staging calibration tree is labelled with it, or with the run ID. Required (not `null`) for `releases-record`: the release whose current build the change set. |
+| `provenance.huggingface` | Where the same bytes live on Hugging Face: an object with exactly `repo`, `commit` and `folder`, or `null`. Required (not `null`) for `calibration-diagnostics` and `releases-record`. For `orrery-inputs` it may be `null`, for a build that exists only on the build machine. |
 | `provenance.huggingface.repo` | The dataset repo, `owner/name`. Each of the two parts is 1–96 characters with the `build_id` character set, starting with a letter or digit. |
-| `provenance.huggingface.commit` | 40 lowercase hex characters: the full ID of the Hugging Face commit that added the folder, which is the commit that wrote these files there. Never a later commit, a branch or a tag, so the same folder always gives the same submission ID. |
-| `provenance.huggingface.folder` | 1–512 characters: one or more segments joined by `/`, each with the `build_id` syntax. There is no leading or trailing `/`, and no empty, `.` or `..` segment. Each file's Hugging Face path is `<folder>/<name>`. |
+| `provenance.huggingface.commit` | 40 lowercase hex characters: the full ID of the Hugging Face commit that added the folder, which is the commit that wrote these files there. Never a later commit, a branch or a tag, so the same folder always gives the same submission ID. For `releases-record`, the commit that wrote the submitted `releases.json`, so each change is its own submission. |
+| `provenance.huggingface.folder` | 1–512 characters: one or more segments joined by `/`, each with the `build_id` syntax. There is no leading or trailing `/`, and no empty, `.` or `..` segment. Each file's Hugging Face path is `<folder>/<name>`, except for `releases-record`: there the folder must be `releases/<release>/<build_id>`, the folder of the build the change made current, and the file is the repo's root `releases.json`. |
 | `files[].name` | A flat file name: `[A-Za-z0-9][A-Za-z0-9._-]{0,191}`, unique within the submission. |
 | `files[].role` | One of the kind's roles below. |
 | `files[].size` | The file's length in bytes: an integer, at least 1, within the role's limit. The emitter's file entries (its Orrery `PublicationFile` and its bundle hand-over entries) call the same number `bytes`, and a client copies that value here unchanged. |
@@ -155,6 +155,7 @@ recorded something it ignored.
 | | `execution_overlay` | exactly 1 | 32 MiB | |
 | | `upstream` | 0 or more | 64 MiB | |
 | | `evidence` | 0 or more | 2 GiB | kept private, never published |
+| `releases-record` | `releases_record` | exactly 1 | 4 MiB | `releases-record` handler (the README's "Moving the latest when releases.json changes") |
 
 The calibration roles are the files the calibration-tree publisher reads for a
 build today. The Orrery roles are the inputs the projection needs
@@ -163,6 +164,12 @@ files that stay in private intake storage. Intake checks each file's role,
 count and size, not its name; the Orrery graph handler rejects a submission
 whose files it cannot use, including a schema over 32 MiB and an `upstream`
 file not named `upstream-<its SHA-256>.json` (see "Orrery graph files").
+
+A `releases-record` submission is what Microcosm sends after a change to a
+release repo's `releases.json` made a published build current without a new
+build (`microcosm-publish-release-build --promote`): its one file is the
+`releases.json` that change wrote, at most 4 MiB, the largest the record's
+writer accepts.
 
 ### The roles the emitter sends
 
@@ -473,7 +480,9 @@ result, a rejection or an error's message, the framework replaces each NUL
 and unpaired surrogate in its text with U+FFFD, because PostgreSQL's `jsonb`
 cannot store them. Where the worker job has its calibration tree Blob token,
 `calibration-diagnostics` submissions build calibration trees (the README's
-"Building trees from submissions"), and where it has its private Orrery
+"Building trees from submissions") and `releases-record` submissions move a
+country's latest tree (the README's "Moving the latest when releases.json
+changes"), and where it has its private Orrery
 bucket, `orrery-inputs` submissions publish Orrery graph files (see "Orrery
 graph files"). Until a kind has a handler, its
 submissions only have their bytes checked and are kept in intake storage,

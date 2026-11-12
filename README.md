@@ -1434,13 +1434,17 @@ compiles it through `transpilePackages`. Its own
 `src/calibration-tree-worker.ts` builds one release's or one staged run's
 tree from local files and writes its gzip parts to a directory, as its own Bun
 process, and `src/calibration-tree-publication.ts` uploads those parts and adds
-the build to the manifest:
+the build to the manifest. `src/calibration-tree-latest.ts` points a country's
+latest at a build the manifest already records (see "Moving the latest when
+releases.json changes"):
 
 ```bash
 cd packages/calibration-tree
 bun run src/calibration-tree-worker.ts REQUEST.json OUTPUT_DIRECTORY
 CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN=... \
   bun run src/calibration-tree-publication.ts PUBLICATION.json
+CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN=... \
+  bun run src/calibration-tree-latest.ts LATEST.json
 ```
 
 The worker builds a release exactly as the publisher builds it from the same
@@ -1484,18 +1488,22 @@ from the submission; only the latest build is decided from Hugging Face.
   does not list, stay in intake storage with the reason in the result.
 - **Time.** The tree records the submission's `accepted_at` as its
   publication time, so reprocessing a submission builds the same tree.
-- **Latest.** A release build becomes its country's latest when the release
-  repo's `releases.json`, read at the repo's head commit when the tree is
-  built, names it as the current build of its default release, as the GitHub
-  Actions publisher decides (the names are compared). Other builds are
-  recorded without moving the latest.
+- **Latest.** For every country the collector lists, a release build becomes
+  its country's latest when the release repo's `releases.json` names it as
+  the current build of its default release, as the GitHub Actions publisher
+  decides (the names are compared). The handler reads `releases.json` at the
+  repo's head commit after the build, under the manifest lock and just before
+  the publication, so a build made current while its tree is being built is
+  never missed (see "Moving the latest when releases.json changes"). Other
+  builds are recorded without moving the latest.
   - A repo without `releases.json` (Hugging Face's 404 without the
     `RepoNotFound` or `RevisionNotFound` error code) keeps the
     `DEFAULT_RELEASES` rule: a build of the country's default release there
-    becomes its latest. The UK's is `microcosm-uk-2024-25-national`; the
-    US's is added once its stable releases are agreed.
-  - Any other failure to read `releases.json` fails the attempt before the
-    submission's files are downloaded, so it runs again.
+    becomes its latest. Only the UK's is listed,
+    `microcosm-uk-2024-25-national`, so builds of another country whose repo
+    has no `releases.json` don't become its latest.
+  - Any other failure to read `releases.json` fails the attempt before
+    anything is published, so it runs again.
   - A `releases.json` the record's rules refuse (as the tree package's
     `release-record.ts` reads it: at most 4 MiB, exactly its keys,
     `schema_version` 1, safe names, each `current` a listed build that isn't
@@ -1504,8 +1512,8 @@ from the submission; only the latest build is decided from Hugging Face.
     `latest_skipped: "releases_record_refused"` and the reason.
   - A build takes the latest only from an older build, by publication time,
     so a retried or reprocessed older build never takes the latest back.
-  - A build made current later, or a change to `releases.json` that comes
-    with no new build, doesn't move the latest through a submission.
+  - A build made current later, with no new build, moves the latest through
+    a `releases-record` submission instead (below).
   - Staging trees never become the latest.
 - **Size.** The worker job has 8 GiB of memory and 2 CPUs: building the
   tree for the largest current diagnostics file (a 128.7 MB US release) peaked
@@ -1534,6 +1542,49 @@ package's production install, without its tests, fixtures and test support.
 CI checks the built image with `tools/check-calibration-tree-image.sh`, which
 builds a small staged run's tree inside it and runs the publication command
 without a token, which must refuse to run.
+
+### Moving the latest when releases.json changes
+
+When `microcosm-publish-release-build --promote` makes an already published
+build current, no tree is built. Microcosm then submits the repo's new
+`releases.json` as a `releases-record` submission (docs/artifact-submissions.md):
+its one file is the `releases.json` the change wrote, and its provenance names
+the release repo, the commit that wrote it, and the release and build it made
+current, whose folder is `releases/<release>/<build>`. Where the worker job has
+its Blob token, `calibration_trees.calibration_tree_latest_handler` handles it,
+for every country the collector lists:
+
+1. **Checks.** A repo that isn't the country's release repo rejects the
+   submission (`repo_not_registered`), and a country the collector does not
+   list stays in intake storage with the reason. A submitted `releases.json`
+   the record's rules refuse rejects it (`releases_record_refused`), and so
+   does one that doesn't name the build as its release's current build
+   (`provenance_mismatch`). The release need not be the default one.
+2. **Under the manifest lock,** it reads `releases.json` at the repo's head
+   commit, not the submitted copy, so a later change is never undone by an
+   earlier change's submission. It then runs the package's latest command,
+   `src/calibration-tree-latest.ts`, for the default release's current build
+   there. The command points the country's latest at the tree the manifest
+   records under that release ID, whether that build is newer or older than
+   the current latest (a rollback in `releases.json` moves the latest back).
+   It writes only the manifest, with the same compare-and-swap as the
+   publication command, and runs with only `PATH`, `LANG` and the Blob token.
+3. **Results.** `current_build`, `build_artifact_id`, `made_latest` (the
+   country's latest is that build's tree) and `latest_moved` (this
+   submission changed it). The latest is left as it is, and `latest_unchanged`
+   says why, when the head has no `releases.json` (`no_releases_record`), one
+   the rules refuse (`releases_record_refused`, with
+   `latest_unchanged_reason`), no current build of its default release
+   (`no_current_build`), or a current build the manifest records no tree for
+   (`no_recorded_tree`). A failed read or any other failure of the latest
+   command fails the attempt, so it runs again.
+
+Both handlers read `releases.json` and write the manifest under the one lock,
+so a build made current while its tree is still being built becomes the
+latest either way: its publication reads the change, or the change's handler
+finds its tree. A tree whose publication comes after a rollback to it isn't
+made the latest by that publication, which takes the latest only from an older
+build; reprocessing the change's `releases-record` submission moves it.
 
 ### Tests
 
@@ -1659,8 +1710,9 @@ What reads Hugging Face:
 - the inventory of past builds, and projecting them again;
 - the calibration tree handler, which reads each release build's repo
   `releases.json` at its head commit to decide the latest (see "Building
-  trees from submissions"), and so needs the token wherever it has the Blob
-  token.
+  trees from submissions"), and the `releases-record` handler, which reads it
+  to move the latest (see "Moving the latest when releases.json changes"),
+  so both need the token wherever they have the Blob token.
 
 A read answered with anything but HTTP 200 reports the status and, for a
 404, Hugging Face's `X-Error-Code`, so a missing file (`EntryNotFound`) can be

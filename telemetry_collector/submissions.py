@@ -43,7 +43,7 @@ INTAKE_ONLY_HANDLER = "intake-only"
 #: (``reproject-past-builds``). No Hugging Face user has this ID.
 COLLECTOR_OWNER_HF_ID = "microcosm-collector"
 
-SubmissionKind = Literal["calibration-diagnostics", "orrery-inputs"]
+SubmissionKind = Literal["calibration-diagnostics", "orrery-inputs", "releases-record"]
 SubmissionStatus = Literal[
     "awaiting_upload", "queued", "processing", "succeeded", "rejected", "failed"
 ]
@@ -102,6 +102,11 @@ ROLE_RULES: dict[str, dict[str, RoleRule]] = {
         "execution_overlay": RoleRule(1, 1, 32 * MEBIBYTE),
         "upstream": RoleRule(0, None, 64 * MEBIBYTE),
         "evidence": RoleRule(0, None, 2 * GIBIBYTE),
+    },
+    # A release repo's releases.json after a change made a build current; the
+    # record's writer accepts at most 4 MiB.
+    "releases-record": {
+        "releases_record": RoleRule(1, 1, 4 * MEBIBYTE),
     },
 }
 
@@ -201,7 +206,23 @@ class SubmissionRequest(BaseModel):
             raise ValueError(
                 "calibration-diagnostics submissions need Hugging Face provenance"
             )
+        if self.kind == "releases-record":
+            self._enforce_releases_record_provenance()
         return self
+
+    def _enforce_releases_record_provenance(self) -> None:
+        # The record's repo and commit, and the build the change made current.
+        provenance = self.provenance
+        if provenance.huggingface is None:
+            raise ValueError("releases-record submissions need Hugging Face provenance")
+        if provenance.release is None:
+            raise ValueError("releases-record submissions need a release")
+        build_folder = f"releases/{provenance.release}/{provenance.build_id}"
+        if provenance.huggingface.folder != build_folder:
+            raise ValueError(
+                "a releases-record submission's folder must be "
+                "releases/<release>/<build_id>, the folder of the build made current"
+            )
 
     def sorted_files(self) -> list[dict[str, Any]]:
         """The inventory as plain values, sorted by file name."""

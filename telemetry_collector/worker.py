@@ -130,6 +130,7 @@ def keep_in_intake_storage(context: JobContext) -> dict[str, Any]:
 DEFAULT_HANDLERS: Mapping[str, JobHandler] = {
     "calibration-diagnostics": keep_in_intake_storage,
     "orrery-inputs": keep_in_intake_storage,
+    "releases-record": keep_in_intake_storage,
 }
 
 
