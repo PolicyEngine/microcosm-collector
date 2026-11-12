@@ -5,7 +5,8 @@ Every kind starts with the handler that keeps its files in intake storage
 where the worker job has the setting it needs:
 
 - ``calibration_trees``: ``calibration-diagnostics``, where
-  ``COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN`` is set;
+  ``COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN`` is set, which then also needs
+  ``COLLECTOR_HF_READ_TOKEN``;
 - ``orrery_graphs``: ``orrery-inputs``, where ``COLLECTOR_ORRERY_BUCKET`` is
   set.
 """
