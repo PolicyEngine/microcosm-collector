@@ -1640,7 +1640,11 @@ its release ID:
   entries get. That reproduces the stored index, so the publication keeps
   every part and moves only the latest: the entry is `built` with
   `made_latest: true`, or `latest_not_moved` when the store's latest is
-  newer. A stored entry that fails the checks is `invalid`, and nothing is
+  newer. It reproduces the index only when the folder at the stored commit
+  lists the files the stored tree was built from and the tree package still
+  builds the same index; otherwise the publication refuses the build, which
+  is reported `refused` and leaves the run incomplete until the stored
+  build is dealt with by hand. A stored entry that fails the checks is `invalid`, and nothing is
   published.
 
 **The store.** The command reads the store's manifest once, with the read-only
@@ -1650,7 +1654,8 @@ run the store already holds, with the same commit and `createdAt`, is
 the millisecond, since the worker stores `createdAt` as `toISOString` writes
 it, keeping milliseconds and dropping finer digits. Neither outcome downloads
 anything, and its `made_latest` says whether the stored build is the store's
-latest, as the store's manifest records.
+latest: as the store's manifest recorded it when the run read it, or as this
+run's publications have since moved it.
 
 **Building.** One build at a time, each in a new temporary directory that is
 removed afterwards. A file listed as larger than 256 MiB is `too_large`

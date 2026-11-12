@@ -59,7 +59,11 @@ store's latest, nothing is done. When it holds it but not as its latest, the
 stored build is published again exactly as stored: from its files at the
 stored entry's commit, with the stored entry's repo and publication time,
 which the stored entry must pass production's entries' checks for. That
-reproduces the stored index, so every part is kept and only the latest moves.
+reproduces the stored index, so every part is kept and only the latest moves,
+as long as the folder at that commit lists the files the stored tree was built
+from and the tree package still builds the same index; otherwise the
+publication refuses the build, which is reported ``refused`` and leaves the
+run incomplete.
 
 **The store.** The store's manifest is read once, with the tree package's
 read-only manifest read. An entry whose release ID or staging run the store
@@ -97,7 +101,7 @@ import tempfile
 import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Final, Literal
@@ -209,7 +213,8 @@ class BackfillOutcome:
     kept_parts: int | None = None
     #: Whether this build is the store's latest now: as its publication
     #: reported, or, for an entry the store already holds and that was not
-    #: published again, as the store's manifest says. ``None`` when neither
+    #: published again, as the store's manifest says once this run's own
+    #: publications are taken into account. ``None`` when neither
     #: tells, as for a dry run's ``would_build``; ``False`` for production's
     #: latest when it ended any other way.
     made_latest: bool | None = None
@@ -931,6 +936,15 @@ class _Backfill:
     clock: Callable[[], float]
     started: float
     time_limit_seconds: float
+    #: Each country's build that this run's publications made the store's
+    #: latest, which replaces the latest the store's manifest named when it
+    #: was read.
+    latest_made: dict[str, str] = field(default_factory=dict)
+
+    def store_latest(self, country: str) -> str | None:
+        """The store's latest now, as far as this run knows."""
+
+        return self.latest_made.get(country, self.stored.latest(country))
 
     def entry(self, entry: ProductionEntry) -> BackfillOutcome:
         def outcome(result: BackfillOutcomeKind, **fields: Any) -> BackfillOutcome:
@@ -961,11 +975,12 @@ class _Backfill:
             stored_fields = {
                 "build_artifact_id": stored_build,
                 "matches_production": stored_build == entry.build_artifact_id,
-                # Nothing is published for it here, so the store's manifest
+                # Nothing is published for it here, so the store's latest, as
+                # read or as this run's publications have since moved it,
                 # says whether it is the latest.
                 "made_latest": (
                     stored_build is not None
-                    and self.stored.latest(entry.country) == stored_build
+                    and self.store_latest(entry.country) == stored_build
                 ),
             }
             differences = []
@@ -988,7 +1003,9 @@ class _Backfill:
             # Production's latest, stored but not as the store's latest: the
             # stored build is published again exactly as stored, from its files
             # at its own commit, with its own repo and publication time. That
-            # reproduces the stored index, so the publication keeps every part
+            # reproduces the stored index (when the folder at that commit lists
+            # the same files and the package builds the same index; otherwise
+            # the publication refuses it), so the publication keeps every part
             # and moves only the latest. The stored entry is checked first, as
             # production's entries are.
             try:
@@ -1048,6 +1065,8 @@ class _Backfill:
             return outcome("refused", reason=shortened_message(str(error)))
         except Exception as error:
             return outcome("error", reason=_described(error), incomplete=True)
+        if published.made_latest:
+            self.latest_made[entry.country] = published.build_artifact_id
         not_moved = entry.make_latest and not published.made_latest
         return outcome(
             "latest_not_moved" if not_moved else "built",
