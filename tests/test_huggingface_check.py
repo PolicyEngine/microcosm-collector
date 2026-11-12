@@ -576,7 +576,7 @@ def test_a_build_without_its_release_manifest_leaves_the_check_unfinished() -> N
     assert outcome.releases_record_completed == ()
 
 
-def test_a_build_whose_manifest_lists_no_files_leaves_the_check_unfinished() -> None:
+def test_a_build_whose_manifest_cannot_be_read_leaves_the_check_unfinished() -> None:
     hub, dataset = switched_on_hub(
         {"releases.json": b"{}", LISTED_MANIFEST: b"not a manifest"}
     )
@@ -624,4 +624,30 @@ def test_a_refused_record_leaves_the_check_unfinished() -> None:
     )
 
     assert [finding.code for finding in outcome.findings] == ["RECORD_INVALID"]
+    assert outcome.releases_record_completed == ()
+
+
+def test_every_listed_build_is_checked_after_one_that_was_not_compared() -> None:
+    # Each build's files are checked even when an earlier build's could not be.
+    data = b"one published file"
+    second_manifest = {"artifacts": {"data": artifact("data.bin", digest(b"else"))}}
+    hub, dataset = switched_on_hub(
+        {
+            "releases.json": b"{}",
+            "releases/release/build-2/release_manifest.json": json.dumps(
+                second_manifest
+            ).encode(),
+            "releases/release/build-2/data.bin": data,
+        }
+    )
+
+    outcome = run_all_checks(
+        reader_for(hub),
+        [dataset],
+        release_rules_loader=lambda: stand_in_release_rules(
+            builds={"release": ["build-1", "build-2"]}
+        ),
+    )
+
+    assert [finding.code for finding in outcome.findings] == ["SHA256_MISMATCH"]
     assert outcome.releases_record_completed == ()

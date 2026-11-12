@@ -969,3 +969,18 @@ def test_the_checks_summary_entry_tells_the_sync_which_checks_finished() -> None
     assert report.completed_checks == ran(
         *(dataset.name for dataset in HUGGINGFACE_DATASETS)
     )
+
+
+# -- Review round 3 --------------------------------------------------------------
+
+
+def test_the_issue_for_a_failed_workflow_says_it_may_have_changed_issues() -> None:
+    # A workflow can fail partway through closing issues, so its issue must not
+    # say that no issue was closed.
+    github = FakeGitHub()
+
+    sync(github, Report(None, WORKFLOW_FAILED_REASON))
+
+    body = github.issues[1]["body"]
+    assert "closes no problem issue" not in body
+    assert "may have changed some issues before it stopped" in " ".join(body.split())
