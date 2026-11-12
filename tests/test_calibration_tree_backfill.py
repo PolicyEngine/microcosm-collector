@@ -20,6 +20,7 @@ import subprocess
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -51,6 +52,11 @@ STAGING_COMMIT = "2" * 40
 BUNDLE_COMMIT = "3" * 40
 CREATED_AT = "2026-10-20T09:00:00.000Z"
 LATER = "2026-11-01T00:00:00.000Z"
+EARLIER = "2026-09-01T00:00:00.000Z"
+#: A tree built from a submission records the submission's accepted_at.
+SUBMISSION_ACCEPTED_AT = "2026-10-21T08:30:00.000Z"
+#: The commit a submission's tree was built from, not production's entry's.
+SUBMISSION_COMMIT = "5" * 40
 US_RELEASE = "microcosm-us-2025"
 US_TAG = f"{US_RELEASE}-20261020T090000Z-0a1b2c3d"
 RUN_ID = "us-calibration-attempt-20261019T083323Z-6cba5d71"
@@ -155,11 +161,18 @@ def production_manifest(
 
 @dataclass
 class Production:
-    """Stands in for the dashboard's public tree manifest, one answer per country."""
+    """Stands in for the dashboard's public tree manifest, one answer per country.
+
+    A country in ``chunked_bodies`` is answered in those chunks, each of which
+    takes ``seconds_per_chunk`` of ``clock`` to arrive.
+    """
 
     manifests: dict[str, Any] = field(default_factory=dict)
     statuses: dict[str, int] = field(default_factory=dict)
     bodies: dict[str, bytes] = field(default_factory=dict)
+    chunked_bodies: dict[str, list[bytes]] = field(default_factory=dict)
+    clock: ManualClock | None = None
+    seconds_per_chunk: float = 0.0
     requests: list[httpx.Request] = field(default_factory=list)
 
     def handle(self, request: httpx.Request) -> httpx.Response:
@@ -175,9 +188,19 @@ class Production:
             )
         if country in self.bodies:
             return httpx.Response(200, content=self.bodies[country])
+        if country in self.chunked_bodies:
+            return httpx.Response(
+                200, content=self._arriving(self.chunked_bodies[country])
+            )
         return httpx.Response(
             200, json=self.manifests.get(country, production_manifest(country, []))
         )
+
+    def _arriving(self, chunks: Sequence[bytes]) -> Iterator[bytes]:
+        for chunk in chunks:
+            if self.clock is not None:
+                self.clock.now += self.seconds_per_chunk
+            yield chunk
 
     def client(self) -> httpx.Client:
         return httpx.Client(transport=httpx.MockTransport(self.handle))
@@ -199,6 +222,17 @@ def store_manifest(
     }
 
 
+def published_instant(entry: Mapping[str, Any]) -> float:
+    """When a build was published, as the publication orders builds; undated first."""
+
+    published = entry.get("createdAt") or entry.get("updatedAt")
+    return (
+        float("-inf")
+        if published is None
+        else datetime.fromisoformat(published).timestamp()
+    )
+
+
 @dataclass
 class ManualClock:
     now: float = 0.0
@@ -213,8 +247,9 @@ class StandInBun:
 
     The worker gives each source production's build ID unless
     ``built_build_ids`` names another, and records the bytes of every file it
-    is given. The publication answers ``madeLatest`` as it was asked, unless
-    the source is in ``latest_not_moved``.
+    is given. The publication answers ``madeLatest`` as it was asked, as the
+    real one does: only when the build is at least as new as ``store``'s
+    latest, and unless the source is in ``latest_not_moved``.
     """
 
     store: dict[str, Any] = field(default_factory=lambda: store_manifest())
@@ -279,7 +314,11 @@ class StandInBun:
                 source, build_id(request["country"], request["kind"], source)
             ),
             "files": [],
-            "manifestEntry": {"kind": request["kind"], "sourceId": source},
+            "manifestEntry": {
+                "kind": request["kind"],
+                "sourceId": source,
+                "createdAt": request["createdAt"],
+            },
         }
         return subprocess.CompletedProcess(
             argv,
@@ -313,7 +352,8 @@ class StandInBun:
             "uploadedParts": 7,
             "keptParts": 0,
             "madeLatest": publication["makeLatest"]
-            and source not in self.latest_not_moved,
+            and source not in self.latest_not_moved
+            and self._at_least_as_new_as_latest(worker),
         }
         return subprocess.CompletedProcess(
             argv,
@@ -321,6 +361,23 @@ class StandInBun:
             json.dumps(answer) if exit_code == 0 else "",
             "" if exit_code == 0 else f"The publication stopped on {source}.",
         )
+
+    def _at_least_as_new_as_latest(self, worker: Mapping[str, Any]) -> bool:
+        """The publication's rule: the latest moves only to a build at least as new."""
+
+        country = self.store["countries"].get(worker["country"], {})
+        latest_build = country.get("latestReleaseBuildArtifactId")
+        latest = next(
+            (
+                build
+                for build in country.get("builds", [])
+                if build["buildArtifactId"] == latest_build
+            ),
+            None,
+        )
+        if latest is None or latest_build == worker["buildArtifactId"]:
+            return True
+        return published_instant(worker["manifestEntry"]) >= published_instant(latest)
 
     def steps(self, step: str) -> list[dict[str, Any]]:
         return [call for call in self.calls if call["step"] == step]
@@ -605,6 +662,32 @@ def test_an_unusable_answer_is_an_error_for_that_country_only(
     assert all(
         request.url.host == "dashboard.example.test" for request in production.requests
     )
+
+
+def test_an_answer_that_takes_too_long_to_arrive_is_an_error_for_that_country_only() -> (
+    None
+):
+    uk_build = release_entry("microcosm-uk-2024-25-national", country="uk")
+    production = Production({"uk": production_manifest("uk", [uk_build])})
+    us_answer = json.dumps(production_manifest("us", [])).encode()
+    # Each chunk arrives well within the client's timeout for one read, but
+    # the whole answer takes far longer than any limit on the read.
+    production.chunked_bodies["us"] = [
+        us_answer[offset : offset + 16] for offset in range(0, len(us_answer), 16)
+    ]
+    production.seconds_per_chunk = 5 * MINUTE
+    backfill = Backfill(production=production, hugging_face=hugging_face_with({}))
+    production.clock = backfill.clock
+    backfill.bun.store = store_manifest("uk", [uk_build])
+
+    outcomes = backfill.run(countries=["us", "uk"])
+
+    assert [(outcome.country, outcome.outcome) for outcome in outcomes] == [
+        ("us", "error"),
+        ("uk", "already_stored"),
+    ]
+    assert "took longer than" in outcomes[0].reason
+    assert outcomes[0].incomplete is True
 
 
 @pytest.mark.parametrize(
@@ -1065,26 +1148,125 @@ def test_only_production_s_latest_is_made_latest_and_each_country_s_goes_first()
     assert summary["incomplete"] is False
 
 
-def test_a_stored_latest_that_is_not_the_store_s_latest_is_published_again() -> None:
+def production_s_latest_stored_as(
+    stored_changes: Mapping[str, Any],
+    *,
+    store_latest: dict[str, Any] | None,
+    files_commit: str = RELEASE_COMMIT,
+) -> tuple[Backfill, dict[str, Any]]:
+    """Production's US latest, which the store holds with ``stored_changes``.
+
+    The store's latest is ``store_latest``, or the stored build itself when it
+    is ``None``; its files are at ``files_commit``.
+    """
+
     latest = release_entry(US_RELEASE, created_at=CREATED_AT)
-    newer_in_store = release_entry("microcosm-us-2026", created_at=LATER)
+    stored = {**latest, **stored_changes}
     backfill = us_backfill(
         [latest],
         latest=latest["buildArtifactId"],
-        files={(US_RELEASES, RELEASE_COMMIT): release_folder(US_RELEASE)},
+        files={(US_RELEASES, files_commit): release_folder(US_RELEASE)},
     )
+    store_latest = store_latest or stored
     backfill.bun.store = store_manifest(
-        "us", [latest, newer_in_store], latest=newer_in_store["buildArtifactId"]
+        "us",
+        [stored] if store_latest is stored else [store_latest, stored],
+        latest=store_latest["buildArtifactId"],
+    )
+    return backfill, stored
+
+
+def test_a_stored_latest_that_is_not_the_store_s_latest_is_published_again() -> None:
+    older_store_latest = release_entry("microcosm-us-2024", created_at=EARLIER)
+    backfill, stored = production_s_latest_stored_as(
+        {}, store_latest=older_store_latest
     )
 
     [outcome] = backfill.run()
 
     assert outcome.outcome == "built"
     request = backfill.bun.build_of(US_RELEASE)["request"]
-    assert request["createdAt"] == latest["createdAt"]
+    assert request["createdAt"] == stored["createdAt"]
     publication = backfill.bun.publication_of(US_RELEASE)["publication"]
     assert publication["makeLatest"] is True
     assert outcome.made_latest is True
+    assert summary_of([outcome])["incomplete"] is False
+
+
+def test_a_stored_latest_built_from_a_submission_is_published_again_as_stored() -> None:
+    # A tree built from a submission records the submission's accepted_at,
+    # not production's createdAt.
+    backfill, stored = production_s_latest_stored_as(
+        {"createdAt": SUBMISSION_ACCEPTED_AT, "updatedAt": SUBMISSION_ACCEPTED_AT},
+        store_latest=release_entry("microcosm-us-2024", created_at=EARLIER),
+    )
+
+    [outcome] = backfill.run()
+
+    assert outcome.outcome == "built"
+    assert outcome.made_latest is True
+    request = backfill.bun.build_of(US_RELEASE)["request"]
+    # Exactly as stored, so the publication reproduces the stored index.
+    assert request["createdAt"] == SUBMISSION_ACCEPTED_AT
+    assert request["hfRepo"] == stored["hfRepo"]
+    assert request["hfCommitSha"] == stored["hfCommitSha"]
+    assert backfill.bun.publication_of(US_RELEASE)["publication"]["makeLatest"]
+    summary = summary_of([outcome])
+    assert summary["latest"]["us"]["made_latest"] is True
+    assert summary["incomplete"] is False
+
+
+def test_a_stored_latest_from_another_commit_is_published_again_from_that_commit() -> (
+    None
+):
+    backfill, stored = production_s_latest_stored_as(
+        {"hfCommitSha": SUBMISSION_COMMIT},
+        store_latest=release_entry("microcosm-us-2024", created_at=EARLIER),
+        files_commit=SUBMISSION_COMMIT,
+    )
+
+    [outcome] = backfill.run()
+
+    assert outcome.outcome == "built"
+    assert outcome.made_latest is True
+    request = backfill.bun.build_of(US_RELEASE)["request"]
+    assert request["hfCommitSha"] == SUBMISSION_COMMIT
+    assert request["createdAt"] == stored["createdAt"]
+    # Every file is read at the stored entry's commit, not production's.
+    assert backfill.hugging_face.requests
+    assert all(
+        f"/{SUBMISSION_COMMIT}/" in request.url.path
+        for request in backfill.hugging_face.requests
+    )
+    assert summary_of([outcome])["incomplete"] is False
+
+
+def test_a_stored_latest_whose_entry_fails_the_checks_is_not_published_again() -> None:
+    backfill, _ = production_s_latest_stored_as(
+        {"hfRepo": US_STAGING},
+        store_latest=release_entry("microcosm-us-2024", created_at=EARLIER),
+    )
+
+    [outcome] = backfill.run()
+
+    assert outcome.outcome == "invalid"
+    assert outcome.made_latest is False
+    assert backfill.hugging_face.requests == []
+    assert backfill.bun.steps("build") == []
+    assert summary_of([outcome])["incomplete"] is True
+
+
+def test_a_stored_latest_older_than_the_store_s_latest_is_not_made_the_latest() -> None:
+    newer_store_latest = release_entry("microcosm-us-2026", created_at=LATER)
+    backfill, _ = production_s_latest_stored_as({}, store_latest=newer_store_latest)
+
+    [outcome] = backfill.run()
+
+    # Published again, but the publication keeps the newer latest.
+    assert backfill.bun.publication_of(US_RELEASE)["publication"]["makeLatest"]
+    assert outcome.outcome == "latest_not_moved"
+    assert outcome.made_latest is False
+    assert summary_of([outcome])["incomplete"] is True
 
 
 def test_a_stored_latest_that_is_already_the_store_s_latest_is_left_alone() -> None:
@@ -1100,6 +1282,26 @@ def test_a_stored_latest_that_is_already_the_store_s_latest_is_left_alone() -> N
     assert outcome.made_latest is True
     assert summary_of([outcome])["latest"]["us"]["made_latest"] is True
     assert backfill.bun.steps("build") == []
+
+
+def test_a_stored_latest_with_another_time_that_is_the_store_s_latest_needs_no_work() -> (
+    None
+):
+    backfill, _ = production_s_latest_stored_as(
+        {"createdAt": SUBMISSION_ACCEPTED_AT, "updatedAt": SUBMISSION_ACCEPTED_AT},
+        store_latest=None,
+    )
+
+    [outcome] = backfill.run()
+
+    assert outcome.outcome == "mismatch"
+    # From the store's manifest: the store's latest is already correct.
+    assert outcome.made_latest is True
+    assert backfill.hugging_face.requests == []
+    assert backfill.bun.events == ["manifest read"]
+    summary = summary_of([outcome])
+    assert summary["latest"]["us"]["made_latest"] is True
+    assert summary["incomplete"] is False
 
 
 def test_a_latest_the_publication_does_not_move_is_reported_and_incomplete() -> None:
@@ -1152,6 +1354,8 @@ def test_builds_stored_already_or_stored_differently_download_nothing() -> None:
         == (same["buildArtifactId"])
     )
     assert all(outcome.incomplete is False for outcome in outcomes)
+    # None of them is the store's latest, as its manifest says.
+    assert all(outcome.made_latest is False for outcome in outcomes)
     assert backfill.hugging_face.requests == []
     assert backfill.bun.events == ["manifest read"]
 
@@ -1166,6 +1370,38 @@ def test_a_stored_time_written_another_way_is_the_same_instant() -> None:
     [outcome] = backfill.run()
 
     assert outcome.outcome == "already_stored"
+
+
+@pytest.mark.parametrize(
+    ("production_time", "stored_time", "expected"),
+    [
+        ("2026-10-20T09:00:00.123456Z", "2026-10-20T09:00:00.123Z", "already_stored"),
+        # Truncated as toISOString truncates, not rounded.
+        ("2026-10-20T09:00:00.123999Z", "2026-10-20T09:00:00.123Z", "already_stored"),
+        (
+            "2026-10-20T10:00:00.123456+01:00",
+            "2026-10-20T09:00:00.123Z",
+            "already_stored",
+        ),
+        ("2026-10-20T09:00:00.123456Z", "2026-10-20T09:00:00.124Z", "mismatch"),
+    ],
+    ids=["microseconds", "not-rounded", "with-an-offset", "another-millisecond"],
+)
+def test_times_are_compared_to_the_millisecond_the_worker_stores(
+    production_time: str, stored_time: str, expected: str
+) -> None:
+    # A staging run's time is copied from its run as written, while the
+    # worker stores createdAt as toISOString writes it, to the millisecond.
+    run = staging_entry(RUN_ID, created_at=production_time)
+    backfill = us_backfill([run])
+    backfill.bun.store = store_manifest(
+        "us", [{**run, "createdAt": stored_time, "updatedAt": stored_time}]
+    )
+
+    [outcome] = backfill.run()
+
+    assert outcome.outcome == expected
+    assert backfill.hugging_face.requests == []
 
 
 # The dry run -------------------------------------------------------------------

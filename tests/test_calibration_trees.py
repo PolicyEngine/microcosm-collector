@@ -16,7 +16,6 @@ from __future__ import annotations
 import hashlib
 import importlib
 import importlib.util
-import inspect
 import json
 import runpy
 import subprocess
@@ -202,28 +201,27 @@ def handler_with(
     hugging_face: FakeHuggingFace | None = None,
     **settings: Any,
 ) -> Any:
+    """The handler, reading Hugging Face from ``hugging_face``.
+
+    A release build's tree reads releases.json to decide the latest; without
+    a stand-in given, it reads the UK release repo without one.
+    """
+
     @contextmanager
     def recorded_lock() -> Iterator[None]:
         runner.events.append("lock taken")
         yield
         runner.events.append("lock released")
 
-    handler_factory = trees().calibration_tree_handler
-    if hugging_face is not None:
-        # A release build's tree reads releases.json to decide the latest.
-        if "reader" not in inspect.signature(handler_factory).parameters:
-            pytest.fail(
-                "calibration_tree_handler takes no Hugging Face reader, which "
-                "the releases.json latest rule needs."
-            )
-        settings["reader"] = HuggingFaceReader(
-            HuggingFaceReadSettings(token=READ_TOKEN), client=hugging_face.client()
-        )
-    return handler_factory(
+    hugging_face = hugging_face or uk_release_repo(record=None)
+    return trees().calibration_tree_handler(
         blob_token=BLOB_TOKEN,
         manifest_lock=recorded_lock,
         bun="/usr/local/bin/bun",
         run_command=runner,
+        reader=HuggingFaceReader(
+            HuggingFaceReadSettings(token=READ_TOKEN), client=hugging_face.client()
+        ),
         **settings,
     )
 
@@ -234,8 +232,12 @@ def releases_record(
     release: str = UK_DEFAULT_RELEASE,
     current: str | None = RUN_ID,
     builds: Sequence[str] = (RUN_ID,),
+    withdrawn: Sequence[str] = (),
 ) -> bytes:
-    """A releases.json with one release, as Microcosm's release writer writes it."""
+    """A releases.json with one release, as Microcosm's release writer writes it.
+
+    The builds in ``withdrawn`` are recorded as withdrawn.
+    """
 
     return json.dumps(
         {
@@ -248,7 +250,7 @@ def releases_record(
                     "builds": {
                         build: {
                             "published_at": "2026-10-20T09:00:00Z",
-                            "withdrawn": False,
+                            "withdrawn": build in withdrawn,
                         }
                         for build in builds
                     },
@@ -603,6 +605,19 @@ def test_the_tree_handler_needs_the_read_token_beside_its_blob_token() -> None:
         )
 
 
+def test_the_tree_handler_cannot_be_made_without_a_hugging_face_reader() -> None:
+    # A handler without one could build no release tree, so it is refused when
+    # it is made rather than on each release build's attempt.
+    @contextmanager
+    def unused_lock() -> Iterator[None]:
+        yield
+
+    with pytest.raises(TypeError, match="reader"):
+        trees().calibration_tree_handler(
+            blob_token=BLOB_TOKEN, manifest_lock=unused_lock
+        )
+
+
 # The latest build, from releases.json ------------------------------------------
 
 
@@ -670,18 +685,60 @@ def test_without_releases_json_the_default_release_rule_decides() -> None:
     assert len(releases_record_reads(hugging_face)) == 2
 
 
+# Each record names RUN_ID as the current build of the UK's default release, so
+# only the broken rule keeps it from becoming the latest.
+ACCEPTED_RECORD = releases_record()
+
+
 @pytest.mark.parametrize(
-    "refused_record",
+    ("refused_record", "reason"),
     [
-        releases_record(current="uk-frs-calibration-attempt-unlisted"),
-        releases_record(default="microcosm-uk-unlisted"),
-        json.dumps({"schema_version": 2, "default": None, "releases": {}}).encode(),
-        b"not json",
+        (
+            releases_record(current="uk-frs-calibration-attempt-unlisted"),
+            "is not listed",
+        ),
+        (releases_record(default="microcosm-uk-unlisted"), "is not listed"),
+        (
+            json.dumps({"schema_version": 2, "default": None, "releases": {}}).encode(),
+            "schema_version must be 1",
+        ),
+        (b"not json", "not a readable JSON document"),
+        # Whitespace after the record keeps it valid JSON, over 4 MiB.
+        (ACCEPTED_RECORD + b" " * (4 * 1024 * 1024), "larger than 4194304 bytes"),
+        (releases_record(withdrawn=(RUN_ID,)), "is withdrawn"),
+        (
+            json.dumps({**json.loads(ACCEPTED_RECORD), "notes": "extra"}).encode(),
+            "must have exactly default, releases, schema_version",
+        ),
+        # Python's True equals 1, which the record's rule does not accept.
+        (
+            ACCEPTED_RECORD.replace(b'"schema_version": 1', b'"schema_version": true'),
+            "schema_version must be 1",
+        ),
+        (
+            ACCEPTED_RECORD.replace(b'"national"', b'"nation\xffal"'),
+            "not a readable JSON document",
+        ),
+        (
+            ACCEPTED_RECORD.replace(b'"schema_version": 1', b'"schema_version": NaN'),
+            "not a readable JSON document",
+        ),
     ],
-    ids=["unlisted-current", "unlisted-default", "schema-2", "not-json"],
+    ids=[
+        "unlisted-current",
+        "unlisted-default",
+        "schema-2",
+        "not-json",
+        "over-4-mib",
+        "withdrawn-current",
+        "extra-key",
+        "boolean-schema-version",
+        "invalid-utf-8",
+        "nan",
+    ],
 )
 def test_a_releases_json_the_rules_refuse_publishes_without_moving_the_latest(
-    refused_record: bytes,
+    refused_record: bytes, reason: str
 ) -> None:
     hugging_face = uk_release_repo(refused_record)
     runner = RecordingRunner()
@@ -691,11 +748,23 @@ def test_a_releases_json_the_rules_refuse_publishes_without_moving_the_latest(
 
     assert submission.record().status == "succeeded"
     assert published_make_latest(runner) is False
-    assert submission.record().result["latest_skipped"] == "releases_record_refused"
+    result = submission.record().result
+    assert result["latest_skipped"] == "releases_record_refused"
+    assert reason in result["latest_skipped_reason"]
+
+
+def test_the_accepted_record_the_refusals_change_makes_the_build_the_latest() -> None:
+    runner = RecordingRunner()
+
+    accepted(RELEASED).run(
+        handler_with(runner, hugging_face=uk_release_repo(ACCEPTED_RECORD))
+    )
+
+    assert published_make_latest(runner) is True
 
 
 @pytest.mark.parametrize("status_code", [401, 429, 500, 503])
-def test_a_failed_releases_json_read_returns_the_job_before_anything_is_built(
+def test_a_failed_head_commit_read_returns_the_job_before_anything_is_built(
     status_code: int,
 ) -> None:
     hugging_face = uk_release_repo(releases_record())
@@ -708,6 +777,46 @@ def test_a_failed_releases_json_read_returns_the_job_before_anything_is_built(
     assert outcome is JobOutcome.RETRY
     assert submission.record().status == "queued"
     assert runner.calls == []
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [(401, None), (429, None), (500, None), (503, None)]
+    # A 404 for the repo or the revision is not a repo without releases.json.
+    + [(404, "RepoNotFound"), (404, "RevisionNotFound")],
+    ids=["401", "429", "500", "503", "404-repo", "404-revision"],
+)
+def test_a_failed_read_of_releases_json_itself_returns_the_job_before_anything_is_built(
+    answer: tuple[int, str | None],
+) -> None:
+    hugging_face = uk_release_repo(releases_record())
+    hugging_face.datasets[UK_RELEASE_REPO].file_answers["releases.json"] = answer
+    runner = RecordingRunner()
+    submission = accepted(RELEASED)
+
+    outcome = submission.run(handler_with(runner, hugging_face=hugging_face))
+
+    assert outcome is JobOutcome.RETRY
+    assert submission.record().status == "queued"
+    assert runner.calls == []
+    # The head commit was read, and then the record at it.
+    assert [request.url.path for request in hugging_face.requests] == [
+        f"/api/datasets/{UK_RELEASE_REPO}",
+        f"/datasets/{UK_RELEASE_REPO}/resolve/{'c' * 40}/releases.json",
+    ]
+
+
+def test_a_404_without_an_error_code_means_the_repo_has_no_record() -> None:
+    hugging_face = uk_release_repo(releases_record())
+    hugging_face.datasets[UK_RELEASE_REPO].file_answers["releases.json"] = (404, None)
+    runner = RecordingRunner()
+    submission = accepted(RELEASED)
+
+    submission.run(handler_with(runner, hugging_face=hugging_face))
+
+    assert submission.record().status == "succeeded"
+    # DEFAULT_RELEASES's rule: a build of the UK's default release.
+    assert published_make_latest(runner) is True
 
 
 def test_a_staged_bundle_reads_nothing_from_hugging_face() -> None:

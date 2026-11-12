@@ -7,7 +7,9 @@ with its ``lastCommit``, and file downloads, and redirects downloads of LFS
 files to a separate content host, as Hugging Face does. A dataset can hold
 other files at other commits (``FakeDataset.revisions``), for reads pinned to
 a commit that is not its head. A 404 carries Hugging Face's ``X-Error-Code``:
-``RepoNotFound``, ``RevisionNotFound`` or ``EntryNotFound``.
+``RepoNotFound``, ``RevisionNotFound`` or ``EntryNotFound``. A download of one
+file can be answered with a status of its own (``FakeDataset.file_answers``),
+while the dataset's other reads succeed.
 """
 
 from __future__ import annotations
@@ -34,6 +36,9 @@ class FakeDataset:
     head_commit: str = "0" * 40
     #: Answer every request for this dataset with this status instead.
     forced_status: int | None = None
+    #: Answer a download of these files with this status and, when given,
+    #: this ``X-Error-Code`` instead; every other read is answered as usual.
+    file_answers: dict[str, tuple[int, str | None]] = field(default_factory=dict)
     #: Report these SHA-256 values for LFS files instead of their content's.
     reported_lfs_sha256: dict[str, str] = field(default_factory=dict)
     #: The last commit (ID and date) of each file or folder, by path, for
@@ -257,6 +262,13 @@ class FakeHuggingFace:
         return entries
 
     def _resolve(self, name, dataset, revision, file_path) -> httpx.Response:
+        if file_path in dataset.file_answers:
+            status_code, error_code = dataset.file_answers[file_path]
+            return httpx.Response(
+                status_code,
+                json={"error": error_code or "forced"},
+                headers={"X-Error-Code": error_code} if error_code else {},
+            )
         files = dataset.files_at(revision)
         if files is None:
             return not_found("RevisionNotFound")
