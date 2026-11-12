@@ -192,6 +192,8 @@ class RecordingRunner:
     latest_answer: dict[str, Any] | None = None
     #: Printed by the latest command in place of its answer, when set.
     latest_stdout: str | None = None
+    #: Raised instead of running the latest command, when set.
+    latest_raises: BaseException | None = None
     events: list[str] = field(default_factory=list)
     calls: list[dict[str, Any]] = field(default_factory=list)
 
@@ -222,6 +224,8 @@ class RecordingRunner:
                 self.build_stderr,
             )
         if step == "latest":
+            if self.latest_raises is not None:
+                raise self.latest_raises
             request = inputs["latest.json"]
             answer = self.latest_answer or {
                 "country": request["country"],
@@ -1533,6 +1537,25 @@ def test_a_failed_follow_raises_for_the_caller_to_try_again(failure: str) -> Non
         follow_with(runner, hugging_face, "uk")
 
 
+@pytest.mark.parametrize(
+    "raised",
+    [subprocess.TimeoutExpired(["bun"], 300), FileNotFoundError("bun")],
+    ids=["timeout", "bun-missing"],
+)
+def test_a_latest_command_that_cannot_finish_raises_the_documented_error(
+    raised: BaseException,
+) -> None:
+    # A caller retries on the two documented errors, so a command that runs
+    # out of time or cannot start raises one of them too.
+    runner = RecordingRunner(latest_raises=raised)
+
+    with pytest.raises(Exception) as caught:
+        follow_with(runner, uk_release_repo(releases_record()), "uk")
+
+    assert isinstance(caught.value, trees().CalibrationTreeCommandError)
+    assert caught.value.__cause__ is raised
+
+
 def test_the_manifest_lock_lets_one_writer_in_at_a_time(postgres_url: str) -> None:
     trees_module = trees()
     engine = create_database_engine(postgres_url)
@@ -1676,8 +1699,17 @@ def test_ci_checks_the_tree_package_in_the_built_image() -> None:
     assert runs.index(f"docker build --tag {IMAGE} .") < runs.index(tree_check)
 
 
+TOKEN_REFUSAL = "CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN is required."
+
+
 def run_tree_image_check(
-    tmp_path: Path, *, build_exit: int, build_answer: str, publication_exit: int
+    tmp_path: Path,
+    *,
+    build_exit: int,
+    build_answer: str,
+    publication_exit: int,
+    latest_exit: int = 1,
+    latest_stderr: str = TOKEN_REFUSAL,
 ) -> subprocess.CompletedProcess[str]:
     bin_directory = tmp_path / "bin"
     bin_directory.mkdir()
@@ -1689,6 +1721,10 @@ def run_tree_image_check(
         'if [[ "$*" == *calibration-tree-worker.ts* ]]; then\n'
         f"  printf '%s\\n' '{build_answer}'\n"
         f"  exit {build_exit}\n"
+        "fi\n"
+        'if [[ "$*" == *calibration-tree-latest.ts* ]]; then\n'
+        f"  printf '%s\\n' '{latest_stderr}' >&2\n"
+        f"  exit {latest_exit}\n"
         "fi\n"
         f"exit {publication_exit}\n"
     )
@@ -1723,7 +1759,7 @@ def test_the_tree_image_check_passes_when_the_image_builds_a_tree(
 
     assert result.returncode == 0, result.stderr
     calls = (tmp_path / "docker-calls").read_text().splitlines()
-    assert len(calls) == 2
+    assert len(calls) == 3
     assert all(call.startswith("run --rm ") and IMAGE in call for call in calls)
     assert (
         "bun run /app/packages/calibration-tree/src/calibration-tree-worker.ts"
@@ -1735,6 +1771,33 @@ def test_the_tree_image_check_passes_when_the_image_builds_a_tree(
     )
     # The publication command runs without a token, so it can write nothing.
     assert "BLOB" not in calls[1]
+    # So does the latest command, which must ship in the image and refuse.
+    assert (
+        "bun run /app/packages/calibration-tree/src/calibration-tree-latest.ts"
+        in calls[2]
+    )
+    assert "BLOB" not in calls[2]
+
+
+@pytest.mark.parametrize(
+    ("latest_exit", "latest_stderr"),
+    [(0, ""), (1, "error: Module not found"), (3, TOKEN_REFUSAL)],
+    ids=["latest-ran", "latest-missing", "latest-other-exit"],
+)
+def test_the_tree_image_check_fails_unless_the_latest_command_refuses(
+    latest_exit: int, latest_stderr: str, tmp_path: Path
+) -> None:
+    result = run_tree_image_check(
+        tmp_path,
+        build_exit=0,
+        build_answer=BUILT_STAGING_TREE,
+        publication_exit=1,
+        latest_exit=latest_exit,
+        latest_stderr=latest_stderr,
+    )
+
+    assert result.returncode != 0
+    assert "latest command" in result.stderr
 
 
 @pytest.mark.parametrize(
