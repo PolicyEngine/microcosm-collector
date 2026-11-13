@@ -1,10 +1,11 @@
 """Read access to Hugging Face for the collector's worker jobs.
 
 Only the collector's worker jobs read Hugging Face, for backfills, old
-releases and back-building; the API service never holds a Hugging Face
-credential. They read with one purpose-specific, fine-grained read token,
-which Google Secret Manager holds and Cloud Run mounts into each job that
-needs it as ``COLLECTOR_HF_READ_TOKEN``. The token is scoped to the datasets
+releases, back-building and the calibration tree handler's latest rule; the
+API service never holds a Hugging Face credential. They read with one
+purpose-specific, fine-grained read token, which Google Secret Manager holds
+and Cloud Run mounts into each job that needs it as
+``COLLECTOR_HF_READ_TOKEN``. The token is scoped to the datasets
 in ``HUGGINGFACE_DATASETS`` that are not public (``token_scope()``).
 
 Code that reads Hugging Face builds its reader with

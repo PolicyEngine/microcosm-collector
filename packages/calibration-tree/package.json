@@ -29,6 +29,7 @@
     "./calibration-tree-artifact": "./src/calibration-tree-artifact.ts",
     "./calibration-tree-blob": "./src/calibration-tree-blob.ts",
     "./calibration-tree-bundle": "./src/calibration-tree-bundle.ts",
+    "./calibration-tree-latest": "./src/calibration-tree-latest.ts",
     "./calibration-tree-manifest": "./src/calibration-tree-manifest.ts",
     "./calibration-tree-manifest-read": "./src/calibration-tree-manifest-read.ts",
     "./calibration-tree-publication": "./src/calibration-tree-publication.ts",
@@ -64,6 +65,7 @@
     "typecheck": "tsc --noEmit",
     "worker": "bun run src/calibration-tree-worker.ts",
     "publication": "bun run src/calibration-tree-publication.ts",
+    "latest": "bun run src/calibration-tree-latest.ts",
     "manifest-read": "bun run src/calibration-tree-manifest-read.ts"
   },
   "dependencies": {

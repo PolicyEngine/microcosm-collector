@@ -76,8 +76,9 @@ Times are compared to the millisecond, as the tree worker stores them.
 removed afterwards: each file is streamed to disk and checked against its
 listing (``HuggingFaceReader.download_file``), and the tree is built and
 published by ``calibration_trees.build_and_publish``, as a submission's is: the
-worker without the Blob token, the publication with it, under the manifest
-lock and nothing else. A file listed as larger than
+worker without the Blob token, then the publication with it, under the
+manifest lock, which the backfill holds for the publication alone (it passes
+no ``decide_latest``). A file listed as larger than
 ``MAX_SOURCE_FILE_BYTES`` is ``too_large`` before anything is downloaded. No
 build starts after ``BUILD_TIME_LIMIT_SECONDS`` of the execution; the rest
 are ``deferred``, so a Cloud Run task retry carries on past what is stored.
