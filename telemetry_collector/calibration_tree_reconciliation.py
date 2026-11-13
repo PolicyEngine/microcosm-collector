@@ -29,8 +29,10 @@ Python:
   and its files are not read. Of the others, a structured run's status is its
   run manifest's; a schema-1 run's is the one ``runs.json`` records, else its
   ``progress.json``'s; a folder without a run manifest counts as a schema-1
-  run only when another run's manifest is schema 1 and ``runs.json`` is
-  schema 1. Only a run whose status is ``passed``, ``published`` or
+  run when ``runs.json`` is schema 1. ``runs.json`` is read whenever a run
+  the store lacks has a schema-1 manifest or none; the publisher reads it
+  when any listed run's manifest is schema 1, and stored runs' manifests
+  are not read. Only a run whose status is ``passed``, ``published`` or
   ``completed`` is built. Its label is its candidate release, else its run
   ID, and its time its progress's ``updated_at``, else its run manifest's, as
   the publisher's ``publishStagingSource`` takes them. A run whose documents
@@ -623,11 +625,14 @@ class _Reconciliation:
                     )
                     continue
             runs.append(run)
-        # A schema-1 runs.json records schema-1 runs' statuses. It is read, as
-        # the staging readers read it, only beside a schema-1 run manifest,
-        # and then makes every run folder without a manifest a schema-1 run.
+        # A schema-1 runs.json records schema-1 runs' statuses, and makes
+        # every run folder without a structured manifest a schema-1 run. The
+        # staging readers read it when any listed run's manifest is schema 1.
+        # Stored runs' manifests are never read (S7), so it is read whenever
+        # a run the store lacks may be a schema-1 run: its manifest is schema
+        # 1, or it has none, whether or not the other runs' manifests are.
         index: dict[str, str | None] | None = None
-        if any(run.run_manifest is not None and not run.structured for run in runs):
+        if any(not run.structured for run in runs):
             try:
                 index = self.run_index(repo, head)
             except Exception as error:

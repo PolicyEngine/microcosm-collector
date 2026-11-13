@@ -2060,9 +2060,12 @@ Python. Without `--kind` it covers both kinds, or only releases for BE.
   store holds is `already_stored`, and its files are not read. Of the
   others, a structured run's status is its run manifest's, and a schema-1
   run's is the one a schema-1 `runs.json` records, else its
-  `progress.json`'s; only `passed`, `published` and `completed` runs are
-  built, the newest first. Its label is its candidate release, else its run
-  ID, and its time its progress's `updated_at`, else its run manifest's.
+  `progress.json`'s. A folder without a run manifest of its own is a
+  schema-1 run when `runs.json` is schema 1, which is read whenever a run
+  the store lacks has a schema-1 manifest or none. Only `passed`,
+  `published` and `completed` runs are built, the newest first. Its label is
+  its candidate release, else its run ID, and its time its progress's
+  `updated_at`, else its run manifest's.
 - A build whose folder (`releases/<release>/<build>` or `staged/<run>`) a
   `queued` or `processing` `calibration-diagnostics` submission holds is
   `submission_in_progress`: the submission builds it.
@@ -2168,6 +2171,12 @@ past builds again".
   switch-over.
 - A staging run reads the manifests of every run the store lacks, including
   runs that will never be final.
+- The publisher reads `runs.json` only when a listed run's manifest is
+  schema 1. This command never reads a stored run's manifest, so it reads
+  `runs.json` whenever a run the store lacks has a schema-1 manifest or
+  none. In a staging repo with a schema-1 `runs.json` and no schema-1 run
+  manifest, a folder without a manifest is therefore a run here and not for
+  the publisher.
 
 ### Tests
 
