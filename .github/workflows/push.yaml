@@ -24,7 +24,9 @@ permissions:
 # the same image, which serves Orrery graph files from that bucket, grants
 # only the service account of the environment's microcosm-runs deployments
 # the Cloud Run Invoker role on it, and checks that it refuses a call without
-# a token. The staging and production environments accept only main, and Google
+# a token. The service revisions also get the environment's optional Vercel
+# OIDC settings, which let read API v2 accept consumer apps' Vercel OIDC
+# tokens. The staging and production environments accept only main, and Google
 # Cloud's Workload Identity provider accepts this repo's tokens only for
 # refs/heads/main. Both jobs also check for a push to main.
 # This workflow runs only for pushes to main, so that check is always true; it
@@ -143,6 +145,13 @@ jobs:
       # deployments act as: the deploy grants it the Cloud Run Invoker role
       # on the Orrery read service, and no revision or job gets it.
       ORRERY_READER_SERVICE_ACCOUNT: ${{ vars.TELEMETRY_ORRERY_READER_SERVICE_ACCOUNT }}
+      # The Vercel team and the <project ID>:<environment> readers whose
+      # Vercel OIDC tokens this environment's read API v2 accepts. Optional,
+      # all three or none: unset, the deploy sets none of them on the service
+      # revisions, which then refuse every Vercel OIDC token.
+      VERCEL_OIDC_TEAM_SLUG: ${{ vars.TELEMETRY_VERCEL_OIDC_TEAM_SLUG }}
+      VERCEL_OIDC_TEAM_ID: ${{ vars.TELEMETRY_VERCEL_OIDC_TEAM_ID }}
+      VERCEL_OIDC_READERS: ${{ vars.TELEMETRY_VERCEL_OIDC_READERS }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -288,6 +297,13 @@ jobs:
       # Only production has the daily Hugging Face check job, which the daily
       # workflow starts (.github/workflows/huggingface-check.yaml).
       HF_CHECK_JOB: ${{ vars.TELEMETRY_HF_CHECK_JOB }}
+      # The Vercel team and the <project ID>:<environment> readers whose
+      # Vercel OIDC tokens this environment's read API v2 accepts. Optional,
+      # all three or none: unset, the deploy sets none of them on the service
+      # revisions, which then refuse every Vercel OIDC token.
+      VERCEL_OIDC_TEAM_SLUG: ${{ vars.TELEMETRY_VERCEL_OIDC_TEAM_SLUG }}
+      VERCEL_OIDC_TEAM_ID: ${{ vars.TELEMETRY_VERCEL_OIDC_TEAM_ID }}
+      VERCEL_OIDC_READERS: ${{ vars.TELEMETRY_VERCEL_OIDC_READERS }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:

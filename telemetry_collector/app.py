@@ -26,7 +26,7 @@ from fastapi import (
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from fastapi.security import APIKeyHeader
+from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
 from jwt import InvalidTokenError
 from pydantic import ValidationError
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -74,6 +74,13 @@ from telemetry_collector.storage import (
     RunRegistrationConflictError,
     TelemetryStore,
 )
+from telemetry_collector.vercel_oidc import (
+    InvalidVercelOidcTokenError,
+    VercelOidcKeysUnavailableError,
+    VercelOidcReaderNotAllowedError,
+    VercelOidcSettings,
+    VercelOidcVerifier,
+)
 
 
 @dataclass(frozen=True)
@@ -93,6 +100,8 @@ class CollectorSettings:
     maintenance_mode: bool = False
     # None while artifact intake is switched off (the default).
     intake: IntakeSettings | None = None
+    # None while read API v2 accepts no Vercel OIDC tokens (the default).
+    vercel_oidc: VercelOidcSettings | None = None
 
     @classmethod
     def from_environment(cls) -> CollectorSettings:
@@ -135,6 +144,7 @@ class CollectorSettings:
             ),
             maintenance_mode=os.environ.get("TELEMETRY_MAINTENANCE_MODE") == "1",
             intake=IntakeSettings.from_environment(),
+            vercel_oidc=VercelOidcSettings.from_environment(),
         )
 
     def __post_init__(self) -> None:
@@ -344,16 +354,48 @@ READ_TOKEN_HEADER = APIKeyHeader(
     auto_error=False,
 )
 
+# A consumer app's Vercel OIDC token, which read API v2 accepts instead of the
+# read credential from the readers the collector is configured for
+# (telemetry_collector.vercel_oidc).
+VERCEL_OIDC_BEARER = HTTPBearer(
+    scheme_name="VercelOidcToken",
+    bearerFormat="JWT",
+    description=(
+        "A consumer app's Vercel OIDC token, accepted from the Vercel projects "
+        "and environments this collector is configured for."
+    ),
+    auto_error=False,
+)
+
+READ_CREDENTIAL_REQUIRED = "A valid dashboard read credential is required."
+VERCEL_OIDC_OFF = "This collector accepts no Vercel OIDC tokens."
+VERCEL_OIDC_TOKEN_INVALID = "The Vercel OIDC token is invalid or expired."
+VERCEL_OIDC_READER_NOT_ALLOWED = (
+    "This Vercel project and environment may not read this collector."
+)
+VERCEL_OIDC_KEYS_UNAVAILABLE = "Vercel's token signing keys could not be read."
+
 V2_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
     401: {
         "model": ErrorMessage,
-        "description": "The read credential is missing or wrong.",
+        "description": (
+            "The read credential is missing or wrong, or the Vercel OIDC token "
+            "is invalid, expired or not accepted by this collector."
+        ),
+    },
+    403: {
+        "model": ErrorMessage,
+        "description": (
+            "The Vercel OIDC token is valid, but its Vercel project and "
+            "environment may not read this collector."
+        ),
     },
     503: {
         "model": ErrorMessage,
         "description": (
             "A deployment is in progress; retry after the `Retry-After` header's "
-            "seconds."
+            "seconds. Without `Retry-After`, Vercel's token signing keys could "
+            "not be read to check a Vercel OIDC token."
         ),
     },
 }
@@ -469,14 +511,23 @@ def create_app(
     store: TelemetryStore,
     huggingface_authenticator: HuggingFaceAuthenticator,
     intake_services: IntakeServices | None = None,
+    vercel_oidc_verifier: VercelOidcVerifier | None = None,
 ) -> FastAPI:
     """Create the collector with explicit dependencies for tests and deployment.
 
-    The submission endpoints exist only when ``settings.intake`` is set.
+    The submission endpoints exist only when ``settings.intake`` is set. Read
+    API v2 accepts Vercel OIDC tokens only when ``settings.vercel_oidc`` is
+    set; the verifier is built from it unless one for the same settings is
+    given.
     """
 
     if settings.intake is not None and intake_services is None:
         raise ValueError("Intake is switched on but its services were not provided.")
+    if vercel_oidc_verifier is None:
+        if settings.vercel_oidc is not None:
+            vercel_oidc_verifier = VercelOidcVerifier(settings.vercel_oidc)
+    elif vercel_oidc_verifier.settings != settings.vercel_oidc:
+        raise ValueError("The Vercel OIDC verifier's settings are not the collector's.")
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> Iterator[None]:
@@ -497,25 +548,51 @@ def create_app(
     if settings.maintenance_mode:
         application.add_middleware(MaintenanceModeMiddleware)
 
+    def read_token_matches(token: str | None) -> bool:
+        # Compared as UTF-8 bytes: compare_digest refuses strings with
+        # characters above ASCII, which a Latin-1 decoded header can hold.
+        return token is not None and hmac.compare_digest(
+            token.encode("utf-8"), settings.read_token.encode("utf-8")
+        )
+
     def require_read_token(
         token: Annotated[str | None, Header(alias="X-Telemetry-Read-Token")] = None,
     ) -> None:
-        # Compared as UTF-8 bytes: compare_digest refuses strings with
-        # characters above ASCII, which a Latin-1 decoded header can hold.
-        if token is None or not hmac.compare_digest(
-            token.encode("utf-8"), settings.read_token.encode("utf-8")
-        ):
-            raise HTTPException(
-                status_code=401,
-                detail="A valid dashboard read credential is required.",
-            )
+        if not read_token_matches(token):
+            raise HTTPException(status_code=401, detail=READ_CREDENTIAL_REQUIRED)
 
-    # The same credential for read API v2, declared as a security scheme so
-    # that its OpenAPI document and typed client describe it.
-    def require_read_token_v2(
+    # Read API v2 takes the read credential or a Vercel OIDC token, each
+    # declared as a security scheme so that its OpenAPI document lists them as
+    # alternatives and its typed client describes them. A matching read
+    # credential is enough; otherwise a bearer token decides the answer.
+    def require_reader_v2(
         token: Annotated[str | None, Security(READ_TOKEN_HEADER)] = None,
+        bearer: Annotated[
+            HTTPAuthorizationCredentials | None, Security(VERCEL_OIDC_BEARER)
+        ] = None,
     ) -> None:
-        require_read_token(token)
+        if read_token_matches(token):
+            return
+        if bearer is None:
+            raise HTTPException(status_code=401, detail=READ_CREDENTIAL_REQUIRED)
+        if vercel_oidc_verifier is None:
+            raise HTTPException(status_code=401, detail=VERCEL_OIDC_OFF)
+        # The token is never logged or returned: each refusal is a fixed
+        # sentence, raised without the verifier's error.
+        try:
+            vercel_oidc_verifier.verify(bearer.credentials)
+        except InvalidVercelOidcTokenError:
+            raise HTTPException(
+                status_code=401, detail=VERCEL_OIDC_TOKEN_INVALID
+            ) from None
+        except VercelOidcReaderNotAllowedError:
+            raise HTTPException(
+                status_code=403, detail=VERCEL_OIDC_READER_NOT_ALLOWED
+            ) from None
+        except VercelOidcKeysUnavailableError:
+            raise HTTPException(
+                status_code=503, detail=VERCEL_OIDC_KEYS_UNAVAILABLE
+            ) from None
 
     def session_claims(
         authorization: Annotated[str | None, Header()] = None,
@@ -661,7 +738,7 @@ def create_app(
     @application.get(
         "/v2/runs",
         response_model=RunPage,
-        dependencies=[Depends(require_read_token_v2)],
+        dependencies=[Depends(require_reader_v2)],
         responses=V2_ERROR_RESPONSES,
         operation_id="listRuns",
         summary="List runs, newest registration first",
@@ -698,7 +775,7 @@ def create_app(
     @application.get(
         "/v2/runs/{run_id}",
         response_model=RunDetail,
-        dependencies=[Depends(require_read_token_v2)],
+        dependencies=[Depends(require_reader_v2)],
         responses={
             **V2_ERROR_RESPONSES,
             404: {"model": ErrorMessage, "description": "The run was not found."},
