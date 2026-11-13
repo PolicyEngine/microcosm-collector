@@ -106,6 +106,39 @@ def _migration(file_name: str = "0002_artifact_intake.py"):
     return migration
 
 
+# Alembic records the current revision in `alembic_version.version_num`,
+# which it creates as `VARCHAR(32)`. A longer revision ID makes every upgrade
+# to that revision fail on Postgres.
+ALEMBIC_VERSION_NUM_LENGTH = 32
+
+
+def test_every_revision_id_fits_alembic_s_version_column() -> None:
+    versions = Path(__file__).resolve().parents[1] / "migrations" / "versions"
+    revision_ids = {
+        source.name: _migration(source.name).revision
+        for source in sorted(versions.glob("*.py"))
+    }
+
+    assert revision_ids
+    assert {
+        file_name: revision_id
+        for file_name, revision_id in revision_ids.items()
+        if len(revision_id) > ALEMBIC_VERSION_NUM_LENGTH
+    } == {}
+
+
+def test_every_migration_file_is_named_after_its_revision_id() -> None:
+    versions = Path(__file__).resolve().parents[1] / "migrations" / "versions"
+    sources = sorted(versions.glob("*.py"))
+
+    assert sources
+    assert {
+        source.name: _migration(source.name).revision
+        for source in sources
+        if _migration(source.name).revision != source.stem
+    } == {}
+
+
 def _status_constraint(table) -> str:
     [constraint] = [
         constraint
