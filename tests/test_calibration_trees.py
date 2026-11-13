@@ -7,8 +7,11 @@ replace the two Bun processes with a recording command runner and run the
 handler through the worker framework, so each exit code ends as the framework
 records it: succeeded, rejected, or returned for another attempt. A release
 build becomes its country's latest when the release repo's ``releases.json``,
-read from a stand-in for Hugging Face, names it as its default release's
-current build.
+read from a stand-in for Hugging Face under the same lock, names it as its
+default release's current build. A ``releases-record`` submission, which
+Microcosm sends after a change made a build current, moves the latest to the
+build the head's ``releases.json`` names, through the package's latest
+command, which the runner also stands in for.
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import importlib.util
+import inspect
 import json
 import runpy
 import subprocess
@@ -28,6 +32,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+import httpx
 import pytest
 import sqlalchemy as sa
 import yaml
@@ -39,14 +44,19 @@ from telemetry_collector.huggingface_read import (
     TOKEN_VARIABLE,
     HuggingFaceReadConfigurationError,
     HuggingFaceReader,
+    HuggingFaceReadError,
     HuggingFaceReadSettings,
 )
-from telemetry_collector.submissions import SubmissionRequest, intake_object_name
+from telemetry_collector.submissions import (
+    ROLE_RULES,
+    SubmissionRequest,
+    intake_object_name,
+)
 from telemetry_collector.worker import DEFAULT_HANDLERS, JobOutcome, run_job
 from tests.fakes import FakeIntakeObjectStore, FakeSubmissionStore
 from tests.huggingface_fakes import FakeHuggingFace
 from tests.test_submission_store import SteppingClock
-from tests.test_submissions import calibration_submission
+from tests.test_submissions import calibration_submission, releases_record_submission
 
 TREES_MODULE = "telemetry_collector.calibration_trees"
 RUN_ID = "uk-frs-calibration-attempt-20261019T083323Z-6cba5d71"
@@ -58,6 +68,11 @@ ACCEPTED_AT = "2026-10-20T09:00:00Z"
 BLOB_TOKEN = "vercel_blob_rw_test_token"
 READ_TOKEN = "hf_collector_read_token"
 UK_DENSE_RELEASE = "microcosm-uk-2024-25-dense"
+US_RELEASE_REPO = "policyengine/populace-us"
+US_DEFAULT_RELEASE = "microcosm-us-2024-national"
+US_BUILD = "populace-us-2024-spm-20261101"
+BE_RELEASE_REPO = "policyengine/populace-be-private"
+BE_RELEASE = "microcosm-be-2024-national"
 OTHER_BUILD = "uk-frs-calibration-attempt-20261101T000000Z-0a1b2c3d"
 CONTENTS = {
     "calibration_diagnostics.json": b'{"schema_version": 8, "targets": []}',
@@ -98,13 +113,14 @@ class Accepted:
     objects: FakeIntakeObjectStore
     submission_id: str
     job_id: str
+    kind: str = "calibration-diagnostics"
 
     def run(self, handler: Any) -> JobOutcome:
         return run_job(
             self.job_id,
             submissions=self.submissions,
             objects=self.objects,
-            handlers={**DEFAULT_HANDLERS, "calibration-diagnostics": handler},
+            handlers={**DEFAULT_HANDLERS, self.kind: handler},
             holder="exec-1",
         )
 
@@ -117,9 +133,17 @@ class Accepted:
 def accepted(submission_provenance: Mapping[str, Any]) -> Accepted:
     submission = calibration_submission()
     submission["provenance"] = dict(submission_provenance)
+    return accepted_submission(submission, CONTENTS)
+
+
+def accepted_submission(
+    submission: dict[str, Any], contents: Mapping[str, bytes]
+) -> Accepted:
+    """``submission``, accepted with each file's bytes from ``contents``."""
+
     for file in submission["files"]:
-        file["size"] = len(CONTENTS[file["name"]])
-        file["sha256"] = hashlib.sha256(CONTENTS[file["name"]]).hexdigest()
+        file["size"] = len(contents[file["name"]])
+        file["sha256"] = hashlib.sha256(contents[file["name"]]).hexdigest()
     submissions = FakeSubmissionStore(clock=SteppingClock())
     objects = FakeIntakeObjectStore()
     record, _ = submissions.create_submission(
@@ -129,7 +153,7 @@ def accepted(submission_provenance: Mapping[str, Any]) -> Accepted:
     generations = {
         file["name"]: objects.upload(
             intake_object_name(record.submission_id, file["name"]),
-            CONTENTS[file["name"]],
+            contents[file["name"]],
             sha256=file["sha256"],
         )
         for file in record.files
@@ -137,7 +161,13 @@ def accepted(submission_provenance: Mapping[str, Any]) -> Accepted:
     acceptance = submissions.accept_submission(record.submission_id, generations)
     assert acceptance.job_id is not None
     submissions.record_dispatch(acceptance.job_id, 1)
-    return Accepted(submissions, objects, record.submission_id, acceptance.job_id)
+    return Accepted(
+        submissions,
+        objects,
+        record.submission_id,
+        acceptance.job_id,
+        kind=submission["kind"],
+    )
 
 
 def plan_for(submission_provenance: Mapping[str, Any]) -> Any:
@@ -146,19 +176,36 @@ def plan_for(submission_provenance: Mapping[str, Any]) -> Any:
 
 @dataclass
 class RecordingRunner:
-    """Stands in for the two Bun processes, recording what each one is given."""
+    """Stands in for the Bun processes, recording what each one is given.
+
+    The worker is ``build``, the publication command ``publication`` and the
+    latest command ``latest``.
+    """
 
     build_exit: int = 0
     build_stderr: str = ""
     publication_exit: int = 0
     publication_stderr: str = ""
+    latest_exit: int = 0
+    latest_stderr: str = ""
+    #: The latest command's answer; by default it moved the latest.
+    latest_answer: dict[str, Any] | None = None
+    #: Printed by the latest command in place of its answer, when set.
+    latest_stdout: str | None = None
+    #: Raised instead of running the latest command, when set.
+    latest_raises: BaseException | None = None
     events: list[str] = field(default_factory=list)
     calls: list[dict[str, Any]] = field(default_factory=list)
 
     def __call__(
         self, argv: Sequence[str], env: Mapping[str, str], timeout: float
     ) -> subprocess.CompletedProcess[str]:
-        step = "publication" if argv[2].endswith("publication.ts") else "build"
+        if argv[2].endswith("calibration-tree-latest.ts"):
+            step = "latest"
+        elif argv[2].endswith("publication.ts"):
+            step = "publication"
+        else:
+            step = "build"
         self.events.append(step)
         inputs = {
             Path(argument).name: json.loads(Path(argument).read_text())
@@ -175,6 +222,23 @@ class RecordingRunner:
                 self.build_exit,
                 json.dumps(worker_result) if self.build_exit == 0 else "",
                 self.build_stderr,
+            )
+        if step == "latest":
+            if self.latest_raises is not None:
+                raise self.latest_raises
+            request = inputs["latest.json"]
+            answer = self.latest_answer or {
+                "country": request["country"],
+                "releaseId": request["releaseId"],
+                "buildArtifactId": "b" * 64,
+                "moved": True,
+            }
+            stdout = json.dumps(answer) if self.latest_exit == 0 else ""
+            return subprocess.CompletedProcess(
+                argv,
+                self.latest_exit,
+                stdout if self.latest_stdout is None else self.latest_stdout,
+                self.latest_stderr,
             )
         published = {
             "buildArtifactId": "a" * 64,
@@ -213,8 +277,11 @@ def handler_with(
         yield
         runner.events.append("lock released")
 
+    make_handler = trees().calibration_tree_handler
+    # The handler reads releases.json to decide the latest, so it takes a reader.
+    assert "reader" in inspect.signature(make_handler).parameters
     hugging_face = hugging_face or uk_release_repo(record=None)
-    return trees().calibration_tree_handler(
+    return make_handler(
         blob_token=BLOB_TOKEN,
         manifest_lock=recorded_lock,
         bun="/usr/local/bin/bun",
@@ -263,13 +330,41 @@ def releases_record(
 def uk_release_repo(record: bytes | None) -> FakeHuggingFace:
     """The UK release repo, with ``record`` as its releases.json when given."""
 
+    return release_repo(UK_RELEASE_REPO, record)
+
+
+def release_repo(repo: str, record: bytes | None) -> FakeHuggingFace:
+    """``repo``, with ``record`` as its releases.json when given."""
+
     hugging_face = FakeHuggingFace(token=READ_TOKEN)
     hugging_face.add_dataset(
-        UK_RELEASE_REPO,
+        repo,
         {} if record is None else {"releases.json": record},
         head_commit="c" * 40,
     )
     return hugging_face
+
+
+def record_reads_in(events: list[str], hugging_face: FakeHuggingFace) -> None:
+    """Note each request to ``hugging_face`` in ``events`` as ``read <path>``.
+
+    Beside the lock's and the Bun steps' events, this shows where each read
+    happens. Call it before the handler makes its client.
+    """
+
+    answer = hugging_face.handle
+
+    def recorded_answer(request: httpx.Request) -> httpx.Response:
+        events.append(f"read {request.url.path}")
+        return answer(request)
+
+    hugging_face.handle = recorded_answer  # type: ignore[method-assign]
+
+
+HEAD_READS = [
+    f"read /api/datasets/{UK_RELEASE_REPO}",
+    f"read /datasets/{UK_RELEASE_REPO}/resolve/{'c' * 40}/releases.json",
+]
 
 
 def test_a_build_folder_submission_plans_a_tree_of_that_build() -> None:
@@ -763,8 +858,27 @@ def test_the_accepted_record_the_refusals_change_makes_the_build_the_latest() ->
     assert published_make_latest(runner) is True
 
 
+def test_releases_json_is_read_under_the_lock_just_before_the_publication() -> None:
+    # Read under the lock the releases-record handler also takes, so a build
+    # made current while this tree was being built is never missed.
+    hugging_face = uk_release_repo(releases_record())
+    runner = RecordingRunner()
+    record_reads_in(runner.events, hugging_face)
+
+    accepted(RELEASED).run(handler_with(runner, hugging_face=hugging_face))
+
+    assert runner.events == [
+        "build",
+        "lock taken",
+        *HEAD_READS,
+        "publication",
+        "lock released",
+    ]
+    assert published_make_latest(runner) is True
+
+
 @pytest.mark.parametrize("status_code", [401, 429, 500, 503])
-def test_a_failed_head_commit_read_returns_the_job_before_anything_is_built(
+def test_a_failed_head_commit_read_returns_the_job_before_anything_is_published(
     status_code: int,
 ) -> None:
     hugging_face = uk_release_repo(releases_record())
@@ -776,7 +890,7 @@ def test_a_failed_head_commit_read_returns_the_job_before_anything_is_built(
 
     assert outcome is JobOutcome.RETRY
     assert submission.record().status == "queued"
-    assert runner.calls == []
+    assert [call["step"] for call in runner.calls] == ["build"]
 
 
 @pytest.mark.parametrize(
@@ -786,7 +900,7 @@ def test_a_failed_head_commit_read_returns_the_job_before_anything_is_built(
     + [(404, "RepoNotFound"), (404, "RevisionNotFound")],
     ids=["401", "429", "500", "503", "404-repo", "404-revision"],
 )
-def test_a_failed_read_of_releases_json_itself_returns_the_job_before_anything_is_built(
+def test_a_failed_read_of_releases_json_itself_returns_the_job_before_anything_is_published(
     answer: tuple[int, str | None],
 ) -> None:
     hugging_face = uk_release_repo(releases_record())
@@ -798,7 +912,7 @@ def test_a_failed_read_of_releases_json_itself_returns_the_job_before_anything_i
 
     assert outcome is JobOutcome.RETRY
     assert submission.record().status == "queued"
-    assert runner.calls == []
+    assert [call["step"] for call in runner.calls] == ["build"]
     # The head commit was read, and then the record at it.
     assert [request.url.path for request in hugging_face.requests] == [
         f"/api/datasets/{UK_RELEASE_REPO}",
@@ -827,6 +941,646 @@ def test_a_staged_bundle_reads_nothing_from_hugging_face() -> None:
 
     assert hugging_face.requests == []
     assert published_make_latest(runner) is False
+
+
+# The latest after a change of releases.json (releases-record) -------------------
+
+#: The commit that wrote a submitted releases.json.
+RECORD_COMMIT = "fedcba9876543210fedcba9876543210fedcba98"
+LATEST_RESULT_KEYS = {
+    "processed_by",
+    "current_build",
+    "build_artifact_id",
+    "made_latest",
+    "latest_moved",
+}
+
+
+def two_release_record(
+    *, national_current: str | None, dense_current: str | None
+) -> bytes:
+    """A releases.json with the UK's national (default) and dense releases."""
+
+    builds = {
+        build: {"published_at": "2026-10-20T09:00:00Z", "withdrawn": False}
+        for build in (RUN_ID, OTHER_BUILD)
+    }
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "default": UK_DEFAULT_RELEASE,
+            "releases": {
+                UK_DEFAULT_RELEASE: {
+                    "role": "national",
+                    "current": national_current,
+                    "builds": builds,
+                },
+                UK_DENSE_RELEASE: {
+                    "role": "dense",
+                    "current": dense_current,
+                    "builds": builds,
+                },
+            },
+        }
+    ).encode()
+
+
+def accepted_releases_record(
+    record: bytes,
+    *,
+    release: str = UK_DEFAULT_RELEASE,
+    build: str = RUN_ID,
+    repo: str = UK_RELEASE_REPO,
+    country_code: str = "UK",
+) -> Accepted:
+    """A releases-record submission of ``record``, after ``build`` was made current."""
+
+    assert "releases-record" in ROLE_RULES
+    submission = releases_record_submission()
+    submission["provenance"] = {
+        "run_id": "uk-promotion-20261113T120000Z",
+        "build_id": build,
+        "country_code": country_code,
+        "release": release,
+        "huggingface": {
+            "repo": repo,
+            "commit": RECORD_COMMIT,
+            "folder": f"releases/{release}/{build}",
+        },
+    }
+    return accepted_submission(submission, {"releases.json": record})
+
+
+def latest_handler_with(
+    runner: RecordingRunner, hugging_face: FakeHuggingFace, **settings: Any
+) -> Any:
+    """The releases-record handler, reading Hugging Face from ``hugging_face``.
+
+    Every read and the lock are recorded in ``runner.events``.
+    """
+
+    module = trees()
+    assert hasattr(module, "calibration_tree_latest_handler")
+
+    @contextmanager
+    def recorded_lock() -> Iterator[None]:
+        runner.events.append("lock taken")
+        yield
+        runner.events.append("lock released")
+
+    record_reads_in(runner.events, hugging_face)
+    return module.calibration_tree_latest_handler(
+        blob_token=BLOB_TOKEN,
+        manifest_lock=recorded_lock,
+        bun="/usr/local/bin/bun",
+        run_command=runner,
+        reader=HuggingFaceReader(
+            HuggingFaceReadSettings(token=READ_TOKEN), client=hugging_face.client()
+        ),
+        **settings,
+    )
+
+
+def test_a_releases_record_moves_the_latest_to_the_current_build_under_the_lock() -> (
+    None
+):
+    record = releases_record()
+    hugging_face = uk_release_repo(record)
+    runner = RecordingRunner()
+    submission = accepted_releases_record(record)
+
+    submission.run(latest_handler_with(runner, hugging_face))
+
+    assert submission.record().status == "succeeded"
+    assert runner.events == [
+        "lock taken",
+        *HEAD_READS,
+        "latest",
+        "lock released",
+    ]
+    latest = runner.call("latest")
+    assert latest["argv"][:3] == [
+        "/usr/local/bin/bun",
+        "run",
+        str(trees().PACKAGE_DIRECTORY / "src" / "calibration-tree-latest.ts"),
+    ]
+    assert latest["inputs"]["latest.json"] == {
+        "country": "uk",
+        "releaseId": f"{UK_DEFAULT_RELEASE}/{RUN_ID}",
+    }
+    # Only the store's token and the base settings, as for the publication.
+    assert latest["env"]["CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN"] == BLOB_TOKEN
+    assert set(latest["env"]) == {
+        "PATH",
+        "LANG",
+        "CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN",
+    }
+    assert submission.record().result == {
+        "processed_by": "calibration-tree-latest",
+        "current_build": f"{UK_DEFAULT_RELEASE}/{RUN_ID}",
+        "build_artifact_id": "b" * 64,
+        "made_latest": True,
+        "latest_moved": True,
+    }
+
+
+def test_the_latest_follows_the_head_s_record_over_the_submitted_one() -> None:
+    # The submitted record made RUN_ID current; a later change made
+    # OTHER_BUILD current, and the head's record decides.
+    submitted = releases_record(builds=(RUN_ID, OTHER_BUILD))
+    hugging_face = uk_release_repo(
+        releases_record(current=OTHER_BUILD, builds=(RUN_ID, OTHER_BUILD))
+    )
+    runner = RecordingRunner()
+    submission = accepted_releases_record(submitted)
+
+    submission.run(latest_handler_with(runner, hugging_face))
+
+    assert runner.call("latest")["inputs"]["latest.json"]["releaseId"] == (
+        f"{UK_DEFAULT_RELEASE}/{OTHER_BUILD}"
+    )
+    assert submission.record().result["current_build"] == (
+        f"{UK_DEFAULT_RELEASE}/{OTHER_BUILD}"
+    )
+
+
+def test_a_change_to_another_release_follows_the_default_release() -> None:
+    # Making a dense build current leaves the national (default) release's
+    # current build as the latest.
+    record = two_release_record(national_current=OTHER_BUILD, dense_current=RUN_ID)
+    hugging_face = uk_release_repo(record)
+    runner = RecordingRunner()
+    submission = accepted_releases_record(record, release=UK_DENSE_RELEASE)
+
+    submission.run(latest_handler_with(runner, hugging_face))
+
+    assert submission.record().status == "succeeded"
+    assert runner.call("latest")["inputs"]["latest.json"]["releaseId"] == (
+        f"{UK_DEFAULT_RELEASE}/{OTHER_BUILD}"
+    )
+
+
+def test_a_build_already_the_latest_is_left_as_it_is() -> None:
+    record = releases_record()
+    runner = RecordingRunner(
+        latest_answer={
+            "country": "uk",
+            "releaseId": f"{UK_DEFAULT_RELEASE}/{RUN_ID}",
+            "buildArtifactId": "b" * 64,
+            "moved": False,
+        }
+    )
+    submission = accepted_releases_record(record)
+
+    submission.run(latest_handler_with(runner, uk_release_repo(record)))
+
+    result = submission.record().result
+    assert result["made_latest"] is True
+    assert result["latest_moved"] is False
+    assert "latest_unchanged" not in result
+
+
+def test_a_current_build_without_a_recorded_tree_leaves_the_latest() -> None:
+    # Its tree may still be building; that build then reads releases.json
+    # under the same lock and becomes the latest itself.
+    record = releases_record()
+    runner = RecordingRunner(
+        latest_exit=2,
+        latest_stderr="The manifest records no uk release build "
+        f"{UK_DEFAULT_RELEASE}/{RUN_ID}.",
+    )
+    submission = accepted_releases_record(record)
+
+    submission.run(latest_handler_with(runner, uk_release_repo(record)))
+
+    assert submission.record().status == "succeeded"
+    assert submission.record().result == {
+        "processed_by": "calibration-tree-latest",
+        "current_build": f"{UK_DEFAULT_RELEASE}/{RUN_ID}",
+        "build_artifact_id": None,
+        "made_latest": False,
+        "latest_moved": False,
+        "latest_unchanged": "no_recorded_tree",
+        "latest_unchanged_reason": "The manifest records no uk release build "
+        f"{UK_DEFAULT_RELEASE}/{RUN_ID}.",
+    }
+
+
+@pytest.mark.parametrize(
+    ("head_record", "unchanged", "reason"),
+    [
+        (None, "no_releases_record", None),
+        (releases_record(withdrawn=(RUN_ID,)), "releases_record_refused", "withdrawn"),
+        (releases_record(current=None), "no_current_build", None),
+        (releases_record(default=None), "no_current_build", None),
+    ],
+    ids=["no-record", "refused-record", "no-current-build", "no-default-release"],
+)
+def test_a_head_record_naming_no_usable_current_build_leaves_the_latest(
+    head_record: bytes | None, unchanged: str, reason: str | None
+) -> None:
+    runner = RecordingRunner()
+    submission = accepted_releases_record(releases_record())
+
+    submission.run(latest_handler_with(runner, uk_release_repo(head_record)))
+
+    assert submission.record().status == "succeeded"
+    assert "latest" not in runner.events
+    result = submission.record().result
+    assert result["latest_unchanged"] == unchanged
+    assert result["current_build"] is None
+    assert result["made_latest"] is False
+    assert result["latest_moved"] is False
+    if reason is None:
+        assert set(result) == LATEST_RESULT_KEYS | {"latest_unchanged"}
+    else:
+        assert reason in result["latest_unchanged_reason"]
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [("forced", 500), ("forced", 429), ("forced", 401)]
+    + [("file", (500, None)), ("file", (404, "RepoNotFound"))]
+    + [("file", (404, "RevisionNotFound"))],
+    ids=[
+        "head-500",
+        "head-429",
+        "head-401",
+        "file-500",
+        "file-404-repo",
+        "file-404-revision",
+    ],
+)
+def test_a_failed_read_of_the_head_s_record_returns_the_job(
+    answer: tuple[str, Any],
+) -> None:
+    record = releases_record()
+    hugging_face = uk_release_repo(record)
+    where, value = answer
+    if where == "forced":
+        hugging_face.datasets[UK_RELEASE_REPO].forced_status = value
+    else:
+        hugging_face.datasets[UK_RELEASE_REPO].file_answers["releases.json"] = value
+    runner = RecordingRunner()
+    submission = accepted_releases_record(record)
+
+    outcome = submission.run(latest_handler_with(runner, hugging_face))
+
+    assert outcome is JobOutcome.RETRY
+    assert submission.record().status == "queued"
+    assert "latest" not in runner.events
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "stdout"),
+    [(3, None), (1, None), (0, "not json"), (0, '["not", "an", "object"]')],
+    ids=["store-error", "request-error", "no-json", "not-an-object"],
+)
+def test_other_failures_of_the_latest_command_return_the_job(
+    exit_code: int, stdout: str | None
+) -> None:
+    record = releases_record()
+    runner = RecordingRunner(
+        latest_exit=exit_code, latest_stderr="store error", latest_stdout=stdout
+    )
+    submission = accepted_releases_record(record)
+
+    outcome = submission.run(latest_handler_with(runner, uk_release_repo(record)))
+
+    assert outcome is JobOutcome.RETRY
+    assert submission.record().status == "queued"
+
+
+@pytest.mark.parametrize(
+    ("submitted", "code"),
+    [
+        (b"not json", "releases_record_refused"),
+        (releases_record(withdrawn=(RUN_ID,)), "releases_record_refused"),
+        # Another build is its release's current build.
+        (
+            releases_record(current=OTHER_BUILD, builds=(RUN_ID, OTHER_BUILD)),
+            "provenance_mismatch",
+        ),
+        # Its release is not in the record.
+        (
+            releases_record(release=UK_DENSE_RELEASE, default=None),
+            "provenance_mismatch",
+        ),
+    ],
+    ids=["not-json", "refused", "another-current-build", "release-not-listed"],
+)
+def test_a_submitted_record_that_does_not_make_its_build_current_is_rejected(
+    submitted: bytes, code: str
+) -> None:
+    hugging_face = uk_release_repo(releases_record())
+    runner = RecordingRunner()
+    submission = accepted_releases_record(submitted)
+
+    submission.run(latest_handler_with(runner, hugging_face))
+
+    assert submission.record().status == "rejected"
+    assert submission.record().rejection["code"] == code
+    assert hugging_face.requests == []
+    assert runner.calls == []
+
+
+def test_a_releases_record_from_a_repo_not_registered_is_rejected() -> None:
+    record = releases_record()
+    hugging_face = uk_release_repo(record)
+    runner = RecordingRunner()
+    # The UK's staging repo holds staged bundles, never releases.json.
+    submission = accepted_releases_record(
+        record, repo="policyengine/populace-uk-staging"
+    )
+
+    submission.run(latest_handler_with(runner, hugging_face))
+
+    assert submission.record().status == "rejected"
+    assert submission.record().rejection["code"] == "repo_not_registered"
+    assert hugging_face.requests == []
+
+
+def test_a_releases_record_of_a_country_not_registered_stays_in_intake_storage() -> (
+    None
+):
+    record = releases_record()
+    hugging_face = uk_release_repo(record)
+    runner = RecordingRunner()
+    submission = accepted_releases_record(
+        record, repo="policyengine/populace-fr", country_code="FR"
+    )
+
+    submission.run(latest_handler_with(runner, hugging_face))
+
+    assert submission.record().status == "succeeded"
+    assert submission.record().result == {
+        "processed_by": "intake-only",
+        "verified_files": 1,
+        "reason": "country_not_registered",
+    }
+    assert hugging_face.requests == []
+
+
+def test_the_releases_record_handler_is_registered_beside_the_tree_handler() -> None:
+    registry = importlib.import_module("telemetry_collector.handlers")
+    environ = {
+        "COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN": BLOB_TOKEN,
+        TOKEN_VARIABLE: READ_TOKEN,
+    }
+
+    without_token = registry.handlers_from_environment(engine=None, environ={})
+    with_token = registry.handlers_from_environment(engine=None, environ=environ)
+
+    assert "releases-record" in DEFAULT_HANDLERS
+    assert without_token.get("releases-record") is DEFAULT_HANDLERS.get(
+        "releases-record"
+    )
+    assert set(trees().registered_handlers(engine=None, environ=environ)) == {
+        "calibration-diagnostics",
+        "releases-record",
+    }
+    assert with_token["releases-record"] is not DEFAULT_HANDLERS["releases-record"]
+
+
+# Every country the collector lists ----------------------------------------------
+
+US_RECORD = releases_record(
+    default=US_DEFAULT_RELEASE,
+    release=US_DEFAULT_RELEASE,
+    current=US_BUILD,
+    builds=(US_BUILD,),
+)
+
+
+def test_a_us_build_releases_json_names_current_becomes_the_us_latest() -> None:
+    # DEFAULT_RELEASES names no US release: only releases.json decides.
+    runner = RecordingRunner()
+    submission = accepted(
+        provenance(
+            f"releases/{US_DEFAULT_RELEASE}/{US_BUILD}",
+            release=US_DEFAULT_RELEASE,
+            repo=US_RELEASE_REPO,
+            country_code="US",
+        )
+        | {"build_id": US_BUILD}
+    )
+
+    submission.run(
+        handler_with(runner, hugging_face=release_repo(US_RELEASE_REPO, US_RECORD))
+    )
+
+    assert submission.record().status == "succeeded"
+    assert published_make_latest(runner) is True
+
+
+def test_a_be_build_without_releases_json_does_not_become_the_latest() -> None:
+    # Without releases.json, DEFAULT_RELEASES decides, and it names no BE
+    # release yet.
+    runner = RecordingRunner()
+    submission = accepted(
+        provenance(
+            f"releases/{BE_RELEASE}/{RUN_ID}",
+            release=BE_RELEASE,
+            repo=BE_RELEASE_REPO,
+            country_code="BE",
+        )
+    )
+
+    submission.run(
+        handler_with(runner, hugging_face=release_repo(BE_RELEASE_REPO, None))
+    )
+
+    assert submission.record().status == "succeeded"
+    assert published_make_latest(runner) is False
+
+
+def test_a_us_releases_record_moves_the_us_latest() -> None:
+    runner = RecordingRunner()
+    submission = accepted_releases_record(
+        US_RECORD,
+        release=US_DEFAULT_RELEASE,
+        build=US_BUILD,
+        repo=US_RELEASE_REPO,
+        country_code="US",
+    )
+
+    submission.run(
+        latest_handler_with(runner, release_repo(US_RELEASE_REPO, US_RECORD))
+    )
+
+    assert submission.record().status == "succeeded"
+    assert runner.call("latest")["inputs"]["latest.json"] == {
+        "country": "us",
+        "releaseId": f"{US_DEFAULT_RELEASE}/{US_BUILD}",
+    }
+    assert submission.record().result["made_latest"] is True
+
+
+def test_a_be_releases_record_without_releases_json_at_the_head_leaves_the_latest() -> (
+    None
+):
+    record = releases_record(
+        default=BE_RELEASE, release=BE_RELEASE, current=RUN_ID, builds=(RUN_ID,)
+    )
+    runner = RecordingRunner()
+    submission = accepted_releases_record(
+        record, release=BE_RELEASE, repo=BE_RELEASE_REPO, country_code="BE"
+    )
+
+    submission.run(latest_handler_with(runner, release_repo(BE_RELEASE_REPO, None)))
+
+    assert submission.record().status == "succeeded"
+    assert submission.record().result["latest_unchanged"] == "no_releases_record"
+    assert "latest" not in runner.events
+
+
+# Following releases.json without a submission -----------------------------------
+
+
+def follow_with(
+    runner: RecordingRunner, hugging_face: FakeHuggingFace, country: str
+) -> Any:
+    """``follow_releases_record`` for ``country``, as another collector job calls it.
+
+    Every read and the lock are recorded in ``runner.events``.
+    """
+
+    module = trees()
+    assert hasattr(module, "follow_releases_record")
+
+    @contextmanager
+    def recorded_lock() -> Iterator[None]:
+        runner.events.append("lock taken")
+        yield
+        runner.events.append("lock released")
+
+    record_reads_in(runner.events, hugging_face)
+    return module.follow_releases_record(
+        country,
+        blob_token=BLOB_TOKEN,
+        manifest_lock=recorded_lock,
+        bun="/usr/local/bin/bun",
+        run_command=runner,
+        reader=HuggingFaceReader(
+            HuggingFaceReadSettings(token=READ_TOKEN), client=hugging_face.client()
+        ),
+    )
+
+
+def test_a_country_s_latest_can_follow_releases_json_without_a_submission() -> None:
+    # As a backfill or switch-over job does at its end: nothing is built.
+    runner = RecordingRunner()
+
+    followed = follow_with(runner, release_repo(US_RELEASE_REPO, US_RECORD), "us")
+
+    assert runner.events == [
+        "lock taken",
+        f"read /api/datasets/{US_RELEASE_REPO}",
+        f"read /datasets/{US_RELEASE_REPO}/resolve/{'c' * 40}/releases.json",
+        "latest",
+        "lock released",
+    ]
+    assert runner.call("latest")["inputs"]["latest.json"] == {
+        "country": "us",
+        "releaseId": f"{US_DEFAULT_RELEASE}/{US_BUILD}",
+    }
+    assert followed == trees().FollowedLatest(
+        country="us",
+        current_build=f"{US_DEFAULT_RELEASE}/{US_BUILD}",
+        build_artifact_id="b" * 64,
+        made_latest=True,
+        latest_moved=True,
+    )
+
+
+def test_following_releases_json_says_why_the_latest_stayed() -> None:
+    runner = RecordingRunner()
+
+    followed = follow_with(runner, release_repo(BE_RELEASE_REPO, None), "be")
+
+    assert followed == trees().FollowedLatest(
+        country="be",
+        current_build=None,
+        build_artifact_id=None,
+        made_latest=False,
+        latest_moved=False,
+        unchanged="no_releases_record",
+    )
+    assert "latest" not in runner.events
+
+
+def test_following_releases_json_of_a_country_the_collector_does_not_list_is_refused() -> (
+    None
+):
+    runner = RecordingRunner()
+    hugging_face = uk_release_repo(releases_record())
+
+    with pytest.raises(ValueError, match="fr is not a country the collector lists"):
+        follow_with(runner, hugging_face, "fr")
+
+    assert hugging_face.requests == []
+    assert runner.events == []
+
+
+@pytest.mark.parametrize("failure", ["read", "command"])
+def test_a_failed_follow_raises_for_the_caller_to_try_again(failure: str) -> None:
+    hugging_face = uk_release_repo(releases_record())
+    runner = RecordingRunner()
+    if failure == "read":
+        hugging_face.datasets[UK_RELEASE_REPO].forced_status = 503
+        expected: type[Exception] = HuggingFaceReadError
+    else:
+        runner.latest_exit = 3
+        expected = trees().CalibrationTreeCommandError
+
+    with pytest.raises(expected):
+        follow_with(runner, hugging_face, "uk")
+
+
+@pytest.mark.parametrize(
+    "raised",
+    [subprocess.TimeoutExpired(["bun"], 300), FileNotFoundError("bun")],
+    ids=["timeout", "bun-missing"],
+)
+def test_a_latest_command_that_cannot_finish_raises_the_documented_error(
+    raised: BaseException,
+) -> None:
+    # A caller retries on the two documented errors, so a command that runs
+    # out of time or cannot start raises one of them too.
+    runner = RecordingRunner(latest_raises=raised)
+
+    with pytest.raises(Exception) as caught:
+        follow_with(runner, uk_release_repo(releases_record()), "uk")
+
+    assert isinstance(caught.value, trees().CalibrationTreeCommandError)
+    assert caught.value.__cause__ is raised
+
+
+# Deeper than Python's JSON decoder goes; the package's parser refuses it too.
+DEEPLY_NESTED_RECORD = b"[" * 100_000 + b"]" * 100_000
+
+
+def test_a_head_record_nested_too_deeply_publishes_without_moving_the_latest() -> None:
+    runner = RecordingRunner()
+    submission = accepted(RELEASED)
+
+    submission.run(
+        handler_with(runner, hugging_face=uk_release_repo(DEEPLY_NESTED_RECORD))
+    )
+
+    assert submission.record().status == "succeeded"
+    assert published_make_latest(runner) is False
+    assert submission.record().result["latest_skipped"] == "releases_record_refused"
+
+
+def test_a_submitted_record_nested_too_deeply_is_rejected() -> None:
+    runner = RecordingRunner()
+    submission = accepted_releases_record(DEEPLY_NESTED_RECORD)
+
+    submission.run(latest_handler_with(runner, uk_release_repo(releases_record())))
+
+    assert submission.record().status == "rejected"
+    assert submission.record().rejection["code"] == "releases_record_refused"
 
 
 def test_the_manifest_lock_lets_one_writer_in_at_a_time(postgres_url: str) -> None:
@@ -972,8 +1726,17 @@ def test_ci_checks_the_tree_package_in_the_built_image() -> None:
     assert runs.index(f"docker build --tag {IMAGE} .") < runs.index(tree_check)
 
 
+TOKEN_REFUSAL = "CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN is required."
+
+
 def run_tree_image_check(
-    tmp_path: Path, *, build_exit: int, build_answer: str, publication_exit: int
+    tmp_path: Path,
+    *,
+    build_exit: int,
+    build_answer: str,
+    publication_exit: int,
+    latest_exit: int = 1,
+    latest_stderr: str = TOKEN_REFUSAL,
 ) -> subprocess.CompletedProcess[str]:
     bin_directory = tmp_path / "bin"
     bin_directory.mkdir()
@@ -985,6 +1748,10 @@ def run_tree_image_check(
         'if [[ "$*" == *calibration-tree-worker.ts* ]]; then\n'
         f"  printf '%s\\n' '{build_answer}'\n"
         f"  exit {build_exit}\n"
+        "fi\n"
+        'if [[ "$*" == *calibration-tree-latest.ts* ]]; then\n'
+        f"  printf '%s\\n' '{latest_stderr}' >&2\n"
+        f"  exit {latest_exit}\n"
         "fi\n"
         f"exit {publication_exit}\n"
     )
@@ -1019,7 +1786,7 @@ def test_the_tree_image_check_passes_when_the_image_builds_a_tree(
 
     assert result.returncode == 0, result.stderr
     calls = (tmp_path / "docker-calls").read_text().splitlines()
-    assert len(calls) == 2
+    assert len(calls) == 3
     assert all(call.startswith("run --rm ") and IMAGE in call for call in calls)
     assert (
         "bun run /app/packages/calibration-tree/src/calibration-tree-worker.ts"
@@ -1031,6 +1798,33 @@ def test_the_tree_image_check_passes_when_the_image_builds_a_tree(
     )
     # The publication command runs without a token, so it can write nothing.
     assert "BLOB" not in calls[1]
+    # So does the latest command, which must ship in the image and refuse.
+    assert (
+        "bun run /app/packages/calibration-tree/src/calibration-tree-latest.ts"
+        in calls[2]
+    )
+    assert "BLOB" not in calls[2]
+
+
+@pytest.mark.parametrize(
+    ("latest_exit", "latest_stderr"),
+    [(0, ""), (1, "error: Module not found"), (3, TOKEN_REFUSAL)],
+    ids=["latest-ran", "latest-missing", "latest-other-exit"],
+)
+def test_the_tree_image_check_fails_unless_the_latest_command_refuses(
+    latest_exit: int, latest_stderr: str, tmp_path: Path
+) -> None:
+    result = run_tree_image_check(
+        tmp_path,
+        build_exit=0,
+        build_answer=BUILT_STAGING_TREE,
+        publication_exit=1,
+        latest_exit=latest_exit,
+        latest_stderr=latest_stderr,
+    )
+
+    assert result.returncode != 0
+    assert "latest command" in result.stderr
 
 
 @pytest.mark.parametrize(
