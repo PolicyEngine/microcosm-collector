@@ -102,12 +102,16 @@ def failing_attempt(context: JobContext) -> dict[str, Any]:
     raise RuntimeError("Storage hiccup.")
 
 
-def test_both_kinds_have_a_handler_that_keeps_files_in_intake_storage() -> None:
+def test_every_kind_has_a_handler_that_keeps_files_in_intake_storage() -> None:
     accepted = accepted_submission()
 
     outcome = accepted.run()
 
-    assert set(DEFAULT_HANDLERS) == {"calibration-diagnostics", "orrery-inputs"}
+    assert set(DEFAULT_HANDLERS) == {
+        "calibration-diagnostics",
+        "orrery-inputs",
+        "releases-record",
+    }
     assert outcome is JobOutcome.FINISHED
     assert accepted.record().status == "succeeded"
     assert accepted.record().result == {

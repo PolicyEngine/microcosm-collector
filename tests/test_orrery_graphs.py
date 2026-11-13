@@ -1247,6 +1247,8 @@ def test_the_registry_holds_both_handlers_where_both_settings_are_set(
         environ={
             "COLLECTOR_ORRERY_BUCKET": BUCKET,
             "COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN": "vercel_blob_rw_test_token",
+            # The tree handler reads releases.json with the read token.
+            "COLLECTOR_HF_READ_TOKEN": "hf_collector_read_token",
         },
     )
 

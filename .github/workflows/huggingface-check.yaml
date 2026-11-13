@@ -1,0 +1,76 @@
+name: Daily Hugging Face check
+
+# Once a day, start the collector's Hugging Face check job in production and
+# keep one GitHub issue per problem it finds (telemetry_collector.huggingface_issues).
+# 06:17 UTC avoids the delays GitHub has for schedules at the start of an hour.
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run the check, but only report what would change in its issues"
+        type: boolean
+        default: true
+
+permissions: {}
+
+concurrency:
+  group: huggingface-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Run the Hugging Face check and sync its issues
+    if: github.repository == 'PolicyEngine/microcosm-collector' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # Deployments to this environment are limited to main. Its secrets name the
+    # provider of the check's own Workload Identity pool, the account that may
+    # only start and follow the check job and read the project's logs, and the
+    # job's project, region and name: as secrets, GitHub hides each of them in
+    # this public log.
+    environment: huggingface-check
+    # The command waits up to 45 minutes for the execution, then reads its log
+    # up to ten times, 30 seconds apart; its step stops at 55 minutes, which
+    # leaves the last step time to report a hang.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      issues: write
+      id-token: write
+    env:
+      PROJECT_ID: ${{ secrets.TELEMETRY_GCP_PROJECT_ID }}
+      REGION: ${{ secrets.TELEMETRY_GCP_REGION }}
+      HF_CHECK_JOB: ${{ secrets.TELEMETRY_HF_CHECK_JOB }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
+        with:
+          workload_identity_provider: ${{ secrets.TELEMETRY_GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.TELEMETRY_HF_CHECK_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
+
+      - name: Run the check and sync its issues
+        run: uv run --frozen --no-dev python -m telemetry_collector.huggingface_issues
+        timeout-minutes: 55
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPO: ${{ github.repository }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+
+      # A failed authentication, a missing setting or a hang stops the run
+      # before the check reports: open or update the issue for a run without
+      # a result, with only GitHub's own token.
+      - name: Report a run that failed before the check reported
+        if: failure()
+        run: uv run --frozen --no-dev python -m telemetry_collector.huggingface_issues --workflow-failed
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPO: ${{ github.repository }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}

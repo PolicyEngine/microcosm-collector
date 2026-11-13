@@ -1,3 +1,21 @@
+## [0.21.0] - 2026-11-13
+
+### Added
+
+- A `releases-record` submission kind moves a country's latest calibration tree when its release repo's `releases.json` changes without a new build, as after `microcosm-publish-release-build --promote`. Its one file is the `releases.json` the change wrote; its provenance names the release repo, the commit that wrote it, and the release and build it made current. Under the manifest lock, the worker reads `releases.json` at the repo's head and points the latest at the tree recorded for the default release's current build there, older or newer, with the tree package's new latest command (`src/calibration-tree-latest.ts`), which writes only the manifest. That step is also `calibration_trees.follow_releases_record(country, ...)`, which another collector job can call to set a country's latest to its `releases.json` without building anything. This applies to every country the collector lists.
+
+### Changed
+
+- A calibration tree built from a release build's submission now becomes its country's latest only when the release repo's `releases.json`, read at the repo's head commit under the manifest lock just before the publication, names it as its default release's current build, for every country the collector lists, as the GitHub Actions publisher decides. A repo without `releases.json` (a 404 without `RepoNotFound` or `RevisionNotFound`) keeps the `DEFAULT_RELEASES` rule. Any other failed read of `releases.json` returns the job for another attempt before anything is published; a `releases.json` nested more deeply than Python's JSON decoder allows is refused like any unreadable record; a `releases.json` that breaks the record's rules publishes the tree without moving the latest, and the result records `latest_skipped: "releases_record_refused"` with the reason. The worker job's tree handler therefore needs `COLLECTOR_HF_READ_TOKEN` beside `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN`, and the worker stops with a message naming it when it is missing; the deploy already mounts both on the worker job.
+
+
+## [0.20.0] - 2026-11-12
+
+### Added
+
+- Check Hugging Face once a day from a production Cloud Run job, `python -m telemetry_collector.huggingface_check`, which the new workflow `.github/workflows/huggingface-check.yaml` starts. The check requests every dataset the collector reads with its read token and fails on any answer but HTTP 200. For datasets switched on, it also checks `releases.json` with the rules in the microcosm-emitter-interface package: one record and no `latest*.json` files, the record's rules, and every published file against the SHA-256 in its build's release manifest, read from the manifest's `artifacts` map. That part is off for every dataset until the package is a dependency. The workflow reads each execution's log entries and keeps one GitHub issue per problem, labelled `huggingface-check`: it opens, updates, reopens and closes them, and keeps one issue for a run that reports no result, including one that fails before the check reports. A completed run closes an issue only for a check it finished. A run by hand is a dry run unless told otherwise. The production deploy updates the job before it changes the service, from three production environment variables.
+
+
 ## [0.19.0] - 2026-11-11
 
 ### Added

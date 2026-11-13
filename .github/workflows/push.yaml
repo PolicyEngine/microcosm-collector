@@ -282,7 +282,8 @@ jobs:
       WORKER_INVOKER_SERVICE_ACCOUNT: ${{ vars.TELEMETRY_WORKER_INVOKER_SERVICE_ACCOUNT }}
       RECOVERY_SERVICE_ACCOUNT: ${{ vars.TELEMETRY_RECOVERY_SERVICE_ACCOUNT }}
       # This environment's own Hugging Face read token, which only its
-      # worker job mounts and only its worker service account may read.
+      # worker job and the daily Hugging Face check job mount, and only its
+      # worker service account may read.
       HF_READ_SECRET_NAME: ${{ vars.TELEMETRY_HF_READ_SECRET_NAME }}
       CALIBRATION_TREE_BLOB_SECRET_NAME: ${{ vars.TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME }}
       # This environment's private Orrery bucket: its worker job publishes
@@ -293,6 +294,9 @@ jobs:
       # deployments act as: the deploy grants it the Cloud Run Invoker role
       # on the Orrery read service, and no revision or job gets it.
       ORRERY_READER_SERVICE_ACCOUNT: ${{ vars.TELEMETRY_ORRERY_READER_SERVICE_ACCOUNT }}
+      # Only production has the daily Hugging Face check job, which the daily
+      # workflow starts (.github/workflows/huggingface-check.yaml).
+      HF_CHECK_JOB: ${{ vars.TELEMETRY_HF_CHECK_JOB }}
       # The Vercel team and the <project ID>:<environment> readers whose
       # Vercel OIDC tokens this environment's read API v2 accepts. Optional,
       # all three or none: unset, the deploy sets none of them on the service
@@ -323,6 +327,11 @@ jobs:
 
       - name: Check the worker and recovery jobs belong to this environment
         run: scripts/deploy.sh check-intake-jobs
+
+      - name: Configure the daily Hugging Face check job
+        run: scripts/deploy.sh configure-huggingface-check-job
+        env:
+          IMAGE_URI: ${{ needs.deploy-staging.outputs.image_uri }}
 
       - name: Deploy an isolated maintenance revision
         run: scripts/deploy.sh deploy-maintenance

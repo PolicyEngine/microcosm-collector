@@ -449,7 +449,7 @@ workflow, revoke the configuration in the same way.
 ## Artifact intake
 
 Builds hand calibration diagnostics and Orrery inputs to the collector as
-submissions. [`docs/artifact-submissions.md`](docs/artifact-submissions.md) is
+submissions, and Microcosm hands it the `releases.json` a promotion wrote. [`docs/artifact-submissions.md`](docs/artifact-submissions.md) is
 the contract: kinds, file roles, provenance, identifiers, statuses, answers,
 receipts and limits. File bytes go straight to a private bucket through signed
 upload URLs; `POST /v1/submissions/{id}/complete` checks the stored objects'
@@ -458,10 +458,12 @@ worker, a Cloud Run Job running
 `uv run --no-sync python -m telemetry_collector.worker`, recomputes every
 file's SHA-256 and runs the handler registered for the kind. Where the
 worker job has its calibration tree Blob token, `calibration-diagnostics`
-submissions build calibration trees ("Building trees from submissions"), and
-where it has its private Orrery bucket, `orrery-inputs` submissions publish
-Orrery graph files ("Publishing Orrery graph files"). Otherwise a kind's
-submissions are only checked and kept in intake storage.
+submissions build calibration trees ("Building trees from submissions") and
+`releases-record` submissions move a country's latest tree ("Moving the
+latest when releases.json changes"), and where it has its private Orrery
+bucket, `orrery-inputs` submissions publish Orrery graph files ("Publishing
+Orrery graph files"). Otherwise a kind's submissions are only checked and
+kept in intake storage.
 
 Intake is off unless `COLLECTOR_INTAKE_ENABLED` is exactly `1`. While it is
 off, the collector reads no other intake setting, and the token exchange for
@@ -498,7 +500,7 @@ bucket.
 | `COLLECTOR_WORKER_INVOKER_SERVICE_ACCOUNT` | service, operations | the account whose OAuth token each Cloud Task uses to run the worker job | `TELEMETRY_WORKER_INVOKER_SERVICE_ACCOUNT` |
 | `COLLECTOR_WORKER_JOB_ID` | worker | set on each execution by its Cloud Task | not set by the deploy |
 | `DATABASE_URL` | worker, operations, Orrery read service | the runtime database secret, as for the service | `TELEMETRY_DATABASE_SECRET_NAME` |
-| `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN` | worker | the read-write token of the environment's own calibration tree Vercel Blob store, a Secret Manager secret; without it, `calibration-diagnostics` submissions stay in intake storage (see "Building trees from submissions") | `TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME`, the secret's name |
+| `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN` | worker | the read-write token of the environment's own calibration tree Vercel Blob store, a Secret Manager secret; without it, `calibration-diagnostics` and `releases-record` submissions stay in intake storage (see "Building trees from submissions" and "Moving the latest when releases.json changes") | `TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME`, the secret's name |
 | `COLLECTOR_ORRERY_BUCKET` | worker, Orrery read service | the name of the environment's private Orrery bucket. For the worker, the bucket it publishes Orrery graph files to; without it, `orrery-inputs` submissions stay in intake storage (see "Publishing Orrery graph files"). For the Orrery read service, the bucket it serves them from; it refuses to start without it (see "Serving Orrery graph files"). The service doesn't get it | `TELEMETRY_ORRERY_BUCKET` |
 
 The `TELEMETRY_*` names are GitHub `staging` and `production` environment
@@ -1323,7 +1325,8 @@ newer builds first among run IDs that share a prefix, such as
 `uk-frs-calibration-attempt-<UTC time>-<suffix>`.
 
 **Running it.** It needs `DATABASE_URL` and `COLLECTOR_HF_READ_TOKEN`, which
-only the worker job mounts, and stops with a message naming either variable
+only the worker job mounts together (production's daily Hugging Face check job
+mounts the token but not the database), and stops with a message naming either variable
 when it is missing. Run it as an execution of the worker job with its
 arguments overridden:
 
@@ -1548,13 +1551,17 @@ compiles it through `transpilePackages`. Its own
 `src/calibration-tree-worker.ts` builds one release's or one staged run's
 tree from local files and writes its gzip parts to a directory, as its own Bun
 process, and `src/calibration-tree-publication.ts` uploads those parts and adds
-the build to the manifest:
+the build to the manifest. `src/calibration-tree-latest.ts` points a country's
+latest at a build the manifest already records (see "Moving the latest when
+releases.json changes"):
 
 ```bash
 cd packages/calibration-tree
 bun run src/calibration-tree-worker.ts REQUEST.json OUTPUT_DIRECTORY
 CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN=... \
   bun run src/calibration-tree-publication.ts PUBLICATION.json
+CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN=... \
+  bun run src/calibration-tree-latest.ts LATEST.json
 ```
 
 The worker builds a release exactly as the publisher builds it from the same
@@ -1582,8 +1589,10 @@ only, from the secret `TELEMETRY_CALIBRATION_TREE_BLOB_SECRET_NAME` names.
 Each environment has its own store, which nothing reads until the dashboard
 switches to it, and its own secret, which only its worker service account may
 read. Without the token, submissions stay in intake storage and can be
-reprocessed later. Nothing here
-reads Hugging Face: every value comes from the submission.
+reprocessed later. With it, the worker job also needs
+`COLLECTOR_HF_READ_TOKEN`, which the deploy mounts beside it, and stops with
+a message naming that variable without it. A tree's files and provenance come
+from the submission; only the latest build is decided from Hugging Face.
 
 - **Which tree.** A build folder, `releases/<release>/<build>`, gives a release
   tree whose release ID is `<release>/<build>`; its `release` and `build_id`
@@ -1596,12 +1605,33 @@ reads Hugging Face: every value comes from the submission.
   does not list, stay in intake storage with the reason in the result.
 - **Time.** The tree records the submission's `accepted_at` as its
   publication time, so reprocessing a submission builds the same tree.
-- **Latest.** A release build becomes its country's latest when its release
-  is the country's default release, listed in `DEFAULT_RELEASES`: the UK's is
-  `microcosm-uk-2024-25-national`; the US's is added once its stable releases
-  are agreed. It takes the latest only from an older build, by publication
-  time, so a retried or reprocessed older build never takes the latest back.
-  Builds of other releases are recorded without moving the latest.
+- **Latest.** For every country the collector lists, a release build becomes
+  its country's latest when the release repo's `releases.json` names it as
+  the current build of its default release, as the GitHub Actions publisher
+  decides (the names are compared). The handler reads `releases.json` at the
+  repo's head commit after the build, under the manifest lock and just before
+  the publication, so a build made current while its tree is being built is
+  never missed (see "Moving the latest when releases.json changes"). Other
+  builds are recorded without moving the latest.
+  - A repo without `releases.json` (Hugging Face's 404 without the
+    `RepoNotFound` or `RevisionNotFound` error code) keeps the
+    `DEFAULT_RELEASES` rule: a build of the country's default release there
+    becomes its latest. Only the UK's is listed,
+    `microcosm-uk-2024-25-national`, so builds of another country whose repo
+    has no `releases.json` don't become its latest.
+  - Any other failure to read `releases.json` fails the attempt before
+    anything is published, so it runs again.
+  - A `releases.json` the record's rules refuse (as the tree package's
+    `release-record.ts` reads it: at most 4 MiB, exactly its keys,
+    `schema_version` 1, safe names, each `current` a listed build that isn't
+    withdrawn, `default` a listed release or null) isn't retried: the tree is
+    published without moving the latest, and the result records
+    `latest_skipped: "releases_record_refused"` and the reason.
+  - A build takes the latest only from an older build, by publication time,
+    so a retried or reprocessed older build never takes the latest back.
+  - A build made current later, with no new build, moves the latest through
+    a `releases-record` submission instead (below).
+  - Staging trees never become the latest.
 - **Size.** The worker job has 8 GiB of memory and 2 CPUs: building the
   tree for the largest current diagnostics file (a 128.7 MB US release) peaked
   at 3.5 GB, and Cloud Run keeps the downloaded and written files in memory.
@@ -1627,8 +1657,61 @@ reads Hugging Face: every value comes from the submission.
 The image holds Bun 1.4.2, copied from the official image by digest, and the
 package's production install, without its tests, fixtures and test support.
 CI checks the built image with `tools/check-calibration-tree-image.sh`, which
-builds a small staged run's tree inside it and runs the publication command
-without a token, which must refuse to run.
+builds a small staged run's tree inside it and runs the publication and latest
+commands without a token, which must each refuse to run.
+
+### Moving the latest when releases.json changes
+
+When `microcosm-publish-release-build --promote` makes an already published
+build current, no tree is built. Microcosm then submits the repo's new
+`releases.json` as a `releases-record` submission (docs/artifact-submissions.md):
+its one file is the `releases.json` the change wrote, and its provenance names
+the release repo, the commit that wrote it, and the release and build it made
+current, whose folder is `releases/<release>/<build>`. Where the worker job has
+its Blob token, `calibration_trees.calibration_tree_latest_handler` handles it,
+for every country the collector lists:
+
+1. **Checks.** A repo that isn't the country's release repo rejects the
+   submission (`repo_not_registered`), and a country the collector does not
+   list stays in intake storage with the reason. A submitted `releases.json`
+   the record's rules refuse rejects it (`releases_record_refused`), and so
+   does one that doesn't name the build as its release's current build
+   (`provenance_mismatch`). The release need not be the default one.
+2. **Under the manifest lock,** it reads `releases.json` at the repo's head
+   commit, not the submitted copy, so a later change is never undone by an
+   earlier change's submission. It then runs the package's latest command,
+   `src/calibration-tree-latest.ts`, for the default release's current build
+   there. The command points the country's latest at the tree the manifest
+   records under that release ID, whether that build is newer or older than
+   the current latest (a rollback in `releases.json` moves the latest back).
+   It writes only the manifest, with the same compare-and-swap as the
+   publication command, and runs with only `PATH`, `LANG` and the Blob token.
+3. **Results.** `current_build`, `build_artifact_id`, `made_latest` (the
+   country's latest is that build's tree) and `latest_moved` (this
+   submission changed it). The latest is left as it is, and `latest_unchanged`
+   says why, when the head has no `releases.json` (`no_releases_record`), one
+   the rules refuse (`releases_record_refused`, with
+   `latest_unchanged_reason`), no current build of its default release
+   (`no_current_build`), or a current build the manifest records no tree for
+   (`no_recorded_tree`). A failed read or any other failure of the latest
+   command fails the attempt, so it runs again.
+
+Step 2 is `calibration_trees.follow_releases_record(country, ...)`, which
+builds nothing and takes the lock itself, so another collector job can call
+it too, for example to set each country's latest to its `releases.json` once
+it has built or backfilled trees. It returns the same fields as the result,
+refuses a country the collector does not list with `ValueError`, and raises
+any other failure (a failed read, `HuggingFaceReadError`; a failed latest
+command, `CalibrationTreeCommandError`; or the lock's or the request file's
+own errors) for its caller to try again. It must not be called while the
+caller holds the manifest lock.
+
+Both handlers read `releases.json` and write the manifest under the one lock,
+so a build made current while its tree is still being built becomes the
+latest either way: its publication reads the change, or the change's handler
+finds its tree. A tree whose publication comes after a rollback to it isn't
+made the latest by that publication, which takes the latest only from an older
+build; reprocessing the change's `releases-record` submission moves it.
 
 ### Tests
 
@@ -1730,7 +1813,8 @@ one-time setup first, in this order:
 ## Hugging Face read access
 
 Only the collector's worker jobs read Hugging Face, for backfills, old
-releases and back-building. The service itself holds no Hugging Face
+releases, back-building and the calibration tree handler's latest rule. The
+service itself holds no Hugging Face
 credential: a build's own token reaches it only at the token exchange, and is
 never stored. The worker jobs read with a purpose-specific, fine-grained
 read token, never a generic `HF_TOKEN`. Staging and production each have
@@ -1748,6 +1832,18 @@ missing or malformed token stops the job with a message naming the variable.
 Face's own tools read without being asked, are refused if set, so a job
 cannot fall back to a token with another scope. No message includes a token,
 and the reader sends it only to `huggingface.co`.
+
+What reads Hugging Face:
+- the inventory of past builds, and projecting them again;
+- the calibration tree handler, which reads each release build's repo
+  `releases.json` at its head commit to decide the latest (see "Building
+  trees from submissions"), and the `releases-record` handler, which reads it
+  to move the latest (see "Moving the latest when releases.json changes"),
+  so both need the token wherever they have the Blob token.
+
+A read answered with anything but HTTP 200 reports the status and, for a
+404, Hugging Face's `X-Error-Code`, so a missing file (`EntryNotFound`) can be
+told from a missing repo or revision (`RepoNotFound`, `RevisionNotFound`).
 
 The datasets the worker jobs read are listed once, in `HUGGINGFACE_DATASETS`:
 
@@ -1782,6 +1878,173 @@ dataset is added here:
    A command that sets a job's secrets with `--set-secrets` replaces all of
    its mounts, so any such command for these jobs must list this one too, as
    the deploy's does.
+
+## Daily Hugging Face check
+
+`python -m telemetry_collector.huggingface_check` runs in production as a
+Cloud Run job. Once a day at 06:17 UTC (`17 6 * * *`), the workflow
+`.github/workflows/huggingface-check.yaml` starts it and keeps a GitHub issue
+for each problem it finds, with `python -m telemetry_collector.huggingface_issues`.
+It reads Hugging Face with production's read token, the one production's
+worker job mounts, and runs two checks:
+
+1. **Token check.** It requests every dataset in `HUGGINGFACE_DATASETS` once.
+   Any answer but HTTP 200 is a problem, including a redirect or no answer.
+2. **`releases.json` check.** For each dataset whose entry sets
+   `checks_releases_record`, at that dataset's head commit:
+   - there is exactly one `releases.json`, at the root, and no `latest*.json`
+     file anywhere;
+   - the record passes the rules in `microcosm_emitter_interface.releases`,
+     the code the emitter's release writer runs before every write: `current`
+     names a listed build that is not withdrawn, `default` names a listed
+     release, and every listed build has its folder and a
+     `release_manifest.json` naming the same release and build;
+   - every file in a listed build's folder is in the `artifacts` map of that
+     build's `release_manifest.json` and has the SHA-256 the map records.
+     `manifest_file_digests` reads each entry's `path`, the file's bare name
+     in the build folder, and its `sha256`. Files stored with LFS are
+     compared by the SHA-256 Hugging Face records for their content, without
+     a download; other files are downloaded and hashed. Three files of a
+     build folder need no entry: the release manifest itself, and the
+     `build_manifest.json` and `sha256sums.txt` that Microcosm's publisher
+     writes beside it.
+
+   The rules that compare one write with the state before it (existing build
+   entries change only `withdrawn`; nothing inside an existing build folder
+   is added, changed or removed) need that earlier state, so only the release
+   writer applies them. The file check above finds any later change to a
+   build's files except a change to those three.
+
+**Problems and issues.** Each problem is one JSON log entry with severity
+`ERROR`, naming the check, the dataset and a code such as `HTTP_404`,
+`UNREACHABLE`, `POINTER_FILE_PRESENT` or `SHA256_MISMATCH`, followed by a
+summary entry. The job then exits 1, or 2 when the token setting itself is
+missing or unusable, so the execution fails. No log entry includes the token.
+
+The workflow starts an execution, waits for it to finish, and reads that
+execution's log entries. It keeps one GitHub issue per problem, keyed by its
+check, dataset and code, each with the `huggingface-check` label:
+
+- a run that finds a new problem opens its issue (at most 10 a run; the next
+  run opens the rest);
+- a run that finds it again updates the open issue with what it logged;
+- a run that finds a problem whose issue was closed reopens it, with a
+  comment, unless the issue was closed as not planned;
+- a completed run that no longer finds a problem closes its issue, with a
+  comment, but only if that run finished the check that found it: a
+  dataset's `releases.json` check that stopped (at a read error, a missing or
+  unreadable record, a failed token check, or without the rules package)
+  leaves its issues as they are, and so does a check that could not compare
+  a listed build's files with its manifest. The check's summary entry lists
+  the datasets whose `releases.json` check ran to its end. An issue for a
+  check that no longer runs (it was switched off for its dataset, or the
+  dataset is no longer checked), or for a dataset with a build whose files
+  can never be compared again (its manifest is gone, and build folders never
+  change), stays open until someone closes it.
+
+A run that reports no result opens or updates one issue titled "The check did
+not report a result" instead, and leaves the problem issues as they are,
+since what they report is then unknown. That covers a job that could not
+start, failed before writing its summary entry, did not finish within 45
+minutes or could not read its token setting, and entries that could not be
+read, or fewer problem entries than the summary counts. A run that fails
+before the command finishes (it could not authenticate, a setting is missing,
+or the command failed or ran out of time) is reported the same way by the
+workflow's last step, which needs only GitHub's own token; a failed checkout
+or dependency install leaves only GitHub's own failure email. This issue reopens
+even if someone closed it as not planned. The next run that reports a result
+closes it. GitHub notifies the repo's watchers of each new issue, and the
+workflow run's summary lists what each run did.
+
+A run by hand ("Run workflow" on the Actions tab) is a dry run unless its
+`dry_run` box is cleared: it runs the check and reports what it would change,
+without changing any issue. The repo is public, so no issue names the
+project, region, job, execution or account, and the workflow passes those as
+secrets, which GitHub hides in its log. (The production deploy's log already
+shows the project, region and job name, which are variables there.) If GitHub
+stops starting the schedule, nothing reports it: GitHub disables scheduled
+workflows in a public repo after 60 days without activity in it, and emails a
+failed scheduled run only to whoever last changed its schedule.
+
+**Deployment.** The production deploy runs
+`scripts/deploy.sh configure-huggingface-check-job` before it changes the
+service. It confirms the read token's secret exists, reading only its
+metadata, then deploys the job with the released image, one task, no retries
+and the token as its only secret. A missing secret or account therefore stops
+the deploy before production changes. The job's names come from three
+production environment variables:
+
+| Variable | Value |
+|---|---|
+| `TELEMETRY_HF_CHECK_JOB` | the check job's name |
+| `TELEMETRY_WORKER_SERVICE_ACCOUNT` | the worker service account, the only identity that may read the token |
+| `TELEMETRY_HF_READ_SECRET_NAME` | the read token's Secret Manager secret |
+
+Staging has no check job, so staging's own read token, which only staging's
+worker job mounts, is not checked; production's job checks production's
+token, once a day. The deployment service account needs metadata read access
+to the secret and permission to act as the worker service account.
+
+**The workflow's access.** The workflow runs in the
+`huggingface-check` environment, which only `main` may use, and reads five
+secrets from it. As
+secrets, GitHub hides their values in the workflow's public log:
+
+| Secret | Value |
+|---|---|
+| `TELEMETRY_GCP_WIF_PROVIDER` | the provider of the check's own Workload Identity pool, which accepts only this repo's `main` in the `huggingface-check` environment |
+| `TELEMETRY_HF_CHECK_SERVICE_ACCOUNT` | the account the workflow acts as, which may only start the check job, follow its executions and read the project's logs |
+| `TELEMETRY_GCP_PROJECT_ID` | the collector's project |
+| `TELEMETRY_GCP_REGION` | the check job's region |
+| `TELEMETRY_HF_CHECK_JOB` | the check job's name, as in production's `TELEMETRY_HF_CHECK_JOB` |
+
+The workflow's account trusts only that pool, and the deployment account
+does not trust it, so the deploy's access is unchanged ("Google Cloud access").
+The deploy's own provider must check the environment before the workflow
+first runs, with the condition
+`assertion.repository=='PolicyEngine/microcosm-collector' && assertion.ref=='refs/heads/main' && assertion.environment in ['staging', 'production']`.
+Without that clause, the check job's token would also pass the deploy's
+provider, and the deployment account trusts every token of this repo that it
+accepts.
+The environment, its secrets, the pool, the account and its access are created
+once by hand; the deploy does not change them. The workflow's `GITHUB_TOKEN` opens and
+changes the issues, so it needs no other GitHub credential.
+
+**Switching on the `releases.json` check.** It is off for every dataset. For
+a dataset, it can be switched on once:
+
+1. the microcosm-emitter-interface package, with
+   `microcosm_emitter_interface.releases` (PolicyEngine/microcosm-emitter#24),
+   is published and added to this collector's dependencies;
+2. Microcosm publishes the dataset's builds into their folders with the
+   release manifest decided on 2026-10-29 (H2c): today's `artifacts` map,
+   each entry with `kind`, `role`, `repo_id`, `sha256` and a bare `path`,
+   and no `revision`;
+3. the dataset publishes builds side by side with `releases.json`, and its
+   `latest*.json` files are deleted. Before that, the check would report them
+   every day;
+4. every file in each listed build's folder is in that build's `artifacts`
+   map, apart from the manifests and the checksum list. Otherwise the check
+   reports each other file as `FILE_NOT_IN_MANIFEST` every day, in an issue
+   that can't close, because build folders never change.
+
+`policyengine/populace-uk-private` and `policyengine/populace-us` meet the
+second and third since their switches on 2026-11-09 and 2026-11-11.
+`policyengine/populace-us` doesn't meet the fourth yet. Each of its three
+`microcosm-us-2024-local` builds holds six files that its checksum list
+records but its manifest doesn't declare, which the switch copied as they
+were. So either the check must also accept files a build's checksum list
+records, or those builds must stay unchecked.
+
+Then one change sets `checks_releases_record=True` on that dataset's entry.
+`tests/test_releases_record_check.py` tests the check against the real rules,
+and is skipped until the package is installed. To run it now against a
+checkout of PolicyEngine/microcosm-emitter:
+
+```bash
+uv run --with ../microcosm-emitter/packages/microcosm-emitter-interface \
+  python -m pytest tests/test_releases_record_check.py
+```
 
 ## Releases
 
@@ -1901,7 +2164,17 @@ assertion.repository=='PolicyEngine/microcosm-collector' && assertion.ref=='refs
 
 The deployment jobs run in those two environments, so they keep their access,
 and a token from a job in any other environment, or in none, is refused. From
-then on, every job that authenticates to Google Cloud must name one of the two.
+then on, every job that authenticates through this provider must name one of
+the two.
+
+The daily Hugging Face check's job also requests an OIDC token, in the
+`huggingface-check` environment. It authenticates through a Workload Identity
+pool and provider of its own, whose condition accepts only this repo's `main`
+in that environment, and acts as an account that trusts only that pool. Once
+the deploy's provider checks the environment, as above, it refuses that token, and
+the deployment account does not trust the check's pool, so the check cannot
+act as the deployment account. That clause must be in place before the
+check's workflow first runs ("Daily Hugging Face check").
 
 Both deployment jobs also require
 `github.event_name == 'push' && github.ref == 'refs/heads/main'`. The Push
