@@ -2,6 +2,9 @@
 
 import hashlib
 import re
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -18,7 +21,12 @@ from telemetry_collector.huggingface_read import (
     HuggingFaceReadSettings,
     token_scope,
 )
-from tests.huggingface_fakes import CONTENT_HOST, FakeHuggingFace, git_blob_id
+from tests.huggingface_fakes import (
+    CONTENT_HOST,
+    FakeHuggingFace,
+    git_blob_id,
+    not_found,
+)
 
 EXAMPLE_TOKEN = "hf_test_collector_read_token"
 UK_RELEASES = "policyengine/populace-uk-private"
@@ -35,6 +43,15 @@ def reader_for(hub: FakeHuggingFace) -> HuggingFaceReader:
     return HuggingFaceReader(
         HuggingFaceReadSettings(token=EXAMPLE_TOKEN), client=hub.client()
     )
+
+
+def reader_method(reader: HuggingFaceReader, name: str) -> Callable[..., Any]:
+    """One of the reader's methods, failing the test clearly when it is missing."""
+
+    method = getattr(reader, name, None)
+    if method is None:
+        pytest.fail(f"HuggingFaceReader has no {name}.")
+    return method
 
 
 # The datasets the collector reads -------------------------------------------
@@ -334,3 +351,268 @@ def test_last_commits_are_read_page_by_page_at_the_revision() -> None:
         and "expand=true" in str(request.url)
         for request in hub.requests
     )
+
+
+def test_a_missing_file_exposes_hugging_face_s_error_code(
+    hub: FakeHuggingFace,
+) -> None:
+    hub.add_dataset(UK_RELEASES, {MANIFEST_PATH: b"manifest"}, head_commit="d" * 40)
+    reader = reader_for(hub)
+
+    with pytest.raises(HuggingFaceReadError) as missing_file:
+        reader.read_file(UK_RELEASES, "releases.json", "d" * 40)
+    with pytest.raises(HuggingFaceReadError) as missing_revision:
+        reader.read_file(UK_RELEASES, MANIFEST_PATH, "e" * 40)
+    with pytest.raises(HuggingFaceReadError) as missing_dataset:
+        reader.read_file("policyengine/populace-fr", MANIFEST_PATH, "d" * 40)
+
+    assert missing_file.value.status_code == 404
+    assert getattr(missing_file.value, "error_code", None) == "EntryNotFound"
+    assert getattr(missing_revision.value, "error_code", None) == "RevisionNotFound"
+    assert getattr(missing_dataset.value, "error_code", None) == "RepoNotFound"
+
+
+def test_an_api_answer_s_error_code_is_exposed_too() -> None:
+    reader = HuggingFaceReader(
+        HuggingFaceReadSettings(token=EXAMPLE_TOKEN),
+        client=httpx.Client(
+            transport=httpx.MockTransport(lambda request: not_found("RepoNotFound"))
+        ),
+    )
+
+    with pytest.raises(HuggingFaceReadError) as raised:
+        reader.dataset_info(UK_RELEASES)
+
+    assert raised.value.status_code == 404
+    assert getattr(raised.value, "error_code", None) == "RepoNotFound"
+
+
+# One folder's files ------------------------------------------------------------
+
+
+def test_a_folder_lists_its_own_files_without_its_subfolders(
+    hub: FakeHuggingFace,
+) -> None:
+    dataset_bytes = b"rows" * 100
+    hub.add_dataset(
+        UK_RELEASES,
+        {
+            MANIFEST_PATH: b"manifest",
+            DATASET_PATH: dataset_bytes,
+            "releases/microcosm-uk-2024-25-national/build-1/extra/notes.json": b"{}",
+            "releases/other/build-2/release_manifest.json": b"{}",
+        },
+        lfs_paths={DATASET_PATH},
+        head_commit="d" * 40,
+    )
+    folder = "releases/microcosm-uk-2024-25-national/build-1"
+
+    files = reader_method(reader_for(hub), "list_folder")(UK_RELEASES, folder, "d" * 40)
+
+    assert sorted(files, key=lambda listed_file: listed_file.path) == [
+        DatasetFile(
+            path=DATASET_PATH,
+            size=len(dataset_bytes),
+            blob_id=git_blob_id(dataset_bytes),
+            lfs_sha256=hashlib.sha256(dataset_bytes).hexdigest(),
+        ),
+        DatasetFile(
+            path=MANIFEST_PATH,
+            size=len(b"manifest"),
+            blob_id=git_blob_id(b"manifest"),
+            lfs_sha256=None,
+        ),
+    ]
+    (request,) = hub.requests
+    assert request.url.path == f"/api/datasets/{UK_RELEASES}/tree/{'d' * 40}/{folder}"
+    assert "recursive" not in str(request.url)
+    assert request.headers["Authorization"] == f"Bearer {EXAMPLE_TOKEN}"
+
+
+def test_a_folder_that_is_not_there_exposes_the_error_code(
+    hub: FakeHuggingFace,
+) -> None:
+    hub.add_dataset(UK_RELEASES, {MANIFEST_PATH: b"manifest"}, head_commit="d" * 40)
+
+    with pytest.raises(HuggingFaceReadError) as raised:
+        reader_method(reader_for(hub), "list_folder")(
+            UK_RELEASES, "releases/absent", "d" * 40
+        )
+
+    assert raised.value.status_code == 404
+    assert getattr(raised.value, "error_code", None) == "EntryNotFound"
+
+
+# Downloads to disk -------------------------------------------------------------
+
+
+def listed_file(reader: HuggingFaceReader, path: str, revision: str) -> DatasetFile:
+    folder = path.rpartition("/")[0]
+    [listed] = [
+        dataset_file
+        for dataset_file in reader_method(reader, "list_folder")(
+            UK_RELEASES, folder, revision
+        )
+        if dataset_file.path == path
+    ]
+    return listed
+
+
+def test_a_file_is_streamed_to_disk_and_checked_against_its_listing(
+    hub: FakeHuggingFace, tmp_path: Path
+) -> None:
+    content = b'{"release": "microcosm-uk-2024-25-national"}' * 50
+    hub.add_dataset(UK_RELEASES, {MANIFEST_PATH: content}, head_commit="d" * 40)
+    reader = reader_for(hub)
+    listed = listed_file(reader, MANIFEST_PATH, "d" * 40)
+    destination = tmp_path / "release_manifest.json"
+
+    downloaded = reader_method(reader, "download_file")(
+        UK_RELEASES, listed, "d" * 40, destination, max_bytes=1024 * 1024
+    )
+
+    assert destination.read_bytes() == content
+    assert downloaded.path == destination
+    assert downloaded.size == len(content)
+    assert downloaded.sha256 == hashlib.sha256(content).hexdigest()
+    download_request = hub.requests[-1]
+    assert download_request.url.path == (
+        f"/datasets/{UK_RELEASES}/resolve/{'d' * 40}/{MANIFEST_PATH}"
+    )
+    assert download_request.headers["Authorization"] == f"Bearer {EXAMPLE_TOKEN}"
+
+
+def test_an_lfs_file_is_downloaded_from_the_content_host_without_the_token(
+    hub: FakeHuggingFace, tmp_path: Path
+) -> None:
+    content = b"rows" * 1000
+    hub.add_dataset(
+        UK_RELEASES,
+        {DATASET_PATH: content},
+        lfs_paths={DATASET_PATH},
+        head_commit="d" * 40,
+    )
+    reader = reader_for(hub)
+    listed = listed_file(reader, DATASET_PATH, "d" * 40)
+
+    downloaded = reader_method(reader, "download_file")(
+        UK_RELEASES, listed, "d" * 40, tmp_path / "dataset.h5", max_bytes=1024 * 1024
+    )
+
+    assert (tmp_path / "dataset.h5").read_bytes() == content
+    assert downloaded.sha256 == listed.lfs_sha256
+    (content_request,) = hub.requests_to(httpx.URL(CONTENT_HOST).host)
+    assert "Authorization" not in content_request.headers
+    assert EXAMPLE_TOKEN not in str(content_request.url)
+    assert all(
+        request.headers.get("Authorization") == f"Bearer {EXAMPLE_TOKEN}"
+        for request in hub.requests_to("huggingface.co")
+    )
+
+
+def test_a_file_listed_over_the_size_limit_is_refused_before_it_is_requested(
+    hub: FakeHuggingFace, tmp_path: Path
+) -> None:
+    content = b"x" * 2048
+    hub.add_dataset(UK_RELEASES, {MANIFEST_PATH: content}, head_commit="d" * 40)
+    reader = reader_for(hub)
+    listed = listed_file(reader, MANIFEST_PATH, "d" * 40)
+    requests_before = len(hub.requests)
+
+    with pytest.raises(HuggingFaceReadError) as raised:
+        reader_method(reader, "download_file")(
+            UK_RELEASES, listed, "d" * 40, tmp_path / "manifest.json", max_bytes=1024
+        )
+
+    assert re.search(r"larger than \d+ bytes", str(raised.value))
+    assert len(hub.requests) == requests_before
+    assert not (tmp_path / "manifest.json").exists()
+
+
+def test_a_download_longer_than_its_listing_is_stopped_and_removed(
+    hub: FakeHuggingFace, tmp_path: Path
+) -> None:
+    content = b"x" * 4096
+    hub.add_dataset(UK_RELEASES, {MANIFEST_PATH: content}, head_commit="d" * 40)
+    listed_shorter = DatasetFile(
+        path=MANIFEST_PATH,
+        size=100,
+        blob_id=git_blob_id(content[:100]),
+        lfs_sha256=None,
+    )
+
+    with pytest.raises(HuggingFaceReadError) as raised:
+        reader_method(reader_for(hub), "download_file")(
+            UK_RELEASES,
+            listed_shorter,
+            "d" * 40,
+            tmp_path / "manifest.json",
+            max_bytes=1024 * 1024,
+        )
+
+    assert "differs from its listing" in str(raised.value)
+    assert not (tmp_path / "manifest.json").exists()
+
+
+def test_a_download_whose_lfs_sha256_differs_from_its_listing_is_refused(
+    hub: FakeHuggingFace, tmp_path: Path
+) -> None:
+    stored = hub.add_dataset(
+        UK_RELEASES,
+        {DATASET_PATH: b"rows"},
+        lfs_paths={DATASET_PATH},
+        head_commit="d" * 40,
+    )
+    stored.reported_lfs_sha256[DATASET_PATH] = "0" * 64
+    reader = reader_for(hub)
+    listed = listed_file(reader, DATASET_PATH, "d" * 40)
+
+    with pytest.raises(HuggingFaceReadError) as raised:
+        reader_method(reader, "download_file")(
+            UK_RELEASES, listed, "d" * 40, tmp_path / "dataset.h5", max_bytes=1024
+        )
+
+    assert "differs from its listing" in str(raised.value)
+    assert not (tmp_path / "dataset.h5").exists()
+
+
+def test_a_download_whose_git_blob_id_differs_from_its_listing_is_refused(
+    hub: FakeHuggingFace, tmp_path: Path
+) -> None:
+    hub.add_dataset(UK_RELEASES, {MANIFEST_PATH: b"manifest"}, head_commit="d" * 40)
+    listed_otherwise = DatasetFile(
+        path=MANIFEST_PATH,
+        size=len(b"manifest"),
+        blob_id=git_blob_id(b"MANIFEST"),
+        lfs_sha256=None,
+    )
+
+    with pytest.raises(HuggingFaceReadError) as raised:
+        reader_method(reader_for(hub), "download_file")(
+            UK_RELEASES,
+            listed_otherwise,
+            "d" * 40,
+            tmp_path / "manifest.json",
+            max_bytes=1024,
+        )
+
+    assert "differs from its listing" in str(raised.value)
+    assert not (tmp_path / "manifest.json").exists()
+
+
+def test_a_download_of_a_missing_file_exposes_the_error_code(
+    hub: FakeHuggingFace, tmp_path: Path
+) -> None:
+    hub.add_dataset(UK_RELEASES, {}, head_commit="d" * 40)
+    listed = DatasetFile(
+        path=MANIFEST_PATH, size=8, blob_id=git_blob_id(b"manifest"), lfs_sha256=None
+    )
+
+    with pytest.raises(HuggingFaceReadError) as raised:
+        reader_method(reader_for(hub), "download_file")(
+            UK_RELEASES, listed, "d" * 40, tmp_path / "manifest.json", max_bytes=1024
+        )
+
+    assert raised.value.status_code == 404
+    assert getattr(raised.value, "error_code", None) == "EntryNotFound"
+    assert EXAMPLE_TOKEN not in str(raised.value)

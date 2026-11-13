@@ -503,6 +503,14 @@ identity column needs no sequence privilege to insert rows.
   can be projected and processes it at once. An operator runs it the same
   way, and only while the worker's account may create objects in the intake
   bucket (see "Projecting past builds again").
+- **Backfilling calibration trees** (`uv run --no-sync python -m
+  telemetry_collector.operations backfill-calibration-trees
+  --production-manifest-url <URL>`, with `--dry-run` to list first) builds
+  every calibration tree production's tree manifest lists that the
+  collector's store doesn't hold yet. It needs the database, the Hugging
+  Face read token and the calibration tree Blob token, so an operator runs
+  it as an execution of the worker job with its arguments overridden (see
+  "Backfilling calibration trees from Hugging Face").
 
 None of these values is secret. Intake needs, in each environment's project
 and region, these resources, created by hand (both environments have them):
@@ -1447,7 +1455,15 @@ CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN=... \
   bun run src/calibration-tree-publication.ts PUBLICATION.json
 CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN=... \
   bun run src/calibration-tree-latest.ts LATEST.json
+CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN=... \
+  bun run src/calibration-tree-manifest-read.ts
 ```
+
+`src/calibration-tree-manifest-read.ts` only reads: it prints the store's
+manifest as one JSON line, read without the cache and checked with the
+manifest's own rules (an empty manifest while the store has none), for the
+backfill to compare with production's. It exits 1 without its token and 3
+when the store can't be read or its manifest breaks the rules.
 
 The worker builds a release exactly as the publisher builds it from the same
 files, commit and publication time, and a staged run as the publisher builds a
@@ -1539,6 +1555,12 @@ from the submission; only the latest build is decided from Hugging Face.
   other failure, including a manifest another writer changed meanwhile, fails
   the attempt so it runs again.
 
+`build_and_publish` in the same module runs the tree worker and the
+publication command for one planned tree, and the backfill runs it too. The
+handler has it read `releases.json` under the lock, as above; the backfill
+reads nothing there and asks for the latest from production's manifest (see
+"Backfilling calibration trees from Hugging Face").
+
 The image holds Bun 1.4.2, copied from the official image by digest, and the
 package's production install, without its tests, fixtures and test support.
 CI checks the built image with `tools/check-calibration-tree-image.sh`, which
@@ -1597,6 +1619,186 @@ latest either way: its publication reads the change, or the change's handler
 finds its tree. A tree whose publication comes after a rollback to it isn't
 made the latest by that publication, which takes the latest only from an older
 build; reprocessing the change's `releases-record` submission moves it.
+
+### Backfilling calibration trees from Hugging Face
+
+Before the dashboard reads trees from the collector's store, that store must
+hold every build the dashboard lists today.
+`python -m telemetry_collector.operations backfill-calibration-trees`
+(`telemetry_collector/calibration_tree_backfill.py`) builds each one the
+store doesn't hold yet, from its Hugging Face files, as the store would have
+built it from a submission.
+
+**Which builds.** The builds come from production's public tree manifest,
+`GET <URL>?country=<cc>`, where `<URL>` is the command's
+`--production-manifest-url`, the dashboard's
+`https://<dashboard>/api/microcosm/tree-manifest`. The command sends it no
+credential, through a client of its own, never the Hugging Face reader's, and
+follows no redirect. `--country us|uk|be` (repeatable) and `--kind
+release|staging` limit what it backfills.
+
+**Checks.** For each country:
+- An answer that isn't HTTP 200, is larger than 16 MiB, takes longer than 2
+  minutes to arrive in whole (checked as each chunk arrives; each connect and
+  each read also times out after 60 seconds), isn't JSON, has another
+  `schemaVersion` than the tree manifest's 6 or another `country`, or names a
+  `latestReleaseBuildArtifactId` that isn't one of its release builds, is one
+  `error` for that country; the other countries continue.
+- Each entry is checked before any of its values is used in a Hugging Face
+  path, and one that fails is `invalid` while the rest of the country
+  continues: its `kind`; its `hfRepo`, the country's release repo or, for a
+  staging build, its staging repo or its release repo (a staged bundle); an
+  `hfCommitSha` of 40 lowercase hex digits; a `releaseId` and
+  `releaseDirectory` that are a `<release>` or `<release>/<build>` folder of
+  safe names; a `stagingRunId` that is one safe name and not `latest`; a
+  `createdAt` that is null or an ISO 8601 time with an offset; and a `label`.
+
+**Files.** Every file is read at the entry's commit.
+- A release build: `releases/<releaseDirectory, else releaseId>/`, with
+  `calibration_diagnostics.json`, and `build_manifest.json`,
+  `release_manifest.json` and `demographics.json` when the folder lists them
+  (null otherwise, as the GitHub Actions publisher's optional reads are).
+- A staging build, by the rules of the tree package's staging readers that
+  locate its files, and only those:
+  - in the staging repo, `runs/<id>/run_manifest.json` and `progress.json`,
+    read to plan, say where the diagnostics are: at the run manifest's
+    declared `calibration_diagnostics` path, whose SHA-256 is checked, or,
+    for a schema-1 run, `runs/<id>/calibration_diagnostics.json`; with
+    `runs/<id>/build_manifest.json` and `release_manifest.json`;
+  - a run manifest that declares a `staged_dataset` receipt instead leads,
+    after the receipt's SHA-256 is checked, to the staged bundle the receipt
+    names in the country's release repo at its revision, with the
+    diagnostics' recorded SHA-256 checked;
+  - an entry whose repo is the release repo is a staged bundle,
+    `staged/<id>/calibration_diagnostics.json` or its single
+    `<dataset>.diagnostics.json`.
+  A staging build's tree is built from its diagnostics (and, from the
+  staging repo, its build and release manifests) only, as the tree worker
+  builds a staged bundle's.
+
+Each tree records the entry's release ID or run, label, repo, commit and
+`createdAt`, so a release build gets production's build ID and index. Two
+limits follow:
+- A staging build's build ID differs from production's: the worker hashes 4
+  of its source files, where the GitHub Actions publisher hashes 7. So links
+  or stored comparisons that carry an old staging build ID don't carry over.
+- A staging build whose diagnostics are in a staged bundle reached through
+  its run's `staged_dataset` receipt has them read from the country's release
+  repo at the receipt's revision, but its tree names the staging repo and
+  commit (production's entry's) for them, because the worker's request gives
+  each file only a path. Production's tree for the same run names their own
+  repo and commit, the release repo and the receipt's revision. So that
+  backfilled tree's provenance names a path that isn't in the repo and commit
+  it names.
+
+**The latest build.** Only the entry production's
+`latestReleaseBuildArtifactId` names asks to become its country's latest, and
+every country's latest is built before any other entry. The publication
+command still moves the latest only to a build at least as new as the
+store's current one. When the store already holds production's latest under
+its release ID:
+- if that stored build is the store's latest, nothing is done, and it is
+  reported `already_stored` or `mismatch` with `made_latest: true`;
+- otherwise the stored build is published again exactly as stored: from its
+  files at the stored entry's commit, with the stored entry's repo and
+  `createdAt` (a tree built from a submission records the submission's
+  `accepted_at`), after the stored entry passes the checks production's
+  entries get. That reproduces the stored index, so the publication keeps
+  every part and moves only the latest: the entry is `built` with
+  `made_latest: true`, or `latest_not_moved` when the store's latest is
+  newer. It reproduces the index only when the folder at the stored commit
+  lists the files the stored tree was built from and the tree package still
+  builds the same index; otherwise the publication refuses the build, which
+  is reported `refused` and leaves the run incomplete until the stored
+  build is dealt with by hand. A stored entry that fails the checks is `invalid`, and nothing is
+  published.
+
+The backfill follows production's latest, not `releases.json`. The two can
+differ: when the store's latest is newer than production's (for example after
+a rollback in `releases.json`), production's latest is published again and
+reported `latest_not_moved` on every run; and production's manifest can be
+behind `releases.json` at the release repo's head. Either way,
+`calibration_trees.follow_releases_record`, or a `releases-record`
+submission ("Moving the latest when releases.json changes"), sets the
+country's latest to `releases.json`'s current build once that build's tree
+is stored.
+
+**The store.** The command reads the store's manifest once, with the read-only
+`src/calibration-tree-manifest-read.ts`. An entry whose release ID or staging
+run the store already holds, with the same commit and `createdAt`, is
+`already_stored`; with another, `mismatch`. Times are compared as instants to
+the millisecond, since the worker stores `createdAt` as `toISOString` writes
+it, keeping milliseconds and dropping finer digits. Neither outcome downloads
+anything, and its `made_latest` says whether the stored build is the store's
+latest: as the store's manifest recorded it when the run read it, or as this
+run's publications have since moved it.
+
+**Building.** One build at a time, each in a new temporary directory that is
+removed afterwards. A file listed as larger than 256 MiB is `too_large`
+before anything is downloaded. Each file is streamed to disk and checked
+against its listing, and the tree is built and published by
+`build_and_publish`, as a submission's is: the worker without the Blob token,
+then the publication with it, inside the manifest lock, which the backfill
+holds for the publication alone. No build starts after 40 minutes of an
+execution; the remaining ones are `deferred`.
+
+**Outcomes.** The command prints one JSON document for each entry, with its
+country, kind, release ID or run, repo, commit, `created_at`, `make_latest`,
+outcome and reason, production's build ID, the build ID built or stored,
+`matches_production`, the parts uploaded and kept, `made_latest` and
+`incomplete`:
+
+| Outcome | Means | Final |
+|---|---|---|
+| `would_build` | a dry run would build it | |
+| `built` | built and published | yes |
+| `already_stored` | the store holds it with the same commit and time | yes |
+| `mismatch` | the store holds it with another commit or time | yes |
+| `invalid` | the entry failed the checks, or, for production's latest that the store holds but not as its latest, the stored entry did | yes |
+| `too_large` | a file is over 256 MiB | yes |
+| `unbuildable` | the worker refused the files (exit 2); a release folder's `calibration_diagnostics.json`, or a run's diagnostics, is not at the entry's commit; a run's `run_manifest.json` or `progress.json` isn't a valid JSON object, the two mix document versions, or one names another run; a structured run manifest's artifacts aren't a list, one isn't an object, has no safe name, path or SHA-256, or is listed twice, or they declare neither diagnostics nor a `staged_dataset` receipt; the receipt is absent, isn't a valid JSON object, differs from its declared SHA-256, records no landed bundle, or names another run, repo or folder, a revision that isn't a commit, or no diagnostics with a SHA-256; a staged bundle's folder holds no diagnostics; or a downloaded file differs from the SHA-256 its run or receipt declared | yes |
+| `refused` | the publication refused the build (exit 2) | yes |
+| `latest_not_moved` | published, but the store's latest is at least as new | yes |
+| `error` | a Bun exit 1 or 3, a timeout, a Hugging Face failure or a download that differs from its listing; the next build still runs | no |
+| `deferred` | the time limit passed before it started | no |
+
+A country whose manifest can't be used is one `error` document with no kind.
+Then it prints:
+
+```json
+{"summary": {"outcomes": {}, "incomplete": false, "release_builds_differing_from_production": 0, "latest": {"us": {"build": null, "made_latest": null}}}}
+```
+
+- `incomplete`: true when anything ended in `error` or `deferred`, a country
+  failed, or a country's latest from production wasn't made the store's
+  latest. The command then exits 1, and Cloud Run runs the task again, up to
+  twice; each run skips what is already stored. It exits 0 otherwise, and 2
+  for an argument error, such as a missing `--production-manifest-url` or one
+  that isn't `https`.
+- `release_builds_differing_from_production`: release builds built or stored
+  whose build ID isn't production's. It should be 0.
+- `latest`: for each country, production's latest build and whether it is
+  the store's latest now (`null` when production names none, or in a dry run
+  for a latest that would be built).
+
+**Running it.** It needs `DATABASE_URL` (for the manifest lock),
+`COLLECTOR_HF_READ_TOKEN` and `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN`, which
+the worker job has, and stops with a message naming a missing one. It needs no
+other access, except that whoever runs it may run the worker job with
+overridden arguments. First the dry run, which reads production's manifest,
+the Hugging Face listings and the store's manifest, and downloads no
+diagnostics, runs no tree worker and takes no lock:
+
+```bash
+gcloud run jobs execute <worker job> --project <project> --region <region> \
+  --args=run,--no-sync,python,-m,telemetry_collector.operations,backfill-calibration-trees,--production-manifest-url,https://<dashboard>/api/microcosm/tree-manifest,--dry-run \
+  --wait
+```
+
+Then the real run, the same without `--dry-run`, until a summary shows
+`"incomplete": false`. Do both in staging, then in production, before the
+dashboard switches to the store. Read each attempt's summary with the logging
+query in "Projecting past builds again".
 
 ### Tests
 
@@ -1725,10 +1927,20 @@ What reads Hugging Face:
   trees from submissions"), and the `releases-record` handler, which reads it
   to move the latest (see "Moving the latest when releases.json changes"),
   so both need the token wherever they have the Blob token.
+- the calibration tree backfill, which lists each build's folders, reads
+  staging runs' manifests and receipts, and downloads each build's files.
 
-A read answered with anything but HTTP 200 reports the status and, for a
-404, Hugging Face's `X-Error-Code`, so a missing file (`EntryNotFound`) can be
-told from a missing repo or revision (`RepoNotFound`, `RevisionNotFound`).
+Files read whole (`HuggingFaceReader.read_file`), such as records and
+manifests, are held in memory and refused above 64 MiB. Files a tree is built
+from are streamed to disk instead (`download_file`), up to the caller's
+limit (256 MiB for the backfill), and each must have its listed size and its
+listed SHA-256 for a file stored with LFS, or git blob ID otherwise.
+`download_file` follows a download's redirects itself and sends the token
+only to Hugging Face's own host, never to the content host LFS files are
+served from. A read answered with anything but HTTP 200 reports the status
+and, for a 404, Hugging Face's `X-Error-Code`, so a missing file
+(`EntryNotFound`) can be told from a missing repo or revision
+(`RepoNotFound`, `RevisionNotFound`).
 
 The datasets the worker jobs read are listed once, in `HUGGINGFACE_DATASETS`:
 

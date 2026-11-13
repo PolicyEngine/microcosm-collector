@@ -538,10 +538,15 @@ def test_collector_uses_store_vocabulary() -> None:
     # GitHub's expression context and the OIDC claim and attribute names in
     # Workload Identity conditions use the word, and so does a function the daily
     # Hugging Face check calls from the emitter's interface package; the
-    # collector's own words do not.
+    # collector's own words do not. The tree backfill reads a staged_dataset
+    # record's key of that name, which is Microcosm's own field name, with this
+    # one exact expression.
     external_names = [
         f"{prefix}.{forbidden_term}" for prefix in ("github", "assertion", "attribute")
-    ] + [f"release_rules.check_{forbidden_term}"]
+    ] + [
+        f"release_rules.check_{forbidden_term}",
+        f'delivery.get("{forbidden_term}")',
+    ]
     source_suffixes = {
         ".env",
         ".ini",
