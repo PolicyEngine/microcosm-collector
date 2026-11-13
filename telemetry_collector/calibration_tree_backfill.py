@@ -556,7 +556,7 @@ class BuildSource:
     files: Mapping[str, SourceFile]
 
 
-class _Listings:
+class Listings:
     """Each folder's files by name, listed once per dataset and revision."""
 
     def __init__(self, reader: HuggingFaceReader) -> None:
@@ -581,7 +581,7 @@ class _Listings:
         return self._folders[key]
 
 
-def _read_json(
+def read_json(
     reader: HuggingFaceReader, dataset: str, path: str, revision: str
 ) -> tuple[dict[str, Any], bytes] | None:
     """A JSON object read whole, with its bytes, or ``None`` when it is absent."""
@@ -601,7 +601,7 @@ def _read_json(
     return document, content
 
 
-def _release_source(entry: ProductionEntry, listings: _Listings) -> BuildSource:
+def release_source(entry: ProductionEntry, listings: Listings) -> BuildSource:
     assert entry.release_directory is not None
     folder = f"releases/{entry.release_directory}"
     listed = listings.folder(entry.hf_repo, entry.hf_commit, folder)
@@ -734,7 +734,7 @@ def _staged_bundle_diagnostics_file(files: Mapping[str, Any] | None) -> str | No
 
 def _staged_bundle_source(
     entry: ProductionEntry,
-    listings: _Listings,
+    listings: Listings,
     *,
     dataset: str,
     revision: str,
@@ -777,14 +777,14 @@ def _staged_bundle_source(
 def _receipt_source(
     entry: ProductionEntry,
     reader: HuggingFaceReader,
-    listings: _Listings,
+    listings: Listings,
     receipt: tuple[str, str],
 ) -> BuildSource:
     """The staged bundle a run's ``staged_dataset`` receipt names."""
 
     run_id = entry.source_id
     receipt_path, receipt_sha256 = receipt
-    read = _read_json(reader, entry.hf_repo, receipt_path, entry.hf_commit)
+    read = read_json(reader, entry.hf_repo, receipt_path, entry.hf_commit)
     if read is None:
         raise SourceUnbuildableError(
             f"Run {run_id}'s staged dataset receipt is declared but absent."
@@ -843,8 +843,8 @@ def _receipt_source(
     )
 
 
-def _staging_source(
-    entry: ProductionEntry, reader: HuggingFaceReader, listings: _Listings
+def staging_source(
+    entry: ProductionEntry, reader: HuggingFaceReader, listings: Listings
 ) -> BuildSource:
     run_id = entry.source_id
     if entry.hf_repo == RELEASE_REPOS[entry.country]:
@@ -852,10 +852,10 @@ def _staging_source(
             entry, listings, dataset=entry.hf_repo, revision=entry.hf_commit
         )
     run_folder = f"runs/{run_id}"
-    run_manifest_read = _read_json(
+    run_manifest_read = read_json(
         reader, entry.hf_repo, f"{run_folder}/run_manifest.json", entry.hf_commit
     )
-    progress_read = _read_json(
+    progress_read = read_json(
         reader, entry.hf_repo, f"{run_folder}/progress.json", entry.hf_commit
     )
     run_manifest = None if run_manifest_read is None else run_manifest_read[0]
@@ -920,7 +920,7 @@ def _staging_source(
 # Building --------------------------------------------------------------------------
 
 
-def _build(
+def build_and_publish_source(
     source: BuildSource, reader: HuggingFaceReader, commands: TreeCommands
 ) -> PublishedTree:
     """Download the build's files into a new directory, then build and publish it."""
@@ -956,7 +956,7 @@ def _build(
 class _Backfill:
     stored: StoredTrees
     reader: HuggingFaceReader
-    listings: _Listings
+    listings: Listings
     commands: TreeCommands
     dry_run: bool
     clock: Callable[[], float]
@@ -1060,9 +1060,9 @@ class _Backfill:
             )
         try:
             source = (
-                _release_source(source_entry, self.listings)
+                release_source(source_entry, self.listings)
                 if source_entry.kind == "release"
-                else _staging_source(source_entry, self.reader, self.listings)
+                else staging_source(source_entry, self.reader, self.listings)
             )
         except SourceUnbuildableError as error:
             return outcome("unbuildable", reason=shortened_message(str(error)))
@@ -1084,7 +1084,7 @@ class _Backfill:
         if self.dry_run:
             return outcome("would_build", reason=republished)
         try:
-            published = _build(source, self.reader, self.commands)
+            published = build_and_publish_source(source, self.reader, self.commands)
         except (SourceUnbuildableError, TreeUnbuildableError) as error:
             return outcome("unbuildable", reason=shortened_message(str(error)))
         except TreeRefusedError as error:
@@ -1165,7 +1165,7 @@ def backfill_calibration_trees(
     backfill = _Backfill(
         stored=stored,
         reader=reader,
-        listings=_Listings(reader),
+        listings=Listings(reader),
         commands=commands,
         dry_run=dry_run,
         clock=clock,

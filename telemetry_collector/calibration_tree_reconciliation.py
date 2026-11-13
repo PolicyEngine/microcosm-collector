@@ -53,12 +53,12 @@ A build whose folder (``releases/<release>/<build>`` or ``staged/<run>``) a
 ``queued`` or ``processing`` ``calibration-diagnostics`` submission holds is
 ``submission_in_progress``: the submission builds it.
 
-**Building.** With the backfill's steps (``_release_source``,
-``_staging_source`` and ``_build``): one build at a time, the current default
-build first, a file over 256 MiB ``too_large``, and no build started after 40
-minutes of the execution (``deferred``). Nothing this command publishes asks
-to become its country's latest (``make_latest`` false, with no
-``decide_latest``).
+**Building.** With the backfill's steps (``release_source``,
+``staging_source`` and ``build_and_publish_source``): one build at a time,
+the current default build first, a file over 256 MiB ``too_large``, and no
+build started after 40 minutes of the execution (``deferred``). Nothing this
+command publishes asks to become its country's latest (``make_latest``
+false, with no ``decide_latest``).
 
 **The latest.** A release run ends with one more step
 (``_Reconciliation.latest_step``): it calls ``follow_latest``, which the
@@ -109,14 +109,14 @@ from telemetry_collector.calibration_tree_backfill import (
     BUILD_KINDS,
     BUILD_TIME_LIMIT_SECONDS,
     BuildKind,
+    Listings,
     ProductionEntry,
     SourceUnbuildableError,
     SourceWithoutDiagnosticsError,
-    _build,
-    _Listings,
-    _read_json,
-    _release_source,
-    _staging_source,
+    build_and_publish_source,
+    read_json,
+    release_source,
+    staging_source,
 )
 from telemetry_collector.calibration_trees import (
     RELEASE_REPOS,
@@ -352,10 +352,10 @@ class _Reconciliation:
     clock: Callable[[], float]
     started: float
     time_limit_seconds: float
-    listings: _Listings = field(init=False)
+    listings: Listings = field(init=False)
 
     def __post_init__(self) -> None:
-        self.listings = _Listings(self.reader)
+        self.listings = Listings(self.reader)
 
     def outcome(
         self, kind: BuildKind, result: ReconcileOutcomeKind, **fields: Any
@@ -482,7 +482,7 @@ class _Reconciliation:
             commit = self.folder_commit(repo, head, folder, listed.values())
             manifest_path = f"{folder}/{_RELEASE_MANIFEST}"
             try:
-                read = _read_json(self.reader, repo, manifest_path, commit)
+                read = read_json(self.reader, repo, manifest_path, commit)
             except SourceUnbuildableError:
                 read = None
             manifest = None if read is None else read[0]
@@ -683,7 +683,7 @@ class _Reconciliation:
         """Read and classify a run's manifest; ``SourceUnbuildableError`` for one
         the staging readers refuse."""
 
-        read = _read_json(
+        read = read_json(
             self.reader, repo, f"runs/{run.run_id}/run_manifest.json", head
         )
         if read is None:
@@ -720,7 +720,7 @@ class _Reconciliation:
         """
 
         try:
-            read = _read_json(self.reader, repo, "runs.json", head)
+            read = read_json(self.reader, repo, "runs.json", head)
         except SourceUnbuildableError:
             return None
         if read is None:
@@ -744,7 +744,7 @@ class _Reconciliation:
         self, repo: str, head: str, run: _StagingRun
     ) -> Mapping[str, Any] | None:
         if not run.progress_read:
-            read = _read_json(
+            read = read_json(
                 self.reader, repo, f"runs/{run.run_id}/progress.json", head
             )
             run.progress = None if read is None else read[0]
@@ -896,9 +896,9 @@ class _Reconciliation:
             )
         try:
             source = (
-                _release_source(entry, self.listings)
+                release_source(entry, self.listings)
                 if kind == "release"
-                else _staging_source(entry, self.reader, self.listings)
+                else staging_source(entry, self.reader, self.listings)
             )
         except SourceWithoutDiagnosticsError as error:
             # As the publisher's reconcileStagingBuilds reports such a run.
@@ -929,7 +929,7 @@ class _Reconciliation:
         if self.dry_run:
             return outcome("would_build")
         try:
-            published = _build(source, self.reader, self.commands)
+            published = build_and_publish_source(source, self.reader, self.commands)
         except (SourceUnbuildableError, TreeUnbuildableError) as error:
             return outcome("unbuildable", reason=shortened_message(str(error)))
         except TreeRefusedError as error:
