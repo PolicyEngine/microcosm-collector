@@ -1,4 +1,4 @@
-"""A release repo's ``releases.json``, read with every build it records.
+"""A release repo's ``releases.json``: the collector's one parser of it.
 
 ``releases.json`` is the one record of which build of each release a
 Microcosm dataset repo has published, and which is current:
@@ -8,34 +8,39 @@ Microcosm dataset repo has published, and which is current:
     releases/<release>/<build>/...
 
 ``parse_releases_record`` refuses exactly what the tree package's
-``parseReleasesRecordBytes`` (``src/release-record.ts``) refuses, and so what
-the tree handler's ``calibration_trees.current_default_build`` refuses: a
-record larger than 4 MiB, one that is not a readable JSON document, one
-without exactly its keys or with a ``schema_version`` other than 1, a release
-or build name that is not a safe identifier, a role that is not one, a
-malformed build, a ``current`` that is not a listed build or is withdrawn, or
-a ``default`` that is not a listed release. It returns every build, withdrawn
-ones included, ordered by release and then build, as the package's
-``recordedBuilds`` orders them.
+``parseReleasesRecordBytes`` (``src/release-record.ts``) refuses: a record
+larger than 4 MiB, one that is not a readable JSON document (nested more
+deeply than Python's decoder goes included), one without exactly its keys or
+with a ``schema_version`` other than 1, a release or build name that is not a
+safe identifier, a role that is not one, a malformed build, a ``current``
+that is not a listed build or is withdrawn, or a ``default`` that is not a
+listed release. It returns every build, withdrawn ones included, ordered by
+release and then build, as the package's ``recordedBuilds`` orders them, and
+each release's current build.
 
-The tree handler's ``current_default_build`` returns only the current build
-of the default release, and this module returns every build. Both follow
-the same rules; once the rule that makes a country's latest tree follow
-``releases.json`` is in ``main``, one parser is to replace both.
+Every reading of the record goes through it: the reconcile command's release
+listing (``telemetry_collector.calibration_tree_reconciliation``), which
+needs every build, and the latest rule's
+``calibration_trees.releases_record_currents`` and ``current_default_build``,
+which need the current builds. So the listing and the latest rule agree on
+every record.
 """
 
 from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Final
 
 RELEASES_RECORD_PATH: Final = "releases.json"
 #: The largest releases.json the record's writer accepts.
 MAX_RELEASES_RECORD_BYTES: Final = 4 * 1024 * 1024
-#: The emitter interface's SAFE_IDENTIFIER and ROLE_IDENTIFIER.
-_SAFE_IDENTIFIER: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+#: A release, build or run name: one path segment that cannot leave its
+#: folder (the emitter interface's SAFE_IDENTIFIER).
+SAFE_IDENTIFIER: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+#: The emitter interface's ROLE_IDENTIFIER.
 _ROLE_IDENTIFIER: Final = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _RECORD_KEYS: Final = frozenset({"default", "releases", "schema_version"})
 _RELEASE_KEYS: Final = frozenset({"builds", "current", "role"})
@@ -80,6 +85,9 @@ class ReleasesRecord:
 
     #: The release a repo's default dataset comes from, or ``None``.
     default: str | None
+    #: Each listed release's current build name, or ``None``, in the
+    #: record's order.
+    current_builds: Mapping[str, str | None]
     #: Every listed build, ordered by release, then build.
     builds: tuple[RecordedBuild, ...]
 
@@ -96,7 +104,7 @@ def _refuse(message: str) -> ReleasesRecordRefusedError:
 
 
 def _is_safe_identifier(value: object) -> bool:
-    return isinstance(value, str) and _SAFE_IDENTIFIER.fullmatch(value) is not None
+    return isinstance(value, str) and SAFE_IDENTIFIER.fullmatch(value) is not None
 
 
 def _reject_constant(constant: str) -> None:
@@ -110,7 +118,8 @@ def _document(content: bytes) -> Any:
     try:
         # As TextDecoder reads it: invalid UTF-8 refused, a leading BOM dropped.
         return json.loads(content.decode("utf-8-sig"), parse_constant=_reject_constant)
-    except ValueError:
+    except (ValueError, RecursionError):
+        # RecursionError: nested more deeply than the decoder goes.
         raise _refuse("not a readable JSON document.") from None
 
 
@@ -166,6 +175,9 @@ def parse_releases_record(content: bytes) -> ReleasesRecord:
             raise _refuse(f"current build {current} of {release} is withdrawn.")
     return ReleasesRecord(
         default=default,
+        current_builds={
+            release: entry["current"] for release, entry in releases.items()
+        },
         builds=tuple(
             RecordedBuild(
                 release=release,

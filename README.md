@@ -2047,7 +2047,9 @@ head commit with the GitHub Actions publisher's listing rules ported to
 Python. Without `--kind` it covers both kinds, or only releases for BE.
 
 - **Release:** every build the release repo's `releases.json` lists,
-  withdrawn ones included, read by `telemetry_collector/releases_record.py`.
+  withdrawn ones included, read by `telemetry_collector/releases_record.py`,
+  the collector's one parser of the record, which the latest rule's
+  `calibration_trees.releases_record_currents` reads it with too.
   A build the store holds under its release ID is `already_stored`, with no
   further read. Any other build's commit is the newest last commit among its
   folder's files; its folder must hold `calibration_diagnostics.json`, and
@@ -2159,9 +2161,6 @@ past builds again".
 
 **Limits.**
 
-- `releases.json` has two parsers with the same rules: this command's, which
-  lists every build, and the tree handler's `current_default_build`. One is
-  to replace both.
 - Stored trees' parts are not audited or repaired, as the GitHub Actions
   publisher audits them.
 - A repo without `releases.json` builds nothing: its tags and pointer files
