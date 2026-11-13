@@ -97,6 +97,9 @@ CALLER_NOT_ALLOWED: Final = (
 )
 KEYS_UNAVAILABLE: Final = "Vercel's token signing keys could not be read."
 QUEUE_UNAVAILABLE: Final = "The worker queue is unavailable; retry the request."
+#: Stands in a 422 answer's ``loc`` for a body key that is not one of the
+#: request's fields, so that no answer repeats the caller's text.
+UNKNOWN_FIELD: Final = "(unknown field)"
 
 BuildKind = Literal["release", "staging"]
 
@@ -468,13 +471,31 @@ def _log_request(
     )
 
 
-def _invalid_body(errors: list[dict[str, Any]]) -> RequestValidationError:
-    """FastAPI's refusal of a body, each error without its ``input``, which
-    could repeat whatever the caller sent."""
+def _location_part(part: int | str) -> int | str:
+    """A part of an error's ``loc``: a request field's name or a position,
+    and ``UNKNOWN_FIELD`` in place of any other key, which the caller chose."""
+
+    if isinstance(part, int) or part in TreeBuildRequestBody.model_fields:
+        return part
+    return UNKNOWN_FIELD
+
+
+def _invalid_body(errors: Sequence[Mapping[str, Any]]) -> RequestValidationError:
+    """FastAPI's refusal of a body, repeating none of it.
+
+    Each error keeps its ``type`` and ``msg``, which name only the request's
+    own fields and rules, and drops its ``input`` and ``ctx``. Its ``loc``
+    keeps the request's field names and positions, and gives
+    ``UNKNOWN_FIELD`` for any other key, such as an unknown field's name.
+    """
 
     return RequestValidationError(
         [
-            {"type": error["type"], "loc": ("body", *error["loc"]), "msg": error["msg"]}
+            {
+                "type": error["type"],
+                "loc": ("body", *(_location_part(part) for part in error["loc"])),
+                "msg": error["msg"],
+            }
             for error in errors
         ]
     )

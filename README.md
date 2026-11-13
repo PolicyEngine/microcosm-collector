@@ -2009,7 +2009,7 @@ delivery cover a failed one.
 | A token that is malformed, expired, or for another issuer or audience | 401 | `The Vercel OIDC token is invalid or expired.` |
 | A valid token whose team, project or environment isn't a caller | 403 | `This Vercel project and environment may not queue calibration tree builds.` |
 | Vercel's signing keys can't be read, and none usable is cached | 503, without `Retry-After` | `Vercel's token signing keys could not be read.` |
-| A body that isn't JSON, has an unknown field, an unregistered country, `staging` for BE, or a malformed repo, ref or commit | 422 | FastAPI's `detail`, each error without its `input` |
+| A body that isn't JSON, has an unknown field, an unregistered country, `staging` for BE, or a malformed repo, ref or commit | 422 | FastAPI's `detail`, each error without its `input`, and with `(unknown field)` in its `loc` in place of a key that isn't one of the request's fields, so that the answer repeats nothing the caller chose |
 | `hf_repo` isn't the collector's repo for the country and kind | 422 | `{"detail", "code": "repo_not_registered"}` |
 | The request table can't be written, or Cloud Tasks can't be reached or answers anything but 200 or 409 | 503, `Retry-After: 30` | `{"detail", "code": "worker_queue_unavailable"}` |
 | A deployment is in progress | 503, `Retry-After: 60` | as every route answers then |
