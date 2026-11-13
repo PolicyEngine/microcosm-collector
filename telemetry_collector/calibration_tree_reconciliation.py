@@ -32,10 +32,14 @@ Python:
   run when ``runs.json`` is schema 1. ``runs.json`` is read whenever a run
   the store lacks has a schema-1 manifest or none; the publisher reads it
   when any listed run's manifest is schema 1, and stored runs' manifests
-  are not read. Only a run whose status is ``passed``, ``published`` or
-  ``completed`` is built. Its label is its candidate release, else its run
-  ID, and its time its progress's ``updated_at``, else its run manifest's, as
-  the publisher's ``publishStagingSource`` takes them. A final run with no
+  are not read. A ``runs.json`` that isn't JSON, or isn't a JSON object, is
+  no index, as the publisher takes it. One that can't be read makes each
+  run the store lacks with a schema-1 manifest or none an ``error``, and
+  the run incomplete; the structured runs are still built. Only a run
+  whose status is ``passed``, ``published`` or ``completed`` is built. Its
+  label is its candidate release, else its run ID, and its time its
+  progress's ``updated_at``, else its run manifest's, as the publisher's
+  ``publishStagingSource`` takes them. A final run with no
   calibration diagnostics to build from is ``ineligible``, as the
   publisher's ``reconcileStagingBuilds`` reports it: a schema-1 folder
   without ``calibration_diagnostics.json``, a structured run declaring
@@ -640,22 +644,30 @@ class _Reconciliation:
         # a run the store lacks may be a schema-1 run: its manifest is schema
         # 1, or it has none, whether or not the other runs' manifests are.
         index: dict[str, str | None] | None = None
+        index_failure: str | None = None
         if any(not run.structured for run in runs):
             try:
                 index = self.run_index(repo, head)
             except Exception as error:
-                return [
-                    *finished,
+                index_failure = f"runs.json could not be read: {_described(error)}"
+        planned: list[_Planned] = []
+        for run in runs:
+            if index_failure is not None and not run.structured:
+                # A run with a schema-1 manifest or none may take its status
+                # from runs.json, and a folder without a run manifest is a run
+                # only beside a schema-1 runs.json. A structured run's status
+                # is its manifest's, so structured runs are still planned.
+                finished.append(
                     self.outcome(
                         "staging",
                         "error",
+                        source_id=run.run_id,
                         hf_repo=repo,
-                        reason=f"runs.json could not be read: {_described(error)}",
+                        reason=index_failure,
                         incomplete=True,
-                    ),
-                ]
-        planned: list[_Planned] = []
-        for run in runs:
+                    )
+                )
+                continue
             if run.run_manifest is None and index is None:
                 # Not a run by the staging readers' rules.
                 continue
@@ -700,9 +712,17 @@ class _Reconciliation:
         run.run_manifest = manifest
 
     def run_index(self, repo: str, head: str) -> dict[str, str | None] | None:
-        """Each run's status in a schema-1 ``runs.json``; ``None`` without one."""
+        """Each run's status in a schema-1 ``runs.json``; ``None`` without one.
 
-        read = _read_json(self.reader, repo, "runs.json", head)
+        A ``runs.json`` that isn't JSON, or isn't a JSON object, is none, as
+        the staging readers' ``stagingJsonOrNull`` and ``asObject`` take it.
+        A failed read raises ``HuggingFaceReadError``.
+        """
+
+        try:
+            read = _read_json(self.reader, repo, "runs.json", head)
+        except SourceUnbuildableError:
+            return None
         if read is None:
             return None
         index = read[0]
