@@ -1733,7 +1733,8 @@ refuses a country the collector does not list with `ValueError`, and raises
 any other failure (a failed read, `HuggingFaceReadError`; a failed latest
 command, `CalibrationTreeCommandError`; or the lock's or the request file's
 own errors) for its caller to try again. It must not be called while the
-caller holds the manifest lock.
+caller holds the manifest lock. The `reconcile-calibration-trees` command's
+release runs end with it ("Queuing calibration tree builds").
 
 Both handlers read `releases.json` and write the manifest under the one lock,
 so a build made current while its tree is still being built becomes the
@@ -2070,12 +2071,32 @@ Python. Without `--kind` it covers both kinds, or only releases for BE.
   another. An execution waits for it for up to 15 minutes, and then reports
   `lock_wait_expired` and exits 1, so Cloud Run tries again. The store's
   manifest is read once for each kind, inside its lock.
-- Nothing it publishes becomes the country's latest.
+- Nothing it publishes asks to become the country's latest.
+- **The latest.** A release run ends by making the country's latest follow
+  the current build of `releases.json` at the release repo's head, newer or
+  older than the current latest, without building anything:
+  `calibration_trees.follow_releases_record` ("Moving the latest when
+  releases.json changes"). This is how a change of current build with no
+  new build, such as a promotion, reaches the latest once the webhook asks
+  for a release run. The step runs after the run's release builds, so the
+  current default build it built can become the latest, and inside the
+  release lock, so an execution queued after a change of `releases.json`
+  runs its step after any earlier execution's. It runs outside the manifest
+  lock, which it takes itself, as each publication does. A release repo
+  without `releases.json` (`no_releases_record`), a dry run and a lock wait
+  that expires skip it; the execution that held the lock runs its own step
+  when its release builds end. A failure leaves the run incomplete, so Cloud
+  Run tries again, except for a country the collector doesn't list, which no
+  attempt gets past.
 
-It prints one JSON document for each build, then
-`{"summary": {"country", "kinds", "request_id", "dry_run", "outcomes",
-"incomplete", "incomplete_sources", "latest"}}`, where `latest` is
-`"not_handled"` for a run that covers releases.
+It prints one JSON document for each build, then, for a run that covers
+releases, the latest step's, `{"latest": {"country", "outcome", ...,
+"incomplete"}}`, then `{"summary": {"country", "kinds", "request_id",
+"dry_run", "outcomes", "incomplete", "incomplete_sources", "latest"}}`. The
+summary's `outcomes` counts the builds' outcomes, and its `latest` repeats
+the latest step's document, or is `null` for a run without releases.
+
+Each build's outcome:
 
 | Outcome | Means | Final |
 |---|---|---|
@@ -2093,8 +2114,17 @@ It prints one JSON document for each build, then
 | `deferred` | the time limit passed before it started | no |
 | `lock_wait_expired` | another execution held the country's and kind's lock for 15 minutes | no |
 
+The latest step's `outcome`:
+
+| `outcome` | Means | Fields |
+|---|---|---|
+| `followed` | `follow_releases_record` answered | `current_build`, `build_artifact_id`, `made_latest`, `latest_moved`, and, when the latest stayed, `latest_unchanged` (`no_releases_record`, `releases_record_refused`, `no_current_build` or `no_recorded_tree`) and `latest_unchanged_reason` |
+| `skipped` | the step didn't run | `skipped` (`dry_run`, `no_releases_record` or `lock_wait_expired`) and `reason` |
+| `error` | the step failed | `reason`; `incomplete` is true unless the country isn't one the collector lists |
+
 The command exits 0 when the run is complete, 1 when anything ended in
-`error`, `deferred` or `lock_wait_expired`, and 2 for an argument error,
+`error`, `deferred` or `lock_wait_expired`, or the latest step failed and
+may be tried again, and 2 for an argument error,
 such as `--kind staging` for BE, a `--request-id` of another country or
 kind, or `--request-id` beside `--dry-run`. It needs `DATABASE_URL`,
 `COLLECTOR_HF_READ_TOKEN` and `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN`, which
@@ -2129,10 +2159,6 @@ past builds again".
 
 **Limits.**
 
-- A release run doesn't move the country's latest yet. A change of current
-  build with no new build reaches the collector only through this endpoint,
-  so it moves the latest only once a release run calls the rule that makes
-  the latest follow `releases.json`, which another task adds.
 - `releases.json` has two parsers with the same rules: this command's, which
   lists every build, and the tree handler's `current_default_build`. One is
   to replace both.

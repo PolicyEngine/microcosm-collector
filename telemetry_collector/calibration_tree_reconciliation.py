@@ -43,11 +43,28 @@ A build whose folder (``releases/<release>/<build>`` or ``staged/<run>``) a
 **Building.** With the backfill's steps (``_release_source``,
 ``_staging_source`` and ``_build``): one build at a time, the current default
 build first, a file over 256 MiB ``too_large``, and no build started after 40
-minutes of the execution (``deferred``). Nothing this command publishes
-becomes its country's latest (``make_latest`` false): which build is the
-latest is the rule that makes the latest follow ``releases.json``, which a
-release run is to call once it is in ``main``. Until then the summary says
-``"latest": "not_handled"``.
+minutes of the execution (``deferred``). Nothing this command publishes asks
+to become its country's latest (``make_latest`` false, with no
+``decide_latest``).
+
+**The latest.** A release run ends with one more step
+(``_Reconciliation.latest_step``): it calls ``follow_latest``, which the
+operations command binds to ``calibration_trees.follow_releases_record``
+for the country, so the country's latest follows the current build of
+``releases.json`` at the release repo's head, whatever its age, and nothing
+is built for it. The step runs after the release builds, so the current
+default build this run built can become the latest, and inside the
+country's and kind's lock, so an execution queued after a change of
+``releases.json`` runs its step after any earlier execution's. It takes the
+manifest lock itself, so it runs outside it; the reconciliation lock is
+taken first and only by this command, so the two locks are always taken
+in that order. Its document, ``{"latest": {...}}``, and the summary's
+``latest`` say what moved or why the latest stayed, with
+``FollowedLatest``'s fields. A ``ValueError`` (a country the collector
+doesn't list) is final; any other failure leaves the run incomplete, so
+Cloud Run tries again. A release repo without ``releases.json``, a dry run
+and a lock wait that expires skip the step: the execution that held the
+lock runs its own step when its release builds end.
 
 **Locks.** Each kind is reconciled inside a Postgres session advisory lock of
 its own country and kind, held on one connection: an execution waits for it
@@ -55,8 +72,8 @@ up to 15 minutes, so that one that started after an event lists Hugging Face
 only after any earlier one has finished; past the wait the kind is
 ``lock_wait_expired`` and the run incomplete. The store's manifest is read
 once for each kind, inside its lock, with the package's read-only manifest
-read. A dry run takes no lock, downloads no diagnostics and builds nothing,
-and reports ``would_build``.
+read. A dry run takes no lock, downloads no diagnostics, builds nothing,
+reports ``would_build`` and skips the latest step.
 """
 
 from __future__ import annotations
@@ -91,6 +108,7 @@ from telemetry_collector.calibration_trees import (
     RELEASE_REPOS,
     SAFE_IDENTIFIER,
     STAGING_REPOS,
+    FollowedLatest,
     TreeCommands,
     TreeRefusedError,
     TreeUnbuildableError,
@@ -125,6 +143,15 @@ ReconcileOutcomeKind = Literal[
     "releases_record_refused",
     "lock_wait_expired",
 ]
+
+#: What the latest step did: ``follow_releases_record`` answered, it was not
+#: called, or it raised.
+LatestStepOutcome = Literal["followed", "skipped", "error"]
+#: Why a release run did not call ``follow_releases_record``.
+LatestStepSkipped = Literal["dry_run", "no_releases_record", "lock_wait_expired"]
+#: ``calibration_trees.follow_releases_record`` for one country, with the
+#: worker job's Blob token, the manifest lock and the Hugging Face reader.
+FollowLatest = Callable[[str], FollowedLatest]
 
 #: How long an execution waits for another one's lock on the same country
 #: and kind, and how often it tries.
@@ -175,6 +202,42 @@ class ReconcileOutcome:
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class LatestStep:
+    """What a release run's last step did to its country's latest tree.
+
+    ``followed``: ``follow_releases_record`` answered, and ``followed`` says
+    what moved or why the latest stayed. ``skipped``: it was not called, and
+    ``skipped`` says why. ``error``: it raised; the run is incomplete unless
+    calling again can't help.
+    """
+
+    country: str
+    outcome: LatestStepOutcome
+    followed: FollowedLatest | None = None
+    skipped: LatestStepSkipped | None = None
+    #: Why the step was skipped, or what it raised.
+    reason: str | None = None
+    #: A later run should try it again.
+    incomplete: bool = False
+
+    def fields(self) -> dict[str, Any]:
+        """The step as the summary's ``latest`` reports it."""
+
+        document: dict[str, Any] = {"country": self.country, "outcome": self.outcome}
+        if self.followed is not None:
+            document.update(self.followed.result())
+        if self.skipped is not None:
+            document["skipped"] = self.skipped
+        if self.reason is not None:
+            document["reason"] = self.reason
+        document["incomplete"] = self.incomplete
+        return document
+
+    def to_json(self) -> dict[str, Any]:
+        return {"latest": self.fields()}
 
 
 class SubmissionsInProgress(Protocol):
@@ -270,6 +333,7 @@ class _Reconciliation:
     reader: HuggingFaceReader
     commands: TreeCommands
     submissions: SubmissionsInProgress
+    follow_latest: FollowLatest
     dry_run: bool
     clock: Callable[[], float]
     started: float
@@ -738,6 +802,39 @@ class _Reconciliation:
             order=(order_time, run_id),
         )
 
+    # The latest --------------------------------------------------------------
+
+    def latest_skipped(self, skipped: LatestStepSkipped, reason: str) -> LatestStep:
+        return LatestStep(
+            country=self.country, outcome="skipped", skipped=skipped, reason=reason
+        )
+
+    def latest_step(self, release_outcomes: Sequence[ReconcileOutcome]) -> LatestStep:
+        """Make the country's latest follow releases.json, after the release
+        builds and outside the manifest lock, which ``follow_latest`` takes."""
+
+        if any(outcome.outcome == "no_releases_record" for outcome in release_outcomes):
+            return self.latest_skipped(
+                "no_releases_record",
+                f"The release repo has no {RELEASES_RECORD_PATH}, so it names no "
+                "current build to follow.",
+            )
+        try:
+            followed = self.follow_latest(self.country)
+        except ValueError as error:
+            # A country the collector doesn't list: calling again can't help.
+            return LatestStep(
+                country=self.country, outcome="error", reason=_described(error)
+            )
+        except Exception as error:
+            return LatestStep(
+                country=self.country,
+                outcome="error",
+                reason=_described(error),
+                incomplete=True,
+            )
+        return LatestStep(country=self.country, outcome="followed", followed=followed)
+
     # Building ----------------------------------------------------------------
 
     def build(self, planned: _Planned) -> ReconcileOutcome:
@@ -814,11 +911,15 @@ def reconcile_calibration_trees(
     commands: TreeCommands,
     submissions: SubmissionsInProgress,
     lock: ReconciliationLock,
+    follow_latest: FollowLatest,
     dry_run: bool = False,
     clock: Callable[[], float] = time.monotonic,
     time_limit_seconds: float = BUILD_TIME_LIMIT_SECONDS,
-) -> Iterator[ReconcileOutcome]:
+) -> Iterator[ReconcileOutcome | LatestStep]:
     """Reconcile ``country``'s ``kinds``, in that order, yielding each outcome.
+
+    The release kind ends with its ``LatestStep``: ``follow_latest`` for the
+    country, called after the release builds and inside the release lock.
 
     Raises ``ValueError`` for a country the collector doesn't build, a kind
     that is neither release nor staging, or staging for a country without a
@@ -837,6 +938,7 @@ def reconcile_calibration_trees(
         reader=reader,
         commands=commands,
         submissions=submissions,
+        follow_latest=follow_latest,
         dry_run=dry_run,
         clock=clock,
         started=clock(),
@@ -845,10 +947,19 @@ def reconcile_calibration_trees(
     for kind in kinds:
         if dry_run:
             yield from reconciliation.reconcile_kind(kind)
+            if kind == "release":
+                yield reconciliation.latest_skipped(
+                    "dry_run", "A dry run does not move the latest."
+                )
             continue
         try:
             with lock(country, kind):
-                yield from reconciliation.reconcile_kind(kind)
+                kind_outcomes: list[ReconcileOutcome] = []
+                for outcome in reconciliation.reconcile_kind(kind):
+                    kind_outcomes.append(outcome)
+                    yield outcome
+                if kind == "release":
+                    yield reconciliation.latest_step(kind_outcomes)
         except ReconciliationLockTimeoutError as error:
             yield reconciliation.outcome(
                 kind,
@@ -856,10 +967,16 @@ def reconcile_calibration_trees(
                 reason=shortened_message(str(error)),
                 incomplete=True,
             )
+            if kind == "release":
+                yield reconciliation.latest_skipped(
+                    "lock_wait_expired",
+                    "Another execution held the lock; it follows releases.json "
+                    "when its release builds end.",
+                )
 
 
 def summarize(
-    outcomes: Iterable[ReconcileOutcome],
+    outcomes: Iterable[ReconcileOutcome | LatestStep],
     *,
     country: str,
     kinds: Sequence[str],
@@ -868,24 +985,29 @@ def summarize(
 ) -> dict[str, Any]:
     """The run's summary: its counts, and whether it is incomplete.
 
-    ``latest`` is ``"not_handled"`` for a run that covers releases: nothing
-    this command publishes moves the country's latest yet.
+    ``outcomes`` counts the builds' and kinds' outcomes, and
+    ``incomplete_sources`` lists those that are incomplete. ``latest`` is
+    the release run's latest step (``LatestStep.fields``), or ``None`` for a
+    run without releases or one that stopped before the step; the run is
+    also incomplete when that step is.
     """
 
     listed = list(outcomes)
+    builds = [outcome for outcome in listed if isinstance(outcome, ReconcileOutcome)]
+    latest_steps = [outcome for outcome in listed if isinstance(outcome, LatestStep)]
     return {
         "country": country,
         "kinds": list(kinds),
         "request_id": request_id,
         "dry_run": dry_run,
-        "outcomes": dict(Counter(outcome.outcome for outcome in listed)),
+        "outcomes": dict(Counter(outcome.outcome for outcome in builds)),
         "incomplete": any(outcome.incomplete for outcome in listed),
         "incomplete_sources": [
             {"kind": outcome.kind, "source_id": outcome.source_id}
-            for outcome in listed
+            for outcome in builds
             if outcome.incomplete
         ],
-        "latest": "not_handled" if "release" in kinds else None,
+        "latest": latest_steps[-1].fields() if latest_steps else None,
     }
 
 

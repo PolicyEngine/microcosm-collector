@@ -60,11 +60,14 @@ prints one document for each build, then a summary, and exits 1 when the run
 is incomplete: a build ended in an error or was deferred past the time limit,
 a repo or the store's manifest could not be read, or another execution held
 the country's and kind's lock past the 15-minute wait; and 2 for an argument
-error. Nothing it publishes becomes the country's latest, and its summary
-says ``"latest": "not_handled"`` for a run that covers releases. With
-``--dry-run`` it lists what it would build, from the Hugging Face listings
-and the store's manifest: it downloads no diagnostics, builds nothing and
-takes no lock.
+error. Nothing it publishes asks to become the country's latest. Instead, a
+release run ends by making the country's latest follow ``releases.json``
+(``calibration_trees.follow_releases_record``), which builds nothing: it
+prints that step's document, ``{"latest": {...}}``, which the summary's
+``latest`` repeats, and exits 1 when the step failed in a way another
+attempt may get past. With ``--dry-run`` it lists what it would build, from
+the Hugging Face listings and the store's manifest: it downloads no
+diagnostics, builds nothing, takes no lock and leaves the latest as it is.
 
 Run them with ``python -m telemetry_collector.operations recover``,
 ``python -m telemetry_collector.operations reprocess``,
@@ -77,6 +80,7 @@ Run them with ``python -m telemetry_collector.operations recover``,
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 import uuid
@@ -506,7 +510,10 @@ def _reconcile_calibration_trees(database_url: str, options: argparse.Namespace)
         )
     kinds = _reconcile_kinds(options)
     request_id: str | None = options.request_id
-    outcomes: list[calibration_tree_reconciliation.ReconcileOutcome] = []
+    outcomes: list[
+        calibration_tree_reconciliation.ReconcileOutcome
+        | calibration_tree_reconciliation.LatestStep
+    ] = []
 
     def summary_of_outcomes() -> dict[str, Any]:
         return reconciliation.summarize(
@@ -523,17 +530,26 @@ def _reconcile_calibration_trees(database_url: str, options: argparse.Namespace)
             request_rows = calibration_tree_builds.PostgresCalibrationTreeBuildRequests(
                 engine
             )
+            manifest_lock = calibration_trees.postgres_manifest_lock(engine)
             reconciled = reconciliation.reconcile_calibration_trees(
                 country=options.country,
                 kinds=kinds,
                 reader=reader,
                 commands=calibration_trees.tree_commands(
                     blob_token=blob_token,
-                    manifest_lock=calibration_trees.postgres_manifest_lock(engine),
+                    manifest_lock=manifest_lock,
                     size_limits=calibration_trees.size_limits_from(os.environ),
                 ),
                 submissions=reconciliation.PostgresSubmissionsInProgress(engine),
                 lock=reconciliation.postgres_reconciliation_lock(engine),
+                # A release run's last step: the country's latest follows
+                # releases.json, under the manifest lock it takes itself.
+                follow_latest=functools.partial(
+                    calibration_trees.follow_releases_record,
+                    blob_token=blob_token,
+                    manifest_lock=manifest_lock,
+                    reader=reader,
+                ),
                 dry_run=options.dry_run,
             )
             if request_id is not None:
