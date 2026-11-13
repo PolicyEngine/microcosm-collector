@@ -589,6 +589,45 @@ def test_a_body_that_is_not_json_is_refused() -> None:
     assert collector.events == []
 
 
+@pytest.mark.parametrize(
+    "unknown_key",
+    ["a-key-only-this-caller-chose-7f3c", "x" * 4096],
+    ids=["a-chosen-key", "a-long-key"],
+)
+def test_a_422_for_an_unknown_field_repeats_none_of_the_body(unknown_key: str) -> None:
+    # Review round 1, bug 3: pydantic's loc for extra_forbidden is the
+    # caller's own key, so the answer repeated it.
+    collector = build_collector()
+
+    response = collector.post(
+        {**UK_STAGING_REQUEST, unknown_key: "a value"}, token=caller_token()
+    )
+
+    assert response.status_code == 422
+    assert unknown_key not in response.text
+    assert "a value" not in response.text
+    assert response.json()["detail"] == [
+        {
+            "type": "extra_forbidden",
+            "loc": ["body", "(unknown field)"],
+            "msg": "Extra inputs are not permitted",
+        }
+    ]
+
+
+def test_a_422_names_the_request_s_own_fields() -> None:
+    collector = build_collector()
+
+    response = collector.post(
+        {**UK_STAGING_REQUEST, "hf_commit": "A" * 40}, token=caller_token()
+    )
+
+    assert response.status_code == 422
+    [error] = response.json()["detail"]
+    assert error["loc"] == ["body", "hf_commit"]
+    assert "A" * 40 not in response.text
+
+
 @pytest.mark.parametrize("case", ["an unknown field", "a list"])
 def test_the_token_is_checked_before_the_body(case: str) -> None:
     collector = build_collector()
