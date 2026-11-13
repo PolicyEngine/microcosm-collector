@@ -26,24 +26,80 @@ answering before it was classed. With ``--dry-run`` it only lists what it would
 project, from Hugging Face's listings: it downloads no build's graph inputs
 and writes nothing.
 
+``backfill-calibration-trees --production-manifest-url URL`` fills the
+collector's calibration tree store with every build production's public tree
+manifest lists (``telemetry_collector.calibration_tree_backfill``), building
+each missing one from its Hugging Face files. ``URL`` is the dashboard's
+``https://<dashboard>/api/microcosm/tree-manifest``, which it requests for
+each country without any credential. ``--country`` (repeatable) and
+``--kind`` limit it, and ``--dry-run`` lists what it would build, from
+Hugging Face's listings and the store's manifest, downloading no diagnostics
+and building nothing. It needs ``DATABASE_URL`` (for the manifest lock),
+``COLLECTOR_HF_READ_TOKEN`` and ``COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN``, so
+it runs as an execution of the worker job with its arguments overridden. It
+prints one document for each entry, then a summary, and exits 1 when the run
+is incomplete: an entry ended in an error or was deferred past the time
+limit, a country's manifest could not be used, or a country's latest build
+was not made the store's latest; and 2 for an argument error.
+
+``reconcile-calibration-trees --country <cc> [--kind release|staging]
+[--request-id <task ID>] [--dry-run]`` builds the country's calibration trees
+that its Hugging Face repos hold and the store lacks
+(``telemetry_collector.calibration_tree_reconciliation``): every build its
+release repo's ``releases.json`` lists, and every finalized run of its staging
+repo, each read at the repo's head. Without ``--kind`` it covers both kinds,
+or only releases for a country without a staging repo. The Cloud Task that
+``POST /v1/calibration-tree-builds`` queues runs it in the worker job with
+``--request-id``, the task's ID: the run records its start, attempts, finish
+and summary on that request's row of ``calibration_tree_build_requests``.
+``--request-id`` must name the same country and kind, and can't be used with
+``--dry-run``. It needs ``DATABASE_URL`` (for its locks, the submissions it
+skips and the request's row), ``COLLECTOR_HF_READ_TOKEN`` and
+``COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN``, which the worker job has. It
+prints one document for each build, then a summary, and exits 1 when the run
+is incomplete: a build ended in an error or was deferred past the time limit,
+a repo or the store's manifest could not be read, or another execution held
+the country's and kind's lock past the 15-minute wait; and 2 for an argument
+error. Nothing it publishes asks to become the country's latest. Instead, a
+release run ends by making the country's latest follow ``releases.json``
+(``calibration_trees.follow_releases_record``), which builds nothing: it
+prints that step's document, ``{"latest": {...}}``, which the summary's
+``latest`` repeats, and exits 1 when the step failed in a way another
+attempt may get past. With ``--dry-run`` it lists what it would build, from
+the Hugging Face listings and the store's manifest: it downloads no
+diagnostics, builds nothing, takes no lock and leaves the latest as it is.
+
 Run them with ``python -m telemetry_collector.operations recover``,
 ``python -m telemetry_collector.operations reprocess``,
-``python -m telemetry_collector.operations past-builds`` and
-``python -m telemetry_collector.operations reproject-past-builds``.
+``python -m telemetry_collector.operations past-builds``,
+``python -m telemetry_collector.operations reproject-past-builds``,
+``python -m telemetry_collector.operations backfill-calibration-trees`` and
+``python -m telemetry_collector.operations reconcile-calibration-trees``.
 """
 
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 import uuid
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import asdict, replace
+from datetime import UTC, datetime
 from typing import Any, get_args
+from urllib.parse import urlsplit
 
-from telemetry_collector import past_builds
+import httpx
+
+from telemetry_collector import (
+    calibration_tree_backfill,
+    calibration_tree_builds,
+    calibration_tree_reconciliation,
+    calibration_trees,
+    past_builds,
+)
 from telemetry_collector.database import create_database_engine
 from telemetry_collector.google_cloud import (
     CloudTasksWorkerQueue,
@@ -73,6 +129,10 @@ from telemetry_collector.submissions import (
 
 OPERATIONS_REQUIREMENT = "running operator commands"
 REPROJECTION_REQUIREMENT = "projecting past builds again"
+BACKFILL_REQUIREMENT = "backfilling calibration trees"
+BACKFILL_COMMAND = "backfill-calibration-trees"
+RECONCILE_REQUIREMENT = "reconciling calibration trees"
+RECONCILE_COMMAND = calibration_tree_builds.RECONCILE_COMMAND
 #: Projected builds whose document isn't published: their jobs wait for the
 #: scheduled recovery (queued, processing) or ended without one (failed,
 #: rejected). They don't make the command exit non-zero.
@@ -183,7 +243,96 @@ def _argument_parser() -> argparse.ArgumentParser:
             "writing nothing."
         ),
     )
+    backfill = commands.add_parser(
+        BACKFILL_COMMAND,
+        help="Build every calibration tree production's tree manifest lists.",
+    )
+    backfill.add_argument(
+        "--production-manifest-url",
+        required=True,
+        metavar="URL",
+        help="Production's tree manifest, https://<dashboard>/api/microcosm/tree-manifest.",
+    )
+    backfill.add_argument(
+        "--country",
+        action="append",
+        dest="countries",
+        choices=list(calibration_trees.RELEASE_REPOS),
+        help="Backfill only this country; repeat for several. Every country by default.",
+    )
+    backfill.add_argument(
+        "--kind",
+        choices=["release", "staging"],
+        help="Backfill only release or only staging builds. Both by default.",
+    )
+    backfill.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "List what would be built, downloading no diagnostics, building "
+            "nothing and taking no lock."
+        ),
+    )
+    reconcile = commands.add_parser(
+        RECONCILE_COMMAND,
+        help="Build a country's calibration trees that its Hugging Face repos hold.",
+    )
+    reconcile.add_argument(
+        "--country",
+        required=True,
+        choices=list(calibration_trees.RELEASE_REPOS),
+        help="The country to reconcile.",
+    )
+    reconcile.add_argument(
+        "--kind",
+        choices=["release", "staging"],
+        help="Reconcile only release or only staging builds. Every kind by default.",
+    )
+    reconcile.add_argument(
+        "--request-id",
+        metavar="TASK_ID",
+        help="The queued request this run answers, whose row it completes.",
+    )
+    reconcile.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "List what would be built, downloading no diagnostics, building "
+            "nothing and taking no lock."
+        ),
+    )
     return parser
+
+
+def _reconcile_argument_error(options: argparse.Namespace) -> str | None:
+    """Why the reconcile command's arguments can't run together, if they can't."""
+
+    if options.kind == "staging" and options.country not in (
+        calibration_trees.STAGING_REPOS
+    ):
+        return f"--kind staging: {options.country} has no staging repo."
+    if options.request_id is None:
+        return None
+    if options.dry_run:
+        return "--request-id can't be used with --dry-run."
+    if options.kind is None:
+        return "--request-id needs --kind."
+    if not calibration_tree_builds.is_request_id(
+        options.request_id, options.country, options.kind
+    ):
+        return (
+            "--request-id must be a calibration-trees-<country>-<kind>-<window> "
+            "task ID of the same country and kind."
+        )
+    return None
+
+
+def _is_https_address(value: str) -> bool:
+    try:
+        address = urlsplit(value)
+    except ValueError:
+        return False
+    return address.scheme == "https" and bool(address.hostname)
 
 
 def _worker_queue_from_environment() -> CloudTasksWorkerQueue:
@@ -295,14 +444,169 @@ def _reproject_past_builds(database_url: str, *, dry_run: bool) -> int:
     return 1 if incomplete_run_ids else 0
 
 
+def _backfill_calibration_trees(database_url: str, options: argparse.Namespace) -> int:
+    blob_token_setting = calibration_trees.BLOB_TOKEN_SETTING
+    blob_token = os.environ.get(blob_token_setting, "").strip()
+    if not blob_token:
+        raise RuntimeError(
+            f"{blob_token_setting} is required when {BACKFILL_REQUIREMENT}."
+        )
+    countries = list(options.countries or calibration_trees.RELEASE_REPOS)
+    kinds = (
+        [options.kind] if options.kind else list(calibration_tree_backfill.BUILD_KINDS)
+    )
+    outcomes = []
+    with (
+        HuggingFaceReader.from_environment() as reader,
+        # Production's manifest is public: this client sends no credential.
+        httpx.Client(
+            timeout=calibration_tree_backfill.PRODUCTION_MANIFEST_TIMEOUT_SECONDS
+        ) as production_client,
+    ):
+        engine = create_database_engine(database_url)
+        try:
+            commands = calibration_trees.tree_commands(
+                blob_token=blob_token,
+                manifest_lock=calibration_trees.postgres_manifest_lock(engine),
+                size_limits=calibration_trees.size_limits_from(os.environ),
+            )
+            # Each outcome is printed as it is produced, so a run that stops
+            # early still logs every entry it finished.
+            for outcome in calibration_tree_backfill.backfill_calibration_trees(
+                production_manifest_url=options.production_manifest_url,
+                reader=reader,
+                production_client=production_client,
+                commands=commands,
+                countries=countries,
+                kinds=kinds,
+                dry_run=options.dry_run,
+            ):
+                _print_json(outcome.to_json())
+                outcomes.append(outcome)
+        finally:
+            engine.dispose()
+    summary = calibration_tree_backfill.summarize(outcomes, countries)
+    _print_json({"summary": summary})
+    return 1 if summary["incomplete"] else 0
+
+
+def _reconcile_kinds(options: argparse.Namespace) -> list[str]:
+    if options.kind is not None:
+        return [options.kind]
+    return [
+        kind
+        for kind in calibration_tree_backfill.BUILD_KINDS
+        if kind == "release" or options.country in calibration_trees.STAGING_REPOS
+    ]
+
+
+def _reconcile_calibration_trees(database_url: str, options: argparse.Namespace) -> int:
+    reconciliation = calibration_tree_reconciliation
+    blob_token_setting = calibration_trees.BLOB_TOKEN_SETTING
+    blob_token = os.environ.get(blob_token_setting, "").strip()
+    if not blob_token:
+        raise RuntimeError(
+            f"{blob_token_setting} is required when {RECONCILE_REQUIREMENT}."
+        )
+    kinds = _reconcile_kinds(options)
+    request_id: str | None = options.request_id
+    outcomes: list[
+        calibration_tree_reconciliation.ReconcileOutcome
+        | calibration_tree_reconciliation.LatestStep
+    ] = []
+
+    def summary_of_outcomes() -> dict[str, Any]:
+        return reconciliation.summarize(
+            outcomes,
+            country=options.country,
+            kinds=kinds,
+            request_id=request_id,
+            dry_run=options.dry_run,
+        )
+
+    with HuggingFaceReader.from_environment() as reader:
+        engine = create_database_engine(database_url)
+        try:
+            request_rows = calibration_tree_builds.PostgresCalibrationTreeBuildRequests(
+                engine
+            )
+            manifest_lock = calibration_trees.postgres_manifest_lock(engine)
+            reconciled = reconciliation.reconcile_calibration_trees(
+                country=options.country,
+                kinds=kinds,
+                reader=reader,
+                commands=calibration_trees.tree_commands(
+                    blob_token=blob_token,
+                    manifest_lock=manifest_lock,
+                    size_limits=calibration_trees.size_limits_from(os.environ),
+                ),
+                submissions=reconciliation.PostgresSubmissionsInProgress(engine),
+                lock=reconciliation.postgres_reconciliation_lock(engine),
+                # A release run's last step: the country's latest follows
+                # releases.json, under the manifest lock it takes itself.
+                follow_latest=functools.partial(
+                    calibration_trees.follow_releases_record,
+                    blob_token=blob_token,
+                    manifest_lock=manifest_lock,
+                    reader=reader,
+                ),
+                dry_run=options.dry_run,
+            )
+            if request_id is not None:
+                request_rows.record_start(
+                    request_id,
+                    execution=os.environ.get("CLOUD_RUN_EXECUTION") or None,
+                    at=datetime.now(UTC),
+                )
+            try:
+                # Each outcome is printed as it is produced, so a run that
+                # stops early still logs every build it finished.
+                for outcome in reconciled:
+                    _print_json(outcome.to_json())
+                    outcomes.append(outcome)
+            except Exception as error:
+                # The request's row records how the attempt ended before the
+                # error ends the execution.
+                if request_id is not None:
+                    request_rows.record_finish(
+                        request_id,
+                        at=datetime.now(UTC),
+                        summary={
+                            **summary_of_outcomes(),
+                            "incomplete": True,
+                            "stopped_by": type(error).__name__,
+                        },
+                    )
+                raise
+            summary = summary_of_outcomes()
+            _print_json({"summary": summary})
+            if request_id is not None:
+                request_rows.record_finish(
+                    request_id, at=datetime.now(UTC), summary=summary
+                )
+        finally:
+            engine.dispose()
+    return 1 if summary["incomplete"] else 0
+
+
 def main(arguments: Sequence[str] | None = None) -> int:
     """Run one operator command.
 
-    Non-zero when a reprocessing was refused, or when projecting past builds
-    left any build incomplete.
+    Non-zero when a reprocessing was refused, when projecting past builds
+    left any build incomplete, or when a backfill or a reconciliation of
+    calibration trees is incomplete; 2 for an argument error.
     """
 
-    options = _argument_parser().parse_args(arguments)
+    parser = _argument_parser()
+    options = parser.parse_args(arguments)
+    if options.command == BACKFILL_COMMAND and not _is_https_address(
+        options.production_manifest_url
+    ):
+        parser.error("--production-manifest-url must be an https:// address.")
+    if options.command == RECONCILE_COMMAND:
+        reconcile_error = _reconcile_argument_error(options)
+        if reconcile_error is not None:
+            parser.error(reconcile_error)
     if options.command == "reprocess" and bool(options.submission_ids) == bool(
         options.kind
     ):
@@ -316,6 +620,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return _print_past_builds(database_url)
     if options.command == "reproject-past-builds":
         return _reproject_past_builds(database_url, dry_run=options.dry_run)
+    if options.command == BACKFILL_COMMAND:
+        return _backfill_calibration_trees(database_url, options)
+    if options.command == RECONCILE_COMMAND:
+        return _reconcile_calibration_trees(database_url, options)
     dry_run = options.command == "reprocess" and options.dry_run
     worker_queue = None if dry_run else _worker_queue_from_environment()
     engine = create_database_engine(database_url)

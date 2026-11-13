@@ -1,0 +1,15 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/v2/runs",
+    "headers": {
+      "Authorization": "Bearer not-a-vercel-oidc-token"
+    }
+  },
+  "response": {
+    "status": 401,
+    "body": {
+      "detail": "This collector accepts no Vercel OIDC tokens."
+    }
+  }
+}

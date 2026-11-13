@@ -56,6 +56,7 @@ require_configuration() {
   require_resource_name ORRERY_BUCKET "$BUCKET_NAME_PATTERN" || failed=1
   require_resource_name ORRERY_READER_SERVICE_ACCOUNT "$SERVICE_ACCOUNT_PATTERN" || failed=1
   orrery_read_service_name > /dev/null || failed=1
+  check_vercel_oidc_configuration || failed=1
   return "$failed"
 }
 
@@ -74,6 +75,16 @@ BUCKET_NAME_PATTERN='^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$'
 QUEUE_NAME_PATTERN='^[A-Za-z0-9-]{1,100}$'
 JOB_NAME_PATTERN='^[a-z][a-z0-9-]{0,62}$'
 SERVICE_ACCOUNT_PATTERN='^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z0-9.-]+\.iam\.gserviceaccount\.com$'
+
+# The collector's patterns for its Vercel OIDC settings
+# (telemetry_collector/vercel_oidc.py), applied to the values the deploy sets
+# them from, so that a malformed value stops the deploy before it
+# authenticates rather than when a revision starts. The deploy script's tests
+# compare these patterns and their verdicts with the collector's.
+VERCEL_OIDC_TEAM_SLUG_PATTERN='^[a-z0-9]([a-z0-9-]{0,98}[a-z0-9])?$'
+VERCEL_OIDC_TEAM_ID_PATTERN='^team_[A-Za-z0-9]{1,64}$'
+VERCEL_OIDC_READER_PATTERN='^prj_[A-Za-z0-9]{1,64}:(production|preview|development)$'
+VERCEL_OIDC_VARIABLES=(VERCEL_OIDC_TEAM_SLUG VERCEL_OIDC_TEAM_ID VERCEL_OIDC_READERS)
 
 require_resource_name() {
   local name="$1"
@@ -102,6 +113,109 @@ require_intake_resource_names() {
   require_resource_name RUNTIME_SERVICE_ACCOUNT "$SERVICE_ACCOUNT_PATTERN" || failed=1
   require_resource_name WORKER_INVOKER_SERVICE_ACCOUNT "$SERVICE_ACCOUNT_PATTERN" || failed=1
   return "$failed"
+}
+
+# Prints the words of the named variable's value, separated by single spaces:
+# the value without surrounding whitespace and with each run of inner
+# whitespace as one space. Whitespace here is the ASCII whitespace that
+# Python's str.split() and str.strip() use, as the collector reads its
+# settings: space, tab, newline, carriage return, vertical tab, form feed and
+# the file, group, record and unit separators (0x1C to 0x1F). Those after
+# newline become spaces before `read` splits the value at space, tab and
+# newline: in IFS, bash 3.2 (the version macOS ships) splits at each of them
+# separately and leaves empty words. `read` splits the value without filename
+# expansion, and returns nonzero at the end of its input, which is expected
+# here.
+vercel_oidc_words() {
+  local IFS=$' \t\n'
+  local value="${!1-}"
+  local words=()
+  value="${value//[$'\r\v\f\x1c\x1d\x1e\x1f']/ }"
+  read -r -d '' -a words <<< "$value" || true
+  printf '%s' "${words[*]-}"
+}
+
+# Fails naming the variable, never printing its value, unless each of its
+# words is a <project ID>:<environment> entry. An unset or blank variable has
+# no entries.
+check_vercel_oidc_entries() {
+  local name="$1"
+  local entries=()
+  local entry
+
+  if [[ -z "$(vercel_oidc_words "$name")" ]]; then
+    return 0
+  fi
+  IFS=' ' read -r -a entries <<< "$(vercel_oidc_words "$name")" || true
+  for entry in "${entries[@]}"; do
+    if [[ ! "$entry" =~ $VERCEL_OIDC_READER_PATTERN ]]; then
+      echo "${name} is not a whitespace-separated list of <project ID>:<environment> entries." >&2
+      return 1
+    fi
+  done
+}
+
+# Read API v2 accepts Vercel OIDC tokens only with all three settings, and
+# with none of them (unset or blank) it refuses every token. Fails naming each
+# missing setting when only some are set, or naming a malformed one, never
+# printing a value. VERCEL_OIDC_TREE_BUILD_CALLERS, the projects and
+# environments that may queue calibration tree builds, is optional too, but
+# needs all three, and is checked with the readers' pattern.
+check_vercel_oidc_configuration() {
+  local missing=()
+  local name
+
+  for name in "${VERCEL_OIDC_VARIABLES[@]}"; do
+    if [[ -z "$(vercel_oidc_words "$name")" ]]; then
+      missing+=("$name")
+    fi
+  done
+  if (( ${#missing[@]} == ${#VERCEL_OIDC_VARIABLES[@]} )); then
+    if [[ -n "$(vercel_oidc_words VERCEL_OIDC_TREE_BUILD_CALLERS)" ]]; then
+      echo "Missing telemetry deployment configuration: ${missing[*]}" >&2
+      return 1
+    fi
+    return 0
+  fi
+  if (( ${#missing[@]} )); then
+    echo "Missing telemetry deployment configuration: ${missing[*]}" >&2
+    return 1
+  fi
+
+  if [[ ! "$(vercel_oidc_words VERCEL_OIDC_TEAM_SLUG)" =~ $VERCEL_OIDC_TEAM_SLUG_PATTERN ]]; then
+    echo "VERCEL_OIDC_TEAM_SLUG is not a valid Vercel team slug." >&2
+    return 1
+  fi
+  if [[ ! "$(vercel_oidc_words VERCEL_OIDC_TEAM_ID)" =~ $VERCEL_OIDC_TEAM_ID_PATTERN ]]; then
+    echo "VERCEL_OIDC_TEAM_ID is not a valid Vercel team ID." >&2
+    return 1
+  fi
+  check_vercel_oidc_entries VERCEL_OIDC_READERS || return 1
+  check_vercel_oidc_entries VERCEL_OIDC_TREE_BUILD_CALLERS || return 1
+}
+
+# The Vercel OIDC settings the service revisions get, each after a comma, or
+# nothing while none is set; the calibration tree build callers only while
+# they are set. The readers and the callers are passed separated by single
+# spaces: `--set-env-vars` splits its value at commas. Only the service
+# revisions get these: no job and not the Orrery read service.
+service_vercel_oidc_settings() {
+  check_vercel_oidc_configuration || return 1
+
+  local readers
+  local callers
+  readers="$(vercel_oidc_words VERCEL_OIDC_READERS)"
+  callers="$(vercel_oidc_words VERCEL_OIDC_TREE_BUILD_CALLERS)"
+  if [[ -z "$readers" ]]; then
+    return 0
+  fi
+  printf ',%s' \
+    "TELEMETRY_VERCEL_OIDC_TEAM_SLUG=$(vercel_oidc_words VERCEL_OIDC_TEAM_SLUG)" \
+    "TELEMETRY_VERCEL_OIDC_TEAM_ID=$(vercel_oidc_words VERCEL_OIDC_TEAM_ID)" \
+    "TELEMETRY_VERCEL_OIDC_READERS=${readers}"
+  if [[ -n "$callers" ]]; then
+    printf ',%s' "TELEMETRY_VERCEL_OIDC_TREE_BUILD_CALLERS=${callers}"
+  fi
 }
 
 # Each environment's worker job reads Hugging Face with that environment's
@@ -543,11 +657,14 @@ deploy_maintenance() {
 
   local intake_settings
   local minimum_instance_count
+  local vercel_oidc_settings
   intake_settings="$(service_intake_settings)"
   minimum_instance_count="$(minimum_instances)"
+  vercel_oidc_settings="$(service_vercel_oidc_settings)"
 
   # The signing key signs new session tokens with ES256. The HS256 secret stays
   # mounted so tokens issued before the switch are accepted until it is retired.
+  # The Vercel OIDC settings are added only when they are set.
   gcloud run deploy "$SERVICE" \
     --project "$PROJECT_ID" \
     --region "$REGION" \
@@ -556,7 +673,7 @@ deploy_maintenance() {
     --service-account "$RUNTIME_SERVICE_ACCOUNT" \
     --add-cloudsql-instances "$CLOUD_SQL_CONNECTION" \
     --set-secrets "DATABASE_URL=${DATABASE_SECRET_NAME}:latest,TELEMETRY_JWT_SECRET=${JWT_SECRET_NAME}:latest,TELEMETRY_JWT_SIGNING_KEY=${JWT_SIGNING_KEY_SECRET_NAME}:latest,TELEMETRY_READ_TOKEN=${READ_SECRET_NAME}:latest" \
-    --set-env-vars "TELEMETRY_MAINTENANCE_MODE=1,${intake_settings}" \
+    --set-env-vars "TELEMETRY_MAINTENANCE_MODE=1,${intake_settings}${vercel_oidc_settings}" \
     --min "$minimum_instance_count" \
     --max 4 \
     --cpu 1 \
@@ -629,11 +746,14 @@ deploy_candidate() {
 
   local intake_settings
   local minimum_instance_count
+  local vercel_oidc_settings
   intake_settings="$(service_intake_settings)"
   minimum_instance_count="$(minimum_instances)"
+  vercel_oidc_settings="$(service_vercel_oidc_settings)"
 
   # The signing key signs new session tokens with ES256. The HS256 secret stays
   # mounted so tokens issued before the switch are accepted until it is retired.
+  # The Vercel OIDC settings are added only when they are set.
   gcloud run deploy "$SERVICE" \
     --project "$PROJECT_ID" \
     --region "$REGION" \
@@ -642,7 +762,7 @@ deploy_candidate() {
     --service-account "$RUNTIME_SERVICE_ACCOUNT" \
     --add-cloudsql-instances "$CLOUD_SQL_CONNECTION" \
     --set-secrets "DATABASE_URL=${DATABASE_SECRET_NAME}:latest,TELEMETRY_JWT_SECRET=${JWT_SECRET_NAME}:latest,TELEMETRY_JWT_SIGNING_KEY=${JWT_SIGNING_KEY_SECRET_NAME}:latest,TELEMETRY_READ_TOKEN=${READ_SECRET_NAME}:latest" \
-    --set-env-vars "TELEMETRY_MAINTENANCE_MODE=0,${intake_settings}" \
+    --set-env-vars "TELEMETRY_MAINTENANCE_MODE=0,${intake_settings}${vercel_oidc_settings}" \
     --min "$minimum_instance_count" \
     --max 4 \
     --cpu 1 \

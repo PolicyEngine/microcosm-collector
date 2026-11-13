@@ -174,15 +174,15 @@ def storable_text(text: str) -> str:
     return _UNSTORABLE_CHARACTER.sub(REPLACEMENT_CHARACTER, text)
 
 
-def _storable(value: Any) -> Any:
+def storable_json(value: Any) -> Any:
     """A JSON value with ``storable_text`` applied to every string, keys too."""
 
     if isinstance(value, str):
         return storable_text(value)
     if isinstance(value, Mapping):
-        return {_storable(key): _storable(item) for key, item in value.items()}
+        return {storable_json(key): storable_json(item) for key, item in value.items()}
     if isinstance(value, list | tuple):
-        return [_storable(item) for item in value]
+        return [storable_json(item) for item in value]
     return value
 
 
@@ -230,7 +230,9 @@ def run_job(
             holder=holder,
             status="rejected",
             result=None,
-            rejection=_storable({"code": rejection.code, "message": rejection.message}),
+            rejection=storable_json(
+                {"code": rejection.code, "message": rejection.message}
+            ),
         )
         return JobOutcome.FINISHED
     except Exception as error:
@@ -246,7 +248,7 @@ def run_job(
         job_id,
         holder=holder,
         status="succeeded",
-        result=_storable(result),
+        result=storable_json(result),
         rejection=None,
     )
     return JobOutcome.FINISHED

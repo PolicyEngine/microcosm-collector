@@ -28,6 +28,7 @@ def test_orm_metadata_defines_telemetry_and_artifact_intake_tables() -> None:
         "artifact_submissions",
         "artifact_jobs",
         "orrery_graph_files",
+        "calibration_tree_build_requests",
     }
     assert set(inspect(ArtifactSubmission).relationships.keys()) == {"jobs"}
     assert set(inspect(ArtifactJob).relationships.keys()) == {"submission"}
@@ -105,6 +106,39 @@ def _migration(file_name: str = "0002_artifact_intake.py"):
     return migration
 
 
+# Alembic records the current revision in `alembic_version.version_num`,
+# which it creates as `VARCHAR(32)`. A longer revision ID makes every upgrade
+# to that revision fail on Postgres.
+ALEMBIC_VERSION_NUM_LENGTH = 32
+
+
+def test_every_revision_id_fits_alembic_s_version_column() -> None:
+    versions = Path(__file__).resolve().parents[1] / "migrations" / "versions"
+    revision_ids = {
+        source.name: _migration(source.name).revision
+        for source in sorted(versions.glob("*.py"))
+    }
+
+    assert revision_ids
+    assert {
+        file_name: revision_id
+        for file_name, revision_id in revision_ids.items()
+        if len(revision_id) > ALEMBIC_VERSION_NUM_LENGTH
+    } == {}
+
+
+def test_every_migration_file_is_named_after_its_revision_id() -> None:
+    versions = Path(__file__).resolve().parents[1] / "migrations" / "versions"
+    sources = sorted(versions.glob("*.py"))
+
+    assert sources
+    assert {
+        source.name: _migration(source.name).revision
+        for source in sources
+        if _migration(source.name).revision != source.stem
+    } == {}
+
+
 def _status_constraint(table) -> str:
     [constraint] = [
         constraint
@@ -139,3 +173,16 @@ def test_the_orrery_graph_migration_keeps_the_models_visibilities() -> None:
     for licensed_data in (True, False):
         visibility = output_visibility("orrery_artifact", licensed_data=licensed_data)
         assert f"'{visibility}'" in migration.VISIBILITIES
+
+
+def test_the_build_request_migration_keeps_the_model_s_kinds() -> None:
+    import importlib
+
+    database = importlib.import_module("telemetry_collector.database")
+    model = getattr(database, "CalibrationTreeBuildRequest", None)
+    assert model is not None, "telemetry_collector.database has no build request model."
+    migration = _migration("0004_tree_build_requests.py")
+
+    assert migration.down_revision == "0003_orrery_graph_files"
+    assert migration.KINDS == _status_constraint(model.__table__)
+    assert migration.KINDS == "kind IN ('release', 'staging')"

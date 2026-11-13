@@ -164,6 +164,13 @@ def v2_requests(client: TestClient) -> dict[str, dict[str, Any]]:
         "path": "/v2/runs",
         "headers": {"X-Telemetry-Read-Token": "not-the-read-token"},
     }
+    # The contract's collector has no Vercel OIDC settings, so it refuses every
+    # Vercel OIDC token, whatever the token holds.
+    requests["list-runs-with-a-bearer-token-while-vercel-oidc-is-off"] = {
+        "method": "GET",
+        "path": "/v2/runs",
+        "headers": {"Authorization": "Bearer not-a-vercel-oidc-token"},
+    }
     requests["list-runs-with-an-invalid-cursor"] = read("/v2/runs?before=not-a-cursor")
     requests["list-runs-with-an-invalid-limit"] = read("/v2/runs?limit=0")
     return requests

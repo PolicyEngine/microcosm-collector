@@ -470,6 +470,24 @@ def test_both_deploy_jobs_read_their_orrery_reader_service_account() -> None:
     assert PUSH_WORKFLOW.read_text(encoding="utf-8").count(mapping) == 2
 
 
+@pytest.mark.parametrize(
+    "setting", ["TEAM_SLUG", "TEAM_ID", "READERS", "TREE_BUILD_CALLERS"]
+)
+def test_both_deploy_jobs_pass_their_vercel_oidc_settings(setting: str) -> None:
+    jobs = load_workflow(PUSH_WORKFLOW)["jobs"]
+    variable = f"VERCEL_OIDC_{setting}"
+    mapping = f"${{{{ vars.TELEMETRY_VERCEL_OIDC_{setting} }}}}"
+
+    # Each environment names its own readers, at job level; no step sets them.
+    # The deploy passes them to the service revisions only
+    # (tests/test_deploy_script.py).
+    for job_name in DEPLOY_JOBS:
+        assert jobs[job_name]["env"].get(variable) == mapping, job_name
+        for step in jobs[job_name]["steps"]:
+            assert variable not in step.get("env", {}), (job_name, step)
+    assert PUSH_WORKFLOW.read_text(encoding="utf-8").count(mapping) == 2
+
+
 def deploy_step(job: dict, command: str) -> dict:
     matching_steps = [
         step
@@ -538,10 +556,15 @@ def test_collector_uses_store_vocabulary() -> None:
     # GitHub's expression context and the OIDC claim and attribute names in
     # Workload Identity conditions use the word, and so does a function the daily
     # Hugging Face check calls from the emitter's interface package; the
-    # collector's own words do not.
+    # collector's own words do not. The tree backfill reads a staged_dataset
+    # record's key of that name, which is Microcosm's own field name, with this
+    # one exact expression.
     external_names = [
         f"{prefix}.{forbidden_term}" for prefix in ("github", "assertion", "attribute")
-    ] + [f"release_rules.check_{forbidden_term}"]
+    ] + [
+        f"release_rules.check_{forbidden_term}",
+        f'delivery.get("{forbidden_term}")',
+    ]
     source_suffixes = {
         ".env",
         ".ini",
