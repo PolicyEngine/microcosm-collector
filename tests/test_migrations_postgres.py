@@ -338,7 +338,7 @@ class IntakeUpgrade:
     """What upgrading from the telemetry schema to the intake schema did."""
 
     statements: list[str]
-    privileges_by_role: dict[str, dict[str, set[str]]]
+    privileges_by_role: dict[str, dict[str, set[str] | None]]
 
 
 def _drop_test_roles(connection: sa.Connection) -> None:
@@ -351,23 +351,29 @@ def _drop_test_roles(connection: sa.Connection) -> None:
             connection.execute(sa.text(f"DROP ROLE {role}"))
 
 
-def _table_privileges(connection: sa.Connection, role: str) -> dict[str, set[str]]:
-    """Each table's privileges for ``role``; none for a table that doesn't exist."""
+def _table_privileges(
+    connection: sa.Connection, role: str
+) -> dict[str, set[str] | None]:
+    """Each table's privileges for ``role``, and ``None`` for a table that
+    doesn't exist, so that no assertion of a role's privileges, "none"
+    included, passes for a missing table."""
 
-    return {
-        table: {
+    privileges: dict[str, set[str] | None] = {}
+    for table in sorted(TABLES_SINCE_TELEMETRY):
+        if not connection.scalar(
+            sa.text("SELECT to_regclass(:table) IS NOT NULL"), {"table": table}
+        ):
+            privileges[table] = None
+            continue
+        privileges[table] = {
             privilege
             for privilege in TABLE_PRIVILEGES
             if connection.scalar(
-                sa.text("SELECT to_regclass(:table) IS NOT NULL"), {"table": table}
-            )
-            and connection.scalar(
                 sa.text("SELECT has_table_privilege(:role, :table, :privilege)"),
                 {"role": role, "table": table, "privilege": privilege},
             )
         }
-        for table in sorted(TABLES_SINCE_TELEMETRY)
-    }
+    return privileges
 
 
 def _upgrade_to_intake_with_default_privileges(postgres_url: str) -> IntakeUpgrade:

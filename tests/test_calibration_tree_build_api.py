@@ -15,9 +15,13 @@ import importlib
 import importlib.util
 import inspect
 import json
+import os
+import subprocess
+import sys
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import ModuleType
 from typing import Any
 
@@ -53,6 +57,7 @@ from tests.vercel_oidc_fakes import (
     token_claims,
 )
 
+ROOT = Path(__file__).resolve().parents[1]
 BUILDS_MODULE = "telemetry_collector.calibration_tree_builds"
 BUILDS_PATH = "/v1/calibration-tree-builds"
 SIGNING_KEY = rsa_private_key()
@@ -782,6 +787,109 @@ def test_the_endpoint_stays_out_of_read_api_v2_s_document() -> None:
     document = collector.client.get("/v2/openapi.json").json()
 
     assert not any("calibration-tree" in path for path in document["paths"])
+
+
+# The deployed app ---------------------------------------------------------------
+
+DEPLOYED_ENVIRONMENT = {
+    "TELEMETRY_JWT_SECRET": "x" * 32,
+    "TELEMETRY_READ_TOKEN": "y" * 24,
+    # Never connected to: creating the app opens no connection.
+    "DATABASE_URL": "postgresql://user:password@database.example.test:1/none",
+    **SETTINGS_ENVIRONMENT,
+    "TELEMETRY_VERCEL_OIDC_TREE_BUILD_CALLERS": f"{DASHBOARD_PROJECT_ID}:production",
+}
+
+
+class StandInQueue:
+    """Stands in for CloudTasksWorkerQueue, recording each one made."""
+
+    made: list[StandInQueue] = []
+
+    def __init__(self, **settings: str) -> None:
+        self.settings = settings
+        StandInQueue.made.append(self)
+
+
+class StandInIntakeObjects:
+    def __init__(self, **settings: str) -> None:
+        self.settings = settings
+
+
+class StandInRequestTable:
+    def __init__(self, engine: Any) -> None:
+        self.engine = engine
+
+
+@pytest.mark.parametrize("callers_set", [True, False])
+def test_the_deployed_app_gives_the_endpoint_the_intake_queue_and_the_store_s_engine(
+    monkeypatch: pytest.MonkeyPatch, callers_set: bool
+) -> None:
+    import telemetry_collector.app as app_module
+    import telemetry_collector.google_cloud as google_cloud
+    from tests.test_intake_settings import INTAKE_ENVIRONMENT
+
+    builds = builds_module()
+    given: dict[str, Any] = {}
+
+    def recorded_create_app(**options: Any) -> str:
+        given.update(options)
+        return "the app"
+
+    monkeypatch.setattr(StandInQueue, "made", [])
+    monkeypatch.setattr(google_cloud, "CloudTasksWorkerQueue", StandInQueue)
+    monkeypatch.setattr(google_cloud, "GoogleCloudStorageIntake", StandInIntakeObjects)
+    monkeypatch.setattr(
+        builds, "PostgresCalibrationTreeBuildRequests", StandInRequestTable
+    )
+    monkeypatch.setattr(app_module, "create_app", recorded_create_app)
+    for name, value in {**DEPLOYED_ENVIRONMENT, **INTAKE_ENVIRONMENT}.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("COLLECTOR_INTAKE_ENABLED", "1")
+    if not callers_set:
+        monkeypatch.delenv("TELEMETRY_VERCEL_OIDC_TREE_BUILD_CALLERS")
+
+    assert app_module.create_app_from_environment() == "the app"
+
+    # One queue, for the intake's dispatches and the endpoint's tasks alike.
+    [queue] = StandInQueue.made
+    assert queue.settings == {
+        "queue": INTAKE_ENVIRONMENT["COLLECTOR_WORKER_QUEUE"],
+        "worker_job": INTAKE_ENVIRONMENT["COLLECTOR_WORKER_JOB"],
+        "invoker_service_account": (
+            INTAKE_ENVIRONMENT["COLLECTOR_WORKER_INVOKER_SERVICE_ACCOUNT"]
+        ),
+    }
+    assert given["intake_services"].worker_queue is queue
+    services = given["calibration_tree_build_services"]
+    if not callers_set:
+        assert services is None
+        return
+    assert services.queue is queue
+    # The request table is on the telemetry store's engine.
+    assert services.requests.engine is given["store"].engine
+
+
+def test_a_collector_with_intake_off_never_imports_the_endpoint_module() -> None:
+    script = (
+        "import sys\n"
+        "from telemetry_collector.app import create_app_from_environment\n"
+        "create_app_from_environment()\n"
+        f"print({BUILDS_MODULE!r} in sys.modules)\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=ROOT,
+        # Intake off: COLLECTOR_INTAKE_ENABLED is unset, and callers are set.
+        env={"PATH": os.environ["PATH"], **DEPLOYED_ENVIRONMENT},
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+    )
+
+    assert completed.stdout.strip().splitlines()[-1] == "False"
 
 
 # What is logged and kept --------------------------------------------------------
