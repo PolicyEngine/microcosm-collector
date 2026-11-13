@@ -166,11 +166,8 @@ def test_a_record_without_a_current_default_build_names_none(change: str) -> Non
 def test_each_release_s_current_build_is_listed_with_the_record() -> None:
     record = parse(encoded(record_document()))
 
-    current_builds = getattr(record, "current_builds", None)
-    if current_builds is None:
-        pytest.fail("The parsed record has no current_builds yet.")
     # Every listed release, with or without a current build.
-    assert dict(current_builds) == {NATIONAL: SECOND_BUILD, LOCAL: None}
+    assert dict(record.current_builds) == {NATIONAL: SECOND_BUILD, LOCAL: None}
 
 
 def test_the_latest_rule_reads_the_same_current_builds() -> None:
@@ -179,7 +176,7 @@ def test_the_latest_rule_reads_the_same_current_builds() -> None:
 
     currents = releases_record_currents(content)
 
-    assert dict(currents.current_builds) == dict(getattr(record, "current_builds", {}))
+    assert dict(currents.current_builds) == dict(record.current_builds)
     assert currents.default_build == f"{NATIONAL}/{SECOND_BUILD}"
 
 

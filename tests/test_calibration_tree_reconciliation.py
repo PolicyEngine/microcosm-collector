@@ -17,7 +17,6 @@ from __future__ import annotations
 import functools
 import importlib
 import importlib.util
-import inspect
 import json
 import subprocess
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -92,23 +91,6 @@ def reconciliation_attribute(name: str) -> Any:
     if attribute is None:
         pytest.fail(f"{RECONCILIATION_MODULE} has no {name} yet.")
     return attribute
-
-
-def latest_step_supported() -> bool:
-    """Whether the command takes the release run's latest step yet."""
-
-    parameters = inspect.signature(
-        reconciliation_module().reconcile_calibration_trees
-    ).parameters
-    return "follow_latest" in parameters
-
-
-def require_latest_step() -> None:
-    """Fails, rather than raising TypeError, while the command has no latest
-    step."""
-
-    if not latest_step_supported():
-        pytest.fail("reconcile_calibration_trees takes no follow_latest yet.")
 
 
 # Hugging Face -------------------------------------------------------------------
@@ -353,7 +335,7 @@ class Reconciliation:
             HuggingFaceReadSettings(token=READ_TOKEN),
             client=self.hugging_face.client(),
         )
-        if latest_step_supported() and "follow_latest" not in options:
+        if "follow_latest" not in options:
 
             def run_latest_command(
                 argv: Sequence[str], env: Mapping[str, str], timeout: float
@@ -677,7 +659,6 @@ def test_a_build_a_submission_is_still_processing_is_skipped() -> None:
 
 
 def test_a_release_run_s_summary_reports_its_latest_step() -> None:
-    require_latest_step()
     reconciliation = us_release_reconciliation()
     outcomes = reconciliation.run()
     [step] = reconciliation.latest_steps
@@ -695,7 +676,7 @@ def test_a_release_run_s_summary_reports_its_latest_step() -> None:
         "kinds": ["release"],
         "request_id": "calibration-trees-us-release-2960000",
         "dry_run": False,
-        # Builds only: the latest step is reported on its own.
+        # Not the latest step, which is reported on its own.
         "outcomes": {"built": 2},
         "incomplete": False,
         "incomplete_sources": [],
@@ -707,7 +688,6 @@ def test_a_release_run_s_summary_reports_its_latest_step() -> None:
 
 
 def test_a_release_run_ends_by_following_releases_json_inside_its_lock() -> None:
-    require_latest_step()
     reconciliation = us_release_reconciliation()
 
     reconciliation.run()
@@ -736,7 +716,6 @@ def test_a_release_run_ends_by_following_releases_json_inside_its_lock() -> None
 
 @pytest.mark.parametrize("moved", [True, False])
 def test_the_latest_step_reports_what_moved(moved: bool) -> None:
-    require_latest_step()
     reconciliation = us_release_reconciliation()
     reconciliation.latest.moved = moved
 
@@ -758,7 +737,6 @@ def test_the_latest_step_reports_what_moved(moved: bool) -> None:
 
 
 def test_the_latest_step_says_why_the_latest_stayed() -> None:
-    require_latest_step()
     reconciliation = us_release_reconciliation()
     # The current default build can't be built, so no tree is recorded for it.
     reconciliation.bun.worker_exits[CURRENT_ID] = 2
@@ -777,7 +755,6 @@ def test_the_latest_step_says_why_the_latest_stayed() -> None:
 
 
 def test_a_releases_json_the_rules_refuse_leaves_the_latest_with_its_reason() -> None:
-    require_latest_step()
     reconciliation = us_release_reconciliation(
         releases_json(TWO_BUILDS, current="us-calibration-attempt-unlisted")
     )
@@ -794,7 +771,6 @@ def test_a_releases_json_the_rules_refuse_leaves_the_latest_with_its_reason() ->
 
 
 def test_a_country_without_releases_json_skips_the_latest_step() -> None:
-    require_latest_step()
     reconciliation = Reconciliation()
     reconciliation.bun.store = store_manifest("be")
 
@@ -814,7 +790,6 @@ def test_a_country_without_releases_json_skips_the_latest_step() -> None:
 
 
 def test_a_dry_run_skips_the_latest_step() -> None:
-    require_latest_step()
     reconciliation = both_kinds()
 
     reconciliation.run(kinds=["release", "staging"], dry_run=True)
@@ -830,7 +805,6 @@ def test_a_dry_run_skips_the_latest_step() -> None:
 
 
 def test_a_lock_wait_that_expires_skips_the_latest_step() -> None:
-    require_latest_step()
     reconciliation = both_kinds()
     reconciliation.held_locks.add(("us", "release"))
 
@@ -845,7 +819,6 @@ def test_a_lock_wait_that_expires_skips_the_latest_step() -> None:
 
 
 def test_the_latest_step_runs_after_the_time_limit() -> None:
-    require_latest_step()
     reconciliation = us_release_reconciliation()
     reconciliation.bun.clock = reconciliation.clock
     reconciliation.bun.seconds_per_build = 45 * MINUTE
@@ -860,7 +833,6 @@ def test_the_latest_step_runs_after_the_time_limit() -> None:
 
 @pytest.mark.parametrize("exit_code", [1, 3])
 def test_a_latest_command_that_fails_leaves_the_run_incomplete(exit_code: int) -> None:
-    require_latest_step()
     reconciliation = us_release_reconciliation()
     reconciliation.latest.exit_code = exit_code
 
@@ -883,7 +855,6 @@ def test_a_latest_command_that_fails_leaves_the_run_incomplete(exit_code: int) -
 
 
 def test_any_other_failure_of_the_latest_step_leaves_the_run_incomplete() -> None:
-    require_latest_step()
     reconciliation = us_release_reconciliation()
 
     def unavailable(country: str) -> FollowedLatest:
@@ -899,7 +870,6 @@ def test_any_other_failure_of_the_latest_step_leaves_the_run_incomplete() -> Non
 
 
 def test_a_country_the_collector_does_not_list_is_an_error_no_retry_gets_past() -> None:
-    require_latest_step()
     reconciliation = us_release_reconciliation()
 
     def not_listed(country: str) -> FollowedLatest:
@@ -922,7 +892,6 @@ def test_a_country_the_collector_does_not_list_is_an_error_no_retry_gets_past() 
 
 
 def test_a_staging_run_has_no_latest_step() -> None:
-    require_latest_step()
     reconciliation = us_staging_reconciliation(structured_staging_run(RUN_ID))
 
     outcomes = reconciliation.run(kinds=["staging"])

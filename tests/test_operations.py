@@ -13,6 +13,7 @@ import pytest
 
 from telemetry_collector import calibration_trees, operations
 from telemetry_collector.auth import HuggingFacePrincipal
+from telemetry_collector.calibration_tree_reconciliation import LatestStep
 from telemetry_collector.calibration_trees import FollowedLatest
 from telemetry_collector.huggingface_read import (
     GENERIC_TOKEN_VARIABLES,
@@ -658,13 +659,10 @@ BUILT_RELEASE = {
 }
 
 
-def latest_step(**fields: Any) -> Any:
-    """A release run's latest step, failing while the command has none."""
+def latest_step(**fields: Any) -> LatestStep:
+    """A US release run's latest step."""
 
-    step = getattr(imported_module(RECONCILIATION_MODULE), "LatestStep", None)
-    if step is None:
-        pytest.fail(f"{RECONCILIATION_MODULE} has no LatestStep yet.")
-    return step(country="us", **fields)
+    return LatestStep(country="us", **fields)
 
 
 def followed_latest() -> FollowedLatest:
