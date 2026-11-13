@@ -3,13 +3,15 @@
   "commit": "4d129fbc6931e0e6862febd4f28ca421fb94b24a",
   "directory": "frontend/packages/calibration-tree",
   "changed": {
-    "package.json": "Publishable from this repository: not private, with a license, the repository, public access, the published files, the worker's and the publication command's exports and their scripts."
+    "package.json": "Publishable from this repository: not private, with a license, the repository, public access, the published files, the worker's, the publication command's and the latest command's exports and their scripts."
   },
   "collectorFiles": [
     "LICENSE",
     "README.md",
     "bun.lock",
     "provenance.json",
+    "src/calibration-tree-latest.test.ts",
+    "src/calibration-tree-latest.ts",
     "src/calibration-tree-publication.test.ts",
     "src/calibration-tree-publication.ts",
     "src/calibration-tree-worker.test.ts",

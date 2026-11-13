@@ -14,6 +14,7 @@ from telemetry_collector.submissions import (
     MAX_FILES_PER_SUBMISSION,
     MAX_JOB_ATTEMPTS,
     MAX_JOB_DISPATCHES,
+    ROLE_RULES,
     SUBMISSION_STATUSES,
     SubmissionRequest,
     canonical_json,
@@ -27,6 +28,9 @@ from telemetry_collector.submissions import (
 
 DIAGNOSTICS_SHA256 = "a" * 64
 MANIFEST_SHA256 = "b" * 64
+RELEASES_RECORD_SHA256 = "f" * 64
+UK_NATIONAL_RELEASE = "microcosm-uk-2024-25-national"
+PROMOTED_BUILD = "uk-frs-calibration-attempt-20261019T083323Z-6cba5d71"
 
 
 def calibration_submission(**changes: Any) -> dict[str, Any]:
@@ -115,6 +119,101 @@ def test_accepts_orrery_inputs_without_huggingface_provenance() -> None:
     request = SubmissionRequest.model_validate(orrery_submission())
 
     assert request.provenance.huggingface is None
+
+
+def releases_record_submission(**changes: Any) -> dict[str, Any]:
+    """The repo's releases.json after a change made ``PROMOTED_BUILD`` current."""
+
+    submission: dict[str, Any] = {
+        "contract_version": 1,
+        "kind": "releases-record",
+        "licensed_data": True,
+        "provenance": {
+            "run_id": "uk-promotion-20261113T120000Z",
+            "build_id": PROMOTED_BUILD,
+            "country_code": "UK",
+            "release": UK_NATIONAL_RELEASE,
+            "huggingface": {
+                "repo": "policyengine/populace-uk-private",
+                # The commit that wrote this releases.json.
+                "commit": "fedcba9876543210fedcba9876543210fedcba98",
+                "folder": f"releases/{UK_NATIONAL_RELEASE}/{PROMOTED_BUILD}",
+            },
+        },
+        "files": [
+            {
+                "name": "releases.json",
+                "role": "releases_record",
+                "size": 1024,
+                "sha256": RELEASES_RECORD_SHA256,
+            }
+        ],
+    }
+    submission.update(changes)
+    return submission
+
+
+def test_accepts_a_releases_record_naming_the_build_made_current() -> None:
+    assert "releases-record" in ROLE_RULES
+
+    request = SubmissionRequest.model_validate(releases_record_submission())
+
+    assert request.kind == "releases-record"
+    assert [file.role for file in request.files] == ["releases_record"]
+
+
+def test_a_releases_record_submission_holds_exactly_one_record() -> None:
+    submission = releases_record_submission()
+    submission["files"].append({**submission["files"][0], "name": "releases-copy.json"})
+
+    with pytest.raises(ValidationError, match="exactly 1 releases_record"):
+        SubmissionRequest.model_validate(submission)
+
+
+def test_a_releases_record_is_at_most_4_mib() -> None:
+    submission = releases_record_submission()
+    submission["files"][0]["size"] = 4 * 1024 * 1024 + 1
+
+    with pytest.raises(ValidationError, match="exceeds the releases_record limit"):
+        SubmissionRequest.model_validate(submission)
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ("huggingface", "releases-record submissions need Hugging Face provenance"),
+        ("release", "releases-record submissions need a release"),
+    ],
+)
+def test_a_releases_record_submission_names_its_repo_and_release(
+    field: str, message: str
+) -> None:
+    submission = releases_record_submission()
+    submission["provenance"][field] = None
+
+    with pytest.raises(ValidationError, match=message):
+        SubmissionRequest.model_validate(submission)
+
+
+@pytest.mark.parametrize(
+    "folder",
+    [
+        f"staged/{PROMOTED_BUILD}",
+        f"releases/microcosm-uk-2024-25-dense/{PROMOTED_BUILD}",
+        f"releases/{UK_NATIONAL_RELEASE}/uk-frs-calibration-attempt-other",
+        f"releases/{UK_NATIONAL_RELEASE}",
+    ],
+)
+def test_a_releases_record_submission_names_the_folder_of_its_build(
+    folder: str,
+) -> None:
+    submission = releases_record_submission()
+    submission["provenance"]["huggingface"]["folder"] = folder
+
+    with pytest.raises(
+        ValidationError, match="folder must be releases/<release>/<build_id>"
+    ):
+        SubmissionRequest.model_validate(submission)
 
 
 def test_submission_id_ignores_file_order() -> None:

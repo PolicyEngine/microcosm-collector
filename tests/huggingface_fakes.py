@@ -4,7 +4,10 @@ It answers through ``httpx.MockTransport``, so no test reaches the network. It
 serves dataset information, recursive file lists (paginated with a ``Link``
 header, as Hugging Face does), one folder's entries with ``expand=true``
 (each with its ``lastCommit``) and file downloads, and redirects downloads of
-LFS files to a separate content host, as Hugging Face does.
+LFS files to a separate content host, as Hugging Face does. A 404 carries
+Hugging Face's ``X-Error-Code``: ``RepoNotFound``, ``RevisionNotFound`` or
+``EntryNotFound``. A download of one file can be answered with a status of its
+own (``FakeDataset.file_answers``), while the dataset's other reads succeed.
 """
 
 from __future__ import annotations
@@ -31,12 +34,21 @@ class FakeDataset:
     head_commit: str = "0" * 40
     #: Answer every request for this dataset with this status instead.
     forced_status: int | None = None
+    #: Answer a download of these files with this status and, when given,
+    #: this ``X-Error-Code`` instead; every other read is answered as usual.
+    file_answers: dict[str, tuple[int, str | None]] = field(default_factory=dict)
     #: Report these SHA-256 values for LFS files instead of their content's.
     reported_lfs_sha256: dict[str, str] = field(default_factory=dict)
     #: The last commit (ID and date) of each file or folder, by path, for
     #: listings with expand=true; ``None`` leaves ``lastCommit`` out. A path
     #: not listed gets the head commit and ``DEFAULT_COMMIT_DATE``.
     last_commits: dict[str, tuple[str, str] | None] = field(default_factory=dict)
+
+
+def not_found(error_code: str) -> httpx.Response:
+    return httpx.Response(
+        404, json={"error": error_code}, headers={"X-Error-Code": error_code}
+    )
 
 
 class FakeHuggingFace:
@@ -108,7 +120,7 @@ class FakeHuggingFace:
     def _guarded(self, request, name, respond) -> httpx.Response:
         dataset = self.datasets.get(name)
         if dataset is None:
-            return httpx.Response(404, json={"error": "Dataset not found"})
+            return not_found("RepoNotFound")
         if dataset.forced_status is not None:
             return httpx.Response(dataset.forced_status, json={"error": "forced"})
         authorized = request.headers.get("Authorization") == f"Bearer {self.token}"
@@ -129,7 +141,7 @@ class FakeHuggingFace:
     def _tree(self, request: httpx.Request, name: str, revision: str, folder: str):
         dataset = self.datasets[name]
         if not self._check_revision(dataset, revision):
-            return httpx.Response(404, json={"error": "Revision not found"})
+            return not_found("RevisionNotFound")
         query = parse_qs(request.url.query.decode())
         if query.get("recursive") == ["true"] and not folder:
             entries = self._entries(dataset)
@@ -138,7 +150,7 @@ class FakeHuggingFace:
         elif query.get("expand") == ["true"] and folder:
             entries = self._folder_entries(dataset, folder)
             if not entries:
-                return httpx.Response(404, json={"error": "Entry not found"})
+                return not_found("EntryNotFound")
             listing_query = {"expand": "true"}
             listing_path = f"{ENDPOINT}/api/datasets/{name}/tree/{revision}/{folder}"
         else:
@@ -226,10 +238,17 @@ class FakeHuggingFace:
         return entries
 
     def _resolve(self, name, dataset, revision, file_path) -> httpx.Response:
+        if file_path in dataset.file_answers:
+            status_code, error_code = dataset.file_answers[file_path]
+            return httpx.Response(
+                status_code,
+                json={"error": error_code or "forced"},
+                headers={"X-Error-Code": error_code} if error_code else {},
+            )
         if not self._check_revision(dataset, revision):
-            return httpx.Response(404, json={"error": "Revision not found"})
+            return not_found("RevisionNotFound")
         if file_path not in dataset.files:
-            return httpx.Response(404, json={"error": "Entry not found"})
+            return not_found("EntryNotFound")
         if file_path in dataset.lfs_paths:
             digest = hashlib.sha256(dataset.files[file_path]).hexdigest()
             return httpx.Response(
