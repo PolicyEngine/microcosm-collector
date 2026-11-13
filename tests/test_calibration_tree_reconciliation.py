@@ -1015,6 +1015,117 @@ def test_a_schema_1_run_s_status_in_runs_json_comes_before_its_progress() -> Non
     assert outcome.outcome == "built"
 
 
+def schema_1_folder_without_manifest(
+    run_id: str, *, status: str | None = "completed"
+) -> dict[str, bytes]:
+    """A schema-1 run folder with no run manifest of its own. Its status is in
+    its ``progress.json``, or, when ``status`` is None, only in ``runs.json``."""
+
+    folder = f"runs/{run_id}"
+    files = {
+        f"{folder}/calibration_diagnostics.json": DIAGNOSTICS,
+        f"{folder}/build_manifest.json": BUILD_MANIFEST,
+    }
+    if status is not None:
+        files[f"{folder}/progress.json"] = json.dumps(
+            {"schema_version": 1, "run_id": run_id, "status": status}
+        ).encode()
+    return files
+
+
+def schema_1_index(statuses: Mapping[str, str]) -> dict[str, bytes]:
+    """A schema-1 ``runs.json`` recording each run's status."""
+
+    rows = [{"run_id": run_id, "status": status} for run_id, status in statuses.items()]
+    return {"runs.json": json.dumps({"schema_version": 1, "runs": rows}).encode()}
+
+
+def stored_staging_build(run_id: str) -> dict[str, Any]:
+    return {
+        "buildArtifactId": "b" * 64,
+        "kind": "staging",
+        "releaseId": None,
+        "stagingRunId": run_id,
+        "hfRepo": US_STAGING,
+        "hfCommitSha": "9" * 40,
+        "createdAt": "2026-11-02T09:15:00.000Z",
+    }
+
+
+@pytest.mark.parametrize("status_in", ["progress.json", "runs.json"])
+def test_a_folder_without_a_manifest_is_listed_once_every_schema_1_run_is_stored(
+    status_in: str,
+) -> None:
+    # Review round 1, bug 1: runs.json was read only beside a schema-1 run
+    # manifest of a run the store lacks, so this folder was dropped.
+    in_index = status_in == "runs.json"
+    reconciliation = us_staging_reconciliation(
+        {
+            **schema_1_run(RUN_ID),
+            **schema_1_folder_without_manifest(
+                OTHER_RUN_ID, status=None if in_index else "completed"
+            ),
+            **schema_1_index(
+                {RUN_ID: "passed", **({OTHER_RUN_ID: "published"} if in_index else {})}
+            ),
+        }
+    )
+    reconciliation.bun.store = store_manifest("us", [stored_staging_build(RUN_ID)])
+
+    outcomes = reconciliation.run(kinds=["staging"])
+
+    assert outcomes_by_source(outcomes) == [
+        (RUN_ID, "already_stored"),
+        (OTHER_RUN_ID, "built"),
+    ]
+    request = reconciliation.bun.build_of(OTHER_RUN_ID)["request"]
+    assert request["label"] == OTHER_RUN_ID
+    assert request["artifacts"]["calibrationDiagnostics"]["path"] == (
+        f"runs/{OTHER_RUN_ID}/calibration_diagnostics.json"
+    )
+    # The stored run's manifest is still never read (S7).
+    assert f"runs/{RUN_ID}/run_manifest.json" not in (
+        reconciliation.hugging_face.downloaded_paths()
+    )
+
+
+def test_a_folder_without_a_manifest_beside_a_schema_1_run_is_a_schema_1_run() -> None:
+    reconciliation = us_staging_reconciliation(
+        {
+            **schema_1_run(RUN_ID),
+            **schema_1_folder_without_manifest(OTHER_RUN_ID),
+            **schema_1_index({RUN_ID: "passed"}),
+        }
+    )
+
+    outcomes = reconciliation.run(kinds=["staging"])
+
+    assert sorted(outcomes_by_source(outcomes)) == sorted(
+        [(RUN_ID, "built"), (OTHER_RUN_ID, "built")]
+    )
+
+
+@pytest.mark.parametrize(
+    "index",
+    [None, {"schema_version": 2, "runs": []}],
+    ids=["no-runs-json", "structured-runs-json"],
+)
+def test_without_a_schema_1_runs_json_a_folder_without_a_manifest_is_not_a_run(
+    index: dict[str, Any] | None,
+) -> None:
+    files = {
+        **structured_staging_run(RUN_ID),
+        **schema_1_folder_without_manifest(OTHER_RUN_ID),
+    }
+    if index is not None:
+        files["runs.json"] = json.dumps(index).encode()
+    reconciliation = us_staging_reconciliation(files)
+
+    outcomes = reconciliation.run(kinds=["staging"])
+
+    assert outcomes_by_source(outcomes) == [(RUN_ID, "built")]
+
+
 def test_a_run_the_store_holds_is_already_stored_without_reading_its_files() -> None:
     reconciliation = us_staging_reconciliation(
         {**structured_staging_run(RUN_ID), **structured_staging_run(OTHER_RUN_ID)}
