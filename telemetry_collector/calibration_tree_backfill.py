@@ -256,6 +256,17 @@ class SourceUnbuildableError(Exception):
     """A build's files can't be found or don't match what records them."""
 
 
+class SourceWithoutDiagnosticsError(SourceUnbuildableError):
+    """A staging run with no calibration diagnostics to build from, where the
+    staging readers' ``resolveStagingCalibrationSource`` finds no source:
+    a schema-1 run folder without ``calibration_diagnostics.json``, a
+    structured run that declares neither diagnostics nor a staged dataset, a
+    staged-dataset receipt that records no landed bundle, or a bundle whose
+    receipt or folder holds no diagnostics file. The backfill reports it as
+    any other ``SourceUnbuildableError``; the reconcile command reports it
+    ``ineligible``, as the publisher's ``reconcileStagingBuilds`` does."""
+
+
 def _described(error: BaseException) -> str:
     return shortened_message(f"{type(error).__name__}: {error}")
 
@@ -734,7 +745,14 @@ def _staged_bundle_source(
     listed = listings.folder(dataset, revision, folder)
     name = file_name or _staged_bundle_diagnostics_file(listed)
     if name is None or name not in listed:
-        raise SourceUnbuildableError(
+        # A diagnostics file the receipt records but the folder lacks is a
+        # damaged bundle; a folder with none is a bundle without diagnostics.
+        error_class = (
+            SourceUnbuildableError
+            if file_name is not None
+            else SourceWithoutDiagnosticsError
+        )
+        raise error_class(
             f"{folder} holds no calibration diagnostics in {dataset} at {revision}."
         )
     diagnostics = SourceFile(dataset, revision, listed[name], declared_sha256)
@@ -778,7 +796,8 @@ def _receipt_source(
             "run manifest declares."
         )
     if delivery.get("status") not in _STAGED_BUNDLE_LANDED:
-        raise SourceUnbuildableError(
+        # A skipped, failed or disabled staging.
+        raise SourceWithoutDiagnosticsError(
             f"Run {run_id}'s staged dataset receipt records no staged bundle."
         )
     if delivery.get("run_id") != run_id:
@@ -809,7 +828,7 @@ def _receipt_source(
     declared = recorded.get(name) if recorded is not None and name else None
     digest = declared.get("sha256") if isinstance(declared, dict) else None
     if name is None or not _matches(_SHA256, digest):
-        raise SourceUnbuildableError(
+        raise SourceWithoutDiagnosticsError(
             f"Run {run_id}'s staged bundle records no calibration diagnostics with "
             "a SHA-256."
         )
@@ -843,13 +862,14 @@ def _staging_source(
     progress = None if progress_read is None else progress_read[0]
     _check_run_documents(run_id, run_manifest, progress)
     diagnostics_sha256: str | None = None
-    if _is_structured(run_manifest):
+    structured = _is_structured(run_manifest)
+    if structured:
         assert run_manifest is not None
         artifacts = _declared_artifacts(run_manifest, run_id)
         if "calibration_diagnostics" not in artifacts:
             # A run that staged its dataset bundle carries its diagnostics there.
             if "staged_dataset" not in artifacts:
-                raise SourceUnbuildableError(
+                raise SourceWithoutDiagnosticsError(
                     f"Run {run_id}'s manifest declares neither calibration "
                     "diagnostics nor a staged dataset."
                 )
@@ -862,7 +882,12 @@ def _staging_source(
         entry.hf_repo, entry.hf_commit, diagnostics_folder
     ).get(diagnostics_name)
     if listed_diagnostics is None:
-        raise SourceUnbuildableError(
+        # Declared diagnostics that are absent are a damaged run; a schema-1
+        # run declares none, and a folder without them has none.
+        error_class = (
+            SourceUnbuildableError if structured else SourceWithoutDiagnosticsError
+        )
+        raise error_class(
             f"{diagnostics_path} is not in {entry.hf_repo} at {entry.hf_commit}."
         )
     files = {

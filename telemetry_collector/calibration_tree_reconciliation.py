@@ -35,8 +35,15 @@ Python:
   are not read. Only a run whose status is ``passed``, ``published`` or
   ``completed`` is built. Its label is its candidate release, else its run
   ID, and its time its progress's ``updated_at``, else its run manifest's, as
-  the publisher's ``publishStagingSource`` takes them. A run whose documents
-  can't be read is ``unbuildable`` on its own, and the other runs continue.
+  the publisher's ``publishStagingSource`` takes them. A final run with no
+  calibration diagnostics to build from is ``ineligible``, as the
+  publisher's ``reconcileStagingBuilds`` reports it: a schema-1 folder
+  without ``calibration_diagnostics.json``, a structured run declaring
+  neither diagnostics nor a staged dataset, a staged-dataset receipt of a
+  skipped, failed or disabled staging, or a bundle recording no diagnostics
+  (``SourceWithoutDiagnosticsError``). A run whose documents can't be read,
+  or whose declared or recorded diagnostics are absent or differ, is
+  ``unbuildable`` on its own, and the other runs continue.
 
 A build whose folder (``releases/<release>/<build>`` or ``staged/<run>``) a
 ``queued`` or ``processing`` ``calibration-diagnostics`` submission holds is
@@ -100,6 +107,7 @@ from telemetry_collector.calibration_tree_backfill import (
     BuildKind,
     ProductionEntry,
     SourceUnbuildableError,
+    SourceWithoutDiagnosticsError,
     _build,
     _Listings,
     _read_json,
@@ -871,6 +879,14 @@ class _Reconciliation:
                 _release_source(entry, self.listings)
                 if kind == "release"
                 else _staging_source(entry, self.reader, self.listings)
+            )
+        except SourceWithoutDiagnosticsError as error:
+            # As the publisher's reconcileStagingBuilds reports such a run.
+            return outcome(
+                "ineligible",
+                reason=shortened_message(
+                    f"Finalized staging run has no calibration diagnostics: {error}"
+                ),
             )
         except SourceUnbuildableError as error:
             return outcome("unbuildable", reason=shortened_message(str(error)))

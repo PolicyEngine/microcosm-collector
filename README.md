@@ -2109,8 +2109,8 @@ Each build's outcome:
 | `built` | built and published, never as the latest | yes |
 | `already_stored` | the store holds it | yes |
 | `submission_in_progress` | a `queued` or `processing` submission of its folder builds it | yes |
-| `ineligible` | a release folder without diagnostics, or whose release manifest is absent or names another build; a staging run that isn't final | yes |
-| `unbuildable` | the worker refused the files (exit 2), or a staging run's documents are incompatible: a run manifest that isn't a JSON object, names another run or has an unsupported schema, and the backfill's own checks of a run's files | yes |
+| `ineligible` | a release folder without diagnostics, or whose release manifest is absent or names another build; a staging run that isn't final; a final staging run without calibration diagnostics, as the publisher reports one: a schema-1 folder without `calibration_diagnostics.json`, a structured run that declares neither diagnostics nor a staged dataset, a staged-dataset receipt of a skipped, failed or disabled staging, or a bundle that records no diagnostics file with a SHA-256 | yes |
+| `unbuildable` | the worker refused the files (exit 2), or a staging run's documents are incompatible: a run manifest that isn't a JSON object, names another run or has an unsupported schema, and the backfill's own checks of a run's files, such as declared or recorded diagnostics that are absent or differ from their SHA-256 | yes |
 | `too_large` | a file is over 256 MiB | yes |
 | `refused` | the publication refused the build (exit 2) | yes |
 | `no_releases_record` | the release repo has no `releases.json`; nothing is built | yes |
