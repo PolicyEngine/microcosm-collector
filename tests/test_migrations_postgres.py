@@ -21,7 +21,7 @@ from telemetry_collector.migrate import (
     verify_database,
 )
 
-HEAD_REVISION = "0004_calibration_tree_build_requests"
+HEAD_REVISION = "0004_tree_build_requests"
 TELEMETRY_TABLES = {"telemetry_runs", "telemetry_producers", "telemetry_events"}
 ARTIFACT_TABLES = {"artifact_submissions", "artifact_jobs"}
 ORRERY_GRAPH_TABLES = {"orrery_graph_files"}

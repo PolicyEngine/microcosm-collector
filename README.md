@@ -578,7 +578,7 @@ needs `SELECT` on `orrery_graph_files` and `artifact_submissions`. The
 calibration tree build endpoint and the `reconcile-calibration-trees`
 command need `SELECT`, `INSERT` and `UPDATE` on
 `calibration_tree_build_requests`, which migration
-`0004_calibration_tree_build_requests` creates: the endpoint writes each
+`0004_tree_build_requests` creates: the endpoint writes each
 request with `INSERT ... ON CONFLICT DO UPDATE`. The command also needs
 `SELECT` on `artifact_submissions`. No table uses a sequence. A `serial`
 column would need `USAGE` on its sequence, which these default privileges
@@ -1957,7 +1957,7 @@ ID, `not_before`, the outcome (`queued`, `already_queued` or `refused`), the
 status and, for a refusal, its code. A body that fails its checks is logged
 without its values. Each task also has one row in
 `calibration_tree_build_requests` (migration
-`0004_calibration_tree_build_requests`), keyed by its task ID:
+`0004_tree_build_requests`), keyed by its task ID:
 
 - the service writes the row before it creates the task, adding one to
   `request_count` and keeping `first_requested_at`, `last_requested_at`, the

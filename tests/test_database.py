@@ -181,7 +181,7 @@ def test_the_build_request_migration_keeps_the_model_s_kinds() -> None:
     database = importlib.import_module("telemetry_collector.database")
     model = getattr(database, "CalibrationTreeBuildRequest", None)
     assert model is not None, "telemetry_collector.database has no build request model."
-    migration = _migration("0004_calibration_tree_build_requests.py")
+    migration = _migration("0004_tree_build_requests.py")
 
     assert migration.down_revision == "0003_orrery_graph_files"
     assert migration.KINDS == _status_constraint(model.__table__)

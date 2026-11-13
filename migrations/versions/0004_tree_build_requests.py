@@ -1,6 +1,6 @@
 """Record the calibration tree builds the service queues.
 
-Revision ID: 0004_calibration_tree_build_requests
+Revision ID: 0004_tree_build_requests
 Revises: 0003_orrery_graph_files
 """
 
@@ -10,7 +10,7 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0004_calibration_tree_build_requests"
+revision: str = "0004_tree_build_requests"
 down_revision: str | Sequence[str] | None = "0003_orrery_graph_files"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
