@@ -1,9 +1,10 @@
 """The parser of ``releases.json`` that lists every build it records.
 
-It follows the rules of the tree package's ``release-record.ts`` and of the
-tree handler's ``current_default_build``: these tests check that it refuses
-exactly the records ``current_default_build`` refuses, and names the same
-current default build for every record both accept.
+It follows the rules of the tree package's ``release-record.ts``. The latest
+rule's ``calibration_trees.current_default_build`` and
+``releases_record_currents`` read the record through it: these tests check
+that both entry points refuse exactly the same records, with one error
+class, and name the same current builds for every record both accept.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import pytest
 from telemetry_collector.calibration_trees import (
     ReleasesRecordRefusedError,
     current_default_build,
+    releases_record_currents,
 )
 
 RELEASES_RECORD_MODULE = "telemetry_collector.releases_record"
@@ -159,6 +161,48 @@ def test_a_record_without_a_current_default_build_names_none(change: str) -> Non
     assert record.current_default_build is None
     assert not any(build.current_default for build in record.builds)
     assert len(record.builds) == 3
+
+
+def test_each_release_s_current_build_is_listed_with_the_record() -> None:
+    record = parse(encoded(record_document()))
+
+    current_builds = getattr(record, "current_builds", None)
+    if current_builds is None:
+        pytest.fail("The parsed record has no current_builds yet.")
+    # Every listed release, with or without a current build.
+    assert dict(current_builds) == {NATIONAL: SECOND_BUILD, LOCAL: None}
+
+
+def test_the_latest_rule_reads_the_same_current_builds() -> None:
+    content = encoded(record_document())
+    record = parse(content)
+
+    currents = releases_record_currents(content)
+
+    assert dict(currents.current_builds) == dict(getattr(record, "current_builds", {}))
+    assert currents.default_build == f"{NATIONAL}/{SECOND_BUILD}"
+
+
+def test_both_entry_points_refuse_with_one_error_class() -> None:
+    # A caller catching either module's refusal catches the other's.
+    assert refused_error() is ReleasesRecordRefusedError
+
+
+#: Deeper than Python's JSON decoder goes; the package's parser refuses it.
+DEEPLY_NESTED_RECORD = b"[" * 100_000 + b"]" * 100_000
+
+
+def test_a_record_nested_too_deeply_is_refused_as_the_latest_rule_refuses_it() -> None:
+    with pytest.raises(ReleasesRecordRefusedError):
+        current_default_build(DEEPLY_NESTED_RECORD)
+    try:
+        parse(DEEPLY_NESTED_RECORD)
+    except RecursionError:
+        pytest.fail("parse_releases_record raised RecursionError, not a refusal.")
+    except refused_error() as refusal:
+        assert "not a readable JSON document" in str(refusal)
+    else:
+        pytest.fail("parse_releases_record accepted a record nested too deeply.")
 
 
 def test_published_at_is_kept_as_the_record_writes_it() -> None:
