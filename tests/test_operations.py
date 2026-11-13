@@ -11,9 +11,13 @@ from typing import Any
 
 import pytest
 
-from telemetry_collector import operations
+from telemetry_collector import calibration_trees, operations
 from telemetry_collector.auth import HuggingFacePrincipal
-from telemetry_collector.huggingface_read import GENERIC_TOKEN_VARIABLES
+from telemetry_collector.calibration_trees import FollowedLatest
+from telemetry_collector.huggingface_read import (
+    GENERIC_TOKEN_VARIABLES,
+    HuggingFaceReader,
+)
 from telemetry_collector.operations import (
     recover_stalled_jobs,
     reprocess_submissions,
@@ -577,12 +581,13 @@ class StandInRequestRows:
 
 def stand_in_reconciliation(
     monkeypatch: pytest.MonkeyPatch,
-    outcomes: list[dict[str, Any]],
+    outcomes: list[Any],
     *,
     raised: Exception | None = None,
 ) -> dict[str, Any]:
     """Replace the reconciliation with one that yields ``outcomes`` (then
-    raises ``raised``, if given) and records its options."""
+    raises ``raised``, if given) and records its options. A dictionary in
+    ``outcomes`` is a build's outcome; anything else is yielded as it is."""
 
     reconciliation = imported_module(RECONCILIATION_MODULE)
     builds = imported_module(BUILDS_MODULE)
@@ -595,7 +600,11 @@ def stand_in_reconciliation(
     def recorded_reconciliation(**options: Any) -> Iterator[Any]:
         given.update(options)
         for outcome in outcomes:
-            yield reconciliation.ReconcileOutcome(**outcome)
+            yield (
+                reconciliation.ReconcileOutcome(**outcome)
+                if isinstance(outcome, dict)
+                else outcome
+            )
         if raised is not None:
             raise raised
 
@@ -638,6 +647,34 @@ STORED_RUN = {
     "outcome": "already_stored",
     "source_id": "uk-frs-calibration-attempt-0",
 }
+US_CURRENT_BUILD = "microcosm-us-2025/us-calibration-attempt-1"
+BUILT_RELEASE = {
+    "country": "us",
+    "kind": "release",
+    "outcome": "built",
+    "source_id": US_CURRENT_BUILD,
+    "build_artifact_id": "d" * 64,
+    "current_default": True,
+}
+
+
+def latest_step(**fields: Any) -> Any:
+    """A release run's latest step, failing while the command has none."""
+
+    step = getattr(imported_module(RECONCILIATION_MODULE), "LatestStep", None)
+    if step is None:
+        pytest.fail(f"{RECONCILIATION_MODULE} has no LatestStep yet.")
+    return step(country="us", **fields)
+
+
+def followed_latest() -> FollowedLatest:
+    return FollowedLatest(
+        country="us",
+        current_build=US_CURRENT_BUILD,
+        build_artifact_id="d" * 64,
+        made_latest=True,
+        latest_moved=True,
+    )
 
 
 def test_the_reconcile_command_passes_its_country_kind_and_dry_run(
@@ -821,15 +858,78 @@ def test_final_outcomes_alone_do_not_fail_the_reconcile_command(
     assert operations.main([RECONCILE_COMMAND, "--country", "uk"]) == 0
 
 
-def test_a_release_run_s_summary_says_the_latest_is_not_handled(
+def test_a_release_run_prints_its_latest_step_and_its_summary_reports_it(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    stand_in_reconciliation(monkeypatch, [])
+    step = latest_step(outcome="followed", followed=followed_latest())
+    stand_in_reconciliation(monkeypatch, [BUILT_RELEASE, step])
+
+    exit_status = operations.main(
+        [RECONCILE_COMMAND, "--country", "us", "--kind", "release"]
+    )
+
+    assert exit_status == 0
+    printed = [json.loads(text) for text in capsys.readouterr().out.splitlines()]
+    assert len(printed) == 3
+    expected_latest = {
+        "country": "us",
+        "outcome": "followed",
+        "current_build": US_CURRENT_BUILD,
+        "build_artifact_id": "d" * 64,
+        "made_latest": True,
+        "latest_moved": True,
+        "incomplete": False,
+    }
+    assert printed[1] == {"latest": expected_latest}
+    summary = printed[2]["summary"]
+    assert summary["latest"] == expected_latest
+    assert summary["outcomes"] == {"built": 1}
+    assert summary["incomplete"] is False
+
+
+def test_a_latest_step_that_failed_makes_the_command_exit_1(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    step = latest_step(
+        outcome="error",
+        reason="CalibrationTreeCommandError: The tree latest command exited with 3.",
+        incomplete=True,
+    )
+    stand_in_reconciliation(monkeypatch, [BUILT_RELEASE, step])
+
+    exit_status = operations.main(
+        [RECONCILE_COMMAND, "--country", "us", "--kind", "release"]
+    )
+
+    assert exit_status == 1
+    summary = json.loads(capsys.readouterr().out.splitlines()[-1])["summary"]
+    assert summary["incomplete"] is True
+    assert summary["latest"]["outcome"] == "error"
+
+
+def test_the_reconcile_command_follows_releases_json_with_the_worker_job_s_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    given = stand_in_reconciliation(monkeypatch, [])
+    followed: list[tuple[str, dict[str, Any]]] = []
+
+    def recorded_follow(country: str, **options: Any) -> FollowedLatest:
+        followed.append((country, options))
+        return followed_latest()
+
+    monkeypatch.setattr(calibration_trees, "follow_releases_record", recorded_follow)
 
     operations.main([RECONCILE_COMMAND, "--country", "us", "--kind", "release"])
 
-    summary = json.loads(capsys.readouterr().out.splitlines()[-1])["summary"]
-    assert summary["latest"] == "not_handled"
+    follow_latest = given.get("follow_latest")
+    assert callable(follow_latest), "The command passes no follow_latest."
+    assert follow_latest("us") == followed_latest()
+    [(country, options)] = followed
+    blob_token = RECONCILE_ENVIRONMENT["COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN"]
+    assert country == "us"
+    assert options["blob_token"] == blob_token
+    assert callable(options["manifest_lock"])
+    assert isinstance(options["reader"], HuggingFaceReader)
 
 
 def test_a_queued_run_records_its_start_and_finish_on_its_request_row(
