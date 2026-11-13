@@ -34,8 +34,8 @@ Python:
   when any listed run's manifest is schema 1, and stored runs' manifests
   are not read. A ``runs.json`` that isn't JSON, or isn't a JSON object, is
   no index, as the publisher takes it. One that can't be read makes each
-  run the store lacks with a schema-1 manifest or none an ``error``, and
-  the run incomplete; the structured runs are still built. Only a run
+  run the store lacks with a schema-1 manifest or none an incomplete
+  ``error``; the structured runs are still built. Only a run
   whose status is ``passed``, ``published`` or ``completed`` is built. Its
   label is its candidate release, else its run ID, and its time its
   progress's ``updated_at``, else its run manifest's, as the publisher's
@@ -1026,11 +1026,16 @@ def summarize(
 ) -> dict[str, Any]:
     """The run's summary: its counts, and whether it is incomplete.
 
-    ``outcomes`` counts the builds' and kinds' outcomes, and
-    ``incomplete_sources`` lists those that are incomplete. ``latest`` is
-    the release run's latest step (``LatestStep.fields``), or ``None`` for a
-    run without releases or one that stopped before the step; the run is
-    also incomplete when that step is.
+    ``outcomes`` counts every ``ReconcileOutcome``: each build's, and each
+    outcome for a whole kind (``no_releases_record``,
+    ``releases_record_refused``, ``lock_wait_expired``, or an ``error`` when
+    a repo or the store's manifest could not be read).
+    ``incomplete_sources`` lists those that are incomplete, a whole kind's
+    with ``source_id`` ``None``. ``latest`` is the release run's latest step
+    (``LatestStep.fields``), or ``None`` for a run without releases or one
+    that stopped before the step. The latest step is not counted in
+    ``outcomes``. When it is incomplete, so is the run, but it adds no entry
+    to ``incomplete_sources``.
     """
 
     listed = list(outcomes)

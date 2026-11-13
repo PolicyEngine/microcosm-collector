@@ -2083,10 +2083,14 @@ Python. Without `--kind` it covers both kinds, or only releases for BE.
   run's is the one a schema-1 `runs.json` records, else its
   `progress.json`'s. A folder without a run manifest of its own is a
   schema-1 run when `runs.json` is schema 1, which is read whenever a run
-  the store lacks has a schema-1 manifest or none. Only `passed`,
-  `published` and `completed` runs are built, the newest first. Its label is
-  its candidate release, else its run ID, and its time its progress's
-  `updated_at`, else its run manifest's.
+  the store lacks has a schema-1 manifest or none. A `runs.json` that isn't
+  JSON, or isn't a JSON object, counts as no `runs.json`, as it does for the
+  publisher. If `runs.json` can't be read, each run the store lacks with a
+  schema-1 manifest or none is an incomplete `error`, so the command exits
+  1; the structured runs are still built. Only `passed`, `published` and
+  `completed` runs are built, the newest first. Its label is its candidate
+  release, else its run ID, and its time its progress's `updated_at`, else
+  its run manifest's.
 - A build whose folder (`releases/<release>/<build>` or `staged/<run>`) a
   `queued` or `processing` `calibration-diagnostics` submission holds is
   `submission_in_progress`: the submission builds it.
@@ -2119,8 +2123,15 @@ It prints one JSON document for each build, then, for a run that covers
 releases, the latest step's, `{"latest": {"country", "outcome", ...,
 "incomplete"}}`, then `{"summary": {"country", "kinds", "request_id",
 "dry_run", "outcomes", "incomplete", "incomplete_sources", "latest"}}`. The
-summary's `outcomes` counts the builds' outcomes, and its `latest` repeats
-the latest step's document, or is `null` for a run without releases.
+summary's `outcomes` counts every outcome in the table below: each build's,
+and each outcome for a whole kind (`no_releases_record`,
+`releases_record_refused`, `lock_wait_expired`, or an `error` when a repo
+or the store's manifest could not be read). `incomplete_sources` lists the
+incomplete ones, with `source_id` `null` for a whole kind. The summary's
+`latest` repeats the latest step's document, or is `null` for a run without
+releases. The latest step is not counted in `outcomes`, and a latest step
+that failed and may be tried again makes `incomplete` true without adding
+an entry to `incomplete_sources`.
 
 Each build's outcome:
 
@@ -2198,6 +2209,25 @@ past builds again".
   none. In a staging repo with a schema-1 `runs.json` and no schema-1 run
   manifest, a folder without a manifest is therefore a run here and not for
   the publisher.
+- If `runs.json` can't be read, only the runs that depend on it are an
+  `error`: each run the store lacks with a schema-1 manifest or none, whose
+  status, or for a folder without a run manifest whether it is a run, may
+  come from `runs.json`. The structured runs are still built. Where the
+  publisher reads `runs.json`, an error answer other than 404 stops its
+  whole staging listing, and a request that gets no answer counts as no
+  `runs.json`. A `runs.json` that isn't JSON, or isn't a JSON object, is no
+  `runs.json` for both.
+- A schema-1 `runs.json` that the publisher's `parseStagingRunIndex`
+  refuses, one with a `schema_name` or whose `runs` isn't a list, is taken
+  here as no `runs.json`, and a malformed row of one is skipped. The
+  publisher's staging listing stops at either.
+- The command reads the `progress.json` of every schema-1 run that
+  `runs.json` doesn't list. The publisher reads at most 50 of them.
+- Builds are ordered by the time they are published with (the progress's
+  `updated_at`, else the run manifest's), then by run ID. The publisher
+  orders its staging listing by each run's summary `updated_at`, then
+  `started_at`, then run ID, and takes those times from a structured run's
+  manifest and from a listed schema-1 run's row in `runs.json`.
 
 ### Tests
 
