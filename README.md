@@ -1713,6 +1713,16 @@ its release ID:
   build is dealt with by hand. A stored entry that fails the checks is `invalid`, and nothing is
   published.
 
+The backfill follows production's latest, not `releases.json`. The two can
+differ: when the store's latest is newer than production's (for example after
+a rollback in `releases.json`), production's latest is published again and
+reported `latest_not_moved` on every run; and production's manifest can be
+behind `releases.json` at the release repo's head. Either way,
+`calibration_trees.follow_releases_record`, or a `releases-record`
+submission ("Moving the latest when releases.json changes"), sets the
+country's latest to `releases.json`'s current build once that build's tree
+is stored.
+
 **The store.** The command reads the store's manifest once, with the read-only
 `src/calibration-tree-manifest-read.ts`. An entry whose release ID or staging
 run the store already holds, with the same commit and `createdAt`, is
