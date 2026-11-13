@@ -351,10 +351,11 @@ revisions only:
 `scripts/deploy.sh require-configuration` checks them with the collector's
 patterns, all three or none, before the deployment authenticates. The
 worker, recovery and migration jobs and the Orrery read service never get
-them. A fourth setting, `TELEMETRY_VERCEL_OIDC_TREE_BUILD_CALLERS`, lists
-the projects and environments that may queue calibration tree builds, apart
-from the readers ("Queuing calibration tree builds"). None is set yet: setting the three variables in both environments is a
-manual step, and the next release deploys them.
+them. None of the three is set yet: setting them in both environments is a
+manual step, and the next release deploys them. A fourth setting,
+`TELEMETRY_VERCEL_OIDC_TREE_BUILD_CALLERS`, lists the projects and
+environments that may queue calibration tree builds, apart from the readers
+("Queuing calibration tree builds"); it is not set yet either.
 
 **Security.** A Vercel OIDC token's audience is the team, not the
 collector: whoever receives one can present it to any other party that
@@ -2039,6 +2040,16 @@ without its values. Each task also has one row in
 
 There is at most one row per country, kind and 10 minutes. No answer, log
 document or row holds the token.
+
+Once `0004_tree_build_requests` is applied, an image without it cannot run
+against the database, as with `0002_artifact_intake` above: its migration
+job cannot find the revision and its `/ready` check fails. To roll back to
+such an image, first run `alembic downgrade 0003_orrery_graph_files` with
+this release's code, as the migration database user. That drops
+`calibration_tree_build_requests` and every row in it. Tasks already queued
+stay in Cloud Tasks and still start the worker job, and those executions
+fail: this release's code finds no request table to record the attempt on,
+and an older image has no `reconcile-calibration-trees` command.
 
 **The command.** `python -m telemetry_collector.operations
 reconcile-calibration-trees --country <cc> [--kind release|staging]

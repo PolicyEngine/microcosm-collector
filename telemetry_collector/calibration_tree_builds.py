@@ -79,7 +79,7 @@ from telemetry_collector.vercel_oidc import (
     VercelOidcTeamNotAllowedError,
     VercelOidcVerifier,
 )
-from telemetry_collector.worker import storable_text
+from telemetry_collector.worker import storable_json
 
 #: Requests of one country and kind within this many seconds share a task.
 WINDOW_SECONDS: Final = 600
@@ -261,18 +261,6 @@ class CalibrationTreeBuildRequestStore(Protocol):
         """Record when Cloud Tasks first accepted the task."""
 
 
-def _storable(value: Any) -> Any:
-    """A JSON value with ``storable_text`` applied to every string, keys too."""
-
-    if isinstance(value, str):
-        return storable_text(value)
-    if isinstance(value, Mapping):
-        return {_storable(key): _storable(item) for key, item in value.items()}
-    if isinstance(value, list | tuple):
-        return [_storable(item) for item in value]
-    return value
-
-
 class PostgresCalibrationTreeBuildRequests:
     """The request table in the collector's database.
 
@@ -381,7 +369,7 @@ class PostgresCalibrationTreeBuildRequests:
             self._execute(
                 sa.update(table)
                 .where(table.c.task_id == task_id)
-                .values(finished_at=at, summary=_storable(summary))
+                .values(finished_at=at, summary=storable_json(summary))
             )
             == 1
         )

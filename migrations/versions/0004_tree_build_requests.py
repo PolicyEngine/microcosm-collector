@@ -54,8 +54,9 @@ def upgrade() -> None:
 def downgrade() -> None:
     """Remove the table, keeping every earlier one.
 
-    Queued tasks stay in Cloud Tasks and still run; their executions find no
-    row to record their attempts on.
+    Queued tasks stay in Cloud Tasks and still start the worker job, and those
+    executions fail: this release's code finds no table to record the attempt
+    on, and an older image has no ``reconcile-calibration-trees`` command.
     """
 
     op.drop_table("calibration_tree_build_requests")
