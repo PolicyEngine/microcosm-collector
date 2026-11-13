@@ -51,11 +51,13 @@ from tests.test_calibration_tree_backfill import (
     DIAGNOSTICS,
     MINUTE,
     READ_TOKEN,
+    RECORD_REPO_KEY,
     ManualClock,
     StandInBun,
     build_id,
     hugging_face_with,
     schema_1_run,
+    sha256,
     store_manifest,
     structured_run,
 )
@@ -178,11 +180,19 @@ def structured_staging_run(
     progress_updated_at: str | None = "2026-11-02T09:15:00Z",
     manifest_updated_at: str | None = "2026-11-02T09:00:00Z",
     manifest_run_id: str | None = None,
+    artifacts: Mapping[str, bytes] | None = None,
+    declared: Mapping[str, bytes] | None = None,
 ) -> dict[str, bytes]:
-    """A schema-2 run with its status, candidate release and times."""
+    """A schema-2 run with its status, candidate release and times, whose
+    manifest declares ``declared`` (``artifacts`` unless given) and whose
+    folder holds ``artifacts`` (its calibration diagnostics unless given)."""
 
     folder = f"runs/{run_id}"
-    files = structured_run(run_id, {"calibration_diagnostics": DIAGNOSTICS})
+    files = structured_run(
+        run_id,
+        {"calibration_diagnostics": DIAGNOSTICS} if artifacts is None else artifacts,
+        declared=declared,
+    )
     manifest = json.loads(files[f"{folder}/run_manifest.json"])
     progress = json.loads(files[f"{folder}/progress.json"])
     for document, updated_at in (
@@ -1185,6 +1195,105 @@ def test_an_incompatible_run_is_reported_on_its_own_and_the_others_continue(
     assert outcome_of(outcomes, RUN_ID).outcome == "unbuildable"
     assert outcome_of(outcomes, RUN_ID).incomplete is False
     assert outcome_of(outcomes, OTHER_RUN_ID).outcome == "built"
+
+
+BUNDLE_COMMIT = "5" * 40
+
+
+def staged_dataset_receipt(**changes: Any) -> bytes:
+    """A run's staged_dataset receipt for a bundle in the US release repo."""
+
+    return json.dumps(
+        {
+            "status": "uploaded",
+            "run_id": RUN_ID,
+            RECORD_REPO_KEY: US_RELEASES,
+            "prefix": f"staged/{RUN_ID}",
+            "revision": BUNDLE_COMMIT,
+            "files": {"calibration_diagnostics.json": {"sha256": sha256(DIAGNOSTICS)}},
+            **changes,
+        }
+    ).encode()
+
+
+def without_diagnostics(files: Mapping[str, bytes]) -> dict[str, bytes]:
+    return {
+        path: content
+        for path, content in files.items()
+        if not path.endswith("calibration_diagnostics.json")
+    }
+
+
+# Review round 1, bug 2: the publisher's resolveStagingCalibrationSource finds
+# no calibration source for these final runs, and reconcileStagingBuilds
+# reports them ineligible ("Finalized staging run has no calibration
+# diagnostics.").
+RUNS_WITHOUT_DIAGNOSTICS = {
+    "schema-1-run-without-diagnostics": without_diagnostics(schema_1_run(RUN_ID)),
+    "structured-run-declaring-neither": structured_staging_run(RUN_ID, artifacts={}),
+    "receipt-of-a-skipped-staging": structured_staging_run(
+        RUN_ID,
+        artifacts={"staged_dataset": staged_dataset_receipt(status="skipped")},
+    ),
+    "receipt-recording-no-diagnostics": structured_staging_run(
+        RUN_ID,
+        artifacts={
+            "staged_dataset": staged_dataset_receipt(
+                files={"microcosm_us_2025.h5": {"sha256": sha256(b"rows")}}
+            )
+        },
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(RUNS_WITHOUT_DIAGNOSTICS))
+def test_a_final_run_without_calibration_diagnostics_is_ineligible(case: str) -> None:
+    reconciliation = us_staging_reconciliation(RUNS_WITHOUT_DIAGNOSTICS[case])
+
+    [outcome] = reconciliation.run(kinds=["staging"])
+
+    assert (outcome.source_id, outcome.outcome) == (RUN_ID, "ineligible")
+    assert outcome.reason.startswith(
+        "Finalized staging run has no calibration diagnostics"
+    )
+    assert outcome.incomplete is False
+    assert reconciliation.bun.steps("build") == []
+
+
+def test_a_dry_run_reports_a_final_run_without_diagnostics_as_ineligible() -> None:
+    reconciliation = us_staging_reconciliation(
+        RUNS_WITHOUT_DIAGNOSTICS["structured-run-declaring-neither"]
+    )
+
+    [outcome] = reconciliation.run(kinds=["staging"], dry_run=True)
+
+    assert outcome.outcome == "ineligible"
+
+
+DAMAGED_RUNS = {
+    "declared-diagnostics-absent": structured_staging_run(
+        RUN_ID, artifacts={}, declared={"calibration_diagnostics": DIAGNOSTICS}
+    ),
+    "recorded-bundle-file-absent": structured_staging_run(
+        RUN_ID, artifacts={"staged_dataset": staged_dataset_receipt()}
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(DAMAGED_RUNS))
+def test_a_final_run_whose_declared_diagnostics_are_absent_stays_unbuildable(
+    case: str,
+) -> None:
+    reconciliation = us_staging_reconciliation(DAMAGED_RUNS[case])
+    # The bundle's commit exists, without the diagnostics its receipt records.
+    reconciliation.hugging_face.datasets[US_RELEASES].revisions[BUNDLE_COMMIT] = {
+        f"staged/{RUN_ID}/microcosm_us_2025.h5": b"rows"
+    }
+
+    [outcome] = reconciliation.run(kinds=["staging"])
+
+    assert (outcome.source_id, outcome.outcome) == (RUN_ID, "unbuildable")
+    assert outcome.incomplete is False
 
 
 def test_a_staged_run_a_submission_is_still_processing_is_skipped() -> None:
