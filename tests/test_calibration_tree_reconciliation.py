@@ -1136,6 +1136,79 @@ def test_without_a_schema_1_runs_json_a_folder_without_a_manifest_is_not_a_run(
     assert outcomes_by_source(outcomes) == [(RUN_ID, "built")]
 
 
+#: A run folder without a run manifest of its own, beside a structured run
+#: and a schema-1 run.
+FOLDER_RUN_ID = "us-calibration-attempt-20261104T080000Z-9c0d1e2f"
+
+
+def runs_of_every_schema() -> dict[str, bytes]:
+    """A structured run, a schema-1 run and a folder without a run manifest,
+    all final and none stored."""
+
+    return {
+        **structured_staging_run(RUN_ID),
+        **schema_1_run(OTHER_RUN_ID),
+        **schema_1_folder_without_manifest(FOLDER_RUN_ID),
+    }
+
+
+@pytest.mark.parametrize(
+    "content",
+    [b"not json", b"[]", b'"runs"'],
+    ids=["not-json", "a-list", "a-string"],
+)
+def test_a_runs_json_that_is_not_a_json_object_is_no_index(content: bytes) -> None:
+    # Review round 2, bug 1: such a runs.json stopped the whole staging kind.
+    # The publisher's stagingJsonOrNull takes a body that isn't JSON as no
+    # index, and asObject one that isn't an object.
+    reconciliation = us_staging_reconciliation(
+        {**runs_of_every_schema(), "runs.json": content}
+    )
+
+    outcomes = reconciliation.run(kinds=["staging"])
+
+    # The schema-1 run's status is its progress's, and without an index the
+    # folder without a manifest is not a run.
+    assert sorted(outcomes_by_source(outcomes)) == [
+        (RUN_ID, "built"),
+        (OTHER_RUN_ID, "built"),
+    ]
+    assert not any(outcome.incomplete for outcome in outcomes)
+
+
+def test_a_runs_json_that_can_t_be_read_leaves_only_the_runs_that_need_it() -> None:
+    # Review round 2, bug 1: a failed read of runs.json stopped the whole
+    # staging kind, though a structured run's status never comes from it.
+    reconciliation = us_staging_reconciliation(
+        {**runs_of_every_schema(), **schema_1_index({FOLDER_RUN_ID: "passed"})}
+    )
+    reconciliation.hugging_face.datasets[US_STAGING].file_answers["runs.json"] = (
+        500,
+        None,
+    )
+
+    outcomes = reconciliation.run(kinds=["staging"])
+
+    assert sorted(outcomes_by_source(outcomes)) == [
+        (RUN_ID, "built"),
+        (OTHER_RUN_ID, "error"),
+        (FOLDER_RUN_ID, "error"),
+    ]
+    assert outcome_of(outcomes, RUN_ID).incomplete is False
+    for run_id in (OTHER_RUN_ID, FOLDER_RUN_ID):
+        failed = outcome_of(outcomes, run_id)
+        assert failed.incomplete is True
+        assert failed.reason.startswith("runs.json could not be read")
+    assert [call["source"] for call in reconciliation.bun.steps("build")] == [RUN_ID]
+    summary = reconciliation_attribute("summarize")(
+        outcomes, country="us", kinds=["staging"], request_id=None, dry_run=False
+    )
+    assert summary["incomplete"] is True
+    assert sorted(
+        incomplete["source_id"] for incomplete in summary["incomplete_sources"]
+    ) == [OTHER_RUN_ID, FOLDER_RUN_ID]
+
+
 def test_a_run_the_store_holds_is_already_stored_without_reading_its_files() -> None:
     reconciliation = us_staging_reconciliation(
         {**structured_staging_run(RUN_ID), **structured_staging_run(OTHER_RUN_ID)}
