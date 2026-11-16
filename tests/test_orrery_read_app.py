@@ -2218,9 +2218,12 @@ def test_the_catalogue_lists_documents_recorded_microseconds_apart_in_order(
     submission_id = record_stores.submit(
         run_id="run-a", licensed_data=False, files=orrery_files("a")
     )
-    record_stores.record(submission_id, "a" * 64, run_id="run-a", build_id="build-1")
-    record_stores.clock.advance(0.000001)
+    # The later document has the smaller SHA-256, so only its microsecond
+    # puts it first: were microseconds lost, the SHA-256 would order them
+    # the other way.
     record_stores.record(submission_id, "b" * 64, run_id="run-a", build_id="build-1")
+    record_stores.clock.advance(0.000001)
+    record_stores.record(submission_id, "a" * 64, run_id="run-a", build_id="build-1")
     catalogue = record_stores.catalogue
 
     [newest] = catalogue.recent_graph_files(limit=1)
@@ -2228,8 +2231,8 @@ def test_the_catalogue_lists_documents_recorded_microseconds_apart_in_order(
         limit=10, before=serving().newest_first(newest)
     )
 
-    assert newest.document_sha256 == "b" * 64
-    assert [document.document_sha256 for document in older] == ["a" * 64]
+    assert newest.document_sha256 == "a" * 64
+    assert [document.document_sha256 for document in older] == ["b" * 64]
 
 
 def test_the_catalogue_reads_one_document_s_record(
