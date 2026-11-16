@@ -86,7 +86,7 @@ const CALIBRATION_CAPABILITIES: readonly CountryCapability[] = [
 ];
 
 // Deprecated upstream identifiers: Microcosm's published HF repositories and
-// deployment variables still use the former Populace names.
+// deployment variables keep their original names.
 export const COUNTRY_REGISTRY = {
   us: {
     repo: "policyengine/populace-us",
@@ -100,7 +100,7 @@ export const COUNTRY_REGISTRY = {
     capabilities: ALL_CAPABILITIES,
     staging: {
       // Deprecated upstream identifier: the US staging publisher still uses
-      // the former Populace repository and deployment-variable names.
+      // the original repository and deployment-variable names.
       repo: "policyengine/populace-us-staging",
       revision: "main",
       repo_env: "POPULACE_STAGING_HF_REPO",
