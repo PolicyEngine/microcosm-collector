@@ -24,6 +24,8 @@ export type RunStatus = RunSummary["status"];
 
 /** The request header that carries the dashboard read credential. */
 export const READ_TOKEN_HEADER = "X-Telemetry-Read-Token";
+// The request header that carries a Vercel OIDC token, as a bearer token.
+const AUTHORIZATION_HEADER = "Authorization";
 /** The largest page the collector answers; it refuses a larger `limit`. */
 export const MAX_PAGE_SIZE = 200;
 /** How long a request may take, from sending it to reading its whole answer. */
@@ -38,14 +40,16 @@ export const COUNTRY_PATTERN = /^[A-Z]{2}$/;
 const RUN_NOT_FOUND = "Run was not found.";
 const MISSING_RUN = Symbol("missing run");
 
-export interface CollectorClientOptions {
+/**
+ * A credential, or a function that returns it. The function is called for
+ * every request, so the credential may rotate or expire between requests.
+ */
+export type CredentialSource = string | (() => string | Promise<string>);
+
+/** Where and how the client sends its requests. */
+export interface CollectorConnectionOptions {
   /** The collector's address: HTTPS, or HTTP on localhost or 127.0.0.1. */
   baseUrl: string;
-  /**
-   * The dashboard read credential, or a function that returns it. The
-   * function is called for every request, so the credential may rotate.
-   */
-  readToken: string | (() => string | Promise<string>);
   /** The `fetch` to send requests with; the global one by default. */
   fetch?: typeof globalThis.fetch | undefined;
   /**
@@ -54,6 +58,31 @@ export interface CollectorClientOptions {
    */
   timeoutMs?: number | undefined;
 }
+
+/** A client that sends the dashboard read credential. */
+export interface ReadTokenClientOptions extends CollectorConnectionOptions {
+  /** The dashboard read credential, sent in `X-Telemetry-Read-Token`. */
+  readToken: CredentialSource;
+  vercelOidcToken?: never;
+}
+
+/**
+ * A client that sends a consumer app's Vercel OIDC token, which the collector
+ * accepts from the Vercel projects and environments it is configured for.
+ */
+export interface VercelOidcClientOptions extends CollectorConnectionOptions {
+  /**
+   * The Vercel OIDC token, sent as `Authorization: Bearer <token>`, such as
+   * `getVercelOidcToken` from `@vercel/oidc`.
+   */
+  vercelOidcToken: CredentialSource;
+  readToken?: never;
+}
+
+/** Exactly one of `readToken` and `vercelOidcToken`. */
+export type CollectorClientOptions =
+  | ReadTokenClientOptions
+  | VercelOidcClientOptions;
 
 export interface ListRunsQuery {
   /** Only runs of this country: two capital letters, such as "US" or "GB". */
@@ -178,6 +207,48 @@ function isAbandoned(error: unknown): boolean {
   );
 }
 
+// The header that carries the request's credential and its value, read
+// from its source for every request.
+type CredentialHeader = () => Promise<[name: string, value: string]>;
+
+async function credentialValue(
+  source: CredentialSource,
+  emptyMessage: string,
+): Promise<string> {
+  const value = typeof source === "function" ? await source() : source;
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error(emptyMessage);
+  }
+  return value;
+}
+
+// Exactly one credential, checked as a JavaScript caller may pass the
+// options: a key given as undefined is not given.
+function credentialHeader(options: CollectorClientOptions): CredentialHeader {
+  const { readToken, vercelOidcToken } = options;
+  if (readToken !== undefined && vercelOidcToken === undefined) {
+    return async () => {
+      const token = await credentialValue(
+        readToken,
+        "The collector read credential is empty.",
+      );
+      return [READ_TOKEN_HEADER, token];
+    };
+  }
+  if (vercelOidcToken !== undefined && readToken === undefined) {
+    return async () => {
+      const token = await credentialValue(
+        vercelOidcToken,
+        "The Vercel OIDC token is empty.",
+      );
+      return [AUTHORIZATION_HEADER, `Bearer ${token}`];
+    };
+  }
+  throw new TypeError(
+    "A collector client takes exactly one of readToken and vercelOidcToken.",
+  );
+}
+
 function retryAfterSeconds(response: Response): number | null {
   const value = response.headers.get("Retry-After");
   if (value === null || !/^\d+$/.test(value.trim())) return null;
@@ -264,17 +335,7 @@ export function createCollectorClient(
 ): CollectorClient {
   const baseUrl = collectorBaseUrl(options.baseUrl);
   const timeoutMs = requestTimeout(options.timeoutMs);
-
-  async function readToken(): Promise<string> {
-    const token =
-      typeof options.readToken === "function"
-        ? await options.readToken()
-        : options.readToken;
-    if (typeof token !== "string" || !token.trim()) {
-      throw new Error("The collector read credential is empty.");
-    }
-    return token;
-  }
+  const credential = credentialHeader(options);
 
   // The parsed JSON body of a 200 answer, or `MISSING_RUN` for a run the
   // collector has no record of.
@@ -285,12 +346,13 @@ export function createCollectorClient(
     // The global fetch is looked up for each request, so one that a test or
     // framework installs after the client is created is used.
     const fetchFunction = options.fetch ?? globalThis.fetch;
+    const [credentialName, credentialText] = await credential();
     const response = await fetchFunction(`${baseUrl}${pathAndQuery}`, {
       method: "GET",
       cache: "no-store",
       headers: {
         Accept: "application/json",
-        [READ_TOKEN_HEADER]: await readToken(),
+        [credentialName]: credentialText,
       },
       signal: AbortSignal.timeout(timeoutMs),
     });

@@ -70,12 +70,36 @@ def test_the_spec_describes_only_read_api_v2() -> None:
             "description": "The dashboard read credential.",
             "in": "header",
             "name": "X-Telemetry-Read-Token",
-        }
+        },
+        "VercelOidcToken": {
+            "type": "http",
+            "description": (
+                "A consumer app's Vercel OIDC token, accepted from the Vercel "
+                "projects and environments this collector is configured for."
+            ),
+            "scheme": "bearer",
+            "bearerFormat": "JWT",
+        },
     }
+    assert "`X-Telemetry-Read-Token`" in spec["info"]["description"]
+    assert "`Authorization: Bearer`" in spec["info"]["description"]
     for operations in spec["paths"].values():
         for operation in operations.values():
-            assert operation["security"] == [{"ReadToken": []}]
-            assert {"200", "401", "422", "503"} <= set(operation["responses"])
+            # Two requirements: either credential is enough.
+            assert operation["security"] == [
+                {"ReadToken": []},
+                {"VercelOidcToken": []},
+            ]
+            assert {"200", "401", "403", "422", "503"} <= set(operation["responses"])
+            assert operation["responses"]["403"]["description"] == (
+                "The Vercel OIDC token is valid, but its Vercel project and "
+                "environment may not read this collector."
+            )
+            assert operation["responses"]["403"]["content"] == {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/ErrorMessage"}
+                }
+            }
 
 
 def test_the_spec_leaves_out_other_routes_security_schemes() -> None:
@@ -95,7 +119,10 @@ def test_the_spec_leaves_out_other_routes_security_schemes() -> None:
     response = TestClient(application).get("/v2/openapi.json")
 
     assert response.status_code == 200
-    assert set(response.json()["components"]["securitySchemes"]) == {"ReadToken"}
+    assert set(response.json()["components"]["securitySchemes"]) == {
+        "ReadToken",
+        "VercelOidcToken",
+    }
 
 
 def test_every_recorded_request_has_an_interaction(stored_client) -> None:
