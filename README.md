@@ -1085,7 +1085,7 @@ previous revision keeps answering.
 | Name | `<service>-orrery` | needs no variable of its own; `require-configuration` checks it fits Cloud Run's 49 characters before the deploy authenticates |
 | Identity | the runtime service account | it may read the bucket, connect to Cloud SQL and read the runtime database secret, as the service does |
 | Start | `uv run --no-sync uvicorn telemetry_collector.orrery_read_app:create_orrery_read_app_from_environment --factory --host 0.0.0.0 --port 8080 --no-access-log`, with container port 8080 | Cloud Run sends requests to and probes port 8080. The TCP startup probe checks only that the service listens: it has no health route |
-| Request timeout | 300 seconds | a fetch of a 64 MiB file reads it twice, in about 130 ranged reads of 1 MiB one after another, and sends it during the second read. Each Cloud Storage request gives up after 10 seconds without connecting or without data, and each call retries for at most 30 seconds: under a quarter of the timeout together |
+| Request timeout | 300 seconds | a fetch of a 64 MiB file reads it twice, in about 130 ranged reads of 1 MiB one after another, and sends it during the second read. Each Cloud Storage request gives up after 10 seconds without connecting or without data, and each call retries for at most 30 seconds: under a quarter of the timeout together. A page of the listing without a run or build ID lists up to 100 folders one after another, each within those limits, with no limit on the page as a whole: a bucket that answers slowly enough can take it past the timeout, and Cloud Run then answers 504 itself rather than the read service's 503 |
 | Memory, CPU, concurrency | 512 MiB, 1 CPU, 10 requests per instance | a request holds about one 1 MiB part of a file at a time, so ten fit beside the Python process with room to spare; hashing and sending are light work for one CPU |
 | Instances | 0 to 2, in both environments | each instance's database pool holds at most five connections, so the read service holds at most ten. microcosm-runs calls it only to show a run's files or its run list, and may cache public files |
 
@@ -1157,8 +1157,9 @@ nothing, and the read service reads no claim.
   - **Order:** newest `created_at` first; documents recorded at the same
     time come in descending order of `document_sha256`, then of
     `submission_id`, as in a run's listing.
-  - **Refusals:** a malformed `limit` or `before`, and either of them beside
-    `run_id` or `build_id`, answer 422 with `orrery_graph_query_invalid`.
+  - **Refusals:** a malformed `limit` or `before`, a `before` longer than
+    256 characters, and either of them beside `run_id` or `build_id`,
+    answer 422 with `orrery_graph_query_invalid`.
 - **`GET /v1/orrery-graphs/<submission_id>/<document_sha256>/<file_name>`**
   returns `graph.orrery.json` or one of its `upstream-<sha256>.json` files
   from the bucket. Each part is checked before it names an object: the

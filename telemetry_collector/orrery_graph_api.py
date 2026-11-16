@@ -104,6 +104,9 @@ CATALOGUE_RETRY_AFTER_SECONDS = 30
 #: listing of its folder in the bucket, for its effective visibility.
 RECENT_LISTING_MAXIMUM = 100
 RECENT_LISTING_DEFAULT = 50
+#: Longer than any ``before`` the listing gives, which is under 200
+#: characters, and short enough that decoding a longer one is never tried.
+MAXIMUM_CURSOR_LENGTH = 256
 
 LOGGER = logging.getLogger(__name__)
 
@@ -239,11 +242,15 @@ def _cursor_place(cursor: str) -> NewestFirstKey:
     refusing anything else with 422."""
 
     invalid = _query_invalid("before is not a cursor this listing gave.")
+    # A long one could hold JSON nested deeply enough for ``json.loads`` to
+    # run out of recursion.
+    if len(cursor) > MAXIMUM_CURSOR_LENGTH:
+        raise invalid
     try:
         padded = cursor + "=" * (-len(cursor) % 4)
         decoded = base64.b64decode(padded, altchars=b"-_", validate=True)
         parts = json.loads(decoded.decode())
-    except (ValueError, binascii.Error):
+    except (ValueError, RecursionError, binascii.Error):
         # ``UnicodeDecodeError`` and ``json.JSONDecodeError`` are
         # ``ValueError``s.
         raise invalid from None
