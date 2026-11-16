@@ -6,6 +6,26 @@ import {
   UnsupportedCalibrationDiagnosticsSchemaError,
 } from "./target-representation";
 
+// The local-area builds whose diagnostics predate `schema_version`, by the
+// build folder name each was published under and its file's SHA-256.
+const AUDITED_UNVERSIONED_ARTIFACTS = [
+  {
+    releaseId: "populace-us-2024-buildo-acs-local-77e2061-20260724T110908Z",
+    sha256:
+      "54251f2209c2e71bb1cce9f5626a3e59879847747156e873de51011c8e8b508f",
+  },
+  {
+    releaseId: "populace-us-2024-buildp-acs-local-592ae5d6-20260819T020303Z",
+    sha256:
+      "b6f05b652049f88c044f1907eeed13c378aea47aec9c6dd6518faa90d1a0dcd0",
+  },
+  {
+    releaseId: "populace-us-2024-buildo-acs-local-767312d60-20260923T074941Z",
+    sha256:
+      "f39d10a72415eb85ac0faa231f7970bffcc408bd53ef0f05985ea8dd0ac94903",
+  },
+];
+
 describe("calibration target representation", () => {
   test("dispatches historical and current readers only by top-level version", () => {
     for (const schemaVersion of [1, 2, 3, 4, 5, 6]) {
@@ -27,33 +47,12 @@ describe("calibration target representation", () => {
   });
 
   test("reads only the exact audited unversioned local-area artifacts", () => {
-    const auditedArtifacts = [
-      {
-        releaseId:
-          "populace-us-2024-buildo-acs-local-77e2061-20260724T110908Z",
-        sha256:
-          "54251f2209c2e71bb1cce9f5626a3e59879847747156e873de51011c8e8b508f",
-      },
-      {
-        releaseId:
-          "populace-us-2024-buildp-acs-local-592ae5d6-20260819T020303Z",
-        sha256:
-          "b6f05b652049f88c044f1907eeed13c378aea47aec9c6dd6518faa90d1a0dcd0",
-      },
-      {
-        releaseId:
-          "populace-us-2024-buildo-acs-local-767312d60-20260923T074941Z",
-        sha256:
-          "f39d10a72415eb85ac0faa231f7970bffcc408bd53ef0f05985ea8dd0ac94903",
-      },
-    ];
-
-    for (const identity of auditedArtifacts) {
+    for (const identity of AUDITED_UNVERSIONED_ARTIFACTS) {
       expect(
         targetRepresentationForDiagnosticsArtifact(undefined, identity),
       ).toBe("legacy");
     }
-    const { releaseId, sha256 } = auditedArtifacts.at(-1)!;
+    const { releaseId, sha256 } = AUDITED_UNVERSIONED_ARTIFACTS.at(-1)!;
     expect(() =>
       targetRepresentationForDiagnosticsArtifact(undefined, {
         releaseId,
@@ -64,6 +63,27 @@ describe("calibration target representation", () => {
       targetRepresentationForDiagnosticsArtifact(undefined, {
         releaseId: "unrecognized-release",
         sha256,
+      }),
+    ).toThrow(UnsupportedCalibrationDiagnosticsSchemaError);
+  });
+
+  test("reads the audited unversioned artifacts under their release folder", () => {
+    // releases.json now lists each of these builds under the
+    // `microcosm-us-2024-local` release, and the publisher identifies a
+    // listed build by its folder, `<release>/<build>`.
+    for (const { releaseId, sha256 } of AUDITED_UNVERSIONED_ARTIFACTS) {
+      expect(
+        targetRepresentationForDiagnosticsArtifact(undefined, {
+          releaseId: `microcosm-us-2024-local/${releaseId}`,
+          sha256,
+        }),
+      ).toBe("legacy");
+    }
+    const { releaseId } = AUDITED_UNVERSIONED_ARTIFACTS.at(-1)!;
+    expect(() =>
+      targetRepresentationForDiagnosticsArtifact(undefined, {
+        releaseId: `microcosm-us-2024-local/${releaseId}`,
+        sha256: "0".repeat(64),
       }),
     ).toThrow(UnsupportedCalibrationDiagnosticsSchemaError);
   });
