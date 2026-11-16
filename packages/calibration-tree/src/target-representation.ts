@@ -1,3 +1,5 @@
+import { buildNameOf } from "./release-record";
+
 export type TargetRepresentation =
   | "legacy"
   | "structured"
@@ -9,6 +11,8 @@ export type TargetRowRepresentation = "legacy" | "structured" | "hierarchy";
 
 export class UnsupportedCalibrationDiagnosticsSchemaError extends Error {}
 
+// Local-area builds whose diagnostics predate `schema_version`, keyed on the
+// build name, with the SHA-256 of the diagnostics file each was audited at.
 const KNOWN_UNVERSIONED_LEGACY_DIAGNOSTICS = new Map([
   [
     "populace-us-2024-buildo-acs-local-77e2061-20260724T110908Z",
@@ -60,7 +64,7 @@ export function targetRepresentationForDiagnosticsArtifact(
     return targetRepresentationForSchema(schemaVersion);
   }
   const expectedSha256 = KNOWN_UNVERSIONED_LEGACY_DIAGNOSTICS.get(
-    identity.releaseId,
+    buildNameOf(identity.releaseId),
   );
   if (expectedSha256 && identity.sha256 === expectedSha256) {
     return "legacy";

@@ -1,3 +1,5 @@
+import { buildNameOf } from "./release-record";
+
 export type HistoricalAttributionStatus =
   | "exact_reconstructed"
   | "derived"
@@ -434,3 +436,14 @@ export const HISTORICAL_ATTRIBUTION_SUPPORT: readonly HistoricalAttributionSuppo
 export const HISTORICAL_ATTRIBUTION_SUPPORT_BY_RELEASE = new Map(
   HISTORICAL_ATTRIBUTION_SUPPORT.map((entry) => [entry.releaseId, entry]),
 );
+
+/**
+ * The pinned recipe for a release, found by its build name whether the
+ * release is identified by that name or by its build folder,
+ * `<release>/<build>`.
+ */
+export function historicalAttributionSupportFor(
+  releaseId: string,
+): HistoricalAttributionSupport | undefined {
+  return HISTORICAL_ATTRIBUTION_SUPPORT_BY_RELEASE.get(buildNameOf(releaseId));
+}
