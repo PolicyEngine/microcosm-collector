@@ -114,7 +114,7 @@ test("derives microcosm-vs-JCT error per reform", () => {
   expect(row.direction).toBe("over"); // microcosm less negative than JCT
 });
 
-test("normalizes legacy populace reform calculations", () => {
+test("normalizes reform calculations stored under the legacy key", () => {
   const v = buildReformValidation(
     raw([
       {
@@ -139,7 +139,7 @@ test("normalizes legacy populace reform calculations", () => {
   expect(v.summary.n_scored).toBe(1);
 });
 
-test("prefers current microcosm calculations over legacy populace values", () => {
+test("prefers current microcosm calculations over values under the legacy key", () => {
   const v = buildReformValidation(
     raw([
       {
