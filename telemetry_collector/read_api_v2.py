@@ -289,9 +289,12 @@ def openapi_document(application: FastAPI) -> dict[str, Any]:
             "version": OPENAPI_VERSION,
             "description": (
                 "Version 2 of the Microcosm collector's read API. Each request "
-                "carries the dashboard read credential in "
-                "`X-Telemetry-Read-Token`. While a deployment is in progress, "
-                "every request may answer 503 with `Retry-After`."
+                "carries either the dashboard read credential in "
+                "`X-Telemetry-Read-Token` or a consumer app's Vercel OIDC token "
+                "in `Authorization: Bearer`, which the collector accepts from the "
+                "Vercel projects and environments it is configured for. While a "
+                "deployment is in progress, every request may answer 503 with "
+                "`Retry-After`."
             ),
         },
         "paths": paths,
