@@ -172,8 +172,14 @@ class LicensedRunsAndBuilds:
         return origin.run_id in self.run_ids or origin.build_id in self.build_ids
 
 
-def newest_first(document: RecordedGraphFile) -> tuple[datetime, str, str]:
-    """The sort key that, in reverse, lists a build's current document first."""
+#: A document's place in the order ``newest_first`` gives: its ``created_at``,
+#: then its ``document_sha256``, then its ``submission_id``.
+NewestFirstKey = tuple[datetime, str, str]
+
+
+def newest_first(document: RecordedGraphFile) -> NewestFirstKey:
+    """The sort key that, in reverse, lists a build's current document first,
+    and the recent listing newest first."""
 
     return (document.created_at, document.document_sha256, document.submission_id)
 
@@ -227,6 +233,13 @@ class OrreryGraphCatalogue(Protocol):
         self, submission_id: str, document_sha256: str
     ) -> RecordedGraphFile | None:
         """One recorded document, or ``None``."""
+
+    def recent_graph_files(
+        self, *, limit: int, before: NewestFirstKey | None = None
+    ) -> list[RecordedGraphFile]:
+        """At most ``limit`` recorded documents of every run, in the reverse of
+        the order ``newest_first`` gives, and only those that come after
+        ``before`` in it when it is given."""
 
     def producing_submissions(
         self, file_sha256s: Collection[str]
@@ -297,6 +310,31 @@ class PostgresOrreryGraphCatalogue:
             query = query.where(OrreryGraphFile.build_id == build_id)
         if country_code is not None:
             query = query.where(OrreryGraphFile.country_code == country_code)
+        with self._sessions() as session:
+            return [_recorded(row) for row in session.scalars(query)]
+
+    def recent_graph_files(
+        self, *, limit: int, before: NewestFirstKey | None = None
+    ) -> list[RecordedGraphFile]:
+        # The text columns are compared byte by byte, as Python compares
+        # strings in ``newest_first``, whatever the database's collation.
+        order = (
+            OrreryGraphFile.created_at,
+            OrreryGraphFile.document_sha256.collate("C"),
+            OrreryGraphFile.submission_id.collate("C"),
+        )
+        query = select(OrreryGraphFile)
+        if before is not None:
+            created_at, document_sha256, submission_id = before
+            query = query.where(
+                sa.tuple_(*order)
+                < sa.tuple_(
+                    sa.literal(created_at, OrreryGraphFile.created_at.type),
+                    sa.literal(document_sha256, sa.Text()),
+                    sa.literal(submission_id, sa.Text()),
+                )
+            )
+        query = query.order_by(*(column.desc() for column in order)).limit(limit)
         with self._sessions() as session:
             return [_recorded(row) for row in session.scalars(query)]
 
