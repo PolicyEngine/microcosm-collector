@@ -6,11 +6,12 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from threading import RLock
 from typing import Any
 
 from telemetry_collector.auth import HuggingFacePrincipal
-from telemetry_collector.google_cloud import cloud_task_id
+from telemetry_collector.google_cloud import StoredObjectConflictError, cloud_task_id
 from telemetry_collector.intake import (
     IntakeObjectMissingError,
     PlannedUpload,
@@ -229,6 +230,12 @@ class FakeSubmissionStore:
         with self._lock:
             record = self._submissions.get(submission_id)
             return None if record is None else self._with_job(record)
+
+    def records(self) -> list[SubmissionRecord]:
+        """Every recorded submission, whatever its status."""
+
+        with self._lock:
+            return [self._with_job(record) for record in self._submissions.values()]
 
     def _add_job(self, record: SubmissionRecord, processing_round: int) -> None:
         values = new_job_values(
@@ -488,6 +495,19 @@ class FakeIntakeObjectStore:
         self.objects[object_name] = (content, sha256, generation)
         return generation
 
+    def create_object(self, object_name: str, source: Path, *, sha256: str) -> bool:
+        """Create the object once, as ``GoogleCloudStorageIntake`` does."""
+
+        stored = self.objects.get(object_name)
+        if stored is not None:
+            if stored[1] != sha256:
+                raise StoredObjectConflictError(
+                    f"{object_name} is already stored without this file's SHA-256."
+                )
+            return False
+        self.upload(object_name, source.read_bytes(), sha256=sha256)
+        return True
+
     def sign_uploads(
         self, uploads: Sequence[PlannedUpload], *, lifetime_seconds: int
     ) -> list[SignedUpload]:
@@ -550,3 +570,26 @@ class FakeWorkerQueue:
         task_id = cloud_task_id(job_id, dispatch_number)
         if task_id not in self.task_ids:
             self.task_ids.append(task_id)
+
+
+class FakeOrreryGraphStore:
+    """In-memory ``orrery_graph_files``: the first record of each document stays.
+
+    ``created_at`` holds when each document was first recorded, as the
+    table's ``created_at`` column does.
+    """
+
+    def __init__(self, *, clock: Callable[[], datetime] | None = None) -> None:
+        self._clock = clock or (lambda: datetime.now(UTC))
+        self.records: dict[tuple[str, str], Any] = {}
+        self.created_at: dict[tuple[str, str], datetime] = {}
+        self.repeated: list[Any] = []
+
+    def record_graph(self, record: Any) -> bool:
+        key = (record.submission_id, record.document_sha256)
+        if key in self.records:
+            self.repeated.append(record)
+            return False
+        self.records[key] = record
+        self.created_at[key] = self._clock()
+        return True

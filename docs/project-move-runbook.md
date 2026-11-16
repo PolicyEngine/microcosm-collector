@@ -278,14 +278,18 @@ gcloud iam workload-identity-pools providers create-oidc microcosm-collector \
   --project "$NEW_PROJECT_ID" --location global --workload-identity-pool github \
   --issuer-uri https://token.actions.githubusercontent.com \
   --attribute-mapping "google.subject=assertion.sub,attribute.actor=assertion.actor,attribute.ref=assertion.ref,attribute.repository=assertion.repository" \
-  --attribute-condition "assertion.repository=='PolicyEngine/microcosm-collector' && assertion.ref=='refs/heads/main'"
+  --attribute-condition "assertion.repository=='PolicyEngine/microcosm-collector' && assertion.ref=='refs/heads/main' && assertion.environment in ['staging', 'production']"
 gcloud iam service-accounts add-iam-policy-binding "$DEPLOY_SERVICE_ACCOUNT" \
   --project "$NEW_PROJECT_ID" --role roles/iam.workloadIdentityUser \
   --member "principalSet://iam.googleapis.com/projects/$NEW_PROJECT_NUMBER/locations/global/workloadIdentityPools/github/attribute.repository/PolicyEngine/microcosm-collector"
 ```
 
 The mapping and condition are the ones in the README's "Google Cloud access"
-section. The provider's resource name, for the `TELEMETRY_GCP_WIF_PROVIDER`
+section, with the environment clause it requires once a job outside the two
+deployment environments requests an OIDC token, as the npm jobs and the daily
+Hugging Face check do. The deployment jobs run in `staging` and `production`,
+so they keep their access, and no other job's token can act as the new
+deployment account at any point of the move. The provider's resource name, for the `TELEMETRY_GCP_WIF_PROVIDER`
 secret, is
 `projects/$NEW_PROJECT_NUMBER/locations/global/workloadIdentityPools/github/providers/microcosm-collector`.
 
@@ -1149,16 +1153,27 @@ Once production's copy is verified, in this order. Each creates its cloud
 resources once, in the new project, and needs nothing in the current project.
 
 1. **The collector's own Hugging Face token and its daily check (S1, S2;
-   #13, #18, #19).** Before merging each PR, create in the new project what
-   its README section names. For S1: one secret per environment, each
+   #13, #18, #19).** Create in the new project what each PR's README section
+   names: before merging it, or, for a PR that merged before the move, as
+   part of the move. For S1: one secret per environment, each
    holding that environment's own token and readable only by the account
    that environment's worker job runs as, which reads it as
    `COLLECTOR_HF_READ_TOKEN`. For
-   S2: production's check job, its Cloud Scheduler job and the account it
-   starts the job as, a notification channel and two Cloud Monitoring alert
-   policies, and its production variables (`TELEMETRY_WORKER_SERVICE_ACCOUNT`,
-   `TELEMETRY_HF_CHECK_JOB`, `TELEMETRY_HF_READ_SECRET_NAME`). Enable
-   `cloudscheduler.googleapis.com` and `monitoring.googleapis.com`.
+   S2: production's check job and its production variables
+   (`TELEMETRY_WORKER_SERVICE_ACCOUNT`, `TELEMETRY_HF_CHECK_JOB`,
+   `TELEMETRY_HF_READ_SECRET_NAME`); and for the daily workflow that starts
+   it, the `huggingface-check` environment and its five secrets, the check's
+   own Workload Identity pool and provider, and the account the workflow acts
+   as, with its access to the job and the project's logs (the README's "Daily
+   Hugging Face check"). Before the workflow first runs, the deploy's
+   provider must check the environment. Step 4.2 creates it with that clause;
+   for a provider created without it, add it first:
+
+   ```bash
+   gcloud iam workload-identity-pools providers update-oidc microcosm-collector \
+     --project "$NEW_PROJECT_ID" --location global --workload-identity-pool github \
+     --attribute-condition "assertion.repository=='PolicyEngine/microcosm-collector' && assertion.ref=='refs/heads/main' && assertion.environment in ['staging', 'production']"
+   ```
 2. **Switching intake on.** Everything in the README's "Artifact intake"
    section: the bucket, the Cloud Tasks queue, the worker and recovery jobs,
    the recovery job's schedule, the accounts and permissions, and the

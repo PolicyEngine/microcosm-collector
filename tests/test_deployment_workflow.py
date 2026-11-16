@@ -41,6 +41,10 @@ WORKLOAD_IDENTITY_SECRETS = {
 # npm's trusted publishing takes this job's GitHub OIDC token; it never
 # authenticates to Google Cloud (tests/test_calibration_tree_package.py).
 NPM_PUBLISH_JOB = ("publish-calibration-tree.yaml", "publish")
+# The daily Hugging Face check starts the check job and reads its logs as an
+# account of its own, from the huggingface-check environment, on a schedule
+# and by hand from main (tests/test_huggingface_check_workflow.py).
+CHECK_JOB = ("huggingface-check.yaml", "check")
 CALIBRATION_TREE_PACKAGE = Path("packages") / "calibration-tree"
 
 
@@ -113,10 +117,11 @@ def test_deployment_runs_only_when_collector_deploy_is_enabled() -> None:
         ("push.yaml", "deploy-production"): "production",
         ("push.yaml", PUBLISH_CLIENT_JOB): "npm",
         NPM_PUBLISH_JOB: "npm",
+        CHECK_JOB: "huggingface-check",
     }
 
 
-def test_google_cloud_authentication_runs_only_on_pushes_to_main() -> None:
+def test_google_cloud_authentication_runs_only_from_main() -> None:
     def jobs_where(condition) -> dict:
         return {
             (workflow_path.name, job_name): (workflow, job)
@@ -134,7 +139,7 @@ def test_google_cloud_authentication_runs_only_on_pushes_to_main() -> None:
     push_only_oidc_jobs = {
         job_key: workflow_and_job
         for job_key, workflow_and_job in oidc_jobs.items()
-        if job_key != NPM_PUBLISH_JOB
+        if job_key not in {NPM_PUBLISH_JOB, CHECK_JOB}
     }
 
     # Only the release pass of push.yaml reaches these jobs, and pull requests,
@@ -142,6 +147,7 @@ def test_google_cloud_authentication_runs_only_on_pushes_to_main() -> None:
     assert set(authenticating_jobs) == {
         ("push.yaml", "deploy-staging"),
         ("push.yaml", "deploy-production"),
+        CHECK_JOB,
     }
     assert set(oidc_jobs) == set(authenticating_jobs) | {
         ("push.yaml", PUBLISH_CLIENT_JOB),
@@ -182,8 +188,11 @@ def test_oidc_tokens_and_workload_identity_secrets_stay_with_their_jobs() -> Non
         )
         if workflow_path.name == NPM_PUBLISH_JOB[0]:
             expected_jobs = {NPM_PUBLISH_JOB[1]}
+        if workflow_path.name == CHECK_JOB[0]:
+            expected_jobs = {CHECK_JOB[1]}
         assert oidc_jobs == expected_jobs, workflow_path.name
     assert NPM_PUBLISH_JOB[0] in {path.name for path in workflow_paths()}
+    assert CHECK_JOB[0] in {path.name for path in workflow_paths()}
 
     jobs = load_workflow(PUSH_WORKFLOW)["jobs"]
     for job_name in DEPLOY_JOBS:
@@ -384,6 +393,8 @@ def test_service_deployment_reads_resource_names_from_environment_variables() ->
         "WORKER_SERVICE_ACCOUNT": "TELEMETRY_WORKER_SERVICE_ACCOUNT",
         "WORKER_INVOKER_SERVICE_ACCOUNT": "TELEMETRY_WORKER_INVOKER_SERVICE_ACCOUNT",
         "RECOVERY_SERVICE_ACCOUNT": "TELEMETRY_RECOVERY_SERVICE_ACCOUNT",
+        "ORRERY_BUCKET": "TELEMETRY_ORRERY_BUCKET",
+        "ORRERY_READER_SERVICE_ACCOUNT": "TELEMETRY_ORRERY_READER_SERVICE_ACCOUNT",
     }
     for environment_name, github_variable_name in expected_variables.items():
         assert (
@@ -426,6 +437,39 @@ def test_both_deploy_jobs_read_their_calibration_tree_blob_secret_name() -> None
     assert PUSH_WORKFLOW.read_text(encoding="utf-8").count(mapping) == 2
 
 
+def test_both_deploy_jobs_read_their_orrery_bucket() -> None:
+    jobs = load_workflow(PUSH_WORKFLOW)["jobs"]
+    mapping = "${{ vars.TELEMETRY_ORRERY_BUCKET }}"
+
+    # Each environment names its own private bucket, which its worker job
+    # publishes to and its service reads from; no step passes it anywhere else.
+    for job_name in DEPLOY_JOBS:
+        assert jobs[job_name]["env"].get("ORRERY_BUCKET") == mapping, job_name
+        for step in jobs[job_name]["steps"]:
+            assert "ORRERY_BUCKET" not in step.get("env", {}), (job_name, step)
+    assert PUSH_WORKFLOW.read_text(encoding="utf-8").count(mapping) == 2
+
+
+def test_both_deploy_jobs_read_their_orrery_reader_service_account() -> None:
+    jobs = load_workflow(PUSH_WORKFLOW)["jobs"]
+    mapping = "${{ vars.TELEMETRY_ORRERY_READER_SERVICE_ACCOUNT }}"
+
+    # Each environment names the service account of its own microcosm-runs
+    # deployments, at job level; no step sets it. The deploy grants it the
+    # Orrery read service's Cloud Run Invoker role and passes it to no
+    # container (tests/test_deploy_script.py).
+    for job_name in DEPLOY_JOBS:
+        assert jobs[job_name]["env"].get("ORRERY_READER_SERVICE_ACCOUNT") == mapping, (
+            job_name
+        )
+        for step in jobs[job_name]["steps"]:
+            assert "ORRERY_READER_SERVICE_ACCOUNT" not in step.get("env", {}), (
+                job_name,
+                step,
+            )
+    assert PUSH_WORKFLOW.read_text(encoding="utf-8").count(mapping) == 2
+
+
 def deploy_step(job: dict, command: str) -> dict:
     matching_steps = [
         step
@@ -465,13 +509,39 @@ def test_release_updates_both_intake_jobs_between_migration_and_candidate(
     assert deploy_step(job, "deploy-candidate")["env"] == {"IMAGE_URI": image_source}
 
 
+@pytest.mark.parametrize(
+    ("job_name", "image_source"),
+    [
+        ("deploy-staging", "${{ steps.image.outputs.uri }}"),
+        ("deploy-production", "${{ needs.deploy-staging.outputs.image_uri }}"),
+    ],
+)
+def test_release_deploys_the_orrery_read_service_once_the_service_is_released(
+    job_name: str, image_source: str
+) -> None:
+    job = load_workflow(PUSH_WORKFLOW)["jobs"][job_name]
+
+    # The read service reads the migrated database, so it is deployed after
+    # the migration; last, so that a failure leaves the service released and
+    # out of maintenance mode.
+    read_service_step = step_position(job, "deploy-orrery-read-service")
+    assert step_position(job, "apply-migrations") < read_service_step
+    assert step_position(job, "verify-stable-service") < read_service_step
+    assert read_service_step == len(job["steps"]) - 1
+    assert deploy_step(job, "deploy-orrery-read-service")["env"] == {
+        "IMAGE_URI": image_source
+    }
+
+
 def test_collector_uses_store_vocabulary() -> None:
     forbidden_term = "repo" + "sitory"
     # GitHub's expression context and the OIDC claim and attribute names in
-    # Workload Identity conditions use the word; the collector's own words do not.
+    # Workload Identity conditions use the word, and so does a function the daily
+    # Hugging Face check calls from the emitter's interface package; the
+    # collector's own words do not.
     external_names = [
         f"{prefix}.{forbidden_term}" for prefix in ("github", "assertion", "attribute")
-    ]
+    ] + [f"release_rules.check_{forbidden_term}"]
     source_suffixes = {
         ".env",
         ".ini",
@@ -554,7 +624,7 @@ def test_workflow_shell_logic_lives_in_scripts() -> None:
                     assert "\n" not in step["run"].strip(), (workflow_path.name, step)
 
     workflow = PUSH_WORKFLOW.read_text(encoding="utf-8")
-    assert workflow.count("run: scripts/deploy.sh") == 34
+    assert workflow.count("run: scripts/deploy.sh") == 37
     for command in (
         "require-configuration",
         "validate-environment-target",
@@ -573,8 +643,43 @@ def test_workflow_shell_logic_lives_in_scripts() -> None:
         "route-service-traffic",
         "verify-stable-service",
         "create-database-backup",
+        "deploy-orrery-read-service",
+        "configure-huggingface-check-job",
     ):
         assert f"run: scripts/deploy.sh {command}" in workflow
+
+
+def test_only_production_configures_the_huggingface_check_job() -> None:
+    staging_job = push_job_text("deploy-staging", "deploy-production")
+    production_job = push_job_text("deploy-production", None)
+    command = "run: scripts/deploy.sh configure-huggingface-check-job"
+
+    assert command not in staging_job
+    assert production_job.count(command) == 1
+    check_step = production_job[production_job.index(command) :]
+    assert check_step.index(
+        "IMAGE_URI: ${{ needs.deploy-staging.outputs.image_uri }}"
+    ) < (check_step.index("- name:"))
+    # A misconfigured check job stops the deploy before production changes.
+    assert production_job.index("check-secrets-exist") < production_job.index(command)
+    assert production_job.index(command) < production_job.index("deploy-maintenance")
+
+
+def test_huggingface_check_job_reads_its_names_from_production_variables() -> None:
+    staging_job = push_job_text("deploy-staging", "deploy-production")
+    production_job = push_job_text("deploy-production", None)
+
+    for environment_name, github_variable_name in {
+        "HF_CHECK_JOB": "TELEMETRY_HF_CHECK_JOB",
+        "WORKER_SERVICE_ACCOUNT": "TELEMETRY_WORKER_SERVICE_ACCOUNT",
+        "HF_READ_SECRET_NAME": "TELEMETRY_HF_READ_SECRET_NAME",
+    }.items():
+        mapping = f"{environment_name}: ${{{{ vars.{github_variable_name} }}}}"
+        assert production_job.count(mapping) == 1
+    # Each environment has its own worker service account and read token, so
+    # staging reads those two as well; only the check job's name is
+    # production's alone.
+    assert "TELEMETRY_HF_CHECK_JOB" not in staging_job
 
 
 def test_service_image_contains_alembic_runtime_files() -> None:

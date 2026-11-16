@@ -1,8 +1,11 @@
 // Validates one Orrery graph document with the pinned @axiom-foundation/orrery,
 // accepting exactly the graph file contents microcosm-runs' publication
 // accepts (lib/service.ts at PolicyEngine/microcosm-runs
-// 204aa72247fd1589d3ee3a07fc4fe453f3692d93). Its checks on the publication
-// itself (file sizes and names) are the Orrery worker's.
+// 204aa72247fd1589d3ee3a07fc4fe453f3692d93). microcosm-runs' checks on the
+// publication itself (file sizes and names) are not made here: they belong to
+// a publication to microcosm-runs, while the collector publishes graph files
+// to its own private bucket, and its projection already refuses a document
+// over 64 MiB.
 //
 // 1. the bytes decode as strict UTF-8 and parse as JSON ("invalid_json");
 // 2. Orrery's parseGraphDocument accepts the document ("invalid_graph");

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -38,8 +39,11 @@ MAX_JOB_DISPATCHES = 3
 UNCLAIMED_JOB_IDLE_SECONDS = 30 * 60
 # The ``processed_by`` of the default handler, which only checks the bytes.
 INTAKE_ONLY_HANDLER = "intake-only"
+#: The owner of the submissions the collector makes itself for past builds
+#: (``reproject-past-builds``). No Hugging Face user has this ID.
+COLLECTOR_OWNER_HF_ID = "microcosm-collector"
 
-SubmissionKind = Literal["calibration-diagnostics", "orrery-inputs"]
+SubmissionKind = Literal["calibration-diagnostics", "orrery-inputs", "releases-record"]
 SubmissionStatus = Literal[
     "awaiting_upload", "queued", "processing", "succeeded", "rejected", "failed"
 ]
@@ -62,6 +66,19 @@ HUGGINGFACE_REPO_PATTERN = rf"^{HUGGINGFACE_REPO_PART}/{HUGGINGFACE_REPO_PART}$"
 GIT_COMMIT_PATTERN = r"^[0-9a-f]{40}$"
 HUGGINGFACE_FOLDER_PATTERN = rf"^{BUILD_IDENTIFIER}(/{BUILD_IDENTIFIER})*$"
 MAX_HUGGINGFACE_FOLDER_CHARACTERS = 512
+#: An ``upstream`` file's name: ``upstream-<its SHA-256>.json``, as Microcosm
+#: names each producing run's file it copies (``save_graph_schema``). Intake
+#: doesn't check it; the Orrery graph handler requires it, so the service can
+#: take a served upstream file's SHA-256 from its name.
+UPSTREAM_FILE_NAME_PATTERN = r"^upstream-([0-9a-f]{64})\.json$"
+
+
+def upstream_file_sha256(name: str) -> str | None:
+    """The SHA-256 an upstream file's name gives, or ``None`` for a name not
+    of the form ``upstream-<64 lowercase hex characters>.json``."""
+
+    named = re.fullmatch(UPSTREAM_FILE_NAME_PATTERN, name)
+    return None if named is None else named.group(1)
 
 
 @dataclass(frozen=True)
@@ -86,6 +103,11 @@ ROLE_RULES: dict[str, dict[str, RoleRule]] = {
         "upstream": RoleRule(0, None, 64 * MEBIBYTE),
         "evidence": RoleRule(0, None, 2 * GIBIBYTE),
     },
+    # A release repo's releases.json after a change made a build current; the
+    # record's writer accepts at most 4 MiB.
+    "releases-record": {
+        "releases_record": RoleRule(1, 1, 4 * MEBIBYTE),
+    },
 }
 
 
@@ -95,7 +117,8 @@ class HuggingFaceLocation(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     repo: str = Field(pattern=HUGGINGFACE_REPO_PATTERN)
-    # The commit that added the folder, never a later commit, branch or tag.
+    # The commit that added the folder, never a later commit, branch or tag;
+    # for releases-record, the commit that wrote the submitted releases.json.
     commit: str = Field(pattern=GIT_COMMIT_PATTERN)
     # Each segment starts with a letter or digit, so "." and ".." cannot occur.
     folder: str = Field(
@@ -184,7 +207,23 @@ class SubmissionRequest(BaseModel):
             raise ValueError(
                 "calibration-diagnostics submissions need Hugging Face provenance"
             )
+        if self.kind == "releases-record":
+            self._enforce_releases_record_provenance()
         return self
+
+    def _enforce_releases_record_provenance(self) -> None:
+        # The record's repo and commit, and the build the change made current.
+        provenance = self.provenance
+        if provenance.huggingface is None:
+            raise ValueError("releases-record submissions need Hugging Face provenance")
+        if provenance.release is None:
+            raise ValueError("releases-record submissions need a release")
+        build_folder = f"releases/{provenance.release}/{provenance.build_id}"
+        if provenance.huggingface.folder != build_folder:
+            raise ValueError(
+                "a releases-record submission's folder must be "
+                "releases/<release>/<build_id>, the folder of the build made current"
+            )
 
     def sorted_files(self) -> list[dict[str, Any]]:
         """The inventory as plain values, sorted by file name."""

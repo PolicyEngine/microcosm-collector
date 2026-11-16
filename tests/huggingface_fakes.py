@@ -2,8 +2,12 @@
 
 It answers through ``httpx.MockTransport``, so no test reaches the network. It
 serves dataset information, recursive file lists (paginated with a ``Link``
-header, as Hugging Face does) and file downloads, and redirects downloads of
-LFS files to a separate content host, as Hugging Face does.
+header, as Hugging Face does), one folder's entries with ``expand=true``
+(each with its ``lastCommit``) and file downloads, and redirects downloads of
+LFS files to a separate content host, as Hugging Face does. A 404 carries
+Hugging Face's ``X-Error-Code``: ``RepoNotFound``, ``RevisionNotFound`` or
+``EntryNotFound``. A download of one file can be answered with a status of its
+own (``FakeDataset.file_answers``), while the dataset's other reads succeed.
 """
 
 from __future__ import annotations
@@ -18,6 +22,8 @@ import httpx
 ENDPOINT = "https://huggingface.co"
 CONTENT_HOST = "https://cdn-lfs.example.test"
 LFS_POINTER_BYTES = 134
+#: The date of every last commit a test doesn't set.
+DEFAULT_COMMIT_DATE = "2026-10-23T00:42:24.000Z"
 
 
 @dataclass
@@ -28,6 +34,21 @@ class FakeDataset:
     head_commit: str = "0" * 40
     #: Answer every request for this dataset with this status instead.
     forced_status: int | None = None
+    #: Answer a download of these files with this status and, when given,
+    #: this ``X-Error-Code`` instead; every other read is answered as usual.
+    file_answers: dict[str, tuple[int, str | None]] = field(default_factory=dict)
+    #: Report these SHA-256 values for LFS files instead of their content's.
+    reported_lfs_sha256: dict[str, str] = field(default_factory=dict)
+    #: The last commit (ID and date) of each file or folder, by path, for
+    #: listings with expand=true; ``None`` leaves ``lastCommit`` out. A path
+    #: not listed gets the head commit and ``DEFAULT_COMMIT_DATE``.
+    last_commits: dict[str, tuple[str, str] | None] = field(default_factory=dict)
+
+
+def not_found(error_code: str) -> httpx.Response:
+    return httpx.Response(
+        404, json={"error": error_code}, headers={"X-Error-Code": error_code}
+    )
 
 
 class FakeHuggingFace:
@@ -77,8 +98,11 @@ class FakeHuggingFace:
             if len(parts) == 2:
                 return self._guarded(request, name, self._information)
             if len(parts) >= 4 and parts[2] == "tree":
+                folder = "/".join(parts[4:])
                 return self._guarded(
-                    request, name, lambda dataset: self._tree(request, name, parts[3])
+                    request,
+                    name,
+                    lambda dataset: self._tree(request, name, parts[3], folder),
                 )
         if path.startswith("/datasets/"):
             parts = path.removeprefix("/datasets/").split("/")
@@ -96,7 +120,7 @@ class FakeHuggingFace:
     def _guarded(self, request, name, respond) -> httpx.Response:
         dataset = self.datasets.get(name)
         if dataset is None:
-            return httpx.Response(404, json={"error": "Dataset not found"})
+            return not_found("RepoNotFound")
         if dataset.forced_status is not None:
             return httpx.Response(dataset.forced_status, json={"error": "forced"})
         authorized = request.headers.get("Authorization") == f"Bearer {self.token}"
@@ -114,26 +138,74 @@ class FakeHuggingFace:
     def _check_revision(self, dataset: FakeDataset, revision: str) -> bool:
         return revision in {"main", dataset.head_commit}
 
-    def _tree(self, request: httpx.Request, name: str, revision: str):
+    def _tree(self, request: httpx.Request, name: str, revision: str, folder: str):
         dataset = self.datasets[name]
         if not self._check_revision(dataset, revision):
-            return httpx.Response(404, json={"error": "Revision not found"})
+            return not_found("RevisionNotFound")
         query = parse_qs(request.url.query.decode())
-        if query.get("recursive") != ["true"]:
-            return httpx.Response(400, json={"error": "expected recursive=true"})
-        entries = self._entries(dataset)
+        if query.get("recursive") == ["true"] and not folder:
+            entries = self._entries(dataset)
+            listing_query = {"recursive": "true"}
+            listing_path = f"{ENDPOINT}/api/datasets/{name}/tree/{revision}"
+        elif query.get("expand") == ["true"] and folder:
+            entries = self._folder_entries(dataset, folder)
+            if not entries:
+                return not_found("EntryNotFound")
+            listing_query = {"expand": "true"}
+            listing_path = f"{ENDPOINT}/api/datasets/{name}/tree/{revision}/{folder}"
+        else:
+            return httpx.Response(
+                400, json={"error": "expected recursive=true or a folder with expand"}
+            )
         offset = int(query.get("cursor", ["0"])[0])
         page = entries[offset : offset + self.page_size]
         headers = {}
         if offset + self.page_size < len(entries):
-            next_query = urlencode(
-                {"recursive": "true", "cursor": offset + self.page_size}
-            )
-            headers["Link"] = (
-                f"<{ENDPOINT}/api/datasets/{name}/tree/{revision}?{next_query}>; "
-                'rel="next"'
-            )
+            next_query = urlencode({**listing_query, "cursor": offset + self.page_size})
+            headers["Link"] = f'<{listing_path}?{next_query}>; rel="next"'
         return httpx.Response(200, content=json.dumps(page), headers=headers)
+
+    def _folder_entries(self, dataset: FakeDataset, folder: str) -> list[dict]:
+        """The entries directly inside ``folder``, each with its last commit."""
+
+        prefix = f"{folder}/"
+        children = sorted(
+            {
+                file_path.removeprefix(prefix).split("/", 1)[0]
+                for file_path in dataset.files
+                if file_path.startswith(prefix)
+            }
+        )
+        entries: list[dict] = []
+        for child in children:
+            child_path = prefix + child
+            if child_path in dataset.files:
+                content = dataset.files[child_path]
+                entry: dict = {
+                    "type": "file",
+                    "oid": git_blob_id(content),
+                    "size": len(content),
+                    "path": child_path,
+                }
+            else:
+                entry = {
+                    "type": "directory",
+                    "oid": "f" * 40,
+                    "size": 0,
+                    "path": child_path,
+                }
+            last_commit = dataset.last_commits.get(
+                child_path, (dataset.head_commit, DEFAULT_COMMIT_DATE)
+            )
+            if last_commit is not None:
+                commit, date = last_commit
+                entry["lastCommit"] = {
+                    "id": commit,
+                    "title": f"Change {child}",
+                    "date": date,
+                }
+            entries.append(entry)
+        return entries
 
     def _entries(self, dataset: FakeDataset) -> list[dict]:
         folders = sorted(
@@ -156,7 +228,9 @@ class FakeHuggingFace:
             }
             if file_path in dataset.lfs_paths:
                 entry["lfs"] = {
-                    "oid": hashlib.sha256(content).hexdigest(),
+                    "oid": dataset.reported_lfs_sha256.get(
+                        file_path, hashlib.sha256(content).hexdigest()
+                    ),
                     "size": len(content),
                     "pointerSize": LFS_POINTER_BYTES,
                 }
@@ -164,10 +238,17 @@ class FakeHuggingFace:
         return entries
 
     def _resolve(self, name, dataset, revision, file_path) -> httpx.Response:
+        if file_path in dataset.file_answers:
+            status_code, error_code = dataset.file_answers[file_path]
+            return httpx.Response(
+                status_code,
+                json={"error": error_code or "forced"},
+                headers={"X-Error-Code": error_code} if error_code else {},
+            )
         if not self._check_revision(dataset, revision):
-            return httpx.Response(404, json={"error": "Revision not found"})
+            return not_found("RevisionNotFound")
         if file_path not in dataset.files:
-            return httpx.Response(404, json={"error": "Entry not found"})
+            return not_found("EntryNotFound")
         if file_path in dataset.lfs_paths:
             digest = hashlib.sha256(dataset.files[file_path]).hexdigest()
             return httpx.Response(
