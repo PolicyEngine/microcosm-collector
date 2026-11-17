@@ -84,11 +84,6 @@ export async function readCalibrationTreeManifest(options: {
     {
       access: "private",
       useCache: options.consistent === false,
-      // A consistent read's ETag is the one a conditional write sends back as
-      // ifMatch. Vercel Blob gives a compressed response the weak form of the
-      // ETag (W/"…"), which no write matches, so this read asks for the
-      // manifest as stored.
-      ...(options.consistent === true ? { headers: { "accept-encoding": "identity" } } : {}),
       ...tokenOption(options.token),
     },
   );

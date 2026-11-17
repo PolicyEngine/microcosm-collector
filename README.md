@@ -1606,12 +1606,7 @@ immutable path (keeping a part already stored with the same bytes), then
 writes the manifest with a compare-and-swap: it creates the manifest only if
 it is still absent and replaces it only if its ETag is still the one read, so
 a manifest another writer changed is never overwritten, and a manifest read
-without an ETag is never replaced. The publication and latest commands read
-the manifest uncompressed (`accept-encoding: identity`): Vercel Blob gives a
-compressed response the weak form of the blob's ETag (`W/"…"`), while a
-conditional write compares the strong one, so a weak ETag would make every
-replacement of the manifest fail. A manifest read with a weak ETag anyway is
-never replaced either. A build asked to become its country's
+without an ETag is never replaced. A build asked to become its country's
 latest does so only if it is at least as new (`createdAt`) as the current
 latest. Exit 2 means the build is refused: another build is already recorded
 for the same release build or staged run, or the same build was already
@@ -1959,15 +1954,15 @@ bun run typecheck
 
 `packages/calibration-tree/provenance.json` records the calibration-diagnostics
 commit the package was copied from, each copied file's git blob ID, the copied
-files changed here and why (its `changed` map), and the files that exist only
+files changed here and why (only `package.json`), and the files that exist only
 here. `src/provenance.test.ts` fails when a copied file no longer has its
 recorded blob ID, when a file is neither copied nor listed as the collector's
 own, or when a file listed as changed is identical to the dashboard's.
 
 While calibration-diagnostics keeps its copy, a change merged there is carried
 over by copying the changed files from a calibration-diagnostics commit,
-keeping this repo's changes to the files `changed` lists, and recording that
-commit and the new blob IDs, which git lists with:
+keeping this repo's changes to `package.json`, and recording that commit and
+the new blob IDs, which git lists with:
 
 ```bash
 git -C ../calibration-diagnostics ls-tree -r \

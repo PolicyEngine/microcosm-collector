@@ -4,7 +4,6 @@
   "directory": "frontend/packages/calibration-tree",
   "changed": {
     "package.json": "Publishable from this repository: not private, with a license, the repository, public access, the published files, the worker's, the publication command's, the latest command's and the manifest read's exports and their scripts.",
-    "src/calibration-tree-blob.ts": "A consistent manifest read asks for the manifest uncompressed, so its ETag is the strong one that Vercel Blob's conditional writes compare, not the weak one a compressed response carries.",
     "src/countries.ts": "Its comments drop the microdata stack's former product name; its code matches the copy.",
     "src/latest-artifact.test.ts": "One test name drops the microdata stack's former product name.",
     "src/latest-artifact.ts": "One comment drops the microdata stack's former product name.",
