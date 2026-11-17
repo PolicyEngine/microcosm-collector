@@ -1519,6 +1519,102 @@ def test_worker_and_publication_refusals_are_final() -> None:
     assert not any(outcome.incomplete for outcome in outcomes)
 
 
+@dataclass
+class StoredMeanwhile(StandInBun):
+    """The tree package's processes, where another writer stores a build's tree.
+
+    The entry ``stored_meanwhile`` gives for a source joins the store's
+    manifest just before that source's publication runs, as a submission's
+    tree does when it is published while this run builds the same build.
+    """
+
+    stored_meanwhile: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    def __call__(
+        self, argv: Sequence[str], env: Mapping[str, str], timeout: float
+    ) -> subprocess.CompletedProcess[str]:
+        if Path(argv[2]).name == "calibration-tree-publication.ts":
+            worker = json.loads(Path(argv[3]).read_text())["worker"]
+            source = worker["manifestEntry"]["sourceId"]
+            if source in self.stored_meanwhile:
+                builds = self.store["countries"][worker["country"]]["builds"]
+                builds.append(self.stored_meanwhile[source])
+        return super().__call__(argv, env, timeout)
+
+
+def stored_release(source_id: str, build_artifact_id: str) -> dict[str, Any]:
+    """A US release build's entry in the store's manifest, from another writer."""
+
+    return {
+        "buildArtifactId": build_artifact_id,
+        "kind": "release",
+        "sourceId": source_id,
+        "label": source_id,
+        "releaseId": source_id,
+        "stagingRunId": None,
+        "hfRepo": US_RELEASES,
+        "hfCommitSha": "f" * 40,
+        "treeSchemaVersion": 6,
+        "indexSha256": "e" * 64,
+        "indexBytes": 1000,
+        "createdAt": "2026-10-20T09:00:00Z",
+        "updatedAt": "2026-10-20T09:00:00Z",
+    }
+
+
+def test_a_tree_stored_meanwhile_from_the_same_file_is_already_stored() -> None:
+    # A submission of the older build publishes its tree from the same
+    # calibration diagnostics (the same build ID) while this run builds it, so
+    # this run's publication is refused with exit 2.
+    reconciliation = us_release_reconciliation()
+    same_build = build_id("us", "release", OLDER_ID)
+    reconciliation.bun = StoredMeanwhile(
+        stored_meanwhile={OLDER_ID: stored_release(OLDER_ID, same_build)}
+    )
+    reconciliation.bun.publication_exits[OLDER_ID] = 2
+
+    outcomes = reconciliation.run()
+
+    assert outcomes_by_source(outcomes) == [
+        (CURRENT_ID, "built"),
+        (OLDER_ID, "already_stored"),
+    ]
+    older = outcome_of(outcomes, OLDER_ID)
+    assert older.build_artifact_id == same_build
+    assert older.incomplete is False
+
+
+def test_a_tree_stored_meanwhile_from_another_file_stays_refused() -> None:
+    # Guard: refused before and after the change.
+    reconciliation = us_release_reconciliation()
+    reconciliation.bun = StoredMeanwhile(
+        stored_meanwhile={OLDER_ID: stored_release(OLDER_ID, "c" * 64)}
+    )
+    reconciliation.bun.publication_exits[OLDER_ID] = 2
+
+    outcomes = reconciliation.run()
+
+    assert outcome_of(outcomes, OLDER_ID).outcome == "refused"
+    assert outcome_of(outcomes, OLDER_ID).incomplete is False
+
+
+@pytest.mark.parametrize("publication_exit", [1, 3])
+def test_a_failed_publication_is_an_incomplete_error(publication_exit: int) -> None:
+    # Guard: exit 3 is what the publication answers for a manifest read with a
+    # weak ETag (collector#72), as for any store error; running again may
+    # succeed, so the execution exits 1 and Cloud Run tries again.
+    reconciliation = us_release_reconciliation()
+    reconciliation.bun.publication_exits[OLDER_ID] = publication_exit
+
+    outcomes = reconciliation.run()
+
+    assert outcomes_by_source(outcomes) == [
+        (CURRENT_ID, "built"),
+        (OLDER_ID, "error"),
+    ]
+    assert outcome_of(outcomes, OLDER_ID).incomplete is True
+
+
 def test_each_outcome_is_one_json_document() -> None:
     reconciliation = us_release_reconciliation()
 
