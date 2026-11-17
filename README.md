@@ -1603,8 +1603,10 @@ CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN=... \
 `src/calibration-tree-manifest-read.ts` only reads: it prints the store's
 manifest as one JSON line, read without the cache and checked with the
 manifest's own rules (an empty manifest while the store has none), for the
-backfill to compare with production's. It exits 1 without its token and 3
-when the store can't be read or its manifest breaks the rules.
+backfill to compare with production's, the reconcile command to see what the
+store holds, and `build_and_publish` to check a refused build (below). It
+exits 1 without its token and 3 when the store can't be read or its manifest
+breaks the rules.
 
 The worker builds a release exactly as the publisher builds it from the same
 files, commit and publication time, and a staged run as the publisher builds a
@@ -1701,12 +1703,28 @@ from the submission; only the latest build is decided from Hugging Face.
   already recorded from another submission), rejects the submission; any
   other failure, including a manifest another writer changed meanwhile, fails
   the attempt so it runs again.
+- **A tree already stored from the same files.** When the publication
+  refuses the build, the store's manifest is read. If it holds a tree of the
+  same kind for the same release build or staged run with the same build ID,
+  the SHA-256 of the same calibration diagnostics, another writer stored it
+  first: the reconcile command (see "Queuing calibration tree builds"), the
+  backfill or another submission, whose index records another time or label.
+  The submission then succeeds, with `already_stored: true` and
+  `made_latest: false` in its result instead of the part counts. It moves no
+  latest; the reconcile command ends each release run, after its builds, by
+  making the latest follow `releases.json`, and a `releases-record`
+  submission's handler finds the stored tree. A refused build with another
+  build ID, run or kind is still `calibration_tree_refused`, and a manifest
+  that can't be read fails the attempt.
 
 `build_and_publish` in the same module runs the tree worker and the
-publication command for one planned tree, and the backfill runs it too. The
-handler has it read `releases.json` under the lock, as above; the backfill
-reads nothing there and asks for the latest from production's manifest (see
-"Backfilling calibration trees from Hugging Face").
+publication command for one planned tree, and the backfill and the reconcile
+command run it too. The handler has it read `releases.json` under the lock,
+as above; the backfill reads nothing there and asks for the latest from
+production's manifest (see "Backfilling calibration trees from Hugging
+Face"), and the reconcile command never asks for the latest. A refused build
+that the store holds from the same files is the backfill's `refused` and the
+reconcile command's `already_stored`.
 
 The image holds Bun 1.4.2, copied from the official image by digest, and the
 package's production install, without its tests, fixtures and test support.
@@ -2117,7 +2135,11 @@ Python. Without `--kind` it covers both kinds, or only releases for BE.
   its run manifest's.
 - A build whose folder (`releases/<release>/<build>` or `staged/<run>`) a
   `queued` or `processing` `calibration-diagnostics` submission holds is
-  `submission_in_progress`: the submission builds it.
+  `submission_in_progress`: the submission builds it. A submission that
+  arrives after this command stored its build's tree succeeds as
+  `already_stored` (see "Building trees from submissions"), and a build
+  whose submission stores its tree while this command builds it is
+  `already_stored` here.
 - Builds use the backfill's steps, one at a time; a file over 256 MiB is
   `too_large`, and no build starts after 40 minutes of the execution.
 - Each kind runs inside a Postgres session advisory lock of its own country
@@ -2163,12 +2185,12 @@ Each build's outcome:
 |---|---|---|
 | `would_build` | a dry run would build it | |
 | `built` | built and published, never as the latest | yes |
-| `already_stored` | the store holds it | yes |
+| `already_stored` | the store holds it, or gained its tree from the same calibration diagnostics while it was built, so its publication was refused | yes |
 | `submission_in_progress` | a `queued` or `processing` submission of its folder builds it | yes |
 | `ineligible` | a release folder without diagnostics, or whose release manifest is absent or names another build; a staging run that isn't final; a final staging run without calibration diagnostics, as the publisher reports one: a schema-1 folder without `calibration_diagnostics.json`, a structured run that declares neither diagnostics nor a staged dataset, a staged-dataset receipt of a skipped, failed or disabled staging, or a bundle that records no diagnostics file with a SHA-256 | yes |
 | `unbuildable` | the worker refused the files (exit 2), or a staging run's documents are incompatible: a run manifest that isn't a JSON object, names another run or has an unsupported schema, and the backfill's own checks of a run's files, such as declared or recorded diagnostics that are absent or differ from their SHA-256 | yes |
 | `too_large` | a file is over 256 MiB | yes |
-| `refused` | the publication refused the build (exit 2) | yes |
+| `refused` | the publication refused the build (exit 2), and the store holds no tree for it from the same calibration diagnostics | yes |
 | `no_releases_record` | the release repo has no `releases.json`; nothing is built | yes |
 | `releases_record_refused` | `releases.json` breaks the record's rules; nothing is built | yes |
 | `error` | a Hugging Face failure, the store's manifest could not be read, a Bun exit 1 or 3, or a timeout | no |
@@ -2247,6 +2269,12 @@ past builds again".
   publisher's staging listing stops at either.
 - The command reads the `progress.json` of every schema-1 run that
   `runs.json` doesn't list. The publisher reads at most 50 of them.
+- A build skipped as `submission_in_progress` is not built later if that
+  submission then fails or is rejected: the outcome is final, so it waits
+  for the next request for its country and kind, or for the submission to
+  be reprocessed.
+- An execution stopped by the worker job's one-hour task timeout leaves its
+  request row without `finished_at` or `summary`.
 - Builds are ordered by the time they are published with (the progress's
   `updated_at`, else the run manifest's), then by run ID. The publisher
   orders its staging listing by each run's summary `updated_at`, then

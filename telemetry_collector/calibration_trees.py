@@ -31,6 +31,17 @@ without moving the latest, and the result says why (``latest_skipped``).
 Staging trees never become the latest. The publication command still moves
 the latest only to a build at least as new as the current latest.
 
+A submission whose tree another writer stored first (the reconcile command,
+the backfill or another submission) succeeds without a tree of its own. The
+publication refuses it, because the stored index records another time or
+label, and the store's manifest then shows a tree of the same kind for the
+same release build or staged run with the same build ID, the SHA-256 of the
+same calibration diagnostics (``TreeAlreadyStoredError``). Its result says
+``already_stored`` and it moves no latest: the reconcile command ends each
+release run, after its builds, by making the latest follow ``releases.json``.
+A refused tree with another build ID, run or kind still rejects the
+submission.
+
 When a published build is made current later, with
 ``microcosm-publish-release-build --promote``, no tree is built. Microcosm
 then submits the repo's new ``releases.json`` as a ``releases-record``
@@ -465,6 +476,51 @@ class TreeRefusedError(Exception):
     """The publication command refused the build (exit 2); another run cannot help."""
 
 
+class TreeAlreadyStoredError(TreeRefusedError):
+    """The publication refused a build whose tree the store already holds.
+
+    The store's manifest records a tree of the same kind for the same release
+    build or staged run with the same build ID, which is the SHA-256 of the
+    calibration diagnostics both were built from. Another writer (the reconcile
+    command, the backfill or another submission) published it first, and its
+    index records another time or label, so the publication refused this one.
+    """
+
+    def __init__(self, message: str, *, build_artifact_id: str) -> None:
+        super().__init__(message)
+        self.build_artifact_id = build_artifact_id
+
+
+def stored_from_same_diagnostics(
+    manifest: Mapping[str, Any], plan: TreeBuildPlan, build_artifact_id: str
+) -> bool:
+    """Whether ``manifest`` holds ``plan``'s build with ``build_artifact_id``.
+
+    The entry must be ``plan``'s country's, of its kind, for its release build
+    (``releaseId``) or staged run (``stagingRunId``), with that build ID.
+    """
+
+    countries = manifest.get("countries")
+    country = countries.get(plan.country) if isinstance(countries, Mapping) else None
+    builds = country.get("builds") if isinstance(country, Mapping) else None
+    if not isinstance(builds, list):
+        return False
+    source_field, source_id = (
+        ("releaseId", plan.release_id)
+        if plan.kind == "release"
+        else ("stagingRunId", plan.run_id)
+    )
+    if source_id is None:
+        return False
+    return any(
+        isinstance(entry, Mapping)
+        and entry.get("buildArtifactId") == build_artifact_id
+        and entry.get("kind") == plan.kind
+        and entry.get(source_field) == source_id
+        for entry in builds
+    )
+
+
 def _answer(completed: subprocess.CompletedProcess[str], step: str) -> dict[str, Any]:
     lines = completed.stdout.strip().splitlines()
     try:
@@ -562,6 +618,12 @@ def build_and_publish(
     any other failure raises ``CalibrationTreeCommandError``, and a timeout
     ``subprocess.TimeoutExpired``. Whatever ``decide_latest`` raises is
     raised before anything is published.
+
+    After a publication exit 2, the store's manifest is read, outside the
+    lock: if it holds this build's tree with the worker's build ID
+    (``stored_from_same_diagnostics``), the refusal is
+    ``TreeAlreadyStoredError``, a ``TreeRefusedError``. A manifest that
+    can't be read raises ``CalibrationTreeCommandError``, as it can't tell.
     """
 
     request_path = directory / "request.json"
@@ -609,7 +671,13 @@ def build_and_publish(
             PUBLICATION_TIMEOUT_SECONDS,
         )
     if published.returncode == EXIT_ENTRY_REFUSED:
-        raise TreeRefusedError(shortened_message(published.stderr))
+        message = shortened_message(published.stderr)
+        build_artifact_id = worker_answer.get("buildArtifactId")
+        if isinstance(build_artifact_id, str) and stored_from_same_diagnostics(
+            read_store_manifest(commands), plan, build_artifact_id
+        ):
+            raise TreeAlreadyStoredError(message, build_artifact_id=build_artifact_id)
+        raise TreeRefusedError(message)
     if published.returncode != 0:
         raise CalibrationTreeCommandError(
             f"The tree publication exited with {published.returncode}: "
@@ -710,6 +778,19 @@ def calibration_tree_handler(
                 raise SubmissionRejectedError(
                     "calibration_tree_unbuildable", str(error)
                 ) from error
+            except TreeAlreadyStoredError as error:
+                # Another writer stored this tree from the same files first:
+                # the submission's tree is in the store, so it succeeds. It
+                # moves no latest; the reconcile command's latest step and
+                # the releases-record handler make the latest follow
+                # releases.json.
+                return {
+                    "processed_by": "calibration-tree",
+                    "build_artifact_id": error.build_artifact_id,
+                    "kind": plan.kind,
+                    "already_stored": True,
+                    "made_latest": False,
+                }
             except TreeRefusedError as error:
                 raise SubmissionRejectedError(
                     "calibration_tree_refused", str(error)

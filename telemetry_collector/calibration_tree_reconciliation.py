@@ -51,7 +51,12 @@ Python:
 
 A build whose folder (``releases/<release>/<build>`` or ``staged/<run>``) a
 ``queued`` or ``processing`` ``calibration-diagnostics`` submission holds is
-``submission_in_progress``: the submission builds it.
+``submission_in_progress``: the submission builds it. A submission that
+arrives later finds the tree this command stored and succeeds as
+``already_stored`` (``calibration_trees.TreeAlreadyStoredError``), and a
+build whose submission stores its tree while this command builds it is
+``already_stored`` here too: in both, the store holds the build's tree from
+the same calibration diagnostics.
 
 **Building.** With the backfill's steps (``release_source``,
 ``staging_source`` and ``build_and_publish_source``): one build at a time,
@@ -123,6 +128,7 @@ from telemetry_collector.calibration_trees import (
     SAFE_IDENTIFIER,
     STAGING_REPOS,
     FollowedLatest,
+    TreeAlreadyStoredError,
     TreeCommands,
     TreeRefusedError,
     TreeUnbuildableError,
@@ -932,6 +938,17 @@ class _Reconciliation:
             published = build_and_publish_source(source, self.reader, self.commands)
         except (SourceUnbuildableError, TreeUnbuildableError) as error:
             return outcome("unbuildable", reason=shortened_message(str(error)))
+        except TreeAlreadyStoredError as error:
+            # A submission (or another writer) stored this build's tree from
+            # the same files while it was being built.
+            return outcome(
+                "already_stored",
+                reason=(
+                    "The store gained this build's tree from the same calibration "
+                    "diagnostics while it was built, so its publication was refused."
+                ),
+                build_artifact_id=error.build_artifact_id,
+            )
         except TreeRefusedError as error:
             return outcome("refused", reason=shortened_message(str(error)))
         except Exception as error:
