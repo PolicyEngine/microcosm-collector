@@ -1,3 +1,10 @@
+## [0.24.0] - 2026-11-17
+
+### Added
+
+- The Orrery read service lists the recorded Orrery graph documents of every run, newest first and a page at a time, when `GET /v1/orrery-graphs` has neither a run ID nor a build ID, so microcosm-runs can show which runs have graphs. That request answered 422 before. `limit` or `before` beside a run or build ID answers 422.
+
+
 ## [0.23.0] - 2026-11-17
 
 ### Added
