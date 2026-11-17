@@ -1,3 +1,10 @@
+## [0.24.1] - 2026-11-17
+
+### Fixed
+
+- The calibration tree publication and latest commands can now replace an existing manifest in Vercel Blob. They read the manifest uncompressed, so the ETag their conditional write sends is the strong one the store compares, not the weak one (`W/"…"`) that a compressed response carries; before, every replacement of a manifest the store served compressed failed with "Precondition failed: ETag mismatch". A manifest read with a weak ETag is refused before any write.
+
+
 ## [0.24.0] - 2026-11-17
 
 ### Added
