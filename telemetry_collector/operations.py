@@ -26,10 +26,27 @@ answering before it was classed. With ``--dry-run`` it only lists what it would
 project, from Hugging Face's listings: it downloads no build's graph inputs
 and writes nothing.
 
+``backfill-calibration-trees --production-manifest-url URL`` fills the
+collector's calibration tree store with every build production's public tree
+manifest lists (``telemetry_collector.calibration_tree_backfill``), building
+each missing one from its Hugging Face files. ``URL`` is the dashboard's
+``https://<dashboard>/api/microcosm/tree-manifest``, which it requests for
+each country without any credential. ``--country`` (repeatable) and
+``--kind`` limit it, and ``--dry-run`` lists what it would build, from
+Hugging Face's listings and the store's manifest, downloading no diagnostics
+and building nothing. It needs ``DATABASE_URL`` (for the manifest lock),
+``COLLECTOR_HF_READ_TOKEN`` and ``COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN``, so
+it runs as an execution of the worker job with its arguments overridden. It
+prints one document for each entry, then a summary, and exits 1 when the run
+is incomplete: an entry ended in an error or was deferred past the time
+limit, a country's manifest could not be used, or a country's latest build
+was not made the store's latest; and 2 for an argument error.
+
 Run them with ``python -m telemetry_collector.operations recover``,
 ``python -m telemetry_collector.operations reprocess``,
-``python -m telemetry_collector.operations past-builds`` and
-``python -m telemetry_collector.operations reproject-past-builds``.
+``python -m telemetry_collector.operations past-builds``,
+``python -m telemetry_collector.operations reproject-past-builds`` and
+``python -m telemetry_collector.operations backfill-calibration-trees``.
 """
 
 from __future__ import annotations
@@ -42,8 +59,15 @@ from collections import Counter
 from collections.abc import Sequence
 from dataclasses import asdict, replace
 from typing import Any, get_args
+from urllib.parse import urlsplit
 
-from telemetry_collector import past_builds
+import httpx
+
+from telemetry_collector import (
+    calibration_tree_backfill,
+    calibration_trees,
+    past_builds,
+)
 from telemetry_collector.database import create_database_engine
 from telemetry_collector.google_cloud import (
     CloudTasksWorkerQueue,
@@ -73,6 +97,8 @@ from telemetry_collector.submissions import (
 
 OPERATIONS_REQUIREMENT = "running operator commands"
 REPROJECTION_REQUIREMENT = "projecting past builds again"
+BACKFILL_REQUIREMENT = "backfilling calibration trees"
+BACKFILL_COMMAND = "backfill-calibration-trees"
 #: Projected builds whose document isn't published: their jobs wait for the
 #: scheduled recovery (queued, processing) or ended without one (failed,
 #: rejected). They don't make the command exit non-zero.
@@ -183,7 +209,45 @@ def _argument_parser() -> argparse.ArgumentParser:
             "writing nothing."
         ),
     )
+    backfill = commands.add_parser(
+        BACKFILL_COMMAND,
+        help="Build every calibration tree production's tree manifest lists.",
+    )
+    backfill.add_argument(
+        "--production-manifest-url",
+        required=True,
+        metavar="URL",
+        help="Production's tree manifest, https://<dashboard>/api/microcosm/tree-manifest.",
+    )
+    backfill.add_argument(
+        "--country",
+        action="append",
+        dest="countries",
+        choices=list(calibration_trees.RELEASE_REPOS),
+        help="Backfill only this country; repeat for several. Every country by default.",
+    )
+    backfill.add_argument(
+        "--kind",
+        choices=["release", "staging"],
+        help="Backfill only release or only staging builds. Both by default.",
+    )
+    backfill.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "List what would be built, downloading no diagnostics, building "
+            "nothing and taking no lock."
+        ),
+    )
     return parser
+
+
+def _is_https_address(value: str) -> bool:
+    try:
+        address = urlsplit(value)
+    except ValueError:
+        return False
+    return address.scheme == "https" and bool(address.hostname)
 
 
 def _worker_queue_from_environment() -> CloudTasksWorkerQueue:
@@ -295,14 +359,66 @@ def _reproject_past_builds(database_url: str, *, dry_run: bool) -> int:
     return 1 if incomplete_run_ids else 0
 
 
+def _backfill_calibration_trees(database_url: str, options: argparse.Namespace) -> int:
+    blob_token_setting = calibration_trees.BLOB_TOKEN_SETTING
+    blob_token = os.environ.get(blob_token_setting, "").strip()
+    if not blob_token:
+        raise RuntimeError(
+            f"{blob_token_setting} is required when {BACKFILL_REQUIREMENT}."
+        )
+    countries = list(options.countries or calibration_trees.RELEASE_REPOS)
+    kinds = (
+        [options.kind] if options.kind else list(calibration_tree_backfill.BUILD_KINDS)
+    )
+    outcomes = []
+    with (
+        HuggingFaceReader.from_environment() as reader,
+        # Production's manifest is public: this client sends no credential.
+        httpx.Client(
+            timeout=calibration_tree_backfill.PRODUCTION_MANIFEST_TIMEOUT_SECONDS
+        ) as production_client,
+    ):
+        engine = create_database_engine(database_url)
+        try:
+            commands = calibration_trees.tree_commands(
+                blob_token=blob_token,
+                manifest_lock=calibration_trees.postgres_manifest_lock(engine),
+                size_limits=calibration_trees.size_limits_from(os.environ),
+            )
+            # Each outcome is printed as it is produced, so a run that stops
+            # early still logs every entry it finished.
+            for outcome in calibration_tree_backfill.backfill_calibration_trees(
+                production_manifest_url=options.production_manifest_url,
+                reader=reader,
+                production_client=production_client,
+                commands=commands,
+                countries=countries,
+                kinds=kinds,
+                dry_run=options.dry_run,
+            ):
+                _print_json(outcome.to_json())
+                outcomes.append(outcome)
+        finally:
+            engine.dispose()
+    summary = calibration_tree_backfill.summarize(outcomes, countries)
+    _print_json({"summary": summary})
+    return 1 if summary["incomplete"] else 0
+
+
 def main(arguments: Sequence[str] | None = None) -> int:
     """Run one operator command.
 
-    Non-zero when a reprocessing was refused, or when projecting past builds
-    left any build incomplete.
+    Non-zero when a reprocessing was refused, when projecting past builds
+    left any build incomplete, or when a backfill of calibration trees is
+    incomplete; 2 for an argument error.
     """
 
-    options = _argument_parser().parse_args(arguments)
+    parser = _argument_parser()
+    options = parser.parse_args(arguments)
+    if options.command == BACKFILL_COMMAND and not _is_https_address(
+        options.production_manifest_url
+    ):
+        parser.error("--production-manifest-url must be an https:// address.")
     if options.command == "reprocess" and bool(options.submission_ids) == bool(
         options.kind
     ):
@@ -316,6 +432,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return _print_past_builds(database_url)
     if options.command == "reproject-past-builds":
         return _reproject_past_builds(database_url, dry_run=options.dry_run)
+    if options.command == BACKFILL_COMMAND:
+        return _backfill_calibration_trees(database_url, options)
     dry_run = options.command == "reprocess" and options.dry_run
     worker_queue = None if dry_run else _worker_queue_from_environment()
     engine = create_database_engine(database_url)

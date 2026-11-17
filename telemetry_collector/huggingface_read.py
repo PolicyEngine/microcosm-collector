@@ -17,6 +17,10 @@ to a credential with a different scope.
 The reader sends the token only to Hugging Face: it never follows an API
 redirect or a file-list page to another host, and httpx drops the
 ``Authorization`` header when a download is redirected to another host.
+``download_file`` follows a download's redirects itself and sends the token
+only to Hugging Face's own host, never to the content host an LFS file is
+served from. It streams the file to disk, so a file larger than
+``read_file``'s limit is never held in memory.
 
 A read Hugging Face answers with anything but HTTP 200 raises
 ``HuggingFaceReadError`` with the status and, for a 404, Hugging Face's
@@ -27,11 +31,13 @@ so a reader can tell a missing file or folder from a missing repo or revision
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import Path
 from types import TracebackType
 from typing import Any, Final
 from urllib.parse import quote
@@ -50,6 +56,9 @@ HUGGINGFACE_ENDPOINT: Final = "https://huggingface.co"
 REQUEST_TIMEOUT_SECONDS: Final = 30.0
 #: Files read whole are records and manifests; anything larger is refused.
 MAX_FILE_BYTES: Final = 64 * 1024 * 1024
+#: How many redirects a download follows before it is refused.
+MAX_DOWNLOAD_REDIRECTS: Final = 5
+_DOWNLOAD_CHUNK_BYTES: Final = 1024 * 1024
 _DATASET_NAME: Final = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$"
 )
@@ -154,7 +163,8 @@ class HuggingFaceReadError(RuntimeError):
     """A read that Hugging Face did not answer with HTTP 200.
 
     ``status_code`` is ``None`` when Hugging Face could not be reached, and 200
-    when it answered with something the reader could not use.
+    when it answered with something the reader could not use, or when the
+    listing of a file to download already shows it is too large.
     ``error_code`` is Hugging Face's ``X-Error-Code`` header, when it sent one.
     """
 
@@ -198,6 +208,15 @@ class DatasetFile:
     blob_id: str
     #: For a file stored with LFS, the SHA-256 of its content.
     lfs_sha256: str | None
+
+
+@dataclass(frozen=True)
+class DownloadedFile:
+    """A file ``download_file`` wrote to disk and checked against its listing."""
+
+    path: Path
+    size: int
+    sha256: str
 
 
 @dataclass(frozen=True)
@@ -289,6 +308,22 @@ class HuggingFaceReader:
             if entry.get("type") != "directory"
         ]
 
+    def list_folder(
+        self, dataset: str, folder: str, revision: str
+    ) -> list[DatasetFile]:
+        """The files directly inside ``folder`` at ``revision``, without subfolders."""
+
+        _check_dataset_name(dataset)
+        url = self._url(
+            f"/api/datasets/{dataset}/tree/{quote(revision, safe='')}/"
+            f"{quote(folder, safe='/')}"
+        )
+        return [
+            _dataset_file(dataset, entry)
+            for entry in self._list_entries(dataset, url, "folder list", {})
+            if entry.get("type") != "directory"
+        ]
+
     def last_commits(
         self, dataset: str, folder: str, revision: str
     ) -> dict[str, LastCommit]:
@@ -335,7 +370,7 @@ class HuggingFaceReader:
         """Each entry of a listing, read page by page on Hugging Face's host."""
 
         page_url: httpx.URL | None = url
-        page_parameters: dict[str, str] | None = parameters
+        page_parameters: dict[str, str] | None = parameters or None
         while page_url is not None:
             response = self._get(dataset, page_url, description, page_parameters)
             entries = _json(dataset, response, description)
@@ -384,6 +419,74 @@ class HuggingFaceReader:
             raise _unreachable(dataset, f"file {path}") from error
         return bytes(content)
 
+    def download_file(
+        self,
+        dataset: str,
+        listed: DatasetFile,
+        revision: str,
+        destination: Path,
+        *,
+        max_bytes: int,
+    ) -> DownloadedFile:
+        """Stream ``listed`` at ``revision`` to ``destination`` and check it.
+
+        A file listed as larger than ``max_bytes`` is refused before it is
+        requested. The download must have the listed size, and the listed
+        SHA-256 for a file stored with LFS or the listed git blob ID
+        otherwise; one that differs, or that runs past its listed size, is
+        refused, and ``destination`` is removed. Redirects are followed here,
+        and the token goes only to Hugging Face's own host.
+        """
+
+        _check_dataset_name(dataset)
+        description = f"file {listed.path}"
+        if listed.size > max_bytes:
+            raise HuggingFaceReadError(
+                dataset,
+                200,
+                f"{listed.path} in {dataset} is larger than {max_bytes} bytes.",
+            )
+        url = self._url(
+            f"/datasets/{dataset}/resolve/{quote(revision, safe='')}/"
+            f"{quote(listed.path, safe='/')}"
+        )
+        try:
+            downloaded = self._download(dataset, url, listed, destination, description)
+        except BaseException:
+            destination.unlink(missing_ok=True)
+            raise
+        return downloaded
+
+    def _download(
+        self,
+        dataset: str,
+        url: httpx.URL,
+        listed: DatasetFile,
+        destination: Path,
+        description: str,
+    ) -> DownloadedFile:
+        for _ in range(MAX_DOWNLOAD_REDIRECTS + 1):
+            # The token goes only to Hugging Face's own host.
+            headers = self._authorization() if self._is_hugging_face(url) else {}
+            try:
+                with self._client.stream(
+                    "GET", url, headers=headers, follow_redirects=False
+                ) as response:
+                    if response.is_redirect:
+                        url = response.url.join(response.headers["Location"])
+                        continue
+                    if response.status_code != 200:
+                        raise _status_error(dataset, response, description)
+                    return _write_checked(dataset, response, listed, destination)
+            except httpx.HTTPError as error:
+                raise _unreachable(dataset, description) from error
+        raise HuggingFaceReadError(
+            dataset,
+            None,
+            f"The download of {listed.path} from {dataset} was redirected more "
+            f"than {MAX_DOWNLOAD_REDIRECTS} times.",
+        )
+
     # Requests -------------------------------------------------------------
 
     def _url(self, path: str) -> httpx.URL:
@@ -418,6 +521,44 @@ class HuggingFaceReader:
         if response.status_code != 200:
             raise _status_error(dataset, response, description)
         return response
+
+
+def _write_checked(
+    dataset: str,
+    response: httpx.Response,
+    listed: DatasetFile,
+    destination: Path,
+) -> DownloadedFile:
+    """Write the answer's bytes to ``destination``, checking them against ``listed``."""
+
+    content_sha256 = hashlib.sha256()
+    # Git hashes a blob's header, which holds its size, and then its bytes.
+    blob_sha1 = hashlib.sha1(f"blob {listed.size}\0".encode(), usedforsecurity=False)
+    written = 0
+    differs = HuggingFaceReadError(
+        dataset,
+        200,
+        f"{listed.path} in {dataset} as downloaded differs from its listing.",
+    )
+    with destination.open("wb") as output:
+        for chunk in response.iter_bytes(_DOWNLOAD_CHUNK_BYTES):
+            written += len(chunk)
+            if written > listed.size:
+                raise differs
+            content_sha256.update(chunk)
+            blob_sha1.update(chunk)
+            output.write(chunk)
+    if written != listed.size:
+        raise differs
+    if listed.lfs_sha256 is not None:
+        matches = content_sha256.hexdigest() == listed.lfs_sha256
+    else:
+        matches = blob_sha1.hexdigest() == listed.blob_id
+    if not matches:
+        raise differs
+    return DownloadedFile(
+        path=destination, size=written, sha256=content_sha256.hexdigest()
+    )
 
 
 def _status_error(
