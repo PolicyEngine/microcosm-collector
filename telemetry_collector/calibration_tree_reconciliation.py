@@ -55,8 +55,10 @@ A build whose folder (``releases/<release>/<build>`` or ``staged/<run>``) a
 arrives later finds the tree this command stored and succeeds as
 ``already_stored`` (``calibration_trees.TreeAlreadyStoredError``), and a
 build whose submission stores its tree while this command builds it is
-``already_stored`` here too: in both, the store holds the build's tree from
-the same calibration diagnostics.
+``already_stored`` here too: a release build's tree with the same build ID,
+or any tree of the same staged run (this command builds a staged bundle from
+its diagnostics alone, its submission from its diagnostics and build
+manifest).
 
 **Building.** With the backfill's steps (``release_source``,
 ``staging_source`` and ``build_and_publish_source``): one build at a time,
@@ -939,13 +941,14 @@ class _Reconciliation:
         except (SourceUnbuildableError, TreeUnbuildableError) as error:
             return outcome("unbuildable", reason=shortened_message(str(error)))
         except TreeAlreadyStoredError as error:
-            # A submission (or another writer) stored this build's tree from
-            # the same files while it was being built.
+            # A submission (or another writer) stored a tree for this build
+            # while it was being built.
             return outcome(
                 "already_stored",
                 reason=(
-                    "The store gained this build's tree from the same calibration "
-                    "diagnostics while it was built, so its publication was refused."
+                    "The store gained a tree for this build while it was built "
+                    f"(build {error.build_artifact_id}), so its publication was "
+                    "refused."
                 ),
                 build_artifact_id=error.build_artifact_id,
             )

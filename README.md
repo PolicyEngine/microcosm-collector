@@ -1698,24 +1698,32 @@ from the submission; only the latest build is decided from Hugging Face.
 - **Results.** A published tree's result names its build ID, kind, how many
   parts were uploaded or already stored, and whether it became the latest.
   The worker refusing the files (`calibration_tree_unbuildable`), or the
-  build being refused (`calibration_tree_refused`: another build already
-  recorded for the same release build or staged run, or the same files
-  already recorded from another submission), rejects the submission; any
-  other failure, including a manifest another writer changed meanwhile, fails
-  the attempt so it runs again.
-- **A tree already stored from the same files.** When the publication
-  refuses the build, the store's manifest is read. If it holds a tree of the
-  same kind for the same release build or staged run with the same build ID,
-  the SHA-256 of the same calibration diagnostics, another writer stored it
-  first: the reconcile command (see "Queuing calibration tree builds"), the
-  backfill or another submission, whose index records another time or label.
-  The submission then succeeds, with `already_stored: true` and
-  `made_latest: false` in its result instead of the part counts. It moves no
-  latest; the reconcile command ends each release run, after its builds, by
-  making the latest follow `releases.json`, and a `releases-record`
-  submission's handler finds the stored tree. A refused build with another
-  build ID, run or kind is still `calibration_tree_refused`, and a manifest
-  that can't be read fails the attempt.
+  build being refused when the store holds no tree for it (below;
+  `calibration_tree_refused`: another build already recorded for the same
+  release build), rejects the submission; any other failure, including a
+  manifest another writer changed meanwhile, fails the attempt so it runs
+  again.
+- **A tree already stored.** When the publication refuses the build, the
+  store's manifest is read. Another writer stored the build's tree first
+  (the reconcile command, see "Queuing calibration tree builds"; the
+  backfill; or another submission) when the manifest holds:
+  - for a release build, a tree of the same release build with the same
+    build ID, whose index records another time or label. A tree's build ID
+    is a hash of the tree schema version, country, kind, source ID and each
+    source file's SHA-256;
+  - for a staged run, a tree of the same run with any build ID. The
+    reconcile command builds a staged bundle from its diagnostics alone,
+    while its submission also sends its build manifest, so their build IDs
+    differ, and the manifest keeps one tree per staged run.
+
+  The submission then succeeds, with `already_stored: true`, the stored
+  tree's `build_artifact_id`, the `submitted_build_artifact_id` its own files
+  give, and `made_latest: false` in its result instead of the part counts. It
+  moves no latest; the reconcile command ends each release run, after its
+  builds, by making the latest follow `releases.json`, and a
+  `releases-record` submission's handler finds the stored tree. Any other
+  refused build is still `calibration_tree_refused`, and a manifest that
+  can't be read fails the attempt.
 
 `build_and_publish` in the same module runs the tree worker and the
 publication command for one planned tree, and the backfill and the reconcile
@@ -1723,7 +1731,7 @@ command run it too. The handler has it read `releases.json` under the lock,
 as above; the backfill reads nothing there and asks for the latest from
 production's manifest (see "Backfilling calibration trees from Hugging
 Face"), and the reconcile command never asks for the latest. A refused build
-that the store holds from the same files is the backfill's `refused` and the
+whose tree the store holds, as above, is the backfill's `refused` and the
 reconcile command's `already_stored`.
 
 The image holds Bun 1.4.2, copied from the official image by digest, and the
@@ -2185,12 +2193,12 @@ Each build's outcome:
 |---|---|---|
 | `would_build` | a dry run would build it | |
 | `built` | built and published, never as the latest | yes |
-| `already_stored` | the store holds it, or gained its tree from the same calibration diagnostics while it was built, so its publication was refused | yes |
+| `already_stored` | the store holds it, or gained a tree for it while it was built (a release build's with the same build ID, or any of the same staged run), so its publication was refused | yes |
 | `submission_in_progress` | a `queued` or `processing` submission of its folder builds it | yes |
 | `ineligible` | a release folder without diagnostics, or whose release manifest is absent or names another build; a staging run that isn't final; a final staging run without calibration diagnostics, as the publisher reports one: a schema-1 folder without `calibration_diagnostics.json`, a structured run that declares neither diagnostics nor a staged dataset, a staged-dataset receipt of a skipped, failed or disabled staging, or a bundle that records no diagnostics file with a SHA-256 | yes |
 | `unbuildable` | the worker refused the files (exit 2), or a staging run's documents are incompatible: a run manifest that isn't a JSON object, names another run or has an unsupported schema, and the backfill's own checks of a run's files, such as declared or recorded diagnostics that are absent or differ from their SHA-256 | yes |
 | `too_large` | a file is over 256 MiB | yes |
-| `refused` | the publication refused the build (exit 2), and the store holds no tree for it from the same calibration diagnostics | yes |
+| `refused` | the publication refused the build (exit 2), and the store holds no tree for it as `already_stored` describes | yes |
 | `no_releases_record` | the release repo has no `releases.json`; nothing is built | yes |
 | `releases_record_refused` | `releases.json` breaks the record's rules; nothing is built | yes |
 | `error` | a Hugging Face failure, the store's manifest could not be read, a Bun exit 1 or 3, or a timeout | no |
@@ -2275,6 +2283,12 @@ past builds again".
   be reprocessed.
 - An execution stopped by the worker job's one-hour task timeout leaves its
   request row without `finished_at` or `summary`.
+- A publication that fails or runs out of time after uploading a tree's
+  index but before writing the manifest leaves that index without a
+  manifest entry. Another writer of the same release build is then refused
+  at that part while the manifest shows no tree for it, so a submission in
+  that position is still rejected, although the first writer's retry later
+  stores the tree.
 - Builds are ordered by the time they are published with (the progress's
   `updated_at`, else the run manifest's), then by run ID. The publisher
   orders its staging listing by each run's summary `updated_at`, then

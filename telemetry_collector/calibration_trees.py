@@ -32,15 +32,17 @@ Staging trees never become the latest. The publication command still moves
 the latest only to a build at least as new as the current latest.
 
 A submission whose tree another writer stored first (the reconcile command,
-the backfill or another submission) succeeds without a tree of its own. The
-publication refuses it, because the stored index records another time or
-label, and the store's manifest then shows a tree of the same kind for the
-same release build or staged run with the same build ID, the SHA-256 of the
-same calibration diagnostics (``TreeAlreadyStoredError``). Its result says
-``already_stored`` and it moves no latest: the reconcile command ends each
-release run, after its builds, by making the latest follow ``releases.json``.
-A refused tree with another build ID, run or kind still rejects the
-submission.
+the backfill or another submission) succeeds without a tree of its own
+(``TreeAlreadyStoredError``). The publication refuses it, and the store's
+manifest then shows a tree for the same build: for a release build, one with
+the same build ID, a hash of the schema version, country, kind, source ID and
+each source file's SHA-256, whose index records another time or label; for a
+staged run, one with any build ID, since the reconcile command builds a staged
+bundle from its diagnostics alone while the submission also sends its build
+manifest. Its result says ``already_stored`` and names both build IDs, and it
+moves no latest: the reconcile command ends each release run, after its
+builds, by making the latest follow ``releases.json``. Any other refused tree
+still rejects the submission.
 
 When a published build is made current later, with
 ``microcosm-publish-release-build --promote``, no tree is built. Microcosm
@@ -479,46 +481,67 @@ class TreeRefusedError(Exception):
 class TreeAlreadyStoredError(TreeRefusedError):
     """The publication refused a build whose tree the store already holds.
 
-    The store's manifest records a tree of the same kind for the same release
-    build or staged run with the same build ID, which is the SHA-256 of the
-    calibration diagnostics both were built from. Another writer (the reconcile
-    command, the backfill or another submission) published it first, and its
-    index records another time or label, so the publication refused this one.
+    Another writer (the reconcile command, the backfill or another submission)
+    published a tree for the same build first, and the publication refused
+    this one: its index records another time or label, or, for a staged run,
+    the other tree was built from other files. A tree's build ID is a hash of
+    the tree schema version, country, kind, source ID and each source file's
+    SHA-256. ``build_artifact_id`` is the stored tree's, and
+    ``submitted_build_artifact_id`` the one this build's files give.
     """
 
-    def __init__(self, message: str, *, build_artifact_id: str) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        build_artifact_id: str,
+        submitted_build_artifact_id: str,
+    ) -> None:
         super().__init__(message)
         self.build_artifact_id = build_artifact_id
+        self.submitted_build_artifact_id = submitted_build_artifact_id
 
 
-def stored_from_same_diagnostics(
+def stored_tree_of(
     manifest: Mapping[str, Any], plan: TreeBuildPlan, build_artifact_id: str
-) -> bool:
-    """Whether ``manifest`` holds ``plan``'s build with ``build_artifact_id``.
+) -> str | None:
+    """The build ID of the tree ``manifest`` holds for ``plan``'s build, if any.
 
-    The entry must be ``plan``'s country's, of its kind, for its release build
-    (``releaseId``) or staged run (``stagingRunId``), with that build ID.
+    A release build counts as stored only with ``build_artifact_id``, the
+    build ID its files give: an entry of ``plan``'s country, of kind
+    ``release``, for its release build (``releaseId``), with that build ID.
+    A staged run counts as stored with any build ID: an entry of kind
+    ``staging`` for its run (``stagingRunId``). The reconcile command builds a
+    staged bundle from its diagnostics alone, while its submission also sends
+    its build manifest, so the two build IDs differ, and the manifest keeps
+    one tree per staged run, so the second could never be stored.
     """
 
     countries = manifest.get("countries")
     country = countries.get(plan.country) if isinstance(countries, Mapping) else None
     builds = country.get("builds") if isinstance(country, Mapping) else None
     if not isinstance(builds, list):
-        return False
+        return None
     source_field, source_id = (
         ("releaseId", plan.release_id)
         if plan.kind == "release"
         else ("stagingRunId", plan.run_id)
     )
     if source_id is None:
-        return False
-    return any(
-        isinstance(entry, Mapping)
-        and entry.get("buildArtifactId") == build_artifact_id
-        and entry.get("kind") == plan.kind
-        and entry.get(source_field) == source_id
-        for entry in builds
-    )
+        return None
+    for entry in builds:
+        if (
+            not isinstance(entry, Mapping)
+            or entry.get("kind") != plan.kind
+            or entry.get(source_field) != source_id
+        ):
+            continue
+        stored_id = entry.get("buildArtifactId")
+        if not isinstance(stored_id, str):
+            continue
+        if plan.kind == "staging" or stored_id == build_artifact_id:
+            return stored_id
+    return None
 
 
 def _answer(completed: subprocess.CompletedProcess[str], step: str) -> dict[str, Any]:
@@ -620,10 +643,12 @@ def build_and_publish(
     raised before anything is published.
 
     After a publication exit 2, the store's manifest is read, outside the
-    lock: if it holds this build's tree with the worker's build ID
-    (``stored_from_same_diagnostics``), the refusal is
-    ``TreeAlreadyStoredError``, a ``TreeRefusedError``. A manifest that
-    can't be read raises ``CalibrationTreeCommandError``, as it can't tell.
+    lock: if it holds a tree for this build (``stored_tree_of``: a release
+    build with the worker's build ID, a staged run with any), the refusal is
+    ``TreeAlreadyStoredError``, a ``TreeRefusedError``. A manifest read that
+    fails raises as it does (``CalibrationTreeCommandError``, or
+    ``subprocess.TimeoutExpired`` or ``OSError``), as it can't tell, so an
+    attempt is tried again.
     """
 
     request_path = directory / "request.json"
@@ -672,11 +697,17 @@ def build_and_publish(
         )
     if published.returncode == EXIT_ENTRY_REFUSED:
         message = shortened_message(published.stderr)
-        build_artifact_id = worker_answer.get("buildArtifactId")
-        if isinstance(build_artifact_id, str) and stored_from_same_diagnostics(
-            read_store_manifest(commands), plan, build_artifact_id
-        ):
-            raise TreeAlreadyStoredError(message, build_artifact_id=build_artifact_id)
+        submitted_id = worker_answer.get("buildArtifactId")
+        if isinstance(submitted_id, str):
+            stored_id = stored_tree_of(
+                read_store_manifest(commands), plan, submitted_id
+            )
+            if stored_id is not None:
+                raise TreeAlreadyStoredError(
+                    message,
+                    build_artifact_id=stored_id,
+                    submitted_build_artifact_id=submitted_id,
+                )
         raise TreeRefusedError(message)
     if published.returncode != 0:
         raise CalibrationTreeCommandError(
@@ -787,6 +818,7 @@ def calibration_tree_handler(
                 return {
                     "processed_by": "calibration-tree",
                     "build_artifact_id": error.build_artifact_id,
+                    "submitted_build_artifact_id": error.submitted_build_artifact_id,
                     "kind": plan.kind,
                     "already_stored": True,
                     "made_latest": False,
