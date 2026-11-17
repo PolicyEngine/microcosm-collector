@@ -1545,14 +1545,20 @@ class StoredMeanwhile(StandInBun):
 def stored_release(source_id: str, build_artifact_id: str) -> dict[str, Any]:
     """A US release build's entry in the store's manifest, from another writer."""
 
+    return stored_entry("release", source_id, build_artifact_id)
+
+
+def stored_entry(kind: str, source_id: str, build_artifact_id: str) -> dict[str, Any]:
+    """A US build's entry in the store's manifest, from another writer."""
+
     return {
         "buildArtifactId": build_artifact_id,
-        "kind": "release",
+        "kind": kind,
         "sourceId": source_id,
-        "label": source_id,
-        "releaseId": source_id,
-        "stagingRunId": None,
-        "hfRepo": US_RELEASES,
+        "label": source_id if kind == "release" else US_RELEASE,
+        "releaseId": source_id if kind == "release" else None,
+        "stagingRunId": source_id if kind == "staging" else None,
+        "hfRepo": US_RELEASES if kind == "release" else US_STAGING,
         "hfCommitSha": "f" * 40,
         "treeSchemaVersion": 6,
         "indexSha256": "e" * 64,
@@ -1596,6 +1602,23 @@ def test_a_tree_stored_meanwhile_from_another_file_stays_refused() -> None:
 
     assert outcome_of(outcomes, OLDER_ID).outcome == "refused"
     assert outcome_of(outcomes, OLDER_ID).incomplete is False
+
+
+def test_a_staged_run_stored_meanwhile_from_other_files_is_already_stored() -> None:
+    # The run's submission stores its tree, built from its diagnostics and
+    # build manifest (another build ID), while this run builds it from the
+    # diagnostics alone. The store keeps one tree per staged run.
+    reconciliation = us_staging_reconciliation(structured_staging_run(RUN_ID))
+    reconciliation.bun = StoredMeanwhile(
+        stored_meanwhile={RUN_ID: stored_entry("staging", RUN_ID, "c" * 64)}
+    )
+    reconciliation.bun.publication_exits[RUN_ID] = 2
+
+    [outcome] = reconciliation.run(kinds=["staging"])
+
+    assert (outcome.source_id, outcome.outcome) == (RUN_ID, "already_stored")
+    assert outcome.build_artifact_id == "c" * 64
+    assert outcome.incomplete is False
 
 
 @pytest.mark.parametrize("publication_exit", [1, 3])

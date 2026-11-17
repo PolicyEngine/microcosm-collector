@@ -632,22 +632,27 @@ def test_an_entry_the_manifest_refuses_rejects_the_submission() -> None:
 
 
 def stored_tree(
-    kind: str, *, build_artifact_id: str = "a" * 64, source_id: str | None = None
+    kind: str,
+    *,
+    build_artifact_id: str = "a" * 64,
+    source_id: str | None = None,
+    recorded_kind: str | None = None,
 ) -> dict[str, Any]:
     """The store's manifest holding one UK tree, as the manifest read prints it.
 
     By default the tree is the one the stand-in worker builds for ``RELEASED``
-    or ``STAGED``: the same build ID, which is the SHA-256 of the calibration
-    diagnostics it was built from, and the same release build or staged run.
-    It records another commit and publication time, as the reconcile command
-    records a build it reads from Hugging Face before the submission arrives.
+    or ``STAGED``: the same build ID, a hash of the source files it was built
+    from, and the same release build or staged run. It records another commit
+    and publication time, as the reconcile command records a build it reads
+    from Hugging Face before the submission arrives. ``recorded_kind``
+    replaces only the entry's ``kind``.
     """
 
     if source_id is None:
         source_id = f"{UK_DEFAULT_RELEASE}/{RUN_ID}" if kind == "release" else RUN_ID
     entry = {
         "buildArtifactId": build_artifact_id,
-        "kind": kind,
+        "kind": recorded_kind or kind,
         "sourceId": source_id,
         "label": source_id if kind == "release" else UK_DEFAULT_RELEASE,
         "releaseId": source_id if kind == "release" else None,
@@ -675,9 +680,9 @@ def test_a_refused_tree_already_stored_from_the_same_diagnostics_succeeds(
     submission_provenance: Mapping[str, Any], kind: str
 ) -> None:
     # Another writer (the reconcile command, the backfill or another
-    # submission) stored this build's tree from the same diagnostics first,
-    # with another time or label in its index, so the publication refuses
-    # this one with exit 2.
+    # submission) stored this build's tree from the same files first, with
+    # another time or label in its index, so the publication refuses this one
+    # with exit 2.
     submission = accepted(submission_provenance)
     runner = RecordingRunner(
         publication_exit=2,
@@ -695,6 +700,7 @@ def test_a_refused_tree_already_stored_from_the_same_diagnostics_succeeds(
     assert submission.record().result == {
         "processed_by": "calibration-tree",
         "build_artifact_id": "a" * 64,
+        "submitted_build_artifact_id": "a" * 64,
         "kind": kind,
         "already_stored": True,
         "made_latest": False,
@@ -704,22 +710,58 @@ def test_a_refused_tree_already_stored_from_the_same_diagnostics_succeeds(
     assert runner.events[-3:] == ["publication", "lock released", "manifest read"]
 
 
+def test_a_refused_staged_run_already_stored_from_other_files_succeeds() -> None:
+    # The reconcile command builds a staged bundle from its diagnostics alone,
+    # while the submission also sends its build manifest, so the stored tree
+    # has another build ID. The store keeps one tree per staged run, so the
+    # submission's tree could never be stored; it succeeds and names both IDs.
+    submission = accepted(STAGED)
+    runner = RecordingRunner(
+        publication_exit=2,
+        publication_stderr="Calibration source already resolves to another build.",
+        stored_manifest=stored_tree("staging", build_artifact_id="c" * 64),
+    )
+
+    outcome = submission.run(handler_with(runner))
+
+    assert outcome is JobOutcome.FINISHED
+    assert submission.record().status == "succeeded"
+    assert submission.record().result == {
+        "processed_by": "calibration-tree",
+        "build_artifact_id": "c" * 64,
+        "submitted_build_artifact_id": "a" * 64,
+        "kind": "staging",
+        "already_stored": True,
+        "made_latest": False,
+    }
+
+
 @pytest.mark.parametrize(
-    "stored",
+    ("submission_provenance", "stored"),
     [
         pytest.param(
-            stored_tree("staging", build_artifact_id="c" * 64), id="other-diagnostics"
+            RELEASED,
+            stored_tree("release", build_artifact_id="c" * 64),
+            id="release-other-build-id",
         ),
-        pytest.param(stored_tree("staging", source_id=OTHER_BUILD), id="other-run"),
-        pytest.param(stored_tree("release"), id="other-kind"),
-        pytest.param(None, id="nothing-stored"),
+        pytest.param(
+            STAGED, stored_tree("staging", source_id=OTHER_BUILD), id="other-run"
+        ),
+        pytest.param(
+            STAGED,
+            stored_tree("staging", recorded_kind="release"),
+            id="other-kind",
+        ),
+        pytest.param(STAGED, None, id="nothing-stored"),
+        pytest.param(RELEASED, None, id="release-nothing-stored"),
     ],
 )
-def test_a_refused_tree_is_rejected_unless_stored_from_the_same_diagnostics(
-    stored: dict[str, Any] | None,
+def test_a_refused_tree_is_rejected_unless_the_store_holds_it(
+    submission_provenance: Mapping[str, Any], stored: dict[str, Any] | None
 ) -> None:
-    # Guards: these submissions are rejected before and after the change.
-    submission = accepted(STAGED)
+    # Guards: these submissions are rejected before and after the change. A
+    # release build's tree counts as stored only with the same build ID.
+    submission = accepted(submission_provenance)
     runner = RecordingRunner(
         publication_exit=2,
         publication_stderr="Calibration source already resolves to another build.",
