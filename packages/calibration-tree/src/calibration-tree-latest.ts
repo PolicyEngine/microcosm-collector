@@ -25,8 +25,8 @@
 //   2  the manifest records no release build of the country with that
 //      release ID; nothing changed;
 //   3  anything else, including a manifest another writer changed meanwhile,
-//      one read without an ETag, and any error from the store; running again
-//      may succeed.
+//      one read without an ETag or with a weak one, and any error from the
+//      store; running again may succeed.
 import { readFileSync } from "node:fs";
 import { get, put } from "@vercel/blob";
 
@@ -36,7 +36,11 @@ import {
   serializeCalibrationTreeManifest,
   withCalibrationTreeManifestEntry,
 } from "./calibration-tree-manifest";
-import { CALIBRATION_TREE_PUBLICATION_TOKEN_VARIABLE } from "./calibration-tree-publication";
+import {
+  CALIBRATION_TREE_PUBLICATION_TOKEN_VARIABLE,
+  CALIBRATION_TREE_WEAK_ETAG_MESSAGE,
+  isWeakEtag,
+} from "./calibration-tree-publication";
 import { isCountry, type MicrocosmCountry } from "./countries";
 
 export const CALIBRATION_TREE_LATEST_EXIT_REQUEST_ERROR = 1;
@@ -120,6 +124,11 @@ export async function moveCalibrationTreeLatest(options: {
   // write would carry no condition.
   if (!current.etag) {
     throw new Error("The stored calibration tree manifest was read without an ETag, so it cannot be replaced safely.");
+  }
+  // The manifest is read uncompressed; a weak ETag (W/"…") would never match
+  // the write's condition.
+  if (isWeakEtag(current.etag)) {
+    throw new Error(CALIBRATION_TREE_WEAK_ETAG_MESSAGE);
   }
   // The recorded entry itself, so only the latest changes.
   const updated = withCalibrationTreeManifestEntry(current.manifest, request.country, entry, true);
