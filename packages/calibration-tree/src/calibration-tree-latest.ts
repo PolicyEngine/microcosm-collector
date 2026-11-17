@@ -36,7 +36,11 @@ import {
   serializeCalibrationTreeManifest,
   withCalibrationTreeManifestEntry,
 } from "./calibration-tree-manifest";
-import { CALIBRATION_TREE_PUBLICATION_TOKEN_VARIABLE, isWeakEtag } from "./calibration-tree-publication";
+import {
+  CALIBRATION_TREE_PUBLICATION_TOKEN_VARIABLE,
+  CALIBRATION_TREE_WEAK_ETAG_MESSAGE,
+  isWeakEtag,
+} from "./calibration-tree-publication";
 import { isCountry, type MicrocosmCountry } from "./countries";
 
 export const CALIBRATION_TREE_LATEST_EXIT_REQUEST_ERROR = 1;
@@ -124,10 +128,7 @@ export async function moveCalibrationTreeLatest(options: {
   // The manifest is read uncompressed; a weak ETag (W/"…") would never match
   // the write's condition.
   if (isWeakEtag(current.etag)) {
-    throw new Error(
-      "The stored calibration tree manifest was read with a weak ETag, which no conditional write matches, " +
-        "so it cannot be replaced safely.",
-    );
+    throw new Error(CALIBRATION_TREE_WEAK_ETAG_MESSAGE);
   }
   // The recorded entry itself, so only the latest changes.
   const updated = withCalibrationTreeManifestEntry(current.manifest, request.country, entry, true);

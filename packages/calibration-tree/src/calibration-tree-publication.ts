@@ -78,7 +78,11 @@ export class CalibrationTreePublicationRequestError extends Error {}
 /** The build is refused; nothing in the manifest changed. */
 export class CalibrationTreeEntryRefusedError extends Error {}
 
-/** Another writer changed the manifest after it was read; nothing was overwritten. */
+/**
+ * The manifest cannot be replaced safely: another writer changed it after it
+ * was read, or it was read without an ETag or with a weak one. Nothing was
+ * overwritten.
+ */
 export class CalibrationTreeManifestConflictError extends Error {}
 
 /**
@@ -89,6 +93,11 @@ export class CalibrationTreeManifestConflictError extends Error {}
 export function isWeakEtag(etag: string): boolean {
   return etag.startsWith("W/");
 }
+
+/** The error message of a manifest read with a weak ETag, shared by the publication and latest commands. */
+export const CALIBRATION_TREE_WEAK_ETAG_MESSAGE =
+  "The stored calibration tree manifest was read with a weak ETag, which no conditional write matches, " +
+  "so it cannot be replaced safely.";
 
 export interface CalibrationTreePublicationPart {
   part: CalibrationTreePart;
@@ -308,10 +317,7 @@ async function addManifestEntry(
     );
   }
   if (current.etag !== null && isWeakEtag(current.etag)) {
-    throw new CalibrationTreeManifestConflictError(
-      "The stored calibration tree manifest was read with a weak ETag, which no conditional write matches, " +
-        "so it cannot be replaced safely.",
-    );
+    throw new CalibrationTreeManifestConflictError(CALIBRATION_TREE_WEAK_ETAG_MESSAGE);
   }
   const makeLatest = request.makeLatest &&
     (request.manifestEntry.kind !== "release" ||

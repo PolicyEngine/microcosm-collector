@@ -1606,9 +1606,10 @@ immutable path (keeping a part already stored with the same bytes), then
 writes the manifest with a compare-and-swap: it creates the manifest only if
 it is still absent and replaces it only if its ETag is still the one read, so
 a manifest another writer changed is never overwritten, and a manifest read
-without an ETag is never replaced. The publication and latest commands read
-the manifest uncompressed (`accept-encoding: identity`): Vercel Blob gives a
-compressed response the weak form of the blob's ETag (`W/"…"`), while a
+without an ETag is never replaced. Every consistent manifest read, including
+the publication and latest commands', reads the manifest uncompressed
+(`accept-encoding: identity`): Vercel Blob gives a compressed response the
+weak form of the blob's ETag (`W/"…"`), while a
 conditional write compares the strong one, so a weak ETag would make every
 replacement of the manifest fail. A manifest read with a weak ETag anyway is
 never replaced either. A build asked to become its country's
