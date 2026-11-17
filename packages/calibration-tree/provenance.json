@@ -3,12 +3,20 @@
   "commit": "4d129fbc6931e0e6862febd4f28ca421fb94b24a",
   "directory": "frontend/packages/calibration-tree",
   "changed": {
-    "package.json": "Publishable from this repository: not private, with a license, the repository, public access, the published files, the worker's, the publication command's, the latest command's and the manifest read's exports and their scripts.",
+    "package.json": "Publishable from this repository: not private, with a license, the repository, public access, the published files, the worker's, the publication command's, the latest command's and the manifest read's exports and their scripts. Its version is 0.1.2.",
     "src/calibration-tree-blob.ts": "A consistent manifest read asks for the manifest uncompressed, so its ETag is the strong one that Vercel Blob's conditional writes compare, not the weak one a compressed response carries.",
     "src/countries.ts": "Its comments drop the microdata stack's former product name; its code matches the copy.",
-    "src/latest-artifact.test.ts": "One test name drops the microdata stack's former product name.",
+    "src/historical-weight-summary.test.ts": "One test finds the September local-area weight summary by its build folder.",
+    "src/historical-weight-summary.ts": "Its lookup matches a release by its build name, so a build folder id finds the pinned summary.",
+    "src/latest-artifact.test.ts": "One test name drops the microdata stack's former product name, and one test reads an audited unversioned local-area build by its build folder.",
     "src/latest-artifact.ts": "One comment drops the microdata stack's former product name.",
-    "src/reforms.test.ts": "Two test names drop the microdata stack's former product name; their fixtures keep the legacy calculation key."
+    "src/reforms.test.ts": "Two test names drop the microdata stack's former product name; their fixtures keep the legacy calculation key.",
+    "src/release-record.ts": "Adds `buildNameOf`, the build name a release id or build folder id ends in.",
+    "src/target-loss-attribution-manifest.ts": "Adds `historicalAttributionSupportFor`, which finds a pinned recipe by the release's build name.",
+    "src/target-loss-attribution.test.ts": "One test finds the September local-area recipe by its build folder.",
+    "src/target-loss-attribution.ts": "Finds the pinned recipe for a release by its build name.",
+    "src/target-representation.test.ts": "The audited unversioned builds are listed once, and one test reads them by their build folders.",
+    "src/target-representation.ts": "Its list of audited unversioned builds is looked up by the release's build name."
   },
   "collectorFiles": [
     "LICENSE",

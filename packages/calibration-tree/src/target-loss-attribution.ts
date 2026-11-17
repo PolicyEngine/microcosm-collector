@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 import {
   HISTORICAL_ATTRIBUTION_SUPPORT_BY_RELEASE,
+  historicalAttributionSupportFor,
   type AttributionVerificationTolerance,
   type HistoricalAttributionRecipe,
   type HistoricalAttributionSupport,
@@ -648,7 +649,7 @@ function supportEvidenceFailure(
 export function classifyHistoricalAttributionEvidence(
   evidence: HistoricalAttributionEvidence,
 ): HistoricalAttributionClassification {
-  const support = HISTORICAL_ATTRIBUTION_SUPPORT_BY_RELEASE.get(evidence.releaseId);
+  const support = historicalAttributionSupportFor(evidence.releaseId);
   if (!support) {
     return {
       status: "unavailable",
@@ -930,7 +931,7 @@ export function normalizeTargetLossAttribution(
   } else {
     const supportReleaseId = inherited ? parentBuildId : releaseId;
     const support = supportReleaseId
-      ? HISTORICAL_ATTRIBUTION_SUPPORT_BY_RELEASE.get(supportReleaseId)
+      ? historicalAttributionSupportFor(supportReleaseId)
       : undefined;
     if (!support) {
       attribution = unavailable(finalLoss, "No pinned historical attribution recipe matches this release.", warnings);

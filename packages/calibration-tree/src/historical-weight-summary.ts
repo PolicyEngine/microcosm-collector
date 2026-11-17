@@ -1,3 +1,5 @@
+import { buildNameOf } from "./release-record";
+
 export interface CalibrationWeightSummary {
   weight_entity: string;
   n_nonzero: number;
@@ -42,10 +44,11 @@ export function historicalWeightSummaryForDiagnostics(
   diagnosticsSha256: string | null,
 ): CalibrationWeightSummary | null {
   if (diagnosticsSha256 == null) return null;
+  const buildName = buildNameOf(releaseId);
   return (
     HISTORICAL_WEIGHT_SUMMARIES.find(
       (record) =>
-        record.releaseId === releaseId &&
+        record.releaseId === buildName &&
         record.diagnosticsSha256 === diagnosticsSha256,
     )?.summary ?? null
   );
