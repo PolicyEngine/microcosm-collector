@@ -1,3 +1,49 @@
+## [0.24.2] - 2026-11-17
+
+### Fixed
+
+- The calibration tree package finds its pinned historical builds when a build is identified by its build folder, `<release>/<build>`, as the publisher identifies a build listed in `releases.json`, as well as by its bare build name. The two audited US local-area builds whose diagnostics have no `schema_version` are read as legacy files again, with their reconstructed weight summary and target-loss attribution, instead of failing every US release reconciliation. Every SHA-256 and target-surface check is unchanged. The package's version is raised to 0.1.2 (microcosm-collector#67).
+
+
+## [0.24.1] - 2026-11-17
+
+### Fixed
+
+- The calibration tree publication and latest commands can now replace an existing manifest in Vercel Blob. They read the manifest uncompressed, so the ETag their conditional write sends is the strong one the store compares, not the weak one (`W/"…"`) that a compressed response carries; before, every replacement of a manifest the store served compressed failed with "Precondition failed: ETag mismatch". A manifest read with a weak ETag is refused before any write.
+
+
+## [0.24.0] - 2026-11-17
+
+### Added
+
+- The Orrery read service lists the recorded Orrery graph documents of every run, newest first and a page at a time, when `GET /v1/orrery-graphs` has neither a run ID nor a build ID, so microcosm-runs can show which runs have graphs. That request answered 422 before. `limit` or `before` beside a run or build ID answers 422.
+
+
+## [0.23.0] - 2026-11-17
+
+### Added
+
+- Add the `backfill-calibration-trees` operator command, which fills the collector's calibration tree store with every build production's public tree manifest lists, before the dashboard reads trees from that store. `--production-manifest-url` (required, `https`) is the dashboard's `https://<dashboard>/api/microcosm/tree-manifest`, which the command requests for each country (`--country`, repeatable; every country by default) with no credential and no redirect followed, through its own client. An answer that isn't HTTP 200, is over 16 MiB, takes over 2 minutes to arrive, isn't JSON, has another schema version or country, or names a latest build that isn't one of its release builds is an `error` for that country only. Each entry is checked before any of its values is used in a Hugging Face path (kind, the country's repo, a 40-hex commit, a `<release>` or `<release>/<build>` release ID and directory, a staging run that is one safe name and not `latest`, a publication time with an offset or none, a label), and an entry that fails is `invalid` while the rest continue. A release build is read from `releases/<releaseDirectory or releaseId>/` at its commit, with its build manifest, release manifest and demographics null when absent; a staging build follows only the staging readers' rules that locate files: a run's declared diagnostics path with its SHA-256 (or, for a schema-1 run, `runs/<id>/calibration_diagnostics.json`) with its build and release manifests, a staged bundle named by a run's `staged_dataset` receipt, or a staged bundle in the release repo. Each tree records production's release ID or run, label, repo, commit and publication time. Only production's latest entry asks to become its country's latest, and each country's latest is built first; production's latest already stored but not the store's latest is published again exactly as stored, from its files at the stored commit with the stored repo and time, so only the latest moves, and one that already is the store's latest needs no work. The store's manifest is read once, with the tree package's new read-only `src/calibration-tree-manifest-read.ts`; an entry the store holds with the same commit and time (to the millisecond) is `already_stored`, with another `mismatch`, and neither downloads anything. Builds run one at a time, each in a removed temporary directory, through the tree handler's shared `build_and_publish`: a file over 256 MiB is `too_large` from its listing, each file is streamed to disk with the new `HuggingFaceReader.download_file` and checked against its listing, the worker runs without the Blob token, and the manifest lock is held only around the publication. Worker and publication exit 2 are `unbuildable` and `refused`; any other failure is `error`, and the next build still runs; no build starts after 40 minutes (`deferred`). Each entry's document says whether its build ID matches production's; staging build IDs are expected to differ, since the worker hashes 4 of a staging build's source files where the GitHub Actions publisher hashes 7. The summary gives the counts, whether the run is incomplete, how many release builds differ from production, and each country's latest. The command exits 1 when anything is `error` or `deferred`, a country failed, or a country's latest wasn't made the store's latest, and 2 for an argument error. `--kind` limits it to release or staging builds, and `--dry-run` reads production's manifest, the Hugging Face listings and the store's manifest, and downloads no diagnostics, runs no tree worker and takes no lock. It needs `DATABASE_URL`, `COLLECTOR_HF_READ_TOKEN` and `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN`, so it runs as an execution of the worker job with its arguments overridden. `HuggingFaceReader` also gains `list_folder`.
+
+### Changed
+
+- The calibration tree handler's build and publication are now `calibration_trees.build_and_publish`, which the `backfill-calibration-trees` command runs too: the tree worker without the Blob token, then, under the manifest lock, the handler's `releases.json` read and the publication command. A submission's trees, results and rejections are unchanged. `TreeBuildPlan` gains each file's full Hugging Face path (`paths`) and the release folder (`release_directory`, the release ID by default), its `created_at` and `run_id` may be `None`, and `worker_request` takes each role's local copy alone.
+
+
+## [0.22.0] - 2026-11-16
+
+### Added
+
+- Read API v2 (`GET /v2/runs`, `GET /v2/runs/{run_id}`) accepts, beside `X-Telemetry-Read-Token`, a consumer app's Vercel OIDC token in `Authorization: Bearer`, from the Vercel projects and environments listed in `TELEMETRY_VERCEL_OIDC_READERS` of the team named by `TELEMETRY_VERCEL_OIDC_TEAM_SLUG` and `TELEMETRY_VERCEL_OIDC_TEAM_ID`. The three settings are optional, all or none; without them every bearer token gets 401, and part of them or a malformed value stops startup naming the setting. A token must be RS256, signed by a key from `https://oidc.vercel.com/.well-known/jwks` (the address Vercel's own `@vercel/oidc` verifier uses), with the team's issuer and audience; an invalid or expired token gets 401, a valid token from another team, project or environment 403, and a token checked while Vercel's keys cannot be read and none usable is cached 503. The keys are cached for 10 minutes, fetched again at most once a minute, by one request at a time, and kept usable for 24 hours while fetches fail; an answer with no usable key is a failed fetch, a request whose key is cached never waits for another request's fetch, and one whose key isn't cached waits for it at most 10 seconds before answering 503. The OpenAPI document lists the `VercelOidcToken` scheme as an alternative to `ReadToken` and adds the 403 response. The typed client takes `vercelOidcToken` (a string or a function called for each request) instead of `readToken`, and throws a `TypeError` for both or neither. `CollectorClientOptions` is now a union type alias of `ReadTokenClientOptions` and `VercelOidcClientOptions` rather than an interface, so `interface … extends CollectorClientOptions` no longer compiles; extend one of the two instead. Both deploy jobs pass the GitHub environment variables `TELEMETRY_VERCEL_OIDC_TEAM_SLUG`, `TELEMETRY_VERCEL_OIDC_TEAM_ID` and `TELEMETRY_VERCEL_OIDC_READERS`, which `scripts/deploy.sh` checks and sets on the service revisions only when all three are set. Version 1 is unchanged.
+
+
+## [0.21.1] - 2026-11-16
+
+### Changed
+
+- Drop the microdata stack's former product name from the calibration tree package's comments and three test names. The published Hugging Face repositories and deployment variables keep their names.
+
+
 ## [0.21.0] - 2026-11-13
 
 ### Added

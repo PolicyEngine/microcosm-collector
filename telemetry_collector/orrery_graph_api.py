@@ -17,6 +17,14 @@ public or private, and decides what to show to whom.
   newest first, with each one's current flag, set per country code and
   build ID, and its effective visibility
   (``telemetry_collector.orrery_serving``).
+- ``GET /v1/orrery-graphs?limit=<n>&before=<cursor>``, with neither ID,
+  lists the recorded documents of every run the same way, newest first, at
+  most ``limit`` at a time (``RECENT_LISTING_MAXIMUM``, by default
+  ``RECENT_LISTING_DEFAULT``). ``before`` is the previous page's
+  ``next_before``, which is null when a page holds fewer than ``limit``
+  documents, so a full last page is followed by an empty one, as for the
+  collector's ``GET /v1/runs``. ``limit`` and ``before`` page only this
+  listing: beside an ID they answer 422.
 - ``GET /v1/orrery-graphs/<submission_id>/<document_sha256>/<file_name>``
   returns ``graph.orrery.json``, or one of its ``upstream-<sha256>.json``
   files, from the private Orrery bucket. The object is read twice at the
@@ -43,7 +51,10 @@ a plain-text 500, lacks both the header and a JSON body.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
+import json
 import logging
 import re
 from collections.abc import Callable, Iterator
@@ -61,6 +72,7 @@ from telemetry_collector.intake_api import IntakeProblemError
 from telemetry_collector.models import SAFE_IDENTIFIER
 from telemetry_collector.orrery_serving import (
     DOCUMENT_FILE_NAME,
+    NewestFirstKey,
     OrreryGraphObjectReader,
     OrreryObjectChangedError,
     OrreryObjectCorruptError,
@@ -87,6 +99,14 @@ VISIBILITY_HEADER = "X-Orrery-Visibility"
 SUBMISSION_ID_PATTERN = r"^sub-[0-9a-f]{32}$"
 STORAGE_RETRY_AFTER_SECONDS = 30
 CATALOGUE_RETRY_AFTER_SECONDS = 30
+#: The most documents one page of the listing without a run or build ID
+#: holds, and how many it holds when ``limit`` isn't given. Each costs one
+#: listing of its folder in the bucket, for its effective visibility.
+RECENT_LISTING_MAXIMUM = 100
+RECENT_LISTING_DEFAULT = 50
+#: Longer than any ``before`` the listing gives, which is under 200
+#: characters, and short enough that decoding a longer one is never tried.
+MAXIMUM_CURSOR_LENGTH = 256
 
 LOGGER = logging.getLogger(__name__)
 
@@ -188,6 +208,71 @@ def _timestamp(value: datetime) -> str:
     """ISO 8601 in UTC with an explicit ``+00:00`` offset, as intake writes it."""
 
     return value.astimezone(UTC).isoformat()
+
+
+def _page_limit(limit: str | None) -> int:
+    """The number of documents a page of the recent listing may hold."""
+
+    if limit is None:
+        return RECENT_LISTING_DEFAULT
+    if (
+        not re.fullmatch(r"[1-9][0-9]{0,2}", limit)
+        or int(limit) > RECENT_LISTING_MAXIMUM
+    ):
+        raise _query_invalid(
+            f"limit is not a whole number from 1 to {RECENT_LISTING_MAXIMUM}."
+        )
+    return int(limit)
+
+
+def _page_cursor(document: RecordedGraphFile) -> str:
+    """The ``before`` that starts the page after ``document``: its place in
+    the listing's order, as JSON in unpadded base64url."""
+
+    created_at, document_sha256, submission_id = newest_first(document)
+    payload = json.dumps(
+        [_timestamp(created_at), document_sha256, submission_id],
+        separators=(",", ":"),
+    ).encode()
+    return base64.urlsafe_b64encode(payload).decode().rstrip("=")
+
+
+def _cursor_place(cursor: str) -> NewestFirstKey:
+    """The place in the listing's order that a ``_page_cursor`` holds,
+    refusing anything else with 422."""
+
+    invalid = _query_invalid("before is not a cursor this listing gave.")
+    # A long one could hold JSON nested deeply enough for ``json.loads`` to
+    # run out of recursion.
+    if len(cursor) > MAXIMUM_CURSOR_LENGTH:
+        raise invalid
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        decoded = base64.b64decode(padded, altchars=b"-_", validate=True)
+        parts = json.loads(decoded.decode())
+    except (ValueError, RecursionError, binascii.Error):
+        # ``UnicodeDecodeError`` and ``json.JSONDecodeError`` are
+        # ``ValueError``s.
+        raise invalid from None
+    if not (
+        isinstance(parts, list)
+        and len(parts) == 3
+        and all(isinstance(part, str) for part in parts)
+    ):
+        raise invalid
+    created_at_text, document_sha256, submission_id = parts
+    if not (
+        re.fullmatch(SHA256_PATTERN, document_sha256)
+        and re.fullmatch(SUBMISSION_ID_PATTERN, submission_id)
+    ):
+        raise invalid
+    try:
+        created_at = datetime.fromisoformat(created_at_text)
+    except ValueError:
+        raise invalid from None
+    if created_at.tzinfo is None:
+        raise invalid
+    return (created_at, document_sha256, submission_id)
 
 
 def _file_path(document: RecordedGraphFile, file_name: str) -> str:
@@ -323,12 +408,75 @@ def orrery_graph_router(*, services: OrreryServingServices) -> APIRouter:
             for document, _ in documents
         }
 
+    def listed(documents: list[RecordedGraphFile]) -> list[dict[str, Any]]:
+        """The listing's rows for ``documents``, in their order."""
+
+        # A build's current document may belong to another run, or fall on
+        # another page, so it is chosen among all of the build's documents:
+        # those with its country code and build ID.
+        builds_documents: list[RecordedGraphFile] = []
+        for country_code, document_build_id in sorted(
+            {document.build for document in documents}
+        ):
+            builds_documents.extend(
+                _from_catalogue(
+                    catalogue.graph_files,
+                    build_id=document_build_id,
+                    country_code=country_code,
+                )
+            )
+        current = current_documents(builds_documents)
+        with_upstreams = [
+            (document, document_upstream_files(document)) for document in documents
+        ]
+        visibility = visibilities(with_upstreams)
+        return [
+            {
+                "submission_id": document.submission_id,
+                "document_sha256": document.document_sha256,
+                "document_bytes": document.document_bytes,
+                "run_id": document.run_id,
+                "build_id": document.build_id,
+                "country_code": document.country_code,
+                "orrery_version": document.orrery_version,
+                "projection_source": document.projection_source,
+                "collector_version": document.collector_version,
+                "reconstructed": document.reconstructed,
+                "created_at": _timestamp(document.created_at),
+                "visibility": visibility[document.key],
+                "current": document.key in current,
+                "document_path": _file_path(document, DOCUMENT_FILE_NAME),
+                "upstream_paths": [
+                    _file_path(document, upstream.name) for upstream in upstreams
+                ],
+            }
+            for document, upstreams in with_upstreams
+        ]
+
+    def recent_page(limit: str | None, before: str | None) -> dict[str, Any]:
+        page_limit = _page_limit(limit)
+        place = None if before is None else _cursor_place(before)
+        page = _from_catalogue(
+            catalogue.recent_graph_files, limit=page_limit, before=place
+        )
+        return {
+            "documents": listed(page),
+            "next_before": _page_cursor(page[-1]) if len(page) == page_limit else None,
+        }
+
     @router.get("")
     def list_graph_files(
-        run_id: str | None = None, build_id: str | None = None
+        run_id: str | None = None,
+        build_id: str | None = None,
+        limit: str | None = None,
+        before: str | None = None,
     ) -> dict[str, Any]:
         if run_id is None and build_id is None:
-            raise _query_invalid("Give run_id, build_id or both.")
+            return recent_page(limit, before)
+        if limit is not None or before is not None:
+            raise _query_invalid(
+                "limit and before page only the listing without run_id or build_id."
+            )
         if run_id is not None and not re.fullmatch(SAFE_IDENTIFIER, run_id):
             raise _query_invalid("run_id is not a run ID.")
         if build_id is not None and not re.fullmatch(
@@ -340,49 +488,7 @@ def orrery_graph_router(*, services: OrreryServingServices) -> APIRouter:
             key=newest_first,
             reverse=True,
         )
-        # A build's current document may belong to another run, so it is
-        # chosen among all of the build's documents: those with its country
-        # code and build ID.
-        builds_documents: list[RecordedGraphFile] = []
-        for country_code, document_build_id in sorted(
-            {document.build for document in matching}
-        ):
-            builds_documents.extend(
-                _from_catalogue(
-                    catalogue.graph_files,
-                    build_id=document_build_id,
-                    country_code=country_code,
-                )
-            )
-        current = current_documents(builds_documents)
-        with_upstreams = [
-            (document, document_upstream_files(document)) for document in matching
-        ]
-        visibility = visibilities(with_upstreams)
-        return {
-            "documents": [
-                {
-                    "submission_id": document.submission_id,
-                    "document_sha256": document.document_sha256,
-                    "document_bytes": document.document_bytes,
-                    "run_id": document.run_id,
-                    "build_id": document.build_id,
-                    "country_code": document.country_code,
-                    "orrery_version": document.orrery_version,
-                    "projection_source": document.projection_source,
-                    "collector_version": document.collector_version,
-                    "reconstructed": document.reconstructed,
-                    "created_at": _timestamp(document.created_at),
-                    "visibility": visibility[document.key],
-                    "current": document.key in current,
-                    "document_path": _file_path(document, DOCUMENT_FILE_NAME),
-                    "upstream_paths": [
-                        _file_path(document, upstream.name) for upstream in upstreams
-                    ],
-                }
-                for document, upstreams in with_upstreams
-            ]
-        }
+        return {"documents": listed(matching)}
 
     @router.get("/{submission_id}/{document_sha256}/{file_name}")
     def read_graph_file(

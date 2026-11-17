@@ -26,3 +26,15 @@ test("does not apply historical weights without both pinned identities", () => {
     historicalWeightSummaryForDiagnostics("another-release", DIAGNOSTICS_SHA256),
   ).toBeNull();
 });
+
+test("finds the September local-area weight summary under its release folder", () => {
+  const summary = historicalWeightSummaryForDiagnostics(
+    `microcosm-us-2024-local/${RELEASE_ID}`,
+    DIAGNOSTICS_SHA256,
+  );
+
+  expect(summary).not.toBeNull();
+  expect(summary).toEqual(
+    historicalWeightSummaryForDiagnostics(RELEASE_ID, DIAGNOSTICS_SHA256),
+  );
+});

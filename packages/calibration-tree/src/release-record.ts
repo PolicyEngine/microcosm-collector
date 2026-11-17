@@ -221,6 +221,16 @@ export function isBuildFolderId(value: unknown): value is string {
 }
 
 /**
+ * The build name a release id ends in: `<build>` for a build folder id
+ * (`<release>/<build>`), and any other id unchanged. The registries of
+ * pinned historical builds are keyed on this name, the folder each build was
+ * published under before releases.json listed it under a release.
+ */
+export function buildNameOf(releaseId: string): string {
+  return parseBuildFolderId(releaseId)?.build ?? releaseId;
+}
+
+/**
  * A folder under `releases/` that release files are read from: a release
  * folder (`<release id>`) or a build folder (`<release>/<build>`). Folders
  * are interpolated into Hugging Face URLs that carry the server's token, so

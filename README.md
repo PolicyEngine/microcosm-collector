@@ -1101,9 +1101,9 @@ previous revision keeps answering.
 | Name | `<service>-orrery` | needs no variable of its own; `require-configuration` checks it fits Cloud Run's 49 characters before the deploy authenticates |
 | Identity | the runtime service account | it may read the bucket, connect to Cloud SQL and read the runtime database secret, as the service does |
 | Start | `uv run --no-sync uvicorn telemetry_collector.orrery_read_app:create_orrery_read_app_from_environment --factory --host 0.0.0.0 --port 8080 --no-access-log`, with container port 8080 | Cloud Run sends requests to and probes port 8080. The TCP startup probe checks only that the service listens: it has no health route |
-| Request timeout | 300 seconds | a fetch of a 64 MiB file reads it twice, in about 130 ranged reads of 1 MiB one after another, and sends it during the second read. Each Cloud Storage request gives up after 10 seconds without connecting or without data, and each call retries for at most 30 seconds: under a quarter of the timeout together |
+| Request timeout | 300 seconds | a fetch of a 64 MiB file reads it twice, in about 130 ranged reads of 1 MiB one after another, and sends it during the second read. Each Cloud Storage request gives up after 10 seconds without connecting or without data, and each call retries for at most 30 seconds: under a quarter of the timeout together. A page of the listing without a run or build ID lists up to 100 folders one after another, each within those limits, with no limit on the page as a whole: a bucket that answers slowly enough can take it past the timeout, and Cloud Run then answers 504 itself rather than the read service's 503 |
 | Memory, CPU, concurrency | 512 MiB, 1 CPU, 10 requests per instance | a request holds about one 1 MiB part of a file at a time, so ten fit beside the Python process with room to spare; hashing and sending are light work for one CPU |
-| Instances | 0 to 2, in both environments | each instance's database pool holds at most five connections, so the read service holds at most ten. microcosm-runs calls it only to show a run's files, and may cache public ones |
+| Instances | 0 to 2, in both environments | each instance's database pool holds at most five connections, so the read service holds at most ten. microcosm-runs calls it only to show a run's files or its run list, and may cache public files |
 
 The deployment service account deploys it as the runtime account and sets
 its IAM policy with Cloud Run Admin (`roles/run.admin`) on the project; it
@@ -1156,8 +1156,26 @@ nothing, and the read service reads no claim.
   `orrery_version`, `projection_source`, `collector_version`,
   `reconstructed`, `created_at`, `visibility` (its effective visibility,
   below), `current`, and `document_path` and `upstream_paths`, the paths of
-  the document and of each upstream file in its folder. Neither filter, or a
-  malformed one, answers 422 with `orrery_graph_query_invalid`.
+  the document and of each upstream file in its folder. A malformed filter
+  answers 422 with `orrery_graph_query_invalid`.
+- **`GET /v1/orrery-graphs?limit=<n>&before=<cursor>`**, with neither
+  `run_id` nor `build_id`, lists the recorded documents of every run, newest
+  first, a page at a time, as `{"documents": [...], "next_before": ...}`.
+  Each document has the fields above, with `current` chosen among all of its
+  build's documents, on any page. microcosm-runs uses it to show which runs
+  have graphs.
+  - **`limit`** is a whole number from 1 to 100, 50 when it isn't given. The
+    cap is lower than `GET /v1/runs`'s 200 because each document costs one
+    listing of its folder in the bucket, for its effective visibility.
+  - **`before`** is the previous page's `next_before`, an opaque cursor.
+    `next_before` is null when a page holds fewer than `limit` documents, so
+    a full last page is followed by an empty one, as for `GET /v1/runs`.
+  - **Order:** newest `created_at` first; documents recorded at the same
+    time come in descending order of `document_sha256`, then of
+    `submission_id`, as in a run's listing.
+  - **Refusals:** a malformed `limit` or `before`, a `before` longer than
+    256 characters, and either of them beside `run_id` or `build_id`,
+    answer 422 with `orrery_graph_query_invalid`.
 - **`GET /v1/orrery-graphs/<submission_id>/<document_sha256>/<file_name>`**
   returns `graph.orrery.json` or one of its `upstream-<sha256>.json` files
   from the bucket. Each part is checked before it names an object: the
@@ -1596,7 +1614,13 @@ immutable path (keeping a part already stored with the same bytes), then
 writes the manifest with a compare-and-swap: it creates the manifest only if
 it is still absent and replaces it only if its ETag is still the one read, so
 a manifest another writer changed is never overwritten, and a manifest read
-without an ETag is never replaced. A build asked to become its country's
+without an ETag is never replaced. Every consistent manifest read, including
+the publication and latest commands', reads the manifest uncompressed
+(`accept-encoding: identity`): Vercel Blob gives a compressed response the
+weak form of the blob's ETag (`W/"…"`), while a
+conditional write compares the strong one, so a weak ETag would make every
+replacement of the manifest fail. A manifest read with a weak ETag anyway is
+never replaced either. A build asked to become its country's
 latest does so only if it is at least as new (`createdAt`) as the current
 latest. Exit 2 means the build is refused: another build is already recorded
 for the same release build or staged run, or the same build was already
@@ -2250,15 +2274,15 @@ bun run typecheck
 
 `packages/calibration-tree/provenance.json` records the calibration-diagnostics
 commit the package was copied from, each copied file's git blob ID, the copied
-files changed here and why (only `package.json`), and the files that exist only
+files changed here and why (its `changed` map), and the files that exist only
 here. `src/provenance.test.ts` fails when a copied file no longer has its
 recorded blob ID, when a file is neither copied nor listed as the collector's
 own, or when a file listed as changed is identical to the dashboard's.
 
 While calibration-diagnostics keeps its copy, a change merged there is carried
 over by copying the changed files from a calibration-diagnostics commit,
-keeping this repo's changes to `package.json`, and recording that commit and
-the new blob IDs, which git lists with:
+keeping this repo's changes to the files `changed` lists, and recording that
+commit and the new blob IDs, which git lists with:
 
 ```bash
 git -C ../calibration-diagnostics ls-tree -r \

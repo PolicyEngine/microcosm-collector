@@ -221,6 +221,25 @@ describe("audited historical support manifest", () => {
     });
   });
 
+  test("finds the September 2026 local-area recipe under its release folder", () => {
+    const entry = HISTORICAL_ATTRIBUTION_SUPPORT.find(
+      (candidate) =>
+        candidate.releaseId ===
+        "populace-us-2024-buildo-acs-local-767312d60-20260923T074941Z",
+    )!;
+
+    expect(
+      classifyHistoricalAttributionEvidence({
+        ...evidence(entry),
+        releaseId: `microcosm-us-2024-local/${entry.releaseId}`,
+      }),
+    ).toEqual({
+      status: "exact_reconstructed",
+      recipe: "uniform_target_scale_cap_100pct_v1",
+      reason: null,
+    });
+  });
+
   test("refuses a familiar weighting name on an unexpected target surface", () => {
     const entry = HISTORICAL_ATTRIBUTION_SUPPORT.find(
       (candidate) => candidate.expectedStatus === "exact_reconstructed",

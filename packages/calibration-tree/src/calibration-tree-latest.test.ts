@@ -104,6 +104,9 @@ class InMemoryBlobStore {
   beforeManifestWrite: (() => void) | null = null;
   // Set to answer the manifest's reads with this ETag instead of its own.
   answeredManifestEtag: string | null = null;
+  // Set to answer reads as Vercel Blob does: compressed, with the weak form
+  // of the ETag (W/"…"), unless the read asks for no content encoding.
+  compressesReads = false;
 
   storeManifest(manifest: CalibrationTreeManifest): void {
     this.store(CALIBRATION_TREE_MANIFEST_PATH, new TextEncoder().encode(JSON.stringify(manifest)));
@@ -119,16 +122,18 @@ class InMemoryBlobStore {
   }
 
   client(): CalibrationTreeBlobClient {
-    const get = async (pathname: string) => {
+    const get = async (pathname: string, options: { headers?: Record<string, string> } = {}) => {
       const stored = this.blobs.get(pathname);
       if (!stored) return null;
+      const etag = this.answeredManifestEtag ?? stored.etag;
+      const compressed = this.compressesReads && options.headers?.["accept-encoding"] !== "identity";
       return {
         statusCode: 200,
         stream: new Response(Buffer.from(stored.bytes)).body,
-        headers: new Headers(),
+        headers: new Headers(compressed ? { "content-encoding": "br" } : {}),
         blob: {
           pathname,
-          etag: this.answeredManifestEtag ?? stored.etag,
+          etag: compressed ? `W/${etag}` : etag,
           contentType: "application/json",
           size: stored.bytes.byteLength,
         },
@@ -332,6 +337,48 @@ test("a manifest read without an ETag is never replaced", async () => {
   });
 
   const error = await moving.catch((caught: unknown) => caught);
+  expect(latest.calibrationTreeLatestExitCode(error)).toBe(3);
+  expect(store.puts).toEqual([]);
+  expect(store.manifest()?.countries.uk?.latestReleaseBuildArtifactId).toBe(NEWER_BUILD_ID);
+});
+
+test("the latest moves when the store compresses reads and weakens their ETags, as Vercel Blob does", async () => {
+  const latest = await latestCommand();
+  const store = new InMemoryBlobStore();
+  store.storeManifest(ukManifest(NEWER_BUILD_ID));
+  store.compressesReads = true;
+  const readEtag = store.etag();
+
+  const moving = latest.moveCalibrationTreeLatest({
+    request: latest.parseCalibrationTreeLatestRequest(OLDER_REQUEST),
+    token: TOKEN,
+    client: store.client(),
+  });
+
+  await expect(moving).resolves.toMatchObject({ buildArtifactId: OLDER_BUILD_ID, moved: true });
+  // The write is conditional on the stored manifest's own, strong ETag.
+  expect(store.puts).toEqual([
+    { pathname: CALIBRATION_TREE_MANIFEST_PATH, allowOverwrite: true, ifMatch: readEtag, token: TOKEN },
+  ]);
+  expect(store.manifest()?.countries.uk?.latestReleaseBuildArtifactId).toBe(OLDER_BUILD_ID);
+});
+
+test("a manifest read with a weak ETag is never replaced", async () => {
+  const latest = await latestCommand();
+  const store = new InMemoryBlobStore();
+  store.storeManifest(ukManifest(NEWER_BUILD_ID));
+  // A store that answers even an uncompressed read with a weak ETag.
+  store.answeredManifestEtag = `W/${store.etag()}`;
+
+  const moving = latest.moveCalibrationTreeLatest({
+    request: latest.parseCalibrationTreeLatestRequest(OLDER_REQUEST),
+    token: TOKEN,
+    client: store.client(),
+  });
+
+  const error = await moving.catch((caught: unknown) => caught);
+  expect(error).toBeInstanceOf(Error);
+  expect((error as Error).message).toMatch(/weak ETag/);
   expect(latest.calibrationTreeLatestExitCode(error)).toBe(3);
   expect(store.puts).toEqual([]);
   expect(store.manifest()?.countries.uk?.latestReleaseBuildArtifactId).toBe(NEWER_BUILD_ID);

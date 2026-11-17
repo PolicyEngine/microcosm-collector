@@ -57,7 +57,7 @@ import {
 import { buildCalibrationTree } from "./calibration-tree";
 import { missingReleasesRecord, missingRevision } from "./test-support/releases-record-responses";
 
-test("keeps Microcosm deployment configuration on its published Populace env contract", () => {
+test("keeps Microcosm deployment configuration on its published env contract", () => {
   expect([
     MICROCOSM_HF_REPO_ENV,
     MICROCOSM_UK_HF_REPO_ENV,
@@ -2365,6 +2365,39 @@ test("an audited unversioned local-area artifact uses the legacy reader", () => 
       ],
     },
     "populace-us-2024-buildp-acs-local-592ae5d6-20260819T020303Z",
+    null,
+    {},
+    { dataset_role: "non_default_local_area", is_default: false },
+    {},
+    "us",
+    "huggingface_immutable",
+    "b6f05b652049f88c044f1907eeed13c378aea47aec9c6dd6518faa90d1a0dcd0",
+  );
+
+  expect(cal.target_schema).toEqual({
+    diagnostics_schema_version: null,
+    structured_dimensions: false,
+    target_representation: "legacy",
+  });
+  expect(cal.diagnostics_status).toBe("ok");
+  expect(cal.included_target_count).toBe(1);
+});
+
+test("an audited unversioned local-area artifact keeps the legacy reader under its release folder", () => {
+  // The publisher passes a listed build's folder, `<release>/<build>`, as
+  // its release id.
+  const cal = buildCalibration(
+    {
+      targets: [
+        {
+          name: "usda_snap.fy2024.state.ct.average_monthly_households",
+          target: 229620.25,
+          initial_estimate: 280095,
+          final_estimate: 229462,
+        },
+      ],
+    },
+    "microcosm-us-2024-local/populace-us-2024-buildp-acs-local-592ae5d6-20260819T020303Z",
     null,
     {},
     { dataset_role: "non_default_local_area", is_default: false },

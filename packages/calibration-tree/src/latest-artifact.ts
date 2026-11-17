@@ -85,7 +85,7 @@ const DEFAULT_GEOGRAPHY = countryRegistration(DEFAULT_COUNTRY).geography;
 const DEFAULT_GEOGRAPHY_LEVEL = "national";
 
 // Deprecated upstream identifiers: Microcosm's published HF repositories and
-// deployment variables still use the former Populace names. The names live on
+// deployment variables keep their original names. The names live on
 // each country's registration; they are re-exported here for deployment docs
 // and tests.
 export const MICROCOSM_HF_REPO_ENV = COUNTRY_REGISTRY.us.repo_env;
