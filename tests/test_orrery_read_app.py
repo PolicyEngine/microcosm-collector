@@ -14,6 +14,7 @@ is set.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import importlib
 import importlib.util
@@ -393,6 +394,24 @@ class InMemoryGraphCatalogue:
         key = (submission_id, document_sha256)
         record = self.graphs.records.get(key)
         return None if record is None else self._recorded(key, record)
+
+    def recent_graph_files(
+        self, *, limit: int, before: tuple[datetime, str, str] | None = None
+    ) -> list[Any]:
+        newest_first = serving().newest_first
+        documents = sorted(
+            (
+                self._recorded(key, record)
+                for key, record in self.graphs.records.items()
+            ),
+            key=newest_first,
+            reverse=True,
+        )
+        if before is not None:
+            documents = [
+                document for document in documents if newest_first(document) < before
+            ]
+        return documents[:limit]
 
     def producing_submissions(
         self, file_sha256s: Collection[str]
@@ -852,12 +871,11 @@ def test_each_country_s_documents_with_one_build_id_have_their_own_current_one(
 @pytest.mark.parametrize(
     "filters",
     [
-        {},
         {"run_id": ""},
         {"run_id": "a run with spaces"},
         {"build_id": "../uk-build"},
     ],
-    ids=["no filter", "an empty run ID", "a malformed run ID", "a malformed build ID"],
+    ids=["an empty run ID", "a malformed run ID", "a malformed build ID"],
 )
 def test_a_listing_needs_a_well_formed_run_or_build(
     service: Serving, filters: dict[str, str]
@@ -865,6 +883,267 @@ def test_a_listing_needs_a_well_formed_run_or_build(
     service.publish()
 
     response = service.get(LISTING, params=filters)
+
+    assert_problem(response, 422, "orrery_graph_query_invalid")
+
+
+# Listing the newest documents of every run, a page at a time.
+
+
+def encoded_cursor(value: object) -> str:
+    """``value`` as JSON in unpadded base64url, the encoding of the cursors
+    the listing gives in ``next_before``."""
+
+    payload = json.dumps(value, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(payload).decode().rstrip("=")
+
+
+WELL_FORMED_CURSOR = encoded_cursor(
+    ["2026-10-20T09:00:00+00:00", "a" * 64, "sub-" + "0" * 32]
+)
+
+
+def recent_page(service: Serving, **query: str) -> dict[str, Any]:
+    response = service.get(LISTING, params=query)
+    assert response.status_code == 200, response.text
+    assert_private(response)
+    page = response.json()
+    assert set(page) == {"documents", "next_before"}
+    return page
+
+
+def test_without_a_run_or_build_the_newest_documents_come_back_a_page_at_a_time(
+    service: Serving,
+) -> None:
+    oldest = service.publish(run_id="uk-run-a", build_id="uk-build-a")
+    service.clock.advance(60)
+    middle = service.publish(run_id="uk-run-b", build_id="uk-build-b")
+    service.clock.advance(60)
+    newest = service.publish(run_id="uk-run-c", build_id="uk-build-c")
+
+    first_page = recent_page(service, limit="2")
+    second_page = recent_page(service, limit="2", before=first_page["next_before"])
+
+    assert [document["document_sha256"] for document in first_page["documents"]] == [
+        newest.document_sha256,
+        middle.document_sha256,
+    ]
+    assert isinstance(first_page["next_before"], str) and first_page["next_before"]
+    assert [document["document_sha256"] for document in second_page["documents"]] == [
+        oldest.document_sha256
+    ]
+    assert second_page["next_before"] is None
+
+
+def test_a_recent_listing_s_documents_have_the_fields_of_a_run_s_listing(
+    service: Serving,
+) -> None:
+    service.publish(upstream={UPSTREAM_NAME: UPSTREAM_CONTENT})
+    service.clock.advance(60)
+    service.publish(run_id="uk-run-rerun")
+    service.clock.advance(60)
+    service.publish(
+        run_id="uk-run-licensed", build_id="uk-build-licensed", licensed_data=True
+    )
+
+    recent = recent_page(service)["documents"]
+
+    assert recent == [
+        *service.listed(run_id="uk-run-licensed"),
+        *service.listed(run_id="uk-run-rerun"),
+        *service.listed(run_id=CONSUMING_RUN),
+    ]
+    assert [(document["visibility"], document["current"]) for document in recent] == [
+        ("private", True),
+        ("public", True),
+        ("public", False),
+    ]
+
+
+def test_a_recent_listing_holds_fifty_documents_unless_given_a_limit(
+    service: Serving,
+) -> None:
+    for _ in range(51):
+        service.publish()
+        service.clock.advance(1)
+
+    first_page = recent_page(service)
+    second_page = recent_page(service, before=first_page["next_before"])
+
+    assert len(first_page["documents"]) == 50
+    assert len(second_page["documents"]) == 1
+    assert second_page["next_before"] is None
+    assert len(recent_page(service, limit="100")["documents"]) == 51
+
+
+def test_a_full_last_page_is_followed_by_an_empty_one(service: Serving) -> None:
+    service.publish()
+    service.clock.advance(60)
+    service.publish()
+
+    full_page = recent_page(service, limit="2")
+    empty_page = recent_page(service, limit="2", before=full_page["next_before"])
+
+    assert len(full_page["documents"]) == 2
+    assert empty_page == {"documents": [], "next_before": None}
+
+
+def test_documents_recorded_at_the_same_time_are_paged_in_sha256_order(
+    service: Serving,
+) -> None:
+    published = [service.publish(), service.publish(), service.publish()]
+    expected = sorted(
+        (document.document_sha256 for document in published), reverse=True
+    )
+
+    paged: list[str] = []
+    cursor: str | None = None
+    for _ in published:
+        query = {"limit": "1"} if cursor is None else {"limit": "1", "before": cursor}
+        page = recent_page(service, **query)
+        paged.extend(document["document_sha256"] for document in page["documents"])
+        cursor = page["next_before"]
+
+    assert paged == expected
+    assert cursor is not None
+    assert recent_page(service, limit="1", before=cursor) == {
+        "documents": [],
+        "next_before": None,
+    }
+
+
+def paged_one_at_a_time(service: Serving) -> list[dict[str, Any]]:
+    """Every document of the recent listing, read one page of one at a time."""
+
+    documents: list[dict[str, Any]] = []
+    query = {"limit": "1"}
+    while True:
+        page = recent_page(service, **query)
+        documents.extend(page["documents"])
+        if page["next_before"] is None:
+            return documents
+        query = {"limit": "1", "before": page["next_before"]}
+
+
+def test_a_build_s_current_document_on_an_earlier_page_leaves_its_others_not_current(
+    service: Serving,
+) -> None:
+    older = service.publish()
+    service.clock.advance(60)
+    other_build = service.publish(run_id="uk-run-other", build_id="uk-build-other")
+    service.clock.advance(60)
+    newer = service.publish(run_id="uk-run-rerun")
+
+    assert [
+        (document["document_sha256"], document["current"])
+        for document in paged_one_at_a_time(service)
+    ] == [
+        (newer.document_sha256, True),
+        (other_build.document_sha256, True),
+        (older.document_sha256, False),
+    ]
+
+
+def test_documents_recorded_microseconds_apart_are_paged_without_a_gap(
+    service: Serving,
+) -> None:
+    published = []
+    for _ in range(3):
+        published.append(service.publish())
+        service.clock.advance(0.000001)
+
+    documents = paged_one_at_a_time(service)
+
+    assert [document["document_sha256"] for document in documents] == [
+        document.document_sha256 for document in reversed(published)
+    ]
+    assert [document["created_at"] for document in documents] == [
+        "2026-10-20T09:00:00.000002+00:00",
+        "2026-10-20T09:00:00.000001+00:00",
+        "2026-10-20T09:00:00+00:00",
+    ]
+
+
+def test_one_document_in_two_submissions_recorded_at_once_pages_by_submission_id(
+    service: Serving,
+) -> None:
+    content = json.dumps({"document": "shared", "nodes": []}).encode()
+    first = service.publish(content=content)
+    second = service.publish(run_id="uk-run-rerun", content=content)
+    assert first.document_sha256 == second.document_sha256
+
+    assert [
+        document["submission_id"] for document in paged_one_at_a_time(service)
+    ] == sorted([first.submission_id, second.submission_id], reverse=True)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        {"limit": "0"},
+        {"limit": "101"},
+        {"limit": "-1"},
+        {"limit": "ten"},
+        {"limit": "1.5"},
+        {"limit": ""},
+        {"before": "not-a-cursor"},
+        {"before": ""},
+        {
+            "before": encoded_cursor(
+                ["2026-10-20T09:00:00", "a" * 64, "sub-" + "0" * 32]
+            )
+        },
+        {
+            "before": encoded_cursor(
+                ["2026-10-20T09:00:00+00:00", "A" * 64, "sub-" + "0" * 32]
+            )
+        },
+        {"before": encoded_cursor(["2026-10-20T09:00:00+00:00", "a" * 64, "sub-1"])},
+        {"before": encoded_cursor(["2026-10-20T09:00:00+00:00", "a" * 64])},
+        {"before": encoded_cursor({"created_at": "2026-10-20T09:00:00+00:00"})},
+        {"before": base64.urlsafe_b64encode(b"[" * 10_000).decode().rstrip("=")},
+    ],
+    ids=[
+        "a limit of zero",
+        "a limit over 100",
+        "a negative limit",
+        "a limit in words",
+        "a fractional limit",
+        "an empty limit",
+        "a cursor that isn't base64 JSON",
+        "an empty cursor",
+        "a cursor time without an offset",
+        "a cursor with an uppercase SHA-256",
+        "a cursor with a malformed submission ID",
+        "a cursor with two parts",
+        "a cursor that isn't a list",
+        "a cursor of deeply nested lists",
+    ],
+)
+def test_a_recent_listing_needs_a_well_formed_limit_and_cursor(
+    service: Serving, query: dict[str, str]
+) -> None:
+    service.publish()
+
+    response = service.get(LISTING, params=query)
+
+    assert_problem(response, 422, "orrery_graph_query_invalid")
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        {"run_id": CONSUMING_RUN, "limit": "5"},
+        {"build_id": BUILD, "before": WELL_FORMED_CURSOR},
+    ],
+    ids=["a run's listing with a limit", "a build's listing with a cursor"],
+)
+def test_limit_and_before_apply_only_to_a_listing_without_a_run_or_build(
+    service: Serving, query: dict[str, str]
+) -> None:
+    service.publish()
+
+    response = service.get(LISTING, params=query)
 
     assert_problem(response, 422, "orrery_graph_query_invalid")
 
@@ -1344,10 +1623,22 @@ def test_a_checksum_failure_the_storage_client_reports_answers_500(
     assert_error_logged(caplog, object_name)
 
 
+def endpoint_path(endpoint: str, published: PublishedDocument) -> str:
+    """The path of a request to ``endpoint``: a run's listing, the recent
+    listing, or the published document's file."""
+
+    return {
+        "listing": f"{LISTING}?run_id={CONSUMING_RUN}",
+        "recent listing": LISTING,
+        "file": published.path(),
+    }[endpoint]
+
+
 # Each storage call that can fail: its operation, and the endpoint whose
 # request makes it.
 STORAGE_FAILURES = {
     "listing a listed document's folder": ("list", "listing"),
+    "listing a recently listed document's folder": ("list", "recent listing"),
     "looking the file up": ("lookup", "file"),
     "reading the file to check it": ("read", "file"),
     "listing the served document's folder": ("list", "file"),
@@ -1362,11 +1653,7 @@ def test_a_bucket_that_does_not_answer_gives_503_and_is_logged_without_credentia
     operation, endpoint = STORAGE_FAILURES[failure]
     service.storage.unavailable.add(operation)
     caplog.set_level(logging.DEBUG)
-    path = (
-        f"{LISTING}?run_id={CONSUMING_RUN}"
-        if endpoint == "listing"
-        else published.path()
-    )
+    path = endpoint_path(endpoint, published)
 
     response = service.get(path)
 
@@ -1415,6 +1702,10 @@ def test_every_storage_call_has_a_timeout_and_a_retry_deadline_well_inside_the_r
         ("listing", "graph_files"),
         ("listing", "producing_submissions"),
         ("listing", "licensed_runs_and_builds"),
+        ("recent listing", "recent_graph_files"),
+        ("recent listing", "graph_files"),
+        ("recent listing", "producing_submissions"),
+        ("recent listing", "licensed_runs_and_builds"),
         ("file", "graph_file"),
         ("file", "producing_submissions"),
         ("file", "licensed_runs_and_builds"),
@@ -1429,11 +1720,7 @@ def test_a_database_that_does_not_answer_gives_503(
         )
     )
     published = harness.publish(upstream={UPSTREAM_NAME: UPSTREAM_CONTENT})
-    path = (
-        f"{LISTING}?run_id={CONSUMING_RUN}"
-        if endpoint == "listing"
-        else published.path()
-    )
+    path = endpoint_path(endpoint, published)
 
     response = harness.get(path)
 
@@ -1441,7 +1728,7 @@ def test_a_database_that_does_not_answer_gives_503(
     assert int(response.headers["Retry-After"]) > 0
 
 
-@pytest.mark.parametrize("endpoint", ["listing", "file"])
+@pytest.mark.parametrize("endpoint", ["listing", "recent listing", "file"])
 def test_the_postgres_catalogue_s_connection_errors_give_503(endpoint: str) -> None:
     engine = create_database_engine(UNREACHABLE_DATABASE_URL)
     try:
@@ -1449,11 +1736,7 @@ def test_the_postgres_catalogue_s_connection_errors_give_503(endpoint: str) -> N
             catalogue=lambda _: serving().PostgresOrreryGraphCatalogue(engine)
         )
         published = harness.publish()
-        path = (
-            f"{LISTING}?run_id={CONSUMING_RUN}"
-            if endpoint == "listing"
-            else published.path()
-        )
+        path = endpoint_path(endpoint, published)
 
         response = harness.get(path)
     finally:
@@ -1506,6 +1789,7 @@ def test_every_answer_of_the_read_service_is_marked_not_to_be_stored(
         service.get(published.path()),
         service.get(published.path(UPSTREAM_NAME)),
         service.get(LISTING),
+        service.get(LISTING, params={"run_id": ""}),
         service.get(published.path("graph.schema.json")),
         service.get(f"{LISTING}/unknown"),
         service.client.post(LISTING),
@@ -1517,6 +1801,7 @@ def test_every_answer_of_the_read_service_is_marked_not_to_be_stored(
     ]
 
     assert [answer.status_code for answer in answers] == [
+        200,
         200,
         200,
         200,
@@ -1881,6 +2166,73 @@ def test_the_catalogue_finds_a_build_s_documents_within_one_country(
         [(uk_submission, "a" * 64), (us_submission, "b" * 64)]
     )
     assert found(build_id="build-1", country_code="FR") == []
+
+
+def test_the_catalogue_lists_recent_documents_newest_first_after_a_cursor(
+    record_stores: RecordStores,
+) -> None:
+    first = record_stores.submit(
+        run_id="run-a", licensed_data=False, files=orrery_files("a")
+    )
+    second = record_stores.submit(
+        run_id="run-b", licensed_data=False, files=orrery_files("b")
+    )
+    record_stores.record(first, "a" * 64, run_id="run-a", build_id="build-1")
+    record_stores.clock.advance(60)
+    # Three documents recorded at the same time, which their SHA-256 orders.
+    record_stores.record(second, "b" * 64, run_id="run-b", build_id="build-1")
+    record_stores.record(second, "c" * 64, run_id="run-b", build_id="build-2")
+    record_stores.record(first, "d" * 64, run_id="run-a", build_id="build-2")
+    catalogue = record_stores.catalogue
+
+    def keys(documents: list[Any]) -> list[tuple[str, str]]:
+        return [
+            (document.submission_id, document.document_sha256) for document in documents
+        ]
+
+    everything = catalogue.recent_graph_files(limit=10)
+
+    assert keys(everything) == [
+        (first, "d" * 64),
+        (second, "c" * 64),
+        (second, "b" * 64),
+        (first, "a" * 64),
+    ]
+    assert keys(catalogue.recent_graph_files(limit=1)) == [(first, "d" * 64)]
+    assert keys(
+        catalogue.recent_graph_files(
+            limit=2, before=serving().newest_first(everything[1])
+        )
+    ) == [(second, "b" * 64), (first, "a" * 64)]
+    assert (
+        catalogue.recent_graph_files(
+            limit=10, before=serving().newest_first(everything[-1])
+        )
+        == []
+    )
+
+
+def test_the_catalogue_lists_documents_recorded_microseconds_apart_in_order(
+    record_stores: RecordStores,
+) -> None:
+    submission_id = record_stores.submit(
+        run_id="run-a", licensed_data=False, files=orrery_files("a")
+    )
+    # The later document has the smaller SHA-256, so only its microsecond
+    # puts it first: were microseconds lost, the SHA-256 would order them
+    # the other way.
+    record_stores.record(submission_id, "b" * 64, run_id="run-a", build_id="build-1")
+    record_stores.clock.advance(0.000001)
+    record_stores.record(submission_id, "a" * 64, run_id="run-a", build_id="build-1")
+    catalogue = record_stores.catalogue
+
+    [newest] = catalogue.recent_graph_files(limit=1)
+    older = catalogue.recent_graph_files(
+        limit=10, before=serving().newest_first(newest)
+    )
+
+    assert newest.document_sha256 == "a" * 64
+    assert [document.document_sha256 for document in older] == ["b" * 64]
 
 
 def test_the_catalogue_reads_one_document_s_record(
