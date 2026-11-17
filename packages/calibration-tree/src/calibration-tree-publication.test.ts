@@ -55,6 +55,9 @@ class InMemoryBlobStore {
   beforeManifestWrite: (() => void) | null = null;
   // Set to answer the manifest's reads with this ETag instead of its own.
   answeredManifestEtag: string | null = null;
+  // Set to answer reads as Vercel Blob does: compressed, with the weak form
+  // of the ETag (W/"…"), unless the read asks for no content encoding.
+  compressesReads = false;
 
   store(pathname: string, bytes: Uint8Array): void {
     this.written += 1;
@@ -62,18 +65,20 @@ class InMemoryBlobStore {
   }
 
   client(): CalibrationTreeBlobClient {
-    const get = async (pathname: string) => {
+    const get = async (pathname: string, options: { headers?: Record<string, string> } = {}) => {
       const stored = this.blobs.get(pathname);
       if (!stored) return null;
+      const etag = pathname === CALIBRATION_TREE_MANIFEST_PATH && this.answeredManifestEtag !== null
+        ? this.answeredManifestEtag
+        : stored.etag;
+      const compressed = this.compressesReads && options.headers?.["accept-encoding"] !== "identity";
       return {
         statusCode: 200,
         stream: new Response(Buffer.from(stored.bytes)).body,
-        headers: new Headers(),
+        headers: new Headers(compressed ? { "content-encoding": "br" } : {}),
         blob: {
           pathname,
-          etag: pathname === CALIBRATION_TREE_MANIFEST_PATH && this.answeredManifestEtag !== null
-            ? this.answeredManifestEtag
-            : stored.etag,
+          etag: compressed ? `W/${etag}` : etag,
           contentType: "application/octet-stream",
           size: stored.bytes.byteLength,
         },
@@ -343,6 +348,56 @@ test("a second submission of the same files for the same run is refused, not ret
   expect(publication.calibrationTreePublicationExitCode(refusal))
     .toBe(publication.CALIBRATION_TREE_PUBLICATION_EXIT_ENTRY_REFUSED);
   expect(store.manifest()).toEqual(manifestBefore);
+});
+
+test("a second publication succeeds when the store compresses reads and weakens their ETags, as Vercel Blob does", async () => {
+  const store = new InMemoryBlobStore();
+  store.compressesReads = true;
+  await publish(store, builtTree("staging"));
+  const etagBefore = store.blobs.get(CALIBRATION_TREE_MANIFEST_PATH)?.etag;
+
+  await expect(publish(store, builtTree("release"))).resolves.toMatchObject({ kind: "release" });
+
+  // The write is conditional on the stored manifest's own, strong ETag.
+  expect(store.puts.filter((put) => put.pathname === CALIBRATION_TREE_MANIFEST_PATH).at(-1)).toEqual({
+    pathname: CALIBRATION_TREE_MANIFEST_PATH,
+    allowOverwrite: true,
+    ifMatch: etagBefore,
+  });
+  expect(store.manifest()?.countries.uk?.builds.map((build) => build.kind).sort()).toEqual(["release", "staging"]);
+});
+
+test("a manifest another writer changed is still never overwritten when the store compresses reads", async () => {
+  const store = new InMemoryBlobStore();
+  store.compressesReads = true;
+  await publish(store, builtTree("staging"));
+  const release = builtTree("release");
+  const otherWriterManifest = new TextEncoder().encode(JSON.stringify({ schemaVersion: 6, countries: {} }));
+  store.beforeManifestWrite = () => {
+    store.beforeManifestWrite = null;
+    store.store(CALIBRATION_TREE_MANIFEST_PATH, otherWriterManifest);
+  };
+
+  await expect(publish(store, release)).rejects.toBeInstanceOf(publication.CalibrationTreeManifestConflictError);
+
+  expect(store.blobs.get(CALIBRATION_TREE_MANIFEST_PATH)?.bytes).toEqual(otherWriterManifest);
+});
+
+test("a manifest read with a weak ETag is never sent as the write's condition", async () => {
+  const store = new InMemoryBlobStore();
+  await publish(store, builtTree("staging"));
+  const manifestBefore = store.blobs.get(CALIBRATION_TREE_MANIFEST_PATH);
+  const manifestWrites = () => store.puts.filter((put) => put.pathname === CALIBRATION_TREE_MANIFEST_PATH).length;
+  const manifestWritesBefore = manifestWrites();
+  // A store that answers even an uncompressed read with a weak ETag.
+  store.answeredManifestEtag = `W/${manifestBefore?.etag}`;
+
+  const failure = await publish(store, builtTree("release")).catch((error: unknown) => error);
+
+  expect(failure).toBeInstanceOf(publication.CalibrationTreeManifestConflictError);
+  expect((failure as Error).message).toMatch(/weak ETag/);
+  expect(manifestWrites()).toBe(manifestWritesBefore);
+  expect(store.blobs.get(CALIBRATION_TREE_MANIFEST_PATH)?.bytes).toEqual(manifestBefore?.bytes);
 });
 
 test("a manifest read without an ETag is never written over", async () => {

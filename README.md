@@ -53,10 +53,14 @@ returned JWT to the build.
 Without `lifetime_seconds`, the exchange is unchanged: the same lifetime, claims
 and response.
 
-The dashboard query endpoints require `X-Telemetry-Read-Token`. The dashboard
-server retrieves this credential from Google Secret Manager at runtime. Vercel
-authenticates using its OIDC identity; the credential is never returned to the
-browser or passed through GitHub Actions.
+The dashboard query endpoints require the dashboard read credential in
+`X-Telemetry-Read-Token`. The dashboard server retrieves this credential from
+Google Secret Manager at runtime, authenticating to Google Cloud with its
+Vercel OIDC identity; the credential is never returned to the browser or
+passed through GitHub Actions. Read API v2 also accepts, instead of the read
+credential, a consumer app's Vercel OIDC token itself, from the Vercel
+projects and environments the collector is configured for (see "Vercel OIDC
+tokens"). Such an app then needs no copy of the read credential.
 
 ### Session tokens
 
@@ -226,6 +230,8 @@ costs one check.
 ## Read API
 
 Both versions take the dashboard read credential in `X-Telemetry-Read-Token`.
+Version 2 also takes a consumer app's Vercel OIDC token in
+`Authorization: Bearer` ("Vercel OIDC tokens", below); version 1 refuses it.
 
 - **Version 1**, `GET /v1/runs` and `GET /v1/runs/{run_id}`, is what the
   dashboard reads today. A run comes back as the documents the dashboard used
@@ -261,6 +267,107 @@ that each answer matches the document's schema. After an intended change to
 either version, run `uv run python tools/update-read-api-contract.py`, review
 the changed files, and regenerate the client's types (below).
 
+### Vercel OIDC tokens
+
+A Vercel deployment holds an OIDC token that Vercel signs for its team (team
+issuer mode, which the dashboard and microcosm-runs use): issuer
+`https://oidc.vercel.com/<team slug>`, audience `https://vercel.com/<team slug>`,
+RS256, with the claims `owner_id` (the team's ID, `team_…`), `project_id`
+(`prj_…`) and `environment` (`production`, `preview` or `development`). A
+function receives it in the `x-vercel-oidc-token` request header, and
+`getVercelOidcToken()` from `@vercel/oidc` returns it; a development token from
+`vercel env pull` lasts 12 hours. Read API v2 accepts it in
+`Authorization: Bearer <token>` from the projects and environments listed as
+readers. Version 1 never does.
+
+Three settings, all optional, switch it on together
+(`telemetry_collector/vercel_oidc.py`):
+
+| Setting | Value |
+|---|---|
+| `TELEMETRY_VERCEL_OIDC_TEAM_SLUG` | the Vercel team's slug, from which the issuer and audience above derive |
+| `TELEMETRY_VERCEL_OIDC_TEAM_ID` | the team's ID, which a token's `owner_id` must equal |
+| `TELEMETRY_VERCEL_OIDC_READERS` | the `<project ID>:<environment>` entries that may read, separated by whitespace (not commas, which `gcloud run deploy --set-env-vars` splits at) |
+
+With none set (unset or blank), the collector refuses every Vercel OIDC
+token. With only some set, or a malformed value, it refuses to start, with a
+message naming the setting but not its value. The staging collector is to
+list the dashboard's `preview` environment, and the production collector its
+`production` environment. The values are not repeated in documentation.
+
+What a v2 request gets:
+
+| Credential | Answer |
+|---|---|
+| The read credential, with or without a bearer token | as today |
+| A bearer token, while the settings are unset | 401 `This collector accepts no Vercel OIDC tokens.` |
+| A token that is malformed, expired, not yet valid, or not signed by Vercel for the team | 401 `The Vercel OIDC token is invalid or expired.` |
+| A valid token whose `owner_id` is not the team, or whose project and environment are not a reader | 403 `This Vercel project and environment may not read this collector.` |
+| A token while Vercel's signing keys can't be read and none usable is cached | 503 `Vercel's token signing keys could not be read.`, without `Retry-After` |
+| A valid token from a reader | the same answer as for the read credential |
+| Neither | 401 `A valid dashboard read credential is required.`, as today |
+
+A token is checked in this order: at most 8,192 characters; a header that
+parses, with `alg` `RS256` and a non-empty `kid`; a signature by the key with
+that `kid`; the team's issuer and audience; `exp`, `iat` and `sub` present;
+`exp` passed by no more than 30 seconds, and `iat` and (when present) `nbf`
+no more than 30 seconds ahead of the collector's clock; `owner_id`,
+`project_id` and `environment` non-empty strings. A token
+that cannot be parsed at all, such as one whose header is nested too deeply
+for Python's JSON decoder, is invalid rather than a server error.
+
+**Signing keys.** The collector reads Vercel's key set from
+`https://oidc.vercel.com/.well-known/jwks`, the address Vercel's own
+`@vercel/oidc` verifier (`verifyVercelOidcToken`) uses for every issuer, team
+issuers included. It never follows a redirect. Only RSA keys with a `kid`,
+whose `use` is absent or `sig` and whose `alg` is absent or `RS256`, are
+usable. A fetch succeeds when the answer is 200 with a JSON object holding a
+`keys` list with at least one usable key. Any other answer, an empty `keys`
+list or one whose keys are all skipped included, is a failed fetch, and leaves
+the cached keys as they are. After a successful fetch, a listed key is used
+without fetching again for 10 minutes. After that, or for a `kid` the set
+doesn't list, the collector fetches again, at most once a minute whatever the
+requests. While fetches fail, keys from the last successful fetch stay usable
+for 24 hours after it; a token whose key the cache doesn't hold, or holds from
+longer ago, answers 503 while the last fetch failed, and 401 once a fetch
+succeeds without its key. One request at a time fetches. A request whose key
+is cached, whether fetched within the 10 minutes or within the 24 hours,
+never waits for another request's fetch, and uses the older key while that
+fetch runs; a request whose key the cache doesn't hold waits for it, for at
+most 10 seconds, and then looks again, or answers 503 once the 10 seconds
+have passed. So a burst of tokens naming keys nobody lists holds a worker
+thread for at most that long each.
+
+**Where the settings come from.** Each is a GitHub environment variable of
+`staging` and `production`, which the deployment passes to the service
+revisions only:
+
+| Setting | Provider | Path to the collector |
+|---|---|---|
+| `TELEMETRY_VERCEL_OIDC_TEAM_SLUG` | GitHub environment variable | `vars.TELEMETRY_VERCEL_OIDC_TEAM_SLUG` → `deploy-staging`'s and `deploy-production`'s `env:` as `VERCEL_OIDC_TEAM_SLUG` → `scripts/deploy.sh deploy-maintenance` and `deploy-candidate` → `--set-env-vars` → the revision's environment → `VercelOidcSettings.from_environment` |
+| `TELEMETRY_VERCEL_OIDC_TEAM_ID` | GitHub environment variable | the same, as `VERCEL_OIDC_TEAM_ID` |
+| `TELEMETRY_VERCEL_OIDC_READERS` | GitHub environment variable | the same, as `VERCEL_OIDC_READERS`; the deploy passes the entries separated by single spaces |
+
+`scripts/deploy.sh require-configuration` checks them with the collector's
+patterns, all three or none, before the deployment authenticates. The
+worker, recovery and migration jobs and the Orrery read service never get
+them. None is set yet: setting the three variables in both environments is a
+manual step, and the next release deploys them.
+
+**Security.** A Vercel OIDC token's audience is the team, not the
+collector: whoever receives one can present it to any other party that
+trusts the same issuer and audience, such as the dashboard's Google Workload
+Identity provider, until it expires. The collector never logs, stores or
+returns a token, and no answer or error message includes one. Every preview
+deployment of an allowed project, from any branch, has `environment:
+preview`, so with that project's `preview` among its readers, each of them
+can read the staging collector. It is unverified whether
+`vercel env pull --environment=preview` or `--environment=production` gives a
+token whose `environment` is `preview` or `production`. If it does, anyone
+allowed to pull the project's variables for an environment can read that
+environment's collector from their own machine, as they can already read
+that environment's other settings.
+
 ### The TypeScript client
 
 `packages/collector-client` is `@policyengine/microcosm-collector-client`, a
@@ -269,6 +376,12 @@ typed client for version 2. Its types are generated from `openapi.json`
 CI fails if the generated types are out of date. Each release gives the client
 the collector's version (`tools/set-client-version.py`, run by
 `tools/update-version.sh`).
+
+A client sends exactly one credential: the read credential (`readToken`), or
+a consumer app's Vercel OIDC token (`vercelOidcToken`, such as
+`getVercelOidcToken` from `@vercel/oidc`), as `Authorization: Bearer`.
+Either may be a function, called before each request. The client does not
+depend on `@vercel/oidc`.
 
 Once production runs a release, and if the repo variable
 `COLLECTOR_CLIENT_PUBLISH_ENABLED` is `true`, the Push workflow publishes that
@@ -503,6 +616,14 @@ identity column needs no sequence privilege to insert rows.
   can be projected and processes it at once. An operator runs it the same
   way, and only while the worker's account may create objects in the intake
   bucket (see "Projecting past builds again").
+- **Backfilling calibration trees** (`uv run --no-sync python -m
+  telemetry_collector.operations backfill-calibration-trees
+  --production-manifest-url <URL>`, with `--dry-run` to list first) builds
+  every calibration tree production's tree manifest lists that the
+  collector's store doesn't hold yet. It needs the database, the Hugging
+  Face read token and the calibration tree Blob token, so an operator runs
+  it as an execution of the worker job with its arguments overridden (see
+  "Backfilling calibration trees from Hugging Face").
 
 None of these values is secret. Intake needs, in each environment's project
 and region, these resources, created by hand (both environments have them):
@@ -601,7 +722,9 @@ runtime environment variables. Generate a P-256 key for local use with
 `openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256` and pass the
 PEM text as `TELEMETRY_JWT_SIGNING_KEY`. `TELEMETRY_JWT_SECRET`, at least 32
 random characters, is needed only to issue or accept HS256 tokens. Use at
-least 24 random characters for the dashboard read credential. Use Microcosm's
+least 24 random characters for the dashboard read credential. Vercel OIDC
+tokens stay refused unless the three `TELEMETRY_VERCEL_OIDC_*` settings are
+given (see "Vercel OIDC tokens"). Use Microcosm's
 loopback-only development option when testing ingestion. Production Microcosm
 builds use the fixed collector origin shipped by the package and do not accept
 a destination environment variable.
@@ -970,9 +1093,9 @@ previous revision keeps answering.
 | Name | `<service>-orrery` | needs no variable of its own; `require-configuration` checks it fits Cloud Run's 49 characters before the deploy authenticates |
 | Identity | the runtime service account | it may read the bucket, connect to Cloud SQL and read the runtime database secret, as the service does |
 | Start | `uv run --no-sync uvicorn telemetry_collector.orrery_read_app:create_orrery_read_app_from_environment --factory --host 0.0.0.0 --port 8080 --no-access-log`, with container port 8080 | Cloud Run sends requests to and probes port 8080. The TCP startup probe checks only that the service listens: it has no health route |
-| Request timeout | 300 seconds | a fetch of a 64 MiB file reads it twice, in about 130 ranged reads of 1 MiB one after another, and sends it during the second read. Each Cloud Storage request gives up after 10 seconds without connecting or without data, and each call retries for at most 30 seconds: under a quarter of the timeout together |
+| Request timeout | 300 seconds | a fetch of a 64 MiB file reads it twice, in about 130 ranged reads of 1 MiB one after another, and sends it during the second read. Each Cloud Storage request gives up after 10 seconds without connecting or without data, and each call retries for at most 30 seconds: under a quarter of the timeout together. A page of the listing without a run or build ID lists up to 100 folders one after another, each within those limits, with no limit on the page as a whole: a bucket that answers slowly enough can take it past the timeout, and Cloud Run then answers 504 itself rather than the read service's 503 |
 | Memory, CPU, concurrency | 512 MiB, 1 CPU, 10 requests per instance | a request holds about one 1 MiB part of a file at a time, so ten fit beside the Python process with room to spare; hashing and sending are light work for one CPU |
-| Instances | 0 to 2, in both environments | each instance's database pool holds at most five connections, so the read service holds at most ten. microcosm-runs calls it only to show a run's files, and may cache public ones |
+| Instances | 0 to 2, in both environments | each instance's database pool holds at most five connections, so the read service holds at most ten. microcosm-runs calls it only to show a run's files or its run list, and may cache public files |
 
 The deployment service account deploys it as the runtime account and sets
 its IAM policy with Cloud Run Admin (`roles/run.admin`) on the project; it
@@ -1025,8 +1148,26 @@ nothing, and the read service reads no claim.
   `orrery_version`, `projection_source`, `collector_version`,
   `reconstructed`, `created_at`, `visibility` (its effective visibility,
   below), `current`, and `document_path` and `upstream_paths`, the paths of
-  the document and of each upstream file in its folder. Neither filter, or a
-  malformed one, answers 422 with `orrery_graph_query_invalid`.
+  the document and of each upstream file in its folder. A malformed filter
+  answers 422 with `orrery_graph_query_invalid`.
+- **`GET /v1/orrery-graphs?limit=<n>&before=<cursor>`**, with neither
+  `run_id` nor `build_id`, lists the recorded documents of every run, newest
+  first, a page at a time, as `{"documents": [...], "next_before": ...}`.
+  Each document has the fields above, with `current` chosen among all of its
+  build's documents, on any page. microcosm-runs uses it to show which runs
+  have graphs.
+  - **`limit`** is a whole number from 1 to 100, 50 when it isn't given. The
+    cap is lower than `GET /v1/runs`'s 200 because each document costs one
+    listing of its folder in the bucket, for its effective visibility.
+  - **`before`** is the previous page's `next_before`, an opaque cursor.
+    `next_before` is null when a page holds fewer than `limit` documents, so
+    a full last page is followed by an empty one, as for `GET /v1/runs`.
+  - **Order:** newest `created_at` first; documents recorded at the same
+    time come in descending order of `document_sha256`, then of
+    `submission_id`, as in a run's listing.
+  - **Refusals:** a malformed `limit` or `before`, a `before` longer than
+    256 characters, and either of them beside `run_id` or `build_id`,
+    answer 422 with `orrery_graph_query_invalid`.
 - **`GET /v1/orrery-graphs/<submission_id>/<document_sha256>/<file_name>`**
   returns `graph.orrery.json` or one of its `upstream-<sha256>.json` files
   from the bucket. Each part is checked before it names an object: the
@@ -1447,7 +1588,15 @@ CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN=... \
   bun run src/calibration-tree-publication.ts PUBLICATION.json
 CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN=... \
   bun run src/calibration-tree-latest.ts LATEST.json
+CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN=... \
+  bun run src/calibration-tree-manifest-read.ts
 ```
+
+`src/calibration-tree-manifest-read.ts` only reads: it prints the store's
+manifest as one JSON line, read without the cache and checked with the
+manifest's own rules (an empty manifest while the store has none), for the
+backfill to compare with production's. It exits 1 without its token and 3
+when the store can't be read or its manifest breaks the rules.
 
 The worker builds a release exactly as the publisher builds it from the same
 files, commit and publication time, and a staged run as the publisher builds a
@@ -1457,7 +1606,13 @@ immutable path (keeping a part already stored with the same bytes), then
 writes the manifest with a compare-and-swap: it creates the manifest only if
 it is still absent and replaces it only if its ETag is still the one read, so
 a manifest another writer changed is never overwritten, and a manifest read
-without an ETag is never replaced. A build asked to become its country's
+without an ETag is never replaced. Every consistent manifest read, including
+the publication and latest commands', reads the manifest uncompressed
+(`accept-encoding: identity`): Vercel Blob gives a compressed response the
+weak form of the blob's ETag (`W/"…"`), while a
+conditional write compares the strong one, so a weak ETag would make every
+replacement of the manifest fail. A manifest read with a weak ETag anyway is
+never replaced either. A build asked to become its country's
 latest does so only if it is at least as new (`createdAt`) as the current
 latest. Exit 2 means the build is refused: another build is already recorded
 for the same release build or staged run, or the same build was already
@@ -1539,6 +1694,12 @@ from the submission; only the latest build is decided from Hugging Face.
   other failure, including a manifest another writer changed meanwhile, fails
   the attempt so it runs again.
 
+`build_and_publish` in the same module runs the tree worker and the
+publication command for one planned tree, and the backfill runs it too. The
+handler has it read `releases.json` under the lock, as above; the backfill
+reads nothing there and asks for the latest from production's manifest (see
+"Backfilling calibration trees from Hugging Face").
+
 The image holds Bun 1.4.2, copied from the official image by digest, and the
 package's production install, without its tests, fixtures and test support.
 CI checks the built image with `tools/check-calibration-tree-image.sh`, which
@@ -1598,6 +1759,186 @@ finds its tree. A tree whose publication comes after a rollback to it isn't
 made the latest by that publication, which takes the latest only from an older
 build; reprocessing the change's `releases-record` submission moves it.
 
+### Backfilling calibration trees from Hugging Face
+
+Before the dashboard reads trees from the collector's store, that store must
+hold every build the dashboard lists today.
+`python -m telemetry_collector.operations backfill-calibration-trees`
+(`telemetry_collector/calibration_tree_backfill.py`) builds each one the
+store doesn't hold yet, from its Hugging Face files, as the store would have
+built it from a submission.
+
+**Which builds.** The builds come from production's public tree manifest,
+`GET <URL>?country=<cc>`, where `<URL>` is the command's
+`--production-manifest-url`, the dashboard's
+`https://<dashboard>/api/microcosm/tree-manifest`. The command sends it no
+credential, through a client of its own, never the Hugging Face reader's, and
+follows no redirect. `--country us|uk|be` (repeatable) and `--kind
+release|staging` limit what it backfills.
+
+**Checks.** For each country:
+- An answer that isn't HTTP 200, is larger than 16 MiB, takes longer than 2
+  minutes to arrive in whole (checked as each chunk arrives; each connect and
+  each read also times out after 60 seconds), isn't JSON, has another
+  `schemaVersion` than the tree manifest's 6 or another `country`, or names a
+  `latestReleaseBuildArtifactId` that isn't one of its release builds, is one
+  `error` for that country; the other countries continue.
+- Each entry is checked before any of its values is used in a Hugging Face
+  path, and one that fails is `invalid` while the rest of the country
+  continues: its `kind`; its `hfRepo`, the country's release repo or, for a
+  staging build, its staging repo or its release repo (a staged bundle); an
+  `hfCommitSha` of 40 lowercase hex digits; a `releaseId` and
+  `releaseDirectory` that are a `<release>` or `<release>/<build>` folder of
+  safe names; a `stagingRunId` that is one safe name and not `latest`; a
+  `createdAt` that is null or an ISO 8601 time with an offset; and a `label`.
+
+**Files.** Every file is read at the entry's commit.
+- A release build: `releases/<releaseDirectory, else releaseId>/`, with
+  `calibration_diagnostics.json`, and `build_manifest.json`,
+  `release_manifest.json` and `demographics.json` when the folder lists them
+  (null otherwise, as the GitHub Actions publisher's optional reads are).
+- A staging build, by the rules of the tree package's staging readers that
+  locate its files, and only those:
+  - in the staging repo, `runs/<id>/run_manifest.json` and `progress.json`,
+    read to plan, say where the diagnostics are: at the run manifest's
+    declared `calibration_diagnostics` path, whose SHA-256 is checked, or,
+    for a schema-1 run, `runs/<id>/calibration_diagnostics.json`; with
+    `runs/<id>/build_manifest.json` and `release_manifest.json`;
+  - a run manifest that declares a `staged_dataset` receipt instead leads,
+    after the receipt's SHA-256 is checked, to the staged bundle the receipt
+    names in the country's release repo at its revision, with the
+    diagnostics' recorded SHA-256 checked;
+  - an entry whose repo is the release repo is a staged bundle,
+    `staged/<id>/calibration_diagnostics.json` or its single
+    `<dataset>.diagnostics.json`.
+  A staging build's tree is built from its diagnostics (and, from the
+  staging repo, its build and release manifests) only, as the tree worker
+  builds a staged bundle's.
+
+Each tree records the entry's release ID or run, label, repo, commit and
+`createdAt`, so a release build gets production's build ID and index. Two
+limits follow:
+- A staging build's build ID differs from production's: the worker hashes 4
+  of its source files, where the GitHub Actions publisher hashes 7. So links
+  or stored comparisons that carry an old staging build ID don't carry over.
+- A staging build whose diagnostics are in a staged bundle reached through
+  its run's `staged_dataset` receipt has them read from the country's release
+  repo at the receipt's revision, but its tree names the staging repo and
+  commit (production's entry's) for them, because the worker's request gives
+  each file only a path. Production's tree for the same run names their own
+  repo and commit, the release repo and the receipt's revision. So that
+  backfilled tree's provenance names a path that isn't in the repo and commit
+  it names.
+
+**The latest build.** Only the entry production's
+`latestReleaseBuildArtifactId` names asks to become its country's latest, and
+every country's latest is built before any other entry. The publication
+command still moves the latest only to a build at least as new as the
+store's current one. When the store already holds production's latest under
+its release ID:
+- if that stored build is the store's latest, nothing is done, and it is
+  reported `already_stored` or `mismatch` with `made_latest: true`;
+- otherwise the stored build is published again exactly as stored: from its
+  files at the stored entry's commit, with the stored entry's repo and
+  `createdAt` (a tree built from a submission records the submission's
+  `accepted_at`), after the stored entry passes the checks production's
+  entries get. That reproduces the stored index, so the publication keeps
+  every part and moves only the latest: the entry is `built` with
+  `made_latest: true`, or `latest_not_moved` when the store's latest is
+  newer. It reproduces the index only when the folder at the stored commit
+  lists the files the stored tree was built from and the tree package still
+  builds the same index; otherwise the publication refuses the build, which
+  is reported `refused` and leaves the run incomplete until the stored
+  build is dealt with by hand. A stored entry that fails the checks is `invalid`, and nothing is
+  published.
+
+The backfill follows production's latest, not `releases.json`. The two can
+differ: when the store's latest is newer than production's (for example after
+a rollback in `releases.json`), production's latest is published again and
+reported `latest_not_moved` on every run; and production's manifest can be
+behind `releases.json` at the release repo's head. Either way,
+`calibration_trees.follow_releases_record`, or a `releases-record`
+submission ("Moving the latest when releases.json changes"), sets the
+country's latest to `releases.json`'s current build once that build's tree
+is stored.
+
+**The store.** The command reads the store's manifest once, with the read-only
+`src/calibration-tree-manifest-read.ts`. An entry whose release ID or staging
+run the store already holds, with the same commit and `createdAt`, is
+`already_stored`; with another, `mismatch`. Times are compared as instants to
+the millisecond, since the worker stores `createdAt` as `toISOString` writes
+it, keeping milliseconds and dropping finer digits. Neither outcome downloads
+anything, and its `made_latest` says whether the stored build is the store's
+latest: as the store's manifest recorded it when the run read it, or as this
+run's publications have since moved it.
+
+**Building.** One build at a time, each in a new temporary directory that is
+removed afterwards. A file listed as larger than 256 MiB is `too_large`
+before anything is downloaded. Each file is streamed to disk and checked
+against its listing, and the tree is built and published by
+`build_and_publish`, as a submission's is: the worker without the Blob token,
+then the publication with it, inside the manifest lock, which the backfill
+holds for the publication alone. No build starts after 40 minutes of an
+execution; the remaining ones are `deferred`.
+
+**Outcomes.** The command prints one JSON document for each entry, with its
+country, kind, release ID or run, repo, commit, `created_at`, `make_latest`,
+outcome and reason, production's build ID, the build ID built or stored,
+`matches_production`, the parts uploaded and kept, `made_latest` and
+`incomplete`:
+
+| Outcome | Means | Final |
+|---|---|---|
+| `would_build` | a dry run would build it | |
+| `built` | built and published | yes |
+| `already_stored` | the store holds it with the same commit and time | yes |
+| `mismatch` | the store holds it with another commit or time | yes |
+| `invalid` | the entry failed the checks, or, for production's latest that the store holds but not as its latest, the stored entry did | yes |
+| `too_large` | a file is over 256 MiB | yes |
+| `unbuildable` | the worker refused the files (exit 2); a release folder's `calibration_diagnostics.json`, or a run's diagnostics, is not at the entry's commit; a run's `run_manifest.json` or `progress.json` isn't a valid JSON object, the two mix document versions, or one names another run; a structured run manifest's artifacts aren't a list, one isn't an object, has no safe name, path or SHA-256, or is listed twice, or they declare neither diagnostics nor a `staged_dataset` receipt; the receipt is absent, isn't a valid JSON object, differs from its declared SHA-256, records no landed bundle, or names another run, repo or folder, a revision that isn't a commit, or no diagnostics with a SHA-256; a staged bundle's folder holds no diagnostics; or a downloaded file differs from the SHA-256 its run or receipt declared | yes |
+| `refused` | the publication refused the build (exit 2) | yes |
+| `latest_not_moved` | published, but the store's latest is at least as new | yes |
+| `error` | a Bun exit 1 or 3, a timeout, a Hugging Face failure or a download that differs from its listing; the next build still runs | no |
+| `deferred` | the time limit passed before it started | no |
+
+A country whose manifest can't be used is one `error` document with no kind.
+Then it prints:
+
+```json
+{"summary": {"outcomes": {}, "incomplete": false, "release_builds_differing_from_production": 0, "latest": {"us": {"build": null, "made_latest": null}}}}
+```
+
+- `incomplete`: true when anything ended in `error` or `deferred`, a country
+  failed, or a country's latest from production wasn't made the store's
+  latest. The command then exits 1, and Cloud Run runs the task again, up to
+  twice; each run skips what is already stored. It exits 0 otherwise, and 2
+  for an argument error, such as a missing `--production-manifest-url` or one
+  that isn't `https`.
+- `release_builds_differing_from_production`: release builds built or stored
+  whose build ID isn't production's. It should be 0.
+- `latest`: for each country, production's latest build and whether it is
+  the store's latest now (`null` when production names none, or in a dry run
+  for a latest that would be built).
+
+**Running it.** It needs `DATABASE_URL` (for the manifest lock),
+`COLLECTOR_HF_READ_TOKEN` and `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN`, which
+the worker job has, and stops with a message naming a missing one. It needs no
+other access, except that whoever runs it may run the worker job with
+overridden arguments. First the dry run, which reads production's manifest,
+the Hugging Face listings and the store's manifest, and downloads no
+diagnostics, runs no tree worker and takes no lock:
+
+```bash
+gcloud run jobs execute <worker job> --project <project> --region <region> \
+  --args=run,--no-sync,python,-m,telemetry_collector.operations,backfill-calibration-trees,--production-manifest-url,https://<dashboard>/api/microcosm/tree-manifest,--dry-run \
+  --wait
+```
+
+Then the real run, the same without `--dry-run`, until a summary shows
+`"incomplete": false`. Do both in staging, then in production, before the
+dashboard switches to the store. Read each attempt's summary with the logging
+query in "Projecting past builds again".
+
 ### Tests
 
 The "Calibration tree package" job in `.github/workflows/pr.yaml` runs the
@@ -1619,15 +1960,15 @@ bun run typecheck
 
 `packages/calibration-tree/provenance.json` records the calibration-diagnostics
 commit the package was copied from, each copied file's git blob ID, the copied
-files changed here and why (only `package.json`), and the files that exist only
+files changed here and why (its `changed` map), and the files that exist only
 here. `src/provenance.test.ts` fails when a copied file no longer has its
 recorded blob ID, when a file is neither copied nor listed as the collector's
 own, or when a file listed as changed is identical to the dashboard's.
 
 While calibration-diagnostics keeps its copy, a change merged there is carried
 over by copying the changed files from a calibration-diagnostics commit,
-keeping this repo's changes to `package.json`, and recording that commit and
-the new blob IDs, which git lists with:
+keeping this repo's changes to the files `changed` lists, and recording that
+commit and the new blob IDs, which git lists with:
 
 ```bash
 git -C ../calibration-diagnostics ls-tree -r \
@@ -1725,10 +2066,20 @@ What reads Hugging Face:
   trees from submissions"), and the `releases-record` handler, which reads it
   to move the latest (see "Moving the latest when releases.json changes"),
   so both need the token wherever they have the Blob token.
+- the calibration tree backfill, which lists each build's folders, reads
+  staging runs' manifests and receipts, and downloads each build's files.
 
-A read answered with anything but HTTP 200 reports the status and, for a
-404, Hugging Face's `X-Error-Code`, so a missing file (`EntryNotFound`) can be
-told from a missing repo or revision (`RepoNotFound`, `RevisionNotFound`).
+Files read whole (`HuggingFaceReader.read_file`), such as records and
+manifests, are held in memory and refused above 64 MiB. Files a tree is built
+from are streamed to disk instead (`download_file`), up to the caller's
+limit (256 MiB for the backfill), and each must have its listed size and its
+listed SHA-256 for a file stored with LFS, or git blob ID otherwise.
+`download_file` follows a download's redirects itself and sends the token
+only to Hugging Face's own host, never to the content host LFS files are
+served from. A read answered with anything but HTTP 200 reports the status
+and, for a 404, Hugging Face's `X-Error-Code`, so a missing file
+(`EntryNotFound`) can be told from a missing repo or revision
+(`RepoNotFound`, `RevisionNotFound`).
 
 The datasets the worker jobs read are listed once, in `HUGGINGFACE_DATASETS`:
 
@@ -2101,6 +2452,11 @@ The deployment's access and configuration are provisioned:
   Orrery graph files").
   `scripts/deploy.sh require-configuration` names any that is missing, and
   the deployment stops before it authenticates.
+- Optionally, each environment holds the three `TELEMETRY_VERCEL_OIDC_*`
+  variables that let read API v2 accept consumer apps' Vercel OIDC tokens
+  (see "Vercel OIDC tokens"). They are not set yet. With only some of them
+  set, `require-configuration` stops the deployment naming the missing ones,
+  and with a malformed one, naming it.
 
 The move from calibration-diagnostics is complete:
 
@@ -2190,6 +2546,19 @@ token or service-account key is required. The runtime caches a retrieved value
 for up to one minute and retries failed retrievals on subsequent requests.
 Configuration checks during deployment only confirm secret existence; they do
 not establish that credentials work or that runtime permissions are correct.
+
+Instead of the read credential, the dashboard can read version 2 through the
+typed client with its own Vercel OIDC token (`vercelOidcToken`), once the
+collector's `TELEMETRY_VERCEL_OIDC_READERS` lists its project and environment:
+its `preview` environment for the staging collector, and its `production`
+environment for the production collector (see "Vercel OIDC tokens"). Its
+collector reads then need neither `MICROCOSM_TELEMETRY_READ_SECRET_VERSION`
+nor Secret Manager. Locally, `vercel env pull` gives a development token,
+whose `environment` is `development`, which only a collector listing the
+project's `development` environment accepts. Whether
+`vercel env pull --environment=preview` or `--environment=production` gives
+a token for that environment, which that environment's collector would
+accept, is unverified (see "Vercel OIDC tokens").
 
 Restrict the Cloud SQL instance to the Cloud Run connection and disable request
 access logs for the container so authorization headers cannot enter application

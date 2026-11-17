@@ -526,8 +526,17 @@ export interface operations {
                     "application/json": components["schemas"]["RunPage"];
                 };
             };
-            /** @description The read credential is missing or wrong. */
+            /** @description The read credential is missing or wrong, or the Vercel OIDC token is invalid, expired or not accepted by this collector. */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorMessage"];
+                };
+            };
+            /** @description The Vercel OIDC token is valid, but its Vercel project and environment may not read this collector. */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -544,7 +553,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
-            /** @description A deployment is in progress; retry after the `Retry-After` header's seconds. */
+            /** @description A deployment is in progress; retry after the `Retry-After` header's seconds. Without `Retry-After`, Vercel's token signing keys could not be read to check a Vercel OIDC token. */
             503: {
                 headers: {
                     [name: string]: unknown;
@@ -575,8 +584,17 @@ export interface operations {
                     "application/json": components["schemas"]["RunDetail"];
                 };
             };
-            /** @description The read credential is missing or wrong. */
+            /** @description The read credential is missing or wrong, or the Vercel OIDC token is invalid, expired or not accepted by this collector. */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorMessage"];
+                };
+            };
+            /** @description The Vercel OIDC token is valid, but its Vercel project and environment may not read this collector. */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -602,7 +620,7 @@ export interface operations {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
-            /** @description A deployment is in progress; retry after the `Retry-After` header's seconds. */
+            /** @description A deployment is in progress; retry after the `Retry-After` header's seconds. Without `Retry-After`, Vercel's token signing keys could not be read to check a Vercel OIDC token. */
             503: {
                 headers: {
                     [name: string]: unknown;

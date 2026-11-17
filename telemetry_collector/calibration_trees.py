@@ -12,7 +12,9 @@ arguments, environment or output. (This is not isolation: the builder runs as
 the same user as the worker, which holds the token in its own environment.)
 It then runs the package's publication command, which holds the token, inside
 one Postgres transaction lock, so collector writers add to the manifest one
-at a time.
+at a time. ``build_and_publish`` is that build and publication, shared with
+the backfill (``telemetry_collector.calibration_tree_backfill``), which asks
+for the latest from production's manifest rather than from ``releases.json``.
 
 The tree's files and provenance come from the submission. The publication
 time recorded in the tree is the submission's ``accepted_at``, so
@@ -59,8 +61,9 @@ import subprocess
 import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC
+from functools import partial
 from pathlib import Path
 from typing import Any, Final, Literal
 
@@ -88,6 +91,8 @@ WORKER_SCRIPT = PACKAGE_DIRECTORY / "src" / "calibration-tree-worker.ts"
 PUBLICATION_SCRIPT = PACKAGE_DIRECTORY / "src" / "calibration-tree-publication.ts"
 #: Points a country's latest at a recorded release build; writes only the manifest.
 LATEST_SCRIPT = PACKAGE_DIRECTORY / "src" / "calibration-tree-latest.ts"
+#: Prints the store's manifest; it only reads, with the publication's token.
+MANIFEST_READ_SCRIPT = PACKAGE_DIRECTORY / "src" / "calibration-tree-manifest-read.ts"
 
 #: The worker job's setting: the read-write token of this environment's
 #: calibration tree Blob store, a Secret Manager secret.
@@ -122,6 +127,7 @@ BUILD_TIMEOUT_SECONDS = WORKER_TASK_TIMEOUT_SECONDS * 3 // 4
 PUBLICATION_TIMEOUT_SECONDS = WORKER_TASK_TIMEOUT_SECONDS // 6
 # The latest command reads and writes only the manifest.
 LATEST_TIMEOUT_SECONDS = 5 * 60
+MANIFEST_READ_TIMEOUT_SECONDS = 5 * 60
 MAX_MESSAGE_CHARACTERS = 500
 
 EXIT_UNBUILDABLE_INPUT = 2
@@ -148,18 +154,25 @@ _ARTIFACTS = {
 
 @dataclass(frozen=True)
 class TreeBuildPlan:
-    """The tree a submission builds, from its provenance alone."""
+    """The tree a submission, or a backfilled build, builds."""
 
     kind: Literal["release", "staging"]
     country: str
     folder: str
     hf_repo: str
     hf_commit: str
-    created_at: str
-    run_id: str
+    #: The publication time the tree records, or ``None`` for an undated build.
+    created_at: str | None
+    #: The staged run; for a release, the submission's run, if any.
+    run_id: str | None
     release_id: str | None
     label: str | None
     make_latest: bool
+    #: Each role's file, by its full path in the Hugging Face dataset.
+    paths: Mapping[str, str] = field(default_factory=dict)
+    #: The ``releases/`` folder a release's files are in; ``release_id`` when
+    #: ``None``.
+    release_directory: str | None = None
 
 
 @dataclass(frozen=True)
@@ -216,6 +229,9 @@ def plan_tree_build(
         "hf_commit": huggingface["commit"],
         "created_at": _accepted_at(submission),
         "run_id": provenance["run_id"],
+        "paths": {
+            file["role"]: f"{folder}/{file['name']}" for file in submission.files
+        },
     }
     if release_folder is not None:
         release, build = release_folder["release"], release_folder["build"]
@@ -250,15 +266,16 @@ def plan_tree_build(
     )
 
 
-def worker_request(
-    plan: TreeBuildPlan, files: Mapping[str, tuple[str, Path]]
-) -> dict[str, Any]:
-    """The Bun worker's request: ``files`` maps each role to its name and local copy."""
+def worker_request(plan: TreeBuildPlan, files: Mapping[str, Path]) -> dict[str, Any]:
+    """The Bun worker's request: ``files`` maps each role to its local copy.
+
+    Each file is named by its path in the dataset, from ``plan.paths``.
+    """
 
     artifacts: dict[str, Any] = dict.fromkeys(_ARTIFACTS.values())
-    for role, (name, local_path) in files.items():
+    for role, local_path in files.items():
         artifacts[_ARTIFACTS[role]] = {
-            "path": f"{plan.folder}/{name}",
+            "path": plan.paths[role],
             "file": str(local_path),
         }
     shared = {
@@ -273,7 +290,7 @@ def worker_request(
     return {
         "kind": "release",
         "releaseId": plan.release_id,
-        "releaseDirectory": plan.release_id,
+        "releaseDirectory": plan.release_directory or plan.release_id,
         **shared,
     }
 
@@ -500,7 +517,7 @@ def shortened_message(text: str) -> str:
     """``text`` stripped and shortened to ``MAX_MESSAGE_CHARACTERS``.
 
     An empty message becomes "(no message)". Used for the messages a job's
-    result records.
+    result and a backfill outcome record.
     """
 
     text = text.strip() or "(no message)"
@@ -515,6 +532,14 @@ class CalibrationTreeCommandError(RuntimeError):
     """A Bun process failed in a way another attempt may get past."""
 
 
+class TreeUnbuildableError(Exception):
+    """The tree worker refused the files (exit 2); another run cannot help."""
+
+
+class TreeRefusedError(Exception):
+    """The publication command refused the build (exit 2); another run cannot help."""
+
+
 def _answer(completed: subprocess.CompletedProcess[str], step: str) -> dict[str, Any]:
     lines = completed.stdout.strip().splitlines()
     try:
@@ -526,6 +551,174 @@ def _answer(completed: subprocess.CompletedProcess[str], step: str) -> dict[str,
     if not isinstance(answer, dict):
         raise CalibrationTreeCommandError(f"The tree {step} printed no JSON answer.")
     return answer
+
+
+@dataclass(frozen=True)
+class TreeCommands:
+    """How the tree package's Bun processes run, and the lock around publication.
+
+    The worker runs with ``build_environment``, which never holds the Blob
+    token; the publication command and the manifest read run with
+    ``publication_environment``, which does.
+    """
+
+    bun: str
+    run_command: CommandRunner
+    manifest_lock: ManifestLock
+    build_environment: Mapping[str, str]
+    publication_environment: Mapping[str, str] = field(repr=False)
+
+
+def tree_commands(
+    *,
+    blob_token: str,
+    manifest_lock: ManifestLock,
+    bun: str = "bun",
+    size_limits: Mapping[str, str] | None = None,
+    run_command: CommandRunner = run_bun,
+) -> TreeCommands:
+    """The Bun processes' settings: only ``PATH``, ``LANG`` and the size limits."""
+
+    return TreeCommands(
+        bun=bun,
+        run_command=run_command,
+        manifest_lock=manifest_lock,
+        build_environment={**_base_environment(), **(size_limits or {})},
+        publication_environment=_publication_environment(blob_token),
+    )
+
+
+def size_limits_from(environ: Mapping[str, str]) -> dict[str, str]:
+    """The tree package's part size limits that ``environ`` sets."""
+
+    return {
+        name: environ[name].strip()
+        for name in SIZE_LIMIT_SETTINGS
+        if environ.get(name, "").strip()
+    }
+
+
+@dataclass(frozen=True)
+class PublishedTree:
+    """What the publication command reports for a published tree.
+
+    ``latest_decision`` is what it was asked: whether to make the tree its
+    country's latest, and why releases.json could not decide when it could
+    not.
+    """
+
+    build_artifact_id: str
+    kind: str
+    uploaded_parts: int
+    kept_parts: int
+    made_latest: bool
+    latest_decision: LatestDecision
+
+
+def build_and_publish(
+    plan: TreeBuildPlan,
+    files: Mapping[str, Path],
+    *,
+    directory: Path,
+    commands: TreeCommands,
+    decide_latest: Callable[[], LatestDecision] | None = None,
+) -> PublishedTree:
+    """Build ``plan``'s tree from ``files`` (role to local copy) and publish it.
+
+    The request, the built parts and the publication request are written
+    under ``directory``, which must be new for each attempt. The worker runs
+    without the Blob token. The manifest lock is then held around two steps
+    only: deciding whether the publication asks to make the tree its
+    country's latest, and the publication, which runs with the token. That
+    decision is ``plan.make_latest``, or, given ``decide_latest``, what it
+    returns: the handler passes ``release_latest``, which reads
+    releases.json, and the backfill passes nothing. Worker exit 2 raises
+    ``TreeUnbuildableError`` and publication exit 2 ``TreeRefusedError``;
+    any other failure raises ``CalibrationTreeCommandError``, and a timeout
+    ``subprocess.TimeoutExpired``. Whatever ``decide_latest`` raises is
+    raised before anything is published.
+    """
+
+    request_path = directory / "request.json"
+    request_path.write_text(json.dumps(worker_request(plan, files)), encoding="utf-8")
+    bundle_directory = directory / "trees"
+    built = commands.run_command(
+        [
+            commands.bun,
+            "run",
+            str(WORKER_SCRIPT),
+            str(request_path),
+            str(bundle_directory),
+        ],
+        commands.build_environment,
+        BUILD_TIMEOUT_SECONDS,
+    )
+    if built.returncode == EXIT_UNBUILDABLE_INPUT:
+        raise TreeUnbuildableError(shortened_message(built.stderr))
+    if built.returncode != 0:
+        raise CalibrationTreeCommandError(
+            f"The tree worker exited with {built.returncode}: "
+            f"{shortened_message(built.stderr)}"
+        )
+    worker_answer = _answer(built, "worker")
+    publication_path = directory / "publication.json"
+    with commands.manifest_lock():
+        latest = (
+            LatestDecision(make_latest=plan.make_latest)
+            if decide_latest is None
+            else decide_latest()
+        )
+        publication_path.write_text(
+            json.dumps(
+                {
+                    "bundleDirectory": str(bundle_directory),
+                    "worker": worker_answer,
+                    "makeLatest": latest.make_latest,
+                }
+            ),
+            encoding="utf-8",
+        )
+        published = commands.run_command(
+            [commands.bun, "run", str(PUBLICATION_SCRIPT), str(publication_path)],
+            commands.publication_environment,
+            PUBLICATION_TIMEOUT_SECONDS,
+        )
+    if published.returncode == EXIT_ENTRY_REFUSED:
+        raise TreeRefusedError(shortened_message(published.stderr))
+    if published.returncode != 0:
+        raise CalibrationTreeCommandError(
+            f"The tree publication exited with {published.returncode}: "
+            f"{shortened_message(published.stderr)}"
+        )
+    answer = _answer(published, "publication")
+    return PublishedTree(
+        build_artifact_id=answer["buildArtifactId"],
+        kind=answer["kind"],
+        uploaded_parts=answer["uploadedParts"],
+        kept_parts=answer["keptParts"],
+        made_latest=answer["madeLatest"],
+        latest_decision=latest,
+    )
+
+
+def read_store_manifest(commands: TreeCommands) -> dict[str, Any]:
+    """The store's calibration tree manifest, as the package's manifest read prints it.
+
+    The read takes no lock: it only reads, and the publication command
+    checks the manifest again under the lock before it writes.
+    """
+
+    completed = commands.run_command(
+        [commands.bun, "run", str(MANIFEST_READ_SCRIPT)],
+        commands.publication_environment,
+        MANIFEST_READ_TIMEOUT_SECONDS,
+    )
+    if completed.returncode != 0:
+        raise CalibrationTreeCommandError(
+            f"The tree manifest read exited with {completed.returncode}: "
+            f"{shortened_message(completed.stderr)}"
+        )
+    return _answer(completed, "manifest read")
 
 
 # The handler ----------------------------------------------------------------------
@@ -543,11 +736,17 @@ def calibration_tree_handler(
     """The ``calibration-diagnostics`` handler, writing with ``blob_token``.
 
     A release build reads its repo's releases.json with ``reader`` to decide
-    the latest (``release_latest``).
+    the latest (``release_latest``), under the manifest lock just before the
+    publication (``build_and_publish``).
     """
 
-    build_environment = {**_base_environment(), **(size_limits or {})}
-    publication_environment = _publication_environment(blob_token)
+    commands = tree_commands(
+        blob_token=blob_token,
+        manifest_lock=manifest_lock,
+        bun=bun,
+        size_limits=size_limits,
+        run_command=run_command,
+    )
 
     def build_tree(context: JobContext) -> dict[str, Any]:
         plan = plan_tree_build(context.submission)
@@ -557,84 +756,48 @@ def calibration_tree_handler(
                 "verified_files": len(context.files()),
                 "reason": plan.reason,
             }
-        latest = LatestDecision(make_latest=False)
         with tempfile.TemporaryDirectory(prefix="calibration-tree-") as directory:
             attempt_directory = Path(directory)
             files_directory = attempt_directory / "files"
             files_directory.mkdir()
             files = {
-                file["role"]: (
-                    file["name"],
-                    context.download(file["name"], files_directory / file["name"]),
+                file["role"]: context.download(
+                    file["name"], files_directory / file["name"]
                 )
                 for file in context.files()
             }
-            request_path = attempt_directory / "request.json"
-            request_path.write_text(
-                json.dumps(worker_request(plan, files)), encoding="utf-8"
-            )
-            bundle_directory = attempt_directory / "trees"
-            built = run_command(
-                [
-                    bun,
-                    "run",
-                    str(WORKER_SCRIPT),
-                    str(request_path),
-                    str(bundle_directory),
-                ],
-                build_environment,
-                BUILD_TIMEOUT_SECONDS,
-            )
-            if built.returncode == EXIT_UNBUILDABLE_INPUT:
-                raise SubmissionRejectedError(
-                    "calibration_tree_unbuildable", shortened_message(built.stderr)
-                )
-            if built.returncode != 0:
-                raise CalibrationTreeCommandError(
-                    f"The tree worker exited with {built.returncode}: "
-                    f"{shortened_message(built.stderr)}"
-                )
-            worker_answer = _answer(built, "worker")
-            publication_path = attempt_directory / "publication.json"
-            with manifest_lock():
-                if plan.kind == "release":
-                    # Under the lock the releases-record handler takes too, so
-                    # a build made current while this tree was built is the
-                    # latest either way.
-                    latest = release_latest(plan, reader)
-                publication_path.write_text(
-                    json.dumps(
-                        {
-                            "bundleDirectory": str(bundle_directory),
-                            "worker": worker_answer,
-                            "makeLatest": latest.make_latest,
-                        }
+            try:
+                published = build_and_publish(
+                    plan,
+                    files,
+                    directory=attempt_directory,
+                    commands=commands,
+                    # Read under the lock the releases-record handler takes
+                    # too, so a build made current while this tree was built
+                    # is the latest either way.
+                    decide_latest=(
+                        partial(release_latest, plan, reader)
+                        if plan.kind == "release"
+                        else None
                     ),
-                    encoding="utf-8",
                 )
-                published = run_command(
-                    [bun, "run", str(PUBLICATION_SCRIPT), str(publication_path)],
-                    publication_environment,
-                    PUBLICATION_TIMEOUT_SECONDS,
-                )
-            if published.returncode == EXIT_ENTRY_REFUSED:
+            except TreeUnbuildableError as error:
                 raise SubmissionRejectedError(
-                    "calibration_tree_refused", shortened_message(published.stderr)
-                )
-            if published.returncode != 0:
-                raise CalibrationTreeCommandError(
-                    f"The tree publication exited with {published.returncode}: "
-                    f"{shortened_message(published.stderr)}"
-                )
-            answer = _answer(published, "publication")
+                    "calibration_tree_unbuildable", str(error)
+                ) from error
+            except TreeRefusedError as error:
+                raise SubmissionRejectedError(
+                    "calibration_tree_refused", str(error)
+                ) from error
         result: dict[str, Any] = {
             "processed_by": "calibration-tree",
-            "build_artifact_id": answer["buildArtifactId"],
-            "kind": answer["kind"],
-            "uploaded_parts": answer["uploadedParts"],
-            "kept_parts": answer["keptParts"],
-            "made_latest": answer["madeLatest"],
+            "build_artifact_id": published.build_artifact_id,
+            "kind": published.kind,
+            "uploaded_parts": published.uploaded_parts,
+            "kept_parts": published.kept_parts,
+            "made_latest": published.made_latest,
         }
+        latest = published.latest_decision
         if latest.skipped is not None:
             result["latest_skipped"] = latest.skipped
             result["latest_skipped_reason"] = latest.skipped_reason
@@ -924,11 +1087,6 @@ def registered_handlers(
     if not blob_token:
         return {}
     reader = HuggingFaceReader(HuggingFaceReadSettings.from_environment(environ))
-    size_limits = {
-        name: environ[name].strip()
-        for name in SIZE_LIMIT_SETTINGS
-        if environ.get(name, "").strip()
-    }
 
     def manifest_lock() -> AbstractContextManager[None]:
         if engine is None:
@@ -939,7 +1097,7 @@ def registered_handlers(
         "calibration-diagnostics": calibration_tree_handler(
             blob_token=blob_token,
             manifest_lock=manifest_lock,
-            size_limits=size_limits,
+            size_limits=size_limits_from(environ),
             reader=reader,
         ),
         "releases-record": calibration_tree_latest_handler(

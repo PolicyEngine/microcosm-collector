@@ -3,7 +3,7 @@
   "info": {
     "title": "Microcosm collector read API",
     "version": "2",
-    "description": "Version 2 of the Microcosm collector's read API. Each request carries the dashboard read credential in `X-Telemetry-Read-Token`. While a deployment is in progress, every request may answer 503 with `Retry-After`."
+    "description": "Version 2 of the Microcosm collector's read API. Each request carries either the dashboard read credential in `X-Telemetry-Read-Token` or a consumer app's Vercel OIDC token in `Authorization: Bearer`, which the collector accepts from the Vercel projects and environments it is configured for. While a deployment is in progress, every request may answer 503 with `Retry-After`."
   },
   "paths": {
     "/v2/runs": {
@@ -16,6 +16,9 @@
         "security": [
           {
             "ReadToken": []
+          },
+          {
+            "VercelOidcToken": []
           }
         ],
         "parameters": [
@@ -83,7 +86,17 @@
             }
           },
           "401": {
-            "description": "The read credential is missing or wrong.",
+            "description": "The read credential is missing or wrong, or the Vercel OIDC token is invalid, expired or not accepted by this collector.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The Vercel OIDC token is valid, but its Vercel project and environment may not read this collector.",
             "content": {
               "application/json": {
                 "schema": {
@@ -93,7 +106,7 @@
             }
           },
           "503": {
-            "description": "A deployment is in progress; retry after the `Retry-After` header's seconds.",
+            "description": "A deployment is in progress; retry after the `Retry-After` header's seconds. Without `Retry-After`, Vercel's token signing keys could not be read to check a Vercel OIDC token.",
             "content": {
               "application/json": {
                 "schema": {
@@ -125,6 +138,9 @@
         "security": [
           {
             "ReadToken": []
+          },
+          {
+            "VercelOidcToken": []
           }
         ],
         "parameters": [
@@ -151,7 +167,17 @@
             }
           },
           "401": {
-            "description": "The read credential is missing or wrong.",
+            "description": "The read credential is missing or wrong, or the Vercel OIDC token is invalid, expired or not accepted by this collector.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The Vercel OIDC token is valid, but its Vercel project and environment may not read this collector.",
             "content": {
               "application/json": {
                 "schema": {
@@ -161,7 +187,7 @@
             }
           },
           "503": {
-            "description": "A deployment is in progress; retry after the `Retry-After` header's seconds.",
+            "description": "A deployment is in progress; retry after the `Retry-After` header's seconds. Without `Retry-After`, Vercel's token signing keys could not be read to check a Vercel OIDC token.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1622,6 +1648,12 @@
         "description": "The dashboard read credential.",
         "in": "header",
         "name": "X-Telemetry-Read-Token"
+      },
+      "VercelOidcToken": {
+        "type": "http",
+        "description": "A consumer app's Vercel OIDC token, accepted from the Vercel projects and environments this collector is configured for.",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
       }
     }
   }
