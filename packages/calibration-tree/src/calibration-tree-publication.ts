@@ -19,7 +19,10 @@
 // bytes is kept; one stored with other bytes stops the publication. The index
 // goes last. The manifest is created only if it is still absent, and an
 // existing one is replaced only if its ETag is still the one read, so a
-// manifest another writer changed is never overwritten. A build asked to
+// manifest another writer changed is never overwritten. The manifest is read
+// uncompressed, because Vercel Blob gives a compressed response the weak form
+// of its ETag (W/"…"), which no conditional write matches; a manifest read
+// with a weak ETag anyway is never written over. A build asked to
 // become the country's latest does so only when it is at least as new
 // (createdAt) as the current latest, so a retried or reprocessed older build
 // never takes the latest back. On success it prints one JSON line and exits
@@ -32,8 +35,9 @@
 //      submission of the same files, whose index records another time or
 //      label), or a staging build was to become the latest release; running
 //      again on the same tree cannot help;
-//   3  anything else, including a manifest another writer changed meanwhile
-//      and any error from the store; running again may succeed.
+//   3  anything else, including a manifest another writer changed meanwhile,
+//      one read without an ETag or with a weak one, and any error from the
+//      store; running again may succeed.
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -76,6 +80,15 @@ export class CalibrationTreeEntryRefusedError extends Error {}
 
 /** Another writer changed the manifest after it was read; nothing was overwritten. */
 export class CalibrationTreeManifestConflictError extends Error {}
+
+/**
+ * Whether an ETag is weak (W/"…"), as Vercel Blob's is on a compressed
+ * response. A conditional write compares ifMatch with the strong ETag, so a
+ * weak one never matches.
+ */
+export function isWeakEtag(etag: string): boolean {
+  return etag.startsWith("W/");
+}
 
 export interface CalibrationTreePublicationPart {
   part: CalibrationTreePart;
@@ -292,6 +305,12 @@ async function addManifestEntry(
   if (current.etag !== null && !current.etag) {
     throw new CalibrationTreeManifestConflictError(
       "The stored calibration tree manifest was read without an ETag, so it cannot be replaced safely.",
+    );
+  }
+  if (current.etag !== null && isWeakEtag(current.etag)) {
+    throw new CalibrationTreeManifestConflictError(
+      "The stored calibration tree manifest was read with a weak ETag, which no conditional write matches, " +
+        "so it cannot be replaced safely.",
     );
   }
   const makeLatest = request.makeLatest &&
