@@ -18,6 +18,7 @@ from __future__ import annotations
 import functools
 import importlib
 import importlib.util
+import inspect
 import json
 import subprocess
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -27,6 +28,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+import httpx
 import pytest
 
 from telemetry_collector.auth import HuggingFacePrincipal
@@ -78,6 +80,11 @@ OLDER_ID = f"{US_RELEASE}/{OLDER_BUILD}"
 CURRENT_ID = f"{US_RELEASE}/{CURRENT_BUILD}"
 RUN_ID = "us-calibration-attempt-20261102T080000Z-1a2b3c4d"
 OTHER_RUN_ID = "us-calibration-attempt-20261103T080000Z-5e6f7a8b"
+#: Run folders change at this time unless a test says otherwise: after the
+#: time from which the webhook-queued job covers runs.
+RECENT_COMMIT_DATE = "2026-11-20T00:00:00.000Z"
+JOB_START_DATE = "2026-11-19T00:00:00.000Z"
+BEFORE_JOB_START_DATE = "2026-11-18T23:59:59.000Z"
 FOLDER_COMMIT = "4" * 40
 NEWER_FOLDER_COMMIT = "6" * 40
 
@@ -302,6 +309,10 @@ class Reconciliation:
     latest: StandInLatestCommand = field(default_factory=StandInLatestCommand)
     #: What the last run's release kind reported of its latest step.
     latest_steps: list[Any] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        for dataset in (US_STAGING, UK_STAGING):
+            self.hugging_face.datasets[dataset].default_commit_date = RECENT_COMMIT_DATE
 
     def lock(self, country: str, kind: str) -> Any:
         @contextmanager
@@ -1725,6 +1736,121 @@ def test_the_summary_counts_what_became_of_the_run_files() -> None:
         outcomes, country="us", kinds=["staging"], request_id=None, dry_run=False
     )
     assert summary.get("run_files") == {"copied": 1}
+
+
+# Runs older than the job's start ----------------------------------------------------
+
+
+def run_changed_at(date: str) -> Reconciliation:
+    reconciliation = us_staging_reconciliation(structured_staging_run(RUN_ID))
+    reconciliation.hugging_face.datasets[US_STAGING].last_commits[f"runs/{RUN_ID}"] = (
+        FOLDER_COMMIT,
+        date,
+    )
+    return reconciliation
+
+
+def run_including_older_runs(
+    reconciliation: Reconciliation, **options: Any
+) -> list[Any]:
+    parameters = inspect.signature(
+        reconciliation_module().reconcile_calibration_trees
+    ).parameters
+    if "include_older_runs" not in parameters:
+        pytest.fail("reconcile_calibration_trees has no include_older_runs yet.")
+    return reconciliation.run(kinds=["staging"], include_older_runs=True, **options)
+
+
+def test_the_job_leaves_a_run_older_than_its_start_to_the_backfill() -> None:
+    reconciliation = run_changed_at(BEFORE_JOB_START_DATE)
+
+    outcomes = reconciliation.run(kinds=["staging"])
+
+    assert outcomes_by_source(outcomes) == [(RUN_ID, "older_run")]
+    assert outcomes[0].incomplete is False
+    assert field_of(outcomes[0], "run_files") is None
+    assert reconciliation.bun.steps("build") == []
+    assert reconciliation.bun.copied_runs == {}
+    assert not any(
+        path.startswith("runs/")
+        for path in reconciliation.hugging_face.downloaded_paths()
+    )
+    summary = reconciliation_attribute("summarize")(
+        outcomes, country="us", kinds=["staging"], request_id=None, dry_run=False
+    )
+    assert summary["incomplete"] is False
+
+
+@pytest.mark.parametrize("date", [JOB_START_DATE, RECENT_COMMIT_DATE])
+def test_the_job_covers_a_run_changed_from_its_start_on(date: str) -> None:
+    reconciliation = run_changed_at(date)
+
+    [outcome] = reconciliation.run(kinds=["staging"])
+
+    assert outcome.outcome == "built"
+    assert field_of(outcome, "run_files") == "copied"
+
+
+def test_the_backfill_option_covers_an_older_run() -> None:
+    reconciliation = run_changed_at(BEFORE_JOB_START_DATE)
+
+    [outcome] = run_including_older_runs(reconciliation)
+
+    assert outcome.outcome == "built"
+    assert field_of(outcome, "run_files") == "copied"
+    assert RUN_ID in reconciliation.bun.copied_runs
+    assert not [
+        request
+        for request in reconciliation.hugging_face.requests
+        if request.url.params.get("expand") == "true"
+    ]
+
+
+def test_a_copied_older_run_stays_covered_by_the_job() -> None:
+    reconciliation = run_changed_at(BEFORE_JOB_START_DATE)
+    run_including_older_runs(reconciliation)
+    remember_built_trees(reconciliation)
+    reconciliation.hugging_face.requests.clear()
+
+    [outcome] = reconciliation.run(kinds=["staging"])
+
+    assert outcome.outcome == "already_stored"
+    assert field_of(outcome, "run_files") == "unchanged"
+    assert not [
+        request
+        for request in reconciliation.hugging_face.requests
+        if request.url.params.get("expand") == "true"
+    ]
+
+
+def test_a_run_folder_without_a_last_commit_is_covered() -> None:
+    reconciliation = us_staging_reconciliation(structured_staging_run(RUN_ID))
+    reconciliation.hugging_face.datasets[US_STAGING].last_commits[f"runs/{RUN_ID}"] = (
+        None
+    )
+
+    [outcome] = reconciliation.run(kinds=["staging"])
+
+    assert outcome.outcome == "built"
+
+
+def test_last_commits_that_can_t_be_read_are_an_error_for_the_kind() -> None:
+    reconciliation = us_staging_reconciliation(structured_staging_run(RUN_ID))
+    answer = reconciliation.hugging_face.handle
+
+    def failing_expanded_listings(request: httpx.Request) -> httpx.Response:
+        if request.url.params.get("expand") == "true":
+            return httpx.Response(500, json={"error": "unavailable"})
+        return answer(request)
+
+    reconciliation.hugging_face.handle = failing_expanded_listings  # type: ignore[method-assign]
+
+    [outcome] = reconciliation.run(kinds=["staging"])
+
+    assert (outcome.source_id, outcome.outcome) == (None, "error")
+    assert outcome.incomplete is True
+    assert reconciliation.bun.copied_runs == {}
+    assert reconciliation.bun.steps("build") == []
 
 
 def test_belgium_has_no_staging_repo_to_reconcile() -> None:
