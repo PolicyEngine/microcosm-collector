@@ -901,6 +901,20 @@ def test_a_built_outcome_says_what_became_of_the_build_s_copies() -> None:
     assert document.get("source_file_conflicts") == ["reformValidation"]
 
 
+def test_a_refused_outcome_names_the_copies_that_differ() -> None:
+    backfill = us_backfill(
+        [release_entry(US_RELEASE)],
+        files={(US_RELEASES, RELEASE_COMMIT): release_folder(US_RELEASE)},
+    )
+    backfill.bun.publication_exits[US_RELEASE] = 2
+    backfill.bun.source_file_conflicts[US_RELEASE] = ["reformValidation"]
+
+    [outcome] = backfill.run()
+
+    assert outcome.outcome == "refused"
+    assert outcome.to_json().get("source_file_conflicts") == ["reformValidation"]
+
+
 def test_a_copied_file_over_its_limit_is_left_out_and_the_tree_is_built(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1097,6 +1111,47 @@ def test_a_staged_bundle_recorded_in_the_release_repo_is_read_from_its_folder() 
     assert backfill.hugging_face.downloaded_paths() == [
         f"staged/{RUN_ID}/microcosm_us_2025.diagnostics.json"
     ]
+
+
+def test_a_run_with_a_staged_dataset_copies_the_files_in_its_run_folder() -> None:
+    diagnostics_name = "microcosm_us_2025.diagnostics.json"
+    receipt = json.dumps(
+        {
+            "status": "uploaded",
+            "run_id": RUN_ID,
+            RECORD_REPO_KEY: US_RELEASES,
+            "prefix": f"staged/{RUN_ID}",
+            "revision": BUNDLE_COMMIT,
+            "files": {diagnostics_name: {"sha256": sha256(DIAGNOSTICS)}},
+        }
+    ).encode()
+    folder = f"runs/{RUN_ID}"
+    backfill = us_backfill(
+        [staging_entry(RUN_ID)],
+        files={
+            (US_STAGING, STAGING_COMMIT): {
+                **structured_run(RUN_ID, {"staged_dataset": receipt}),
+                f"{folder}/parent_build_manifest.json": PARENT_BUILD_MANIFEST,
+                f"{folder}/reform_validation.json": REFORM_VALIDATION,
+                # Not a file this run's tree is built from.
+                f"{folder}/build_manifest.json": BUILD_MANIFEST,
+            },
+            (US_RELEASES, BUNDLE_COMMIT): {
+                f"staged/{RUN_ID}/{diagnostics_name}": DIAGNOSTICS,
+            },
+        },
+    )
+
+    [outcome] = backfill.run()
+
+    assert outcome.outcome == "built"
+    build = backfill.bun.build_of(RUN_ID)
+    assert build["inputs"].get("parentBuildManifest") == PARENT_BUILD_MANIFEST
+    assert build["inputs"].get("reformValidation") == REFORM_VALIDATION
+    assert "buildManifest" not in build["inputs"]
+    assert build["request"]["artifacts"]["reformValidation"]["path"] == (
+        f"{folder}/reform_validation.json"
+    )
 
 
 def test_a_staged_bundle_a_run_s_receipt_names_is_read_from_the_release_repo() -> None:

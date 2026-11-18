@@ -1624,6 +1624,18 @@ def test_a_built_outcome_says_what_became_of_the_build_s_copies() -> None:
     assert document.get("source_file_conflicts") == ["reformValidation"]
 
 
+def test_a_refused_outcome_names_the_copies_that_differ() -> None:
+    reconciliation = us_release_reconciliation()
+    reconciliation.bun.publication_exits[OLDER_ID] = 2
+    reconciliation.bun.source_file_conflicts[OLDER_ID] = ["reformValidation"]
+
+    outcomes = reconciliation.run()
+
+    older = outcome_of(outcomes, OLDER_ID)
+    assert older.outcome == "refused"
+    assert older.to_json().get("source_file_conflicts") == ["reformValidation"]
+
+
 def test_a_tree_stored_meanwhile_still_names_a_copy_that_differs() -> None:
     reconciliation = us_release_reconciliation()
     same_build = build_id("us", "release", OLDER_ID)

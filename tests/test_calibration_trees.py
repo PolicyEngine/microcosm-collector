@@ -199,6 +199,8 @@ class RecordingRunner:
     latest_raises: BaseException | None = None
     #: The copies of original files the publication finds stored with other bytes.
     source_file_conflicts: list[str] = field(default_factory=list)
+    #: Printed by the publication in place of its usual output, when set.
+    publication_stdout: str | None = None
     events: list[str] = field(default_factory=list)
     calls: list[dict[str, Any]] = field(default_factory=list)
 
@@ -271,6 +273,8 @@ class RecordingRunner:
             stdout = json.dumps(published)
         elif self.publication_exit == 2 and self.source_file_conflicts:
             stdout = json.dumps({"sourceFileConflicts": self.source_file_conflicts})
+        if self.publication_stdout is not None:
+            stdout = self.publication_stdout
         return subprocess.CompletedProcess(
             argv, self.publication_exit, stdout, self.publication_stderr
         )
@@ -711,6 +715,42 @@ def test_an_entry_the_manifest_refuses_rejects_the_submission() -> None:
     assert submission.record().rejection == {
         "code": "calibration_tree_refused",
         "message": "Calibration source already resolves to another build.",
+    }
+
+
+def test_a_rejected_tree_names_the_copies_that_differ() -> None:
+    submission = accepted(STAGED)
+    runner = RecordingRunner(
+        publication_exit=2,
+        publication_stderr="Calibration source already resolves to another build.",
+        source_file_conflicts=["reformValidation"],
+    )
+
+    submission.run(handler_with(runner))
+
+    assert submission.record().status == "rejected"
+    rejection = submission.record().rejection
+    assert rejection["code"] == "calibration_tree_refused"
+    assert "reformValidation" in rejection["message"]
+    assert "already resolves to another build" in rejection["message"]
+
+
+@pytest.mark.parametrize(
+    "printed",
+    ["not json", "[]", '{"sourceFileConflicts": "reformValidation"}', ""],
+)
+def test_a_refusal_s_other_output_names_no_copies(printed: str) -> None:
+    submission = accepted(STAGED)
+    message = "Calibration source already resolves to another build."
+    runner = RecordingRunner(
+        publication_exit=2, publication_stderr=message, publication_stdout=printed
+    )
+
+    submission.run(handler_with(runner))
+
+    assert submission.record().rejection == {
+        "code": "calibration_tree_refused",
+        "message": message,
     }
 
 
