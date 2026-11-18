@@ -1,6 +1,6 @@
 {
   "name": "@policyengine/calibration-tree",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Builds, validates, reads and publishes Microcosm calibration tree artifacts (tree schema 6), with the release and staging readers they are built from.",
   "license": "MIT",
   "repository": {
@@ -51,6 +51,8 @@
     "./source-label": "./src/source-label.ts",
     "./source-labels": "./src/source-labels.ts",
     "./staging-artifact": "./src/staging-artifact.ts",
+    "./staging-run-files": "./src/staging-run-files.ts",
+    "./staging-run-files-command": "./src/staging-run-files-command.ts",
     "./staging-contract": "./src/staging-contract.ts",
     "./structured-dimension-reader": "./src/structured-dimension-reader.ts",
     "./structured-target-reader": "./src/structured-target-reader.ts",
@@ -67,7 +69,8 @@
     "worker": "bun run src/calibration-tree-worker.ts",
     "publication": "bun run src/calibration-tree-publication.ts",
     "latest": "bun run src/calibration-tree-latest.ts",
-    "manifest-read": "bun run src/calibration-tree-manifest-read.ts"
+    "manifest-read": "bun run src/calibration-tree-manifest-read.ts",
+    "staging-run-files": "bun run src/staging-run-files-command.ts"
   },
   "dependencies": {
     "@vercel/blob": "^2.6.1"

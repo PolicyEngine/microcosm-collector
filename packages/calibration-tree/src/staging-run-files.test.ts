@@ -400,7 +400,7 @@ test("the command prints the source files a stored tree was built from", async (
     buildManifest: null,
   };
   store.store(
-    `calibration-trees/uk/builds/${BUILD_ID}/index.json.gz`,
+    `calibration-trees/uk/${BUILD_ID}/index.json.gz`,
     gzipSync(JSON.stringify({ build: { sourceArtifacts: sources } })),
   );
   const printed: string[] = [];

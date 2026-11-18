@@ -12,8 +12,13 @@
 //   {
 //     "bundleDirectory": "<the worker's output directory>",
 //     "worker": <the worker's printed result>,
-//     "makeLatest": false
+//     "makeLatest": false,
+//     "replaceStagingRun": true
 //   }
+//
+// replaceStagingRun is optional, and only for a staging build: its entry then
+// takes the place of the run's earlier tree in the manifest, whose parts stay
+// stored. Without it another tree of the same run is refused.
 //
 // Each copy and part is read from disk and checked against the worker's record
 // of its raw bytes before anything is uploaded. One already stored with the
@@ -138,6 +143,7 @@ export interface CalibrationTreePublicationRequest {
   sourceFiles: CalibrationTreePublicationSourceFile[];
   manifestEntry: CalibrationTreeManifestEntry;
   makeLatest: boolean;
+  replaceStagingRun: boolean;
 }
 
 export interface CalibrationTreePublicationResult {
@@ -237,12 +243,18 @@ function publicationSourceFiles(
 /** Checks a publication request read from JSON. */
 export function parseCalibrationTreePublicationRequest(value: unknown): CalibrationTreePublicationRequest {
   const request = requestObject(value, "The request");
-  const unknown = Object.keys(request).filter((field) => !["bundleDirectory", "worker", "makeLatest"].includes(field));
+  const unknown = Object.keys(request).filter(
+    (field) => !["bundleDirectory", "worker", "makeLatest", "replaceStagingRun"].includes(field),
+  );
   if (unknown.length > 0) {
     throw new CalibrationTreePublicationRequestError(`The request has unknown fields: ${unknown.join(", ")}.`);
   }
   if (typeof request.makeLatest !== "boolean") {
     throw new CalibrationTreePublicationRequestError("makeLatest must be true or false.");
+  }
+  const replaceStagingRun = request.replaceStagingRun ?? false;
+  if (typeof replaceStagingRun !== "boolean") {
+    throw new CalibrationTreePublicationRequestError("replaceStagingRun must be true or false.");
   }
   const bundleDirectory = requestString(request, "bundleDirectory", "bundleDirectory");
   const worker = requestObject(request.worker, "worker");
@@ -283,6 +295,9 @@ export function parseCalibrationTreePublicationRequest(value: unknown): Calibrat
   ) {
     throw new CalibrationTreePublicationRequestError("worker.manifestEntry does not describe the tree's index.");
   }
+  if (replaceStagingRun && manifestEntry.kind !== "staging") {
+    throw new CalibrationTreePublicationRequestError("Only a staging build can replace a run's tree.");
+  }
   return {
     bundleDirectory,
     country,
@@ -291,6 +306,7 @@ export function parseCalibrationTreePublicationRequest(value: unknown): Calibrat
     sourceFiles,
     manifestEntry,
     makeLatest: request.makeLatest,
+    replaceStagingRun,
   };
 }
 
@@ -465,7 +481,9 @@ async function addManifestEntry(
       isAtLeastAsNewAsLatest(current.manifest, request.country, request.manifestEntry));
   let updated;
   try {
-    updated = withCalibrationTreeManifestEntry(current.manifest, request.country, request.manifestEntry, makeLatest);
+    updated = withCalibrationTreeManifestEntry(current.manifest, request.country, request.manifestEntry, makeLatest, {
+      replaceStagingRun: request.replaceStagingRun,
+    });
   } catch (error) {
     throw new CalibrationTreeEntryRefusedError(error instanceof Error ? error.message : String(error));
   }

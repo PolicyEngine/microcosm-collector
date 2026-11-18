@@ -46,8 +46,9 @@ was not made the store's latest; and 2 for an argument error.
 [--request-id <task ID>] [--dry-run]`` builds the country's calibration trees
 that its Hugging Face repos hold and the store lacks
 (``telemetry_collector.calibration_tree_reconciliation``): every build its
-release repo's ``releases.json`` lists, and every finalized run of its staging
-repo, each read at the repo's head. Without ``--kind`` it covers both kinds,
+release repo's ``releases.json`` lists, and every run of its staging repo with
+calibration diagnostics, each read at the repo's head. It also keeps copies of
+the files the dashboard reads for every staging run. Without ``--kind`` it covers both kinds,
 or only releases for a country without a staging repo. The Cloud Task that
 ``POST /v1/calibration-tree-builds`` queues runs it in the worker job with
 ``--request-id``, the task's ID: the run records its start, attempts, finish

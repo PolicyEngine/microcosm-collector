@@ -669,6 +669,7 @@ def build_and_publish(
     directory: Path,
     commands: TreeCommands,
     decide_latest: Callable[[], LatestDecision] | None = None,
+    replace_staged_run: bool = False,
 ) -> PublishedTree:
     """Build ``plan``'s tree from ``files`` (role to local copy) and publish it.
 
@@ -679,7 +680,9 @@ def build_and_publish(
     country's latest, and the publication, which runs with the token. That
     decision is ``plan.make_latest``, or, given ``decide_latest``, what it
     returns: the handler passes ``release_latest``, which reads
-    releases.json, and the backfill passes nothing. Worker exit 2 raises
+    releases.json, and the backfill passes nothing. ``replace_staged_run``
+    makes the tree take the place of the staged run's earlier tree in the
+    manifest. Worker exit 2 raises
     ``TreeUnbuildableError`` and publication exit 2 ``TreeRefusedError``;
     any other failure raises ``CalibrationTreeCommandError``, and a timeout
     ``subprocess.TimeoutExpired``. Whatever ``decide_latest`` raises is
@@ -729,6 +732,7 @@ def build_and_publish(
                     "bundleDirectory": str(bundle_directory),
                     "worker": worker_answer,
                     "makeLatest": latest.make_latest,
+                    **({"replaceStagingRun": True} if replace_staged_run else {}),
                 }
             ),
             encoding="utf-8",

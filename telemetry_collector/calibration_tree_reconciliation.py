@@ -24,30 +24,40 @@ Python:
   without ``releases.json`` is ``no_releases_record`` and builds nothing; its
   tags and pointer files are not read. A ``releases.json`` the rules refuse is
   ``releases_record_refused`` and builds nothing.
-- **Staging:** the runs of the staging repo's ``runs/<id>/`` folders, as
-  ``loadStagingRuns`` finds them. A run the store holds is ``already_stored``,
-  and its files are not read. Of the others, a structured run's status is its
-  run manifest's; a schema-1 run's is the one ``runs.json`` records, else its
-  ``progress.json``'s; a folder without a run manifest counts as a schema-1
-  run when ``runs.json`` is schema 1. ``runs.json`` is read whenever a run
-  the store lacks has a schema-1 manifest or none; the publisher reads it
-  when any listed run's manifest is schema 1, and stored runs' manifests
-  are not read. A ``runs.json`` that isn't JSON, or isn't a JSON object, is
-  no index, as the publisher takes it. One that can't be read makes each
-  run the store lacks with a schema-1 manifest or none an incomplete
-  ``error``; the structured runs are still built. Only a run
-  whose status is ``passed``, ``published`` or ``completed`` is built. Its
-  label is its candidate release, else its run ID, and its time its
-  progress's ``updated_at``, else its run manifest's, as the publisher's
-  ``publishStagingSource`` takes them. A final run with no
-  calibration diagnostics to build from is ``ineligible``, as the
-  publisher's ``reconcileStagingBuilds`` reports it: a schema-1 folder
-  without ``calibration_diagnostics.json``, a structured run declaring
-  neither diagnostics nor a staged dataset, a staged-dataset receipt of a
-  skipped, failed or disabled staging, or a bundle recording no diagnostics
-  (``SourceWithoutDiagnosticsError``). A run whose documents can't be read,
-  or whose declared or recorded diagnostics are absent or differ, is
-  ``unbuildable`` on its own, and the other runs continue.
+- **Staging:** every run of the staging repo's ``runs/<id>/`` folders, whatever
+  its status. A folder is a run when it holds ``run_manifest.json``, or, beside
+  a schema-1 ``runs.json``, when it holds ``progress.json`` or the index lists
+  it; any other folder is ``not_a_run``. ``runs.json`` is read only when a
+  folder has no run manifest. One that isn't JSON, or isn't a JSON object, is no
+  index, as the staging readers take it; one that can't be read makes each
+  folder without a run manifest an incomplete ``error``.
+
+  The files the dashboard reads are copied first
+  (``telemetry_collector.staging_run_files``), in batches, at the head commit.
+  A run whose folder has the fingerprint its record holds is not read again:
+  ``run_files`` is ``unchanged``. Each run's outcome says what became of its
+  files in ``run_files``: ``copied``, ``unchanged``, ``would_copy``,
+  ``deferred`` or ``error``, the last two leaving the run incomplete. The job
+  stores what the files say and works out no status of its own: an unfinished
+  run's status comes from telemetry when a page is requested.
+
+  A run with calibration diagnostics then has a tree, whatever its status. Its
+  label is its candidate release, else its run ID, and its time its progress's
+  ``updated_at``, else its run manifest's. A stored tree stays
+  (``already_stored``) while the diagnostics and manifests the run has now match
+  the digests its index records; a file only the tree has does not count. When
+  one differs or is new, the run's tree is built again and replaces the stored
+  one in the manifest, and ``replaced_build_artifact_id`` names the old build,
+  whose parts stay stored. Commits are not compared: a run's folder usually gets
+  further commits after its tree's. A run with no diagnostics to build from is
+  ``ineligible``: a schema-1 folder without ``calibration_diagnostics.json``, a
+  structured run declaring neither diagnostics nor a staged dataset, a
+  staged-dataset receipt of a skipped, failed or disabled staging, or a bundle
+  recording no diagnostics (``SourceWithoutDiagnosticsError``). A run whose
+  documents can't be read, or whose declared or recorded diagnostics are absent
+  or differ, is ``unbuildable`` on its own, and the other runs continue. A
+  settled result is kept in the run's record, so the tree is looked at again
+  only when the folder or the stored build changes.
 
 A build whose folder (``releases/<release>/<build>`` or ``staged/<run>``) a
 ``queued`` or ``processing`` ``calibration-diagnostics`` submission holds is
@@ -60,7 +70,9 @@ or any tree of the same staged run, which this command may build from other
 files than its submission's: a staged bundle from its diagnostics alone, and
 any other run from its ``runs/<id>/`` folder.
 
-**Building.** With the backfill's steps (``release_source``,
+**Building.** Run files are copied before any tree is built, and no batch of
+them starts after 40 minutes of the execution. With the backfill's steps
+(``release_source``,
 ``staging_source`` and ``build_and_publish_source``): one build at a time,
 the current default build first, a file over 256 MiB ``too_large``, and no
 build started after 40 minutes of the execution (``deferred``). Nothing this
@@ -92,30 +104,35 @@ up to 15 minutes, so that one that started after an event lists Hugging Face
 only after any earlier one has finished; past the wait the kind is
 ``lock_wait_expired`` and the run incomplete. The store's manifest is read
 once for each kind, inside its lock, with the package's read-only manifest
-read. A dry run takes no lock, downloads no diagnostics, builds nothing,
-reports ``would_build`` and skips the latest step.
+read. A dry run takes no lock, downloads no diagnostics or run files, builds and
+stores nothing, reports ``would_build`` and ``would_copy`` and skips the latest
+step.
 """
 
 from __future__ import annotations
 
 import hashlib
-import re
 import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Final, Literal, Protocol
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
 from telemetry_collector import calibration_tree_backfill as backfill
+from telemetry_collector import staging_run_files
 from telemetry_collector.calibration_tree_backfill import (
     BUILD_KINDS,
     BUILD_TIME_LIMIT_SECONDS,
+    MAX_COPIED_FILE_BYTES,
     BuildKind,
+    BuildSource,
     Listings,
     ProductionEntry,
     SourceUnbuildableError,
@@ -164,7 +181,10 @@ ReconcileOutcomeKind = Literal[
     "no_releases_record",
     "releases_record_refused",
     "lock_wait_expired",
+    "not_a_run",
 ]
+#: What became of a staging run's copied files.
+RunFilesOutcome = Literal["copied", "unchanged", "would_copy", "deferred", "error"]
 
 #: What the latest step did: ``follow_releases_record`` answered, it was not
 #: called, or it raised.
@@ -179,13 +199,16 @@ FollowLatest = Callable[[str], FollowedLatest]
 #: and kind, and how often it tries.
 LOCK_WAIT_SECONDS: Final = 15 * 60
 LOCK_POLL_SECONDS: Final = 5.0
-#: The staging statuses the publisher builds (FINAL_STAGING_STATUSES).
-FINAL_STAGING_STATUSES: Final = frozenset({"passed", "published", "completed"})
 #: The submissions that still build their own tree.
 IN_PROGRESS_STATUSES: Final = ("queued", "processing")
-_RUN_FILE: Final = re.compile(r"runs/([A-Za-z0-9][A-Za-z0-9._-]*)/.+")
-_RUN_MANIFEST: Final = re.compile(
-    r"runs/([A-Za-z0-9][A-Za-z0-9._-]*)/run_manifest\.json"
+_RUN_MANIFEST_FILE: Final = "run_manifest.json"
+_PROGRESS_FILE: Final = "progress.json"
+#: The roles a staging tree is built from, by the name its index records them
+#: under.
+_TREE_SOURCE_ROLES: Final = (
+    ("calibration_diagnostics", "calibrationDiagnostics"),
+    ("build_manifest", "buildManifest"),
+    ("release_manifest", "releaseManifest"),
 )
 _STRUCTURED_MANIFEST_SCHEMA: Final = "microcosm.staging.run-manifest"
 _STRUCTURED_SCHEMA_VERSIONS: Final = (2, 3)
@@ -223,6 +246,13 @@ class ReconcileOutcome:
     kept_source_files: int | None = None
     #: The build's copies left as stored because they hold other bytes.
     source_file_conflicts: list[str] | None = None
+    #: The stored build a run's new tree replaces, or would replace.
+    replaced_build_artifact_id: str | None = None
+    #: What became of a staging run's copied files.
+    run_files: RunFilesOutcome | None = None
+    #: How many of the run's files were stored anew.
+    copied_run_files: int | None = None
+    run_files_reason: str | None = None
     #: A later run should try it again.
     incomplete: bool = False
 
@@ -340,6 +370,10 @@ class _Planned:
     withdrawn: bool | None = None
     #: The newest first: a staging run's time, then its ID.
     order: tuple[float, str] = (0.0, "")
+    #: A staging run's stored tree, if it has one.
+    stored_build: Mapping[str, Any] | None = None
+    #: The state of a staging run's folder this plan was made from.
+    folder_fingerprint: str | None = None
 
 
 @dataclass
@@ -347,10 +381,23 @@ class _StagingRun:
     """What the listing rules read of one staging run."""
 
     run_id: str
+    folder: staging_run_files.RunFolder
+    #: The run's row in a schema-1 ``runs.json``.
+    index_row: Mapping[str, Any] | None = None
     run_manifest: Mapping[str, Any] | None = None
     progress: Mapping[str, Any] | None = None
     progress_read: bool = False
     structured: bool = False
+
+
+@dataclass(frozen=True)
+class _RunCopy:
+    """What became of one run's copied files."""
+
+    outcome: RunFilesOutcome
+    files: int | None = None
+    reason: str | None = None
+    incomplete: bool = False
 
 
 @dataclass
@@ -365,6 +412,11 @@ class _Reconciliation:
     started: float
     time_limit_seconds: float
     listings: Listings = field(init=False)
+    #: What became of each staging run's files in this execution.
+    run_copies: dict[str, _RunCopy] = field(default_factory=dict)
+    #: The settled tree results to record in the runs' copies.
+    tree_checks: list[dict[str, str | None]] = field(default_factory=list)
+    staging_commit: str | None = None
 
     def __post_init__(self) -> None:
         self.listings = Listings(self.reader)
@@ -396,7 +448,66 @@ class _Reconciliation:
             else self.staging_plan(stored)
         )
         for item in planned:
-            yield item if isinstance(item, ReconcileOutcome) else self.build(item)
+            outcome = item if isinstance(item, ReconcileOutcome) else self.build(item)
+            yield self.with_run_files(outcome)
+        if kind == "staging":
+            yield from self.record_tree_checks()
+
+    def with_run_files(self, outcome: ReconcileOutcome) -> ReconcileOutcome:
+        """``outcome`` with what became of its run's copied files."""
+
+        copy = (
+            self.run_copies.get(outcome.source_id)
+            if outcome.kind == "staging" and outcome.source_id is not None
+            else None
+        )
+        if copy is None:
+            return outcome
+        return replace(
+            outcome,
+            run_files=copy.outcome,
+            copied_run_files=copy.files,
+            run_files_reason=copy.reason,
+            incomplete=outcome.incomplete or copy.incomplete,
+        )
+
+    def record_tree_checks(self) -> Iterator[ReconcileOutcome]:
+        """Keep this execution's settled tree results in the runs' copies."""
+
+        if self.dry_run or not self.tree_checks:
+            return
+        repo = STAGING_REPOS[self.country]
+        try:
+            with TemporaryDirectory(prefix="staging-run-files-") as directory:
+                staging_run_files.publish(
+                    self.commands,
+                    self.run_files_request(repo, [], self.tree_checks),
+                    Path(directory),
+                )
+        except Exception as error:
+            yield self.outcome(
+                "staging",
+                "error",
+                hf_repo=repo,
+                reason=(
+                    f"The runs' tree results could not be recorded: {_described(error)}"
+                ),
+                incomplete=True,
+            )
+
+    def run_files_request(
+        self,
+        repo: str,
+        runs: Sequence[Mapping[str, Any]],
+        tree_checks: Sequence[Mapping[str, str | None]],
+    ) -> dict[str, Any]:
+        return {
+            "country": self.country,
+            "hfRepo": repo,
+            "hfCommitSha": self.staging_commit,
+            "runs": list(runs),
+            "treeChecks": list(tree_checks),
+        }
 
     # Releases ----------------------------------------------------------------
 
@@ -567,13 +678,14 @@ class _Reconciliation:
     def staging_plan(
         self, stored: Mapping[str, Mapping[str, Any]]
     ) -> list[ReconcileOutcome | _Planned]:
-        """Each run's final outcome, then the plans of the runs to build, the
-        newest first, as the staging readers order runs."""
+        """Copy every run's changed files, then give each run's final outcome
+        and the plans of the trees to look at, the newest first, as the
+        staging readers order runs."""
 
         repo = STAGING_REPOS[self.country]
         try:
             head = self.reader.head_commit(repo)
-            paths = [listed.path for listed in self.reader.list_files(repo, head)]
+            listed = self.reader.list_files(repo, head)
         except HuggingFaceReadError as error:
             return [
                 self.outcome(
@@ -584,112 +696,230 @@ class _Reconciliation:
                     incomplete=True,
                 )
             ]
-        run_ids = sorted(
-            {match[1] for path in paths if (match := _RUN_FILE.fullmatch(path))}
-        )
-        with_manifest = {
-            match[1] for path in paths if (match := _RUN_MANIFEST.fullmatch(path))
-        }
+        self.staging_commit = head
+        try:
+            copied_runs = staging_run_files.read_copied_runs(
+                self.commands, self.country
+            )
+        except Exception as error:
+            return [
+                self.outcome(
+                    "staging",
+                    "error",
+                    hf_repo=repo,
+                    hf_commit=head,
+                    reason=(
+                        "The index of copied run files could not be read: "
+                        f"{_described(error)}"
+                    ),
+                    incomplete=True,
+                )
+            ]
+        folders = staging_run_files.run_folders(listed)
+        # A schema-1 runs.json makes a folder without a run manifest a run,
+        # and only such a folder needs it.
+        index: dict[str, Mapping[str, Any]] | None = None
+        index_failure: str | None = None
+        if any(_RUN_MANIFEST_FILE not in folder.files for folder in folders.values()):
+            try:
+                index = self.run_index(repo, head)
+            except Exception as error:
+                index_failure = f"runs.json could not be read: {_described(error)}"
         finished: list[ReconcileOutcome] = []
         runs: list[_StagingRun] = []
-        for run_id in run_ids:
-            if run_id in stored:
-                build = stored[run_id]
-                finished.append(
-                    self.outcome(
-                        "staging",
-                        "already_stored",
-                        source_id=run_id,
-                        hf_repo=build.get("hfRepo", repo),
-                        hf_commit=build.get("hfCommitSha"),
-                        created_at=build.get("createdAt"),
-                        label=build.get("label"),
-                        build_artifact_id=build.get("buildArtifactId"),
-                    )
-                )
-                continue
+        for run_id, folder in sorted(folders.items()):
+            reported = {"source_id": run_id, "hf_repo": repo}
             if SAFE_IDENTIFIER.fullmatch(run_id) is None or run_id == "latest":
                 finished.append(
                     self.outcome(
                         "staging",
                         "unbuildable",
-                        source_id=run_id,
-                        hf_repo=repo,
                         hf_commit=head,
                         reason=f"Run folder {run_id} is not a run ID the tree worker takes.",
+                        **reported,
                     )
                 )
                 continue
-            run = _StagingRun(run_id)
-            if run_id in with_manifest:
-                try:
-                    self.read_run_manifest(repo, head, run)
-                except SourceUnbuildableError as error:
-                    finished.append(
-                        self.outcome(
-                            "staging",
-                            "unbuildable",
-                            source_id=run_id,
-                            hf_repo=repo,
-                            hf_commit=head,
-                            reason=shortened_message(str(error)),
-                        )
-                    )
-                    continue
-                except Exception as error:
+            if _RUN_MANIFEST_FILE not in folder.files:
+                if index_failure is not None:
                     finished.append(
                         self.outcome(
                             "staging",
                             "error",
-                            source_id=run_id,
-                            hf_repo=repo,
-                            reason=_described(error),
+                            reason=index_failure,
                             incomplete=True,
+                            **reported,
                         )
                     )
                     continue
-            runs.append(run)
-        # A schema-1 runs.json records schema-1 runs' statuses, and makes
-        # every run folder without a structured manifest a schema-1 run. The
-        # staging readers read it when any listed run's manifest is schema 1.
-        # Stored runs' manifests are never read (S7), so it is read whenever
-        # a run the store lacks may be a schema-1 run: its manifest is schema
-        # 1, or it has none, whether or not the other runs' manifests are.
-        index: dict[str, str | None] | None = None
-        index_failure: str | None = None
-        if any(not run.structured for run in runs):
-            try:
-                index = self.run_index(repo, head)
-            except Exception as error:
-                index_failure = f"runs.json could not be read: {_described(error)}"
+                if index is None or (
+                    _PROGRESS_FILE not in folder.files and run_id not in index
+                ):
+                    finished.append(
+                        self.outcome(
+                            "staging",
+                            "not_a_run",
+                            hf_commit=head,
+                            reason=f"Folder {run_id} holds no run documents.",
+                            **reported,
+                        )
+                    )
+                    continue
+            runs.append(
+                _StagingRun(
+                    run_id,
+                    folder,
+                    index_row=None if index is None else index.get(run_id),
+                )
+            )
+        self.copy_run_files(repo, head, runs, copied_runs)
         planned: list[_Planned] = []
         for run in runs:
-            if index_failure is not None and not run.structured:
-                # A run with a schema-1 manifest or none may take its status
-                # from runs.json, and a folder without a run manifest is a run
-                # only beside a schema-1 runs.json. A structured run's status
-                # is its manifest's, so structured runs are still planned.
-                finished.append(
-                    self.outcome(
-                        "staging",
-                        "error",
-                        source_id=run.run_id,
-                        hf_repo=repo,
-                        reason=index_failure,
-                        incomplete=True,
-                    )
-                )
+            build = stored.get(run.run_id)
+            settled = self.settled_outcome(
+                repo, head, run, build, copied_runs.get(run.run_id)
+            )
+            if settled is not None:
+                finished.append(settled)
                 continue
-            if run.run_manifest is None and index is None:
-                # Not a run by the staging readers' rules.
-                continue
-            result = self.staging_run(repo, head, run, index)
+            result = self.staging_run(repo, head, run, build)
             if isinstance(result, _Planned):
                 planned.append(result)
             else:
                 finished.append(result)
-        planned.sort(key=lambda build: build.order, reverse=True)
+        planned.sort(key=lambda planned_build: planned_build.order, reverse=True)
         return [*finished, *planned]
+
+    def copy_run_files(
+        self,
+        repo: str,
+        head: str,
+        runs: Sequence[_StagingRun],
+        copied_runs: Mapping[str, Mapping[str, Any]],
+    ) -> None:
+        """Store the copied files of each run whose folder changed."""
+
+        changed: list[_StagingRun] = []
+        for run in runs:
+            record = copied_runs.get(run.run_id)
+            if record and record.get("folderFingerprint") == run.folder.fingerprint:
+                self.run_copies[run.run_id] = _RunCopy("unchanged")
+            elif self.dry_run:
+                self.run_copies[run.run_id] = _RunCopy(
+                    "would_copy", files=len(run.folder.copied_files)
+                )
+            else:
+                changed.append(run)
+        batch_size = staging_run_files.RUN_FILE_BATCH_SIZE
+        for start in range(0, len(changed), batch_size):
+            if self.clock() - self.started >= self.time_limit_seconds:
+                for run in changed[start:]:
+                    self.run_copies[run.run_id] = _RunCopy(
+                        "deferred",
+                        reason="No copy starts after the execution's time limit.",
+                        incomplete=True,
+                    )
+                return
+            self.copy_run_file_batch(repo, head, changed[start : start + batch_size])
+
+    def copy_run_file_batch(
+        self, repo: str, head: str, runs: Sequence[_StagingRun]
+    ) -> None:
+        with TemporaryDirectory(prefix="staging-run-files-") as directory:
+            root = Path(directory)
+            requested: list[dict[str, Any]] = []
+            for number, run in enumerate(runs):
+                try:
+                    requested.append(self.downloaded_run(repo, head, run, root, number))
+                except Exception as error:
+                    self.run_copies[run.run_id] = _RunCopy(
+                        "error", reason=_described(error), incomplete=True
+                    )
+            if not requested:
+                return
+            try:
+                answer = staging_run_files.publish(
+                    self.commands, self.run_files_request(repo, requested, []), root
+                )
+            except Exception as error:
+                for run_request in requested:
+                    self.run_copies[run_request["runId"]] = _RunCopy(
+                        "error", reason=_described(error), incomplete=True
+                    )
+                return
+        for run_request in requested:
+            run_id = run_request["runId"]
+            self.run_copies[run_id] = _RunCopy(
+                "copied", files=answer.get(run_id, {}).get("uploaded")
+            )
+
+    def downloaded_run(
+        self, repo: str, head: str, run: _StagingRun, root: Path, number: int
+    ) -> dict[str, Any]:
+        """The publication request of one run, with its files on disk."""
+
+        folder = root / str(number)
+        folder.mkdir()
+        files: list[dict[str, str]] = []
+        for position, (name, listed) in enumerate(run.folder.copied_files.items()):
+            if listed.size > MAX_COPIED_FILE_BYTES:
+                continue
+            destination = folder / str(position)
+            self.reader.download_file(
+                repo, listed, head, destination, max_bytes=MAX_COPIED_FILE_BYTES
+            )
+            files.append(
+                {"name": name, "file": str(destination), "hfBlobId": listed.blob_id}
+            )
+        return {
+            "runId": run.run_id,
+            "folderFingerprint": run.folder.fingerprint,
+            "indexRow": run.index_row,
+            "files": files,
+        }
+
+    def settled_outcome(
+        self,
+        repo: str,
+        head: str,
+        run: _StagingRun,
+        build: Mapping[str, Any] | None,
+        record: Mapping[str, Any] | None,
+    ) -> ReconcileOutcome | None:
+        """The run's outcome when its tree needs no further look, else ``None``."""
+
+        check = record.get("treeCheck") if record else None
+        stored_id = build.get("buildArtifactId") if build else None
+        if (
+            not isinstance(check, Mapping)
+            or check.get("folderFingerprint") != run.folder.fingerprint
+            or check.get("buildArtifactId") != stored_id
+        ):
+            return None
+        if build is not None:
+            return self.stored_run_outcome(repo, run.run_id, build)
+        return self.outcome(
+            "staging",
+            "ineligible",
+            source_id=run.run_id,
+            hf_repo=repo,
+            hf_commit=head,
+            reason="Staging run has no calibration diagnostics; its folder is unchanged.",
+        )
+
+    def stored_run_outcome(
+        self, repo: str, run_id: str, build: Mapping[str, Any]
+    ) -> ReconcileOutcome:
+        return self.outcome(
+            "staging",
+            "already_stored",
+            source_id=run_id,
+            hf_repo=build.get("hfRepo", repo),
+            hf_commit=build.get("hfCommitSha"),
+            created_at=build.get("createdAt"),
+            label=build.get("label"),
+            build_artifact_id=build.get("buildArtifactId"),
+        )
 
     def read_run_manifest(self, repo: str, head: str, run: _StagingRun) -> None:
         """Read and classify a run's manifest; ``SourceUnbuildableError`` for one
@@ -723,8 +953,8 @@ class _Reconciliation:
             )
         run.run_manifest = manifest
 
-    def run_index(self, repo: str, head: str) -> dict[str, str | None] | None:
-        """Each run's status in a schema-1 ``runs.json``; ``None`` without one.
+    def run_index(self, repo: str, head: str) -> dict[str, Mapping[str, Any]] | None:
+        """Each run's row in a schema-1 ``runs.json``; ``None`` without one.
 
         A ``runs.json`` that isn't JSON, or isn't a JSON object, is none, as
         the staging readers' ``stagingJsonOrNull`` and ``asObject`` take it.
@@ -747,7 +977,7 @@ class _Reconciliation:
         ):
             return None
         return {
-            row["run_id"]: _string(row.get("status"))
+            row["run_id"]: row
             for row in rows
             if isinstance(row, dict) and _string(row.get("run_id"))
         }
@@ -768,29 +998,21 @@ class _Reconciliation:
         repo: str,
         head: str,
         run: _StagingRun,
-        index: Mapping[str, str | None] | None,
+        build: Mapping[str, Any] | None,
     ) -> ReconcileOutcome | _Planned:
         run_id = run.run_id
         reported = {"source_id": run_id, "hf_repo": repo, "hf_commit": head}
         try:
-            if run.structured:
-                assert run.run_manifest is not None
-                status = _string(run.run_manifest.get("status"))
-            elif index is not None and run_id in index:
-                status = index[run_id]
-            else:
-                progress = self.progress(repo, head, run)
-                if progress is not None and progress.get("run_id") != run_id:
-                    raise SourceUnbuildableError(
-                        f"Run {run_id}'s progress names another run."
-                    )
-                status = None if progress is None else _string(progress.get("status"))
-            if status not in FINAL_STAGING_STATUSES:
-                return self.outcome(
-                    "staging",
-                    "ineligible",
-                    reason=f"Run {run_id} is not final (status {status}).",
-                    **reported,
+            if _RUN_MANIFEST_FILE in run.folder.files:
+                self.read_run_manifest(repo, head, run)
+            progress = self.progress(repo, head, run)
+            if (
+                not run.structured
+                and progress is not None
+                and progress.get("run_id") not in (None, run_id)
+            ):
+                raise SourceUnbuildableError(
+                    f"Run {run_id}'s progress names another run."
                 )
             folder = f"staged/{run_id}"
             if self.submissions.in_progress(self.country, folder):
@@ -800,7 +1022,7 @@ class _Reconciliation:
                     reason=f"A submission of {folder} is still being processed.",
                     **reported,
                 )
-            progress = self.progress(repo, head, run) or {}
+            progress = progress or {}
             manifest = run.run_manifest or {}
             candidate_key = "candidate_id" if run.structured else "candidate_release_id"
             label = (
@@ -845,7 +1067,56 @@ class _Reconciliation:
                 make_latest=False,
             ),
             order=(order_time, run_id),
+            stored_build=build,
+            folder_fingerprint=run.folder.fingerprint,
         )
+
+    def tree_sources_differ(
+        self, source: BuildSource, stored_build: Mapping[str, Any]
+    ) -> bool:
+        """Whether the run has a tree source its stored tree was not built from.
+
+        A file only the stored tree has does not count: a submission's tree can
+        hold manifests the run's folder lacks.
+        """
+
+        stored_sources = staging_run_files.read_tree_sources(
+            self.commands, self.country, str(stored_build.get("buildArtifactId"))
+        )
+        for role, source_name in _TREE_SOURCE_ROLES:
+            source_file = source.files.get(role)
+            if source_file is None:
+                continue
+            recorded = stored_sources.get(source_name)
+            recorded_sha256 = (
+                recorded.get("sha256") if isinstance(recorded, Mapping) else None
+            )
+            sha256 = (
+                source_file.declared_sha256
+                or source_file.listed.lfs_sha256
+                or hashlib.sha256(
+                    self.reader.read_file(
+                        source_file.dataset,
+                        source_file.listed.path,
+                        source_file.revision,
+                    )
+                ).hexdigest()
+            )
+            if sha256 != recorded_sha256:
+                return True
+        return False
+
+    def settle_tree(self, planned: _Planned, build_artifact_id: str | None) -> None:
+        """Remember that this state of the run's folder needs no further look."""
+
+        if not self.dry_run and planned.folder_fingerprint is not None:
+            self.tree_checks.append(
+                {
+                    "runId": planned.entry.source_id,
+                    "folderFingerprint": planned.folder_fingerprint,
+                    "buildArtifactId": build_artifact_id,
+                }
+            )
 
     # The latest --------------------------------------------------------------
 
@@ -913,17 +1184,39 @@ class _Reconciliation:
                 else staging_source(entry, self.reader, self.listings)
             )
         except SourceWithoutDiagnosticsError as error:
-            # As the publisher's reconcileStagingBuilds reports such a run.
+            stored_id = (
+                planned.stored_build.get("buildArtifactId")
+                if planned.stored_build
+                else None
+            )
+            self.settle_tree(planned, stored_id)
+            if planned.stored_build is not None:
+                return self.stored_run_outcome(
+                    entry.hf_repo, entry.source_id, planned.stored_build
+                )
             return outcome(
                 "ineligible",
                 reason=shortened_message(
-                    f"Finalized staging run has no calibration diagnostics: {error}"
+                    f"Staging run has no calibration diagnostics: {error}"
                 ),
             )
         except SourceUnbuildableError as error:
             return outcome("unbuildable", reason=shortened_message(str(error)))
         except Exception as error:
             return outcome("error", reason=_described(error), incomplete=True)
+        replaced: str | None = None
+        if planned.stored_build is not None:
+            try:
+                differs = self.tree_sources_differ(source, planned.stored_build)
+            except Exception as error:
+                return outcome("error", reason=_described(error), incomplete=True)
+            stored_id = planned.stored_build.get("buildArtifactId")
+            if not differs:
+                self.settle_tree(planned, stored_id)
+                return self.stored_run_outcome(
+                    entry.hf_repo, entry.source_id, planned.stored_build
+                )
+            replaced = stored_id
         limit = backfill.MAX_SOURCE_FILE_BYTES
         oversized = [
             source_file.listed
@@ -939,9 +1232,14 @@ class _Reconciliation:
                 ),
             )
         if self.dry_run:
-            return outcome("would_build")
+            return outcome("would_build", replaced_build_artifact_id=replaced)
         try:
-            published = build_and_publish_source(source, self.reader, self.commands)
+            published = build_and_publish_source(
+                source,
+                self.reader,
+                self.commands,
+                replace_staged_run=replaced is not None,
+            )
         except (SourceUnbuildableError, TreeUnbuildableError) as error:
             return outcome("unbuildable", reason=shortened_message(str(error)))
         except TreeAlreadyStoredError as error:
@@ -961,8 +1259,10 @@ class _Reconciliation:
             return outcome("refused", reason=shortened_message(str(error)))
         except Exception as error:
             return outcome("error", reason=_described(error), incomplete=True)
+        self.settle_tree(planned, published.build_artifact_id)
         return outcome(
             "built",
+            replaced_build_artifact_id=replaced,
             build_artifact_id=published.build_artifact_id,
             uploaded_parts=published.uploaded_parts,
             kept_parts=published.kept_parts,
@@ -1063,12 +1363,16 @@ def summarize(
     (``LatestStep.fields``), or ``None`` for a run without releases or one
     that stopped before the step. The latest step is not counted in
     ``outcomes``. When it is incomplete, so is the run, but it adds no entry
-    to ``incomplete_sources``.
+    to ``incomplete_sources``. ``run_files``, present for a run that looked at
+    staging runs, counts what became of their copied files.
     """
 
     listed = list(outcomes)
     builds = [outcome for outcome in listed if isinstance(outcome, ReconcileOutcome)]
     latest_steps = [outcome for outcome in listed if isinstance(outcome, LatestStep)]
+    run_files = Counter(
+        outcome.run_files for outcome in builds if outcome.run_files is not None
+    )
     return {
         "country": country,
         "kinds": list(kinds),
@@ -1082,6 +1386,7 @@ def summarize(
             if outcome.incomplete
         ],
         "latest": latest_steps[-1].fields() if latest_steps else None,
+        **({"run_files": dict(run_files)} if run_files else {}),
     }
 
 

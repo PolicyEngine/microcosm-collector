@@ -3,8 +3,9 @@
   "commit": "4d129fbc6931e0e6862febd4f28ca421fb94b24a",
   "directory": "frontend/packages/calibration-tree",
   "changed": {
-    "package.json": "Publishable from this repository: not private, with a license, the repository, public access, the published files, the worker's, the publication command's, the latest command's and the manifest read's exports and their scripts, and the stored original files' reader's export. Its version is 0.1.3.",
+    "package.json": "Publishable from this repository: not private, with a license, the repository, public access, the published files, the worker's, the publication command's, the latest command's and the manifest read's exports and their scripts, the stored original files' reader's export, and the exports and script of the stored staging run files. Its version is 0.1.4.",
     "src/calibration-tree-blob.ts": "A consistent manifest read asks for the manifest uncompressed, so its ETag is the strong one that Vercel Blob's conditional writes compare, not the weak one a compressed response carries.",
+    "src/calibration-tree-manifest.ts": "`withCalibrationTreeManifestEntry` can replace a staged run's earlier tree when asked to.",
     "src/countries.ts": "Its comments drop the microdata stack's former product name; its code matches the copy.",
     "src/historical-weight-summary.test.ts": "One test finds the September local-area weight summary by its build folder.",
     "src/historical-weight-summary.ts": "Its lookup matches a release by its build name, so a build folder id finds the pinned summary.",
@@ -12,6 +13,7 @@
     "src/latest-artifact.ts": "One comment drops the microdata stack's former product name.",
     "src/reforms.test.ts": "Two test names drop the microdata stack's former product name; their fixtures keep the legacy calculation key.",
     "src/release-record.ts": "Adds `buildNameOf`, the build name a release id or build folder id ends in.",
+    "src/staging-artifact.ts": "Exports `summaryFromProgress`, `summaryFromManifest` and `sortRuns` for the reader of copied run files.",
     "src/target-loss-attribution-manifest.ts": "Adds `historicalAttributionSupportFor`, which finds a pinned recipe by the release's build name.",
     "src/target-loss-attribution.test.ts": "One test finds the September local-area recipe by its build folder.",
     "src/target-loss-attribution.ts": "Finds the pinned recipe for a release by its build name.",
@@ -36,7 +38,9 @@
     "src/calibration-tree-worker.ts",
     "src/npm-package.test.ts",
     "src/provenance.test.ts",
-    "src/staging-run-files.test.ts"
+    "src/staging-run-files-command.ts",
+    "src/staging-run-files.test.ts",
+    "src/staging-run-files.ts"
   ],
   "files": {
     "package.json": "349e0155cc191f99b71c344c3177896549151e68",

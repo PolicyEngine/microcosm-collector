@@ -2152,20 +2152,33 @@ Python. Without `--kind` it covers both kinds, or only releases for BE.
   its `release_manifest.json` must name the same release and build. Its tree
   records the record's `published_at` as `toISOString` writes it. The current
   default build is built first.
-- **Staging:** the runs in the staging repo's `runs/<id>/` folders. A run the
-  store holds is `already_stored`, and its files are not read. Of the
-  others, a structured run's status is its run manifest's, and a schema-1
-  run's is the one a schema-1 `runs.json` records, else its
-  `progress.json`'s. A folder without a run manifest of its own is a
-  schema-1 run when `runs.json` is schema 1, which is read whenever a run
-  the store lacks has a schema-1 manifest or none. A `runs.json` that isn't
-  JSON, or isn't a JSON object, counts as no `runs.json`, as it does for the
-  publisher. If `runs.json` can't be read, each run the store lacks with a
-  schema-1 manifest or none is an incomplete `error`, so the command exits
-  1; the structured runs are still built. Only `passed`, `published` and
-  `completed` runs are built, the newest first. Its label is its candidate
-  release, else its run ID, and its time its progress's `updated_at`, else
-  its run manifest's.
+- **Staging:** every run in the staging repo's `runs/<id>/` folders, whatever
+  its status. A folder is a run when it holds `run_manifest.json`, or, beside
+  a schema-1 `runs.json`, when it holds `progress.json` or that file lists it.
+  Any other folder is `not_a_run`, and nothing is read from it. `runs.json` is
+  read only when a folder has no run manifest. One that isn't JSON, or isn't a
+  JSON object, counts as none; one that can't be read makes each folder without
+  a run manifest an incomplete `error`.
+- **Copies of run files.** For each run the command first keeps private gzip
+  copies of `run_manifest.json`, `progress.json`, `events.ndjson`,
+  `calibration_progress.json`, `reform_validation.json` and
+  `artifacts/staged_dataset.json`, read at the head commit. They are stored in
+  the tree store at `staging-run-files/<country>/runs/<run ID>/<SHA-256>.gz`,
+  and `staging-run-files/<country>/index.json` says which versions are current,
+  with each run's list entry, so a reader never sees part of an update. A run's
+  folder is compared by a fingerprint of its files' paths and git blob IDs from
+  the listing the command already reads, so an unchanged run costs no Hugging
+  Face request. Runs are stored ten at a time, and no batch starts after 40
+  minutes, so a later execution carries on from what is stored. The copies hold
+  what the files say. The job works out no status of its own: an unfinished
+  run's status comes from telemetry when a page is requested.
+- **Trees of staging runs.** A run with calibration diagnostics has a tree,
+  whatever its status, built the newest first. Its label is its candidate
+  release, else its run ID, and its time its progress's `updated_at`, else its
+  run manifest's. A stored tree stays while the diagnostics and manifests the
+  run has now match the SHA-256 values its index records. When one differs or
+  is new, the tree is built again and replaces the stored one in the manifest;
+  the old parts stay stored. A file only the stored tree has does not count.
 - A build whose folder (`releases/<release>/<build>` or `staged/<run>`) a
   `queued` or `processing` `calibration-diagnostics` submission holds is
   `submission_in_progress`: the submission builds it. A submission that
@@ -2210,7 +2223,12 @@ incomplete ones, with `source_id` `null` for a whole kind. The summary's
 `latest` repeats the latest step's document, or is `null` for a run without
 releases. The latest step is not counted in `outcomes`, and a latest step
 that failed and may be tried again makes `incomplete` true without adding
-an entry to `incomplete_sources`.
+an entry to `incomplete_sources`. A staging run's document also has
+`run_files`, what became of its copies (`copied`, `unchanged`, `would_copy`,
+`deferred` or `error`, the last two leaving the run incomplete),
+`copied_run_files` and `run_files_reason`, and the summary's `run_files` counts
+those results. `replaced_build_artifact_id` names the stored tree a new one
+replaced.
 
 Each build's outcome:
 
@@ -2220,7 +2238,8 @@ Each build's outcome:
 | `built` | built and published, never as the latest | yes |
 | `already_stored` | the store holds it, or gained a tree for it while it was built (a release build's with the same build ID, or any of the same staged run), so its publication was refused | yes |
 | `submission_in_progress` | a `queued` or `processing` submission of its folder builds it | yes |
-| `ineligible` | a release folder without diagnostics, or whose release manifest is absent or names another build; a staging run that isn't final; a final staging run without calibration diagnostics, as the publisher reports one: a schema-1 folder without `calibration_diagnostics.json`, a structured run that declares neither diagnostics nor a staged dataset, a staged-dataset receipt of a skipped, failed or disabled staging, or a bundle that records no diagnostics file with a SHA-256 | yes |
+| `not_a_run` | a folder under `runs/` with no run documents | yes |
+| `ineligible` | a release folder without diagnostics, or whose release manifest is absent or names another build; a staging run without calibration diagnostics: a schema-1 folder without `calibration_diagnostics.json`, a structured run that declares neither diagnostics nor a staged dataset, a staged-dataset receipt of a skipped, failed or disabled staging, or a bundle that records no diagnostics file with a SHA-256 | yes |
 | `unbuildable` | the worker refused the files (exit 2), or a staging run's documents are incompatible: a run manifest that isn't a JSON object, names another run or has an unsupported schema, and the backfill's own checks of a run's files, such as declared or recorded diagnostics that are absent or differ from their SHA-256 | yes |
 | `too_large` | a file is over 256 MiB | yes |
 | `refused` | the publication refused the build (exit 2), and the store holds no tree for it as `already_stored` describes | yes |
