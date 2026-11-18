@@ -321,6 +321,44 @@ test("another build already recorded for the same run is refused, not retried", 
   expect(store.manifest()).toEqual(manifestBefore);
 });
 
+function publishReplacing(store: InMemoryBlobStore, tree: BuiltTree) {
+  return publication.publishBuiltCalibrationTree({
+    request: publication.parseCalibrationTreePublicationRequest({
+      bundleDirectory: tree.bundleDirectory,
+      worker: tree.worker,
+      makeLatest: false,
+      replaceStagingRun: true,
+    }),
+    token: TOKEN,
+    client: store.client(),
+  });
+}
+
+test("a staged run's tree is replaced when the publication asks for it", async () => {
+  const store = new InMemoryBlobStore();
+  const first = builtTree("staging");
+  await publish(store, first);
+  const release = goldenReleaseInputs()["uk-release"];
+  const changed = builtTree("staging", `${release.diagnosticsText}\n`);
+
+  await publishReplacing(store, changed);
+
+  expect(store.manifest()?.countries.uk?.builds as unknown).toEqual([changed.worker.manifestEntry]);
+  // The replaced tree's parts stay stored.
+  for (const file of first.worker.files) expect(store.blobs.has(file.path)).toBe(true);
+});
+
+test("only a staged run's tree can be asked to replace another", () => {
+  const tree = builtTree("release");
+
+  expect(() => publication.parseCalibrationTreePublicationRequest({
+    bundleDirectory: tree.bundleDirectory,
+    worker: tree.worker,
+    makeLatest: false,
+    replaceStagingRun: true,
+  })).toThrow(publication.CalibrationTreePublicationRequestError);
+});
+
 test("a release build becomes the country's latest only when asked to", async () => {
   const store = new InMemoryBlobStore();
   const release = builtTree("release");

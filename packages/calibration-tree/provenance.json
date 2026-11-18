@@ -35,7 +35,8 @@
     "src/calibration-tree-worker.test.ts",
     "src/calibration-tree-worker.ts",
     "src/npm-package.test.ts",
-    "src/provenance.test.ts"
+    "src/provenance.test.ts",
+    "src/staging-run-files.test.ts"
   ],
   "files": {
     "package.json": "349e0155cc191f99b71c344c3177896549151e68",

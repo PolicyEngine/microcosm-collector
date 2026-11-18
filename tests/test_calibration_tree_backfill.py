@@ -273,6 +273,13 @@ class StandInBun:
     latest_not_moved: set[str] = field(default_factory=set)
     #: Each source's copies the publication finds stored with other bytes.
     source_file_conflicts: dict[str, list[str]] = field(default_factory=dict)
+    #: The copied staging runs the store's index holds, by run ID.
+    copied_runs: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: The source files of stored trees, by build ID; any other stored tree
+    #: was built from this module's diagnostics and manifests.
+    tree_sources: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: Exit codes for the run-file command's actions.
+    run_file_exits: dict[str, int] = field(default_factory=dict)
     clock: ManualClock | None = None
     seconds_per_build: float = 0.0
     events: list[str] = field(default_factory=list)
@@ -292,7 +299,64 @@ class StandInBun:
             return self._build(argv, env, timeout)
         if script == "calibration-tree-publication.ts":
             return self._publish(argv, env, timeout)
+        if script == "staging-run-files-command.ts":
+            return self._run_files(argv, env)
         raise AssertionError(f"Unexpected Bun script {script}.")
+
+    def _run_files(
+        self, argv: Sequence[str], env: Mapping[str, str]
+    ) -> subprocess.CompletedProcess[str]:
+        action = argv[3]
+        call: dict[str, Any] = {
+            "step": f"run files {action}",
+            "argv": list(argv),
+            "env": dict(env),
+        }
+        self.calls.append(call)
+        exit_code = self.run_file_exits.get(action, 0)
+        if exit_code != 0:
+            return subprocess.CompletedProcess(
+                argv, exit_code, "", f"The run-file {action} failed."
+            )
+        if action == "read":
+            answer: dict[str, Any] = {"schemaVersion": 1, "runs": self.copied_runs}
+        elif action == "tree-sources":
+            answer = self.tree_sources.get(
+                argv[5],
+                {
+                    "calibrationDiagnostics": {"sha256": sha256(DIAGNOSTICS)},
+                    "buildManifest": {"sha256": sha256(BUILD_MANIFEST)},
+                    "releaseManifest": {"sha256": sha256(RELEASE_MANIFEST)},
+                },
+            )
+        else:
+            assert action == "publish"
+            request = json.loads(Path(argv[4]).read_text())
+            call["request"] = request
+            call["contents"] = {}
+            answer = {"runs": {}}
+            for run in request["runs"]:
+                run_id = run["runId"]
+                contents = {
+                    file["name"]: Path(file["file"]).read_bytes()
+                    for file in run["files"]
+                }
+                call["contents"][run_id] = contents
+                previous = self.copied_runs.get(run_id, {})
+                self.copied_runs[run_id] = {
+                    "folderFingerprint": run["folderFingerprint"],
+                    "hfCommitSha": request["hfCommitSha"],
+                    "files": sorted(contents),
+                    "treeCheck": previous.get("treeCheck"),
+                }
+                answer["runs"][run_id] = {"uploaded": len(contents), "kept": 0}
+            for check in request["treeChecks"]:
+                if check["runId"] in self.copied_runs:
+                    self.copied_runs[check["runId"]]["treeCheck"] = {
+                        "folderFingerprint": check["folderFingerprint"],
+                        "buildArtifactId": check["buildArtifactId"],
+                    }
+        return subprocess.CompletedProcess(argv, 0, json.dumps(answer), "")
 
     def _build(
         self, argv: Sequence[str], env: Mapping[str, str], timeout: float

@@ -2,9 +2,10 @@
 
 The ``reconcile-calibration-trees`` command lists a country's builds at each
 repo's head commit, with the GitHub Actions publisher's listing rules ported
-to Python: every build ``releases.json`` lists, and every finalized staging
-run. It skips what the store already holds and what a submission is still
-processing, and builds the rest with the backfill's steps. A release run
+to Python: every build ``releases.json`` lists, and every staging run, whose
+run files it also copies. It skips what the store already holds and what a
+submission is still processing, and builds the rest with the backfill's steps.
+A release run
 then makes the country's latest follow ``releases.json``
 (``calibration_trees.follow_releases_record``). These tests stand in for
 Hugging Face, for the tree package's Bun processes and for the database, so
@@ -64,6 +65,7 @@ from tests.test_submissions import calibration_submission
 
 RECONCILIATION_MODULE = "telemetry_collector.calibration_tree_reconciliation"
 BACKFILL_MODULE = "telemetry_collector.calibration_tree_backfill"
+RUN_FILES_MODULE = "telemetry_collector.staging_run_files"
 US_RELEASES = "policyengine/populace-us"
 US_STAGING = "policyengine/populace-us-staging"
 UK_RELEASES = "policyengine/populace-uk-private"
@@ -974,20 +976,19 @@ def test_a_run_without_a_candidate_or_a_progress_time_uses_its_id_and_manifest()
     assert request["createdAt"] == "2026-11-02T09:00:00.000Z"
 
 
-@pytest.mark.parametrize("status", ["running", "failed", "blocked"])
-def test_a_run_that_is_not_final_is_ineligible(status: str) -> None:
+@pytest.mark.parametrize("status", ["running", "failed", "blocked", "completed"])
+def test_a_run_with_diagnostics_is_built_whatever_its_status(status: str) -> None:
     reconciliation = us_staging_reconciliation(
         structured_staging_run(RUN_ID, status=status)
     )
 
     [outcome] = reconciliation.run(kinds=["staging"])
 
-    assert outcome.outcome == "ineligible"
-    assert status in outcome.reason
-    assert reconciliation.bun.steps("build") == []
+    assert outcome.outcome == "built"
+    assert reconciliation.bun.build_of(RUN_ID)["request"]["runId"] == RUN_ID
 
 
-def test_a_schema_1_run_s_status_comes_from_its_progress() -> None:
+def test_an_unfinished_schema_1_run_is_built() -> None:
     running = schema_1_run(OTHER_RUN_ID)
     running[f"runs/{OTHER_RUN_ID}/progress.json"] = json.dumps(
         {"schema_version": 1, "run_id": OTHER_RUN_ID, "status": "running"}
@@ -997,7 +998,7 @@ def test_a_schema_1_run_s_status_comes_from_its_progress() -> None:
     outcomes = reconciliation.run(kinds=["staging"])
 
     assert outcome_of(outcomes, RUN_ID).outcome == "built"
-    assert outcome_of(outcomes, OTHER_RUN_ID).outcome == "ineligible"
+    assert outcome_of(outcomes, OTHER_RUN_ID).outcome == "built"
     assert reconciliation.bun.build_of(RUN_ID)["request"]["label"] == RUN_ID
 
 
@@ -1075,18 +1076,13 @@ def test_a_folder_without_a_manifest_is_listed_once_every_schema_1_run_is_stored
 
     outcomes = reconciliation.run(kinds=["staging"])
 
-    assert outcomes_by_source(outcomes) == [
-        (RUN_ID, "already_stored"),
-        (OTHER_RUN_ID, "built"),
-    ]
+    assert sorted(outcomes_by_source(outcomes)) == sorted(
+        [(RUN_ID, "already_stored"), (OTHER_RUN_ID, "built")]
+    )
     request = reconciliation.bun.build_of(OTHER_RUN_ID)["request"]
     assert request["label"] == OTHER_RUN_ID
     assert request["artifacts"]["calibrationDiagnostics"]["path"] == (
         f"runs/{OTHER_RUN_ID}/calibration_diagnostics.json"
-    )
-    # The stored run's manifest is still never read (S7).
-    assert f"runs/{RUN_ID}/run_manifest.json" not in (
-        reconciliation.hugging_face.downloaded_paths()
     )
 
 
@@ -1124,7 +1120,10 @@ def test_without_a_schema_1_runs_json_a_folder_without_a_manifest_is_not_a_run(
 
     outcomes = reconciliation.run(kinds=["staging"])
 
-    assert outcomes_by_source(outcomes) == [(RUN_ID, "built")]
+    assert sorted(outcomes_by_source(outcomes)) == sorted(
+        [(RUN_ID, "built"), (OTHER_RUN_ID, "not_a_run")]
+    )
+    assert OTHER_RUN_ID not in reconciliation.bun.copied_runs
 
 
 #: A run folder without a run manifest of its own, beside a structured run
@@ -1160,16 +1159,20 @@ def test_a_runs_json_that_is_not_a_json_object_is_no_index(content: bytes) -> No
 
     # The schema-1 run's status is its progress's, and without an index the
     # folder without a manifest is not a run.
-    assert sorted(outcomes_by_source(outcomes)) == [
-        (RUN_ID, "built"),
-        (OTHER_RUN_ID, "built"),
-    ]
+    assert sorted(outcomes_by_source(outcomes)) == sorted(
+        [
+            (RUN_ID, "built"),
+            (OTHER_RUN_ID, "built"),
+            (FOLDER_RUN_ID, "not_a_run"),
+        ]
+    )
     assert not any(outcome.incomplete for outcome in outcomes)
 
 
 def test_a_runs_json_that_can_t_be_read_leaves_only_the_runs_that_need_it() -> None:
     # Review round 2, bug 1: a failed read of runs.json stopped the whole
-    # staging kind, though a structured run's status never comes from it.
+    # staging kind. Only a folder without a run manifest needs it, to tell
+    # whether it is a run.
     reconciliation = us_staging_reconciliation(
         {**runs_of_every_schema(), **schema_1_index({FOLDER_RUN_ID: "passed"})}
     )
@@ -1180,53 +1183,50 @@ def test_a_runs_json_that_can_t_be_read_leaves_only_the_runs_that_need_it() -> N
 
     outcomes = reconciliation.run(kinds=["staging"])
 
-    assert sorted(outcomes_by_source(outcomes)) == [
-        (RUN_ID, "built"),
-        (OTHER_RUN_ID, "error"),
-        (FOLDER_RUN_ID, "error"),
-    ]
+    assert sorted(outcomes_by_source(outcomes)) == sorted(
+        [
+            (RUN_ID, "built"),
+            (OTHER_RUN_ID, "built"),
+            (FOLDER_RUN_ID, "error"),
+        ]
+    )
     assert outcome_of(outcomes, RUN_ID).incomplete is False
-    for run_id in (OTHER_RUN_ID, FOLDER_RUN_ID):
-        failed = outcome_of(outcomes, run_id)
-        assert failed.incomplete is True
-        assert failed.reason.startswith("runs.json could not be read")
-    assert [call["source"] for call in reconciliation.bun.steps("build")] == [RUN_ID]
+    assert outcome_of(outcomes, OTHER_RUN_ID).incomplete is False
+    failed = outcome_of(outcomes, FOLDER_RUN_ID)
+    assert failed.incomplete is True
+    assert failed.reason.startswith("runs.json could not be read")
+    assert sorted(call["source"] for call in reconciliation.bun.steps("build")) == (
+        sorted([RUN_ID, OTHER_RUN_ID])
+    )
     summary = reconciliation_attribute("summarize")(
         outcomes, country="us", kinds=["staging"], request_id=None, dry_run=False
     )
     assert summary["incomplete"] is True
-    assert sorted(
+    assert [
         incomplete["source_id"] for incomplete in summary["incomplete_sources"]
-    ) == [OTHER_RUN_ID, FOLDER_RUN_ID]
+    ] == [FOLDER_RUN_ID]
 
 
-def test_a_run_the_store_holds_is_already_stored_without_reading_its_files() -> None:
+def test_a_stored_run_whose_folder_has_not_changed_is_not_read_again() -> None:
     reconciliation = us_staging_reconciliation(
         {**structured_staging_run(RUN_ID), **structured_staging_run(OTHER_RUN_ID)}
     )
-    reconciliation.bun.store = store_manifest(
-        "us",
-        [
-            {
-                "buildArtifactId": "b" * 64,
-                "kind": "staging",
-                "releaseId": None,
-                "stagingRunId": RUN_ID,
-                "hfRepo": US_STAGING,
-                "hfCommitSha": "9" * 40,
-                "createdAt": "2026-11-02T09:15:00.000Z",
-            }
-        ],
-    )
+    reconciliation.run(kinds=["staging"])
+    remember_built_trees(reconciliation)
+    first_reads = len(reconciliation.hugging_face.requests)
 
     outcomes = reconciliation.run(kinds=["staging"])
 
-    assert outcome_of(outcomes, RUN_ID).outcome == "already_stored"
-    assert outcome_of(outcomes, OTHER_RUN_ID).outcome == "built"
-    assert not any(
-        f"runs/{RUN_ID}/" in path
-        for path in reconciliation.hugging_face.downloaded_paths()
+    assert sorted(outcomes_by_source(outcomes)) == sorted(
+        [(RUN_ID, "already_stored"), (OTHER_RUN_ID, "already_stored")]
     )
+    assert {field_of(outcome, "run_files") for outcome in outcomes} == {"unchanged"}
+    assert len(reconciliation.bun.steps("build")) == 2
+    assert not [
+        request
+        for request in reconciliation.hugging_face.requests[first_reads:]
+        if "/runs/" in request.url.path
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1288,10 +1288,8 @@ def without_diagnostics(files: Mapping[str, bytes]) -> dict[str, bytes]:
     }
 
 
-# Review round 1, bug 2: the publisher's resolveStagingCalibrationSource finds
-# no calibration source for these final runs, and reconcileStagingBuilds
-# reports them ineligible ("Finalized staging run has no calibration
-# diagnostics.").
+# Review round 1, bug 2: the staging readers' resolveStagingCalibrationSource
+# finds no calibration source for these runs, so they have no tree.
 RUNS_WITHOUT_DIAGNOSTICS = {
     "schema-1-run-without-diagnostics": without_diagnostics(schema_1_run(RUN_ID)),
     "structured-run-declaring-neither": structured_staging_run(RUN_ID, artifacts={}),
@@ -1311,20 +1309,22 @@ RUNS_WITHOUT_DIAGNOSTICS = {
 
 
 @pytest.mark.parametrize("case", sorted(RUNS_WITHOUT_DIAGNOSTICS))
-def test_a_final_run_without_calibration_diagnostics_is_ineligible(case: str) -> None:
+def test_a_run_without_calibration_diagnostics_is_copied_without_a_tree(
+    case: str,
+) -> None:
     reconciliation = us_staging_reconciliation(RUNS_WITHOUT_DIAGNOSTICS[case])
 
     [outcome] = reconciliation.run(kinds=["staging"])
 
     assert (outcome.source_id, outcome.outcome) == (RUN_ID, "ineligible")
-    assert outcome.reason.startswith(
-        "Finalized staging run has no calibration diagnostics"
-    )
+    assert outcome.reason.startswith("Staging run has no calibration diagnostics")
+    assert field_of(outcome, "run_files") == "copied"
     assert outcome.incomplete is False
     assert reconciliation.bun.steps("build") == []
+    assert RUN_ID in reconciliation.bun.copied_runs
 
 
-def test_a_dry_run_reports_a_final_run_without_diagnostics_as_ineligible() -> None:
+def test_a_dry_run_reports_a_run_without_diagnostics_as_ineligible() -> None:
     reconciliation = us_staging_reconciliation(
         RUNS_WITHOUT_DIAGNOSTICS["structured-run-declaring-neither"]
     )
@@ -1388,6 +1388,343 @@ def test_the_newest_finalized_runs_are_built_first() -> None:
         OTHER_RUN_ID,
         RUN_ID,
     ]
+
+
+# Copies of run files --------------------------------------------------------------
+
+
+def remember_built_trees(reconciliation: Reconciliation) -> None:
+    """The store's manifest after this run's publications, as the real one has it."""
+
+    reconciliation.bun.store = store_manifest(
+        "us",
+        [
+            stored_entry(
+                "staging",
+                call["source"],
+                call["publication"]["worker"]["buildArtifactId"],
+            )
+            for call in reconciliation.bun.steps("publication")
+        ],
+    )
+
+
+def copied_contents(
+    reconciliation: Reconciliation,
+) -> list[dict[str, dict[str, bytes]]]:
+    """What each publication of run files gave the command, by run and file."""
+
+    return [
+        call["contents"]
+        for call in reconciliation.bun.steps("run files publish")
+        if call["contents"]
+    ]
+
+
+def field_of(outcome: Any, name: str) -> Any:
+    """A field of an outcome's document, ``None`` while it has no such field."""
+
+    return outcome.to_json().get(name)
+
+
+def stored_tree(
+    reconciliation: Reconciliation, run_id: str, sources: Mapping[str, bytes]
+) -> None:
+    """A stored tree of ``run_id`` built from ``sources``, by the tree's role names."""
+
+    build = "b" * 64
+    reconciliation.bun.store = store_manifest(
+        "us", [stored_entry("staging", run_id, build)]
+    )
+    reconciliation.bun.tree_sources[build] = {
+        role: {"sha256": sha256(content)} for role, content in sources.items()
+    }
+
+
+def test_the_files_the_dashboard_reads_are_copied_for_every_status() -> None:
+    folder = f"runs/{RUN_ID}"
+    run = structured_staging_run(RUN_ID, status="running", artifacts={})
+    run |= {
+        f"{folder}/events.ndjson": b'{"sequence": 1}\n',
+        f"{folder}/calibration_progress.json": b'{"epoch": 1}',
+        f"{folder}/reform_validation.json": b'{"reforms": []}',
+        f"{folder}/artifacts/staged_dataset.json": b'{"status": "skipped"}',
+        f"{folder}/artifacts/fit_summary.json": b'{"not": "read"}',
+        f"{folder}/stored_inputs.json": b'{"not": "read"}',
+    }
+    reconciliation = us_staging_reconciliation(run)
+
+    [outcome] = reconciliation.run(kinds=["staging"])
+
+    assert field_of(outcome, "run_files") == "copied"
+    assert field_of(outcome, "copied_run_files") == 6
+    [published] = copied_contents(reconciliation)
+    assert sorted(published[RUN_ID]) == [
+        "artifacts/staged_dataset.json",
+        "calibration_progress.json",
+        "events.ndjson",
+        "progress.json",
+        "reform_validation.json",
+        "run_manifest.json",
+    ]
+    assert published[RUN_ID]["events.ndjson"] == b'{"sequence": 1}\n'
+    assert not any(
+        path.endswith(("fit_summary.json", "stored_inputs.json"))
+        for path in reconciliation.hugging_face.downloaded_paths()
+    )
+
+
+def test_a_copy_records_the_head_commit_and_is_read_at_it() -> None:
+    reconciliation = us_staging_reconciliation(structured_staging_run(RUN_ID))
+    head = head_commit(reconciliation.hugging_face, US_STAGING)
+
+    reconciliation.run(kinds=["staging"])
+
+    publishes = reconciliation.bun.steps("run files publish")
+    assert publishes, "The run's files were not copied."
+    publish = publishes[0]
+    assert publish["request"]["hfRepo"] == US_STAGING
+    assert publish["request"]["hfCommitSha"] == head
+    resolved = [
+        str(request.url)
+        for request in reconciliation.hugging_face.requests
+        if "/resolve/" in request.url.path and "/progress.json" in request.url.path
+    ]
+    assert resolved
+    assert all(f"/resolve/{head}/" in address for address in resolved)
+
+
+def test_a_folder_without_run_documents_is_not_a_run() -> None:
+    other_folder = "runs/lwi-county-poc-20261117"
+    reconciliation = us_staging_reconciliation(
+        {
+            **schema_1_run(RUN_ID),
+            **schema_1_index({RUN_ID: "passed"}),
+            f"{other_folder}/county-poc/calibration_diagnostics.json": DIAGNOSTICS,
+            f"{other_folder}/agi.log": b"log",
+        }
+    )
+
+    outcomes = reconciliation.run(kinds=["staging"])
+
+    assert outcome_of(outcomes, "lwi-county-poc-20261117").outcome == "not_a_run"
+    assert outcome_of(outcomes, "lwi-county-poc-20261117").incomplete is False
+    assert sorted(reconciliation.bun.copied_runs) == [RUN_ID]
+    assert not any(
+        other_folder in path for path in reconciliation.hugging_face.downloaded_paths()
+    )
+
+
+def test_a_changed_file_is_copied_again_without_rebuilding_the_tree() -> None:
+    reconciliation = us_staging_reconciliation(structured_staging_run(RUN_ID))
+    reconciliation.run(kinds=["staging"])
+    remember_built_trees(reconciliation)
+    at_head(
+        reconciliation.hugging_face,
+        US_STAGING,
+        structured_staging_run(RUN_ID, status="failed"),
+    )
+    reconciliation.bun.tree_sources[build_id("us", "staging", RUN_ID)] = {
+        "calibrationDiagnostics": {"sha256": sha256(DIAGNOSTICS)}
+    }
+
+    [outcome] = reconciliation.run(kinds=["staging"])
+
+    assert outcome.outcome == "already_stored"
+    assert field_of(outcome, "run_files") == "copied"
+    assert len(copied_contents(reconciliation)) == 2
+    assert b'"failed"' in (copied_contents(reconciliation)[1][RUN_ID]["progress.json"])
+    assert len(reconciliation.bun.steps("build")) == 1
+
+
+def test_a_stored_tree_of_the_same_files_is_kept_and_remembered() -> None:
+    reconciliation = us_staging_reconciliation(structured_staging_run(RUN_ID))
+    stored_tree(reconciliation, RUN_ID, {"calibrationDiagnostics": DIAGNOSTICS})
+
+    [outcome] = reconciliation.run(kinds=["staging"])
+
+    assert outcome.outcome == "already_stored"
+    assert outcome.build_artifact_id == "b" * 64
+    assert reconciliation.bun.steps("build") == []
+    record = reconciliation.bun.copied_runs[RUN_ID]
+    assert record["treeCheck"] == {
+        "folderFingerprint": record["folderFingerprint"],
+        "buildArtifactId": "b" * 64,
+    }
+
+
+def test_changed_diagnostics_replace_the_run_s_tree() -> None:
+    reconciliation = us_staging_reconciliation(structured_staging_run(RUN_ID))
+    stored_tree(reconciliation, RUN_ID, {"calibrationDiagnostics": b"older"})
+
+    [outcome] = reconciliation.run(kinds=["staging"])
+
+    assert outcome.outcome == "built"
+    assert field_of(outcome, "replaced_build_artifact_id") == "b" * 64
+    publication = reconciliation.bun.publication_of(RUN_ID)["publication"]
+    assert publication["replaceStagingRun"] is True
+    assert reconciliation.bun.copied_runs[RUN_ID]["treeCheck"]["buildArtifactId"] == (
+        build_id("us", "staging", RUN_ID)
+    )
+
+
+def test_a_manifest_that_arrives_later_replaces_the_run_s_tree() -> None:
+    reconciliation = us_staging_reconciliation(schema_1_run(RUN_ID))
+    stored_tree(reconciliation, RUN_ID, {"calibrationDiagnostics": DIAGNOSTICS})
+
+    [outcome] = reconciliation.run(kinds=["staging"])
+
+    assert outcome.outcome == "built"
+    assert reconciliation.bun.publication_of(RUN_ID)["publication"]["replaceStagingRun"]
+
+
+def test_a_file_only_the_stored_tree_has_does_not_replace_it() -> None:
+    reconciliation = us_staging_reconciliation(structured_staging_run(RUN_ID))
+    stored_tree(
+        reconciliation,
+        RUN_ID,
+        {"calibrationDiagnostics": DIAGNOSTICS, "buildManifest": BUILD_MANIFEST},
+    )
+
+    [outcome] = reconciliation.run(kinds=["staging"])
+
+    assert outcome.outcome == "already_stored"
+    assert reconciliation.bun.steps("build") == []
+
+
+def test_a_new_tree_does_not_ask_to_replace_anything() -> None:
+    reconciliation = us_staging_reconciliation(structured_staging_run(RUN_ID))
+
+    reconciliation.run(kinds=["staging"])
+
+    assert (
+        "replaceStagingRun"
+        not in (reconciliation.bun.publication_of(RUN_ID)["publication"])
+    )
+
+
+def test_a_tree_stored_by_another_writer_is_compared_again() -> None:
+    reconciliation = us_staging_reconciliation(structured_staging_run(RUN_ID))
+    reconciliation.run(kinds=["staging"])
+    stored_tree(reconciliation, RUN_ID, {"calibrationDiagnostics": b"older"})
+
+    [outcome] = reconciliation.run(kinds=["staging"])
+
+    assert outcome.outcome == "built"
+    assert field_of(outcome, "run_files") == "unchanged"
+    assert len(reconciliation.bun.steps("build")) == 2
+
+
+def test_a_stored_tree_that_can_t_be_read_leaves_the_run_incomplete() -> None:
+    reconciliation = us_staging_reconciliation(structured_staging_run(RUN_ID))
+    stored_tree(reconciliation, RUN_ID, {"calibrationDiagnostics": DIAGNOSTICS})
+    reconciliation.bun.run_file_exits["tree-sources"] = 3
+
+    [outcome] = reconciliation.run(kinds=["staging"])
+
+    assert outcome.outcome == "error"
+    assert outcome.incomplete is True
+    assert reconciliation.bun.steps("build") == []
+
+
+def test_a_dry_run_reports_copies_and_replacements_and_writes_nothing() -> None:
+    reconciliation = us_staging_reconciliation(structured_staging_run(RUN_ID))
+    stored_tree(reconciliation, RUN_ID, {"calibrationDiagnostics": b"older"})
+
+    [outcome] = reconciliation.run(kinds=["staging"], dry_run=True)
+
+    assert outcome.outcome == "would_build"
+    assert field_of(outcome, "run_files") == "would_copy"
+    assert field_of(outcome, "replaced_build_artifact_id") == "b" * 64
+    assert reconciliation.bun.steps("run files publish") == []
+    assert reconciliation.bun.copied_runs == {}
+    assert not any(
+        path.endswith("events.ndjson")
+        for path in reconciliation.hugging_face.downloaded_paths()
+    )
+
+
+def test_a_file_that_can_t_be_read_leaves_only_its_run_incomplete() -> None:
+    reconciliation = us_staging_reconciliation(
+        {**structured_staging_run(RUN_ID), **structured_staging_run(OTHER_RUN_ID)}
+    )
+    reconciliation.hugging_face.datasets[US_STAGING].file_answers[
+        f"runs/{RUN_ID}/progress.json"
+    ] = (500, None)
+
+    outcomes = reconciliation.run(kinds=["staging"])
+
+    failed = outcome_of(outcomes, RUN_ID)
+    assert field_of(failed, "run_files") == "error"
+    assert failed.incomplete is True
+    assert field_of(failed, "run_files_reason")
+    assert field_of(outcome_of(outcomes, OTHER_RUN_ID), "run_files") == "copied"
+    assert outcome_of(outcomes, OTHER_RUN_ID).incomplete is False
+    assert sorted(reconciliation.bun.copied_runs) == [OTHER_RUN_ID]
+
+
+def test_a_failed_publication_of_run_files_leaves_the_run_incomplete() -> None:
+    reconciliation = us_staging_reconciliation(structured_staging_run(RUN_ID))
+    reconciliation.bun.run_file_exits["publish"] = 3
+
+    outcomes = reconciliation.run(kinds=["staging"])
+
+    outcome = outcome_of(outcomes, RUN_ID)
+    assert field_of(outcome, "run_files") == "error"
+    assert outcome.incomplete is True
+
+
+def test_an_index_that_can_t_be_read_is_an_error_for_the_kind() -> None:
+    reconciliation = us_staging_reconciliation(structured_staging_run(RUN_ID))
+    reconciliation.bun.run_file_exits["read"] = 3
+
+    [outcome] = reconciliation.run(kinds=["staging"])
+
+    assert (outcome.source_id, outcome.outcome) == (None, "error")
+    assert outcome.incomplete is True
+    assert reconciliation.bun.steps("build") == []
+
+
+def test_run_files_are_saved_in_batches_so_a_stopped_job_keeps_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if importlib.util.find_spec(RUN_FILES_MODULE) is None:
+        pytest.fail(f"{RUN_FILES_MODULE} does not exist yet.")
+    monkeypatch.setattr(
+        importlib.import_module(RUN_FILES_MODULE), "RUN_FILE_BATCH_SIZE", 1
+    )
+    reconciliation = us_staging_reconciliation(
+        {**structured_staging_run(RUN_ID), **structured_staging_run(OTHER_RUN_ID)}
+    )
+
+    reconciliation.run(kinds=["staging"])
+
+    published = copied_contents(reconciliation)
+    assert sorted(run_id for batch in published for run_id in batch) == sorted(
+        [RUN_ID, OTHER_RUN_ID]
+    )
+    assert all(len(batch) <= 1 for batch in published)
+
+
+def test_no_copy_starts_after_the_time_limit() -> None:
+    reconciliation = us_staging_reconciliation(structured_staging_run(RUN_ID))
+
+    [outcome] = reconciliation.run(kinds=["staging"], time_limit_seconds=0)
+
+    assert field_of(outcome, "run_files") == "deferred"
+    assert outcome.incomplete is True
+    assert reconciliation.bun.steps("run files publish") == []
+
+
+def test_the_summary_counts_what_became_of_the_run_files() -> None:
+    reconciliation = us_staging_reconciliation(structured_staging_run(RUN_ID))
+
+    outcomes = reconciliation.run(kinds=["staging"])
+
+    summary = reconciliation_attribute("summarize")(
+        outcomes, country="us", kinds=["staging"], request_id=None, dry_run=False
+    )
+    assert summary.get("run_files") == {"copied": 1}
 
 
 def test_belgium_has_no_staging_repo_to_reconcile() -> None:
