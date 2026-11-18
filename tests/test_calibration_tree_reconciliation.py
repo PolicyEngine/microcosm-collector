@@ -1724,8 +1724,8 @@ def test_a_run_removed_from_hugging_face_is_marked_and_returns_with_its_folder()
     reconciliation.run(kinds=["staging"])
     remember_built_trees(reconciliation)
     dataset = reconciliation.hugging_face.datasets[US_STAGING]
-    for repository_path in run:
-        del dataset.files[repository_path]
+    for run_file in run:
+        del dataset.files[run_file]
 
     outcomes = reconciliation.run(kinds=["staging"])
 
