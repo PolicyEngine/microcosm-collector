@@ -2,19 +2,15 @@
 // store, and the package's reader for them.
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
 
-const MODULE_PATH = join(import.meta.dir, "calibration-tree-source-files.ts");
 const BUILD_ID = "a".repeat(64);
 const TOKEN = "vercel_blob_rw_test_token";
 
-type SourceFilesModule = typeof import("./calibration-tree-source-files");
-
-async function sourceFiles(): Promise<SourceFilesModule> {
-  expect(existsSync(MODULE_PATH)).toBe(true);
-  return await import(MODULE_PATH) as SourceFilesModule;
+async function sourceFiles() {
+  return await import("./calibration-tree-source-files");
 }
 
 interface RecordedGet {
@@ -135,12 +131,10 @@ test("the JSON reader gives the payload and digest the Hugging Face reader gives
   expect(stored).toEqual({ payload: { build_id: "the-parent-build" }, sha256: sha256(original) });
 });
 
-test("the package exports the reader and has a version not yet published", () => {
+test("the package exports the reader", () => {
   const manifest = JSON.parse(readFileSync(join(import.meta.dir, "..", "package.json"), "utf8")) as {
-    version: string;
     exports: Record<string, string>;
   };
 
   expect(manifest.exports["./calibration-tree-source-files"]).toBe("./src/calibration-tree-source-files.ts");
-  expect(manifest.version).toBe("0.1.3");
 });

@@ -242,6 +242,10 @@ class ReconcileOutcome:
     build_artifact_id: str | None = None
     uploaded_parts: int | None = None
     kept_parts: int | None = None
+    uploaded_source_files: int | None = None
+    kept_source_files: int | None = None
+    #: The build's copies left as stored because they hold other bytes.
+    source_file_conflicts: list[str] | None = None
     #: A later run should try it again.
     incomplete: bool = False
 
@@ -1035,6 +1039,7 @@ class _Reconciliation:
                     "refused."
                 ),
                 build_artifact_id=error.build_artifact_id,
+                source_file_conflicts=list(error.source_file_conflicts),
             )
         except TreeRefusedError as error:
             return outcome("refused", reason=shortened_message(str(error)))
@@ -1045,6 +1050,9 @@ class _Reconciliation:
             build_artifact_id=published.build_artifact_id,
             uploaded_parts=published.uploaded_parts,
             kept_parts=published.kept_parts,
+            uploaded_source_files=published.uploaded_source_files,
+            kept_source_files=published.kept_source_files,
+            source_file_conflicts=list(published.source_file_conflicts),
         )
 
 
