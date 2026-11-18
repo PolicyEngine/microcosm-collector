@@ -1,6 +1,6 @@
 {
   "name": "@policyengine/calibration-tree",
-  "version": "0.1.3",
+  "version": "0.1.5",
   "description": "Builds, validates, reads and publishes Microcosm calibration tree artifacts (tree schema 6), with the release and staging readers they are built from.",
   "license": "MIT",
   "repository": {
@@ -33,6 +33,8 @@
     "./calibration-tree-manifest": "./src/calibration-tree-manifest.ts",
     "./calibration-tree-manifest-read": "./src/calibration-tree-manifest-read.ts",
     "./calibration-tree-publication": "./src/calibration-tree-publication.ts",
+    "./calibration-tree-releases-record": "./src/calibration-tree-releases-record.ts",
+    "./calibration-tree-releases-record-copy": "./src/calibration-tree-releases-record-copy.ts",
     "./calibration-tree-source-files": "./src/calibration-tree-source-files.ts",
     "./calibration-tree-worker": "./src/calibration-tree-worker.ts",
     "./chronicle-metadata": "./src/chronicle-metadata.ts",
@@ -67,7 +69,8 @@
     "worker": "bun run src/calibration-tree-worker.ts",
     "publication": "bun run src/calibration-tree-publication.ts",
     "latest": "bun run src/calibration-tree-latest.ts",
-    "manifest-read": "bun run src/calibration-tree-manifest-read.ts"
+    "manifest-read": "bun run src/calibration-tree-manifest-read.ts",
+    "releases-record-copy": "bun run src/calibration-tree-releases-record-copy.ts"
   },
   "dependencies": {
     "@vercel/blob": "^2.6.1"

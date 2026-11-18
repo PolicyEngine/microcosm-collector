@@ -74,6 +74,38 @@ const manifest = await readCalibrationTreeSourceJson({
 It returns the parsed `payload` and the file's `sha256`, or `null` without a
 copy. `readCalibrationTreeSourceFile` returns the original bytes instead.
 
+## A country's stored releases.json
+
+The collector keeps each country's `releases.json` at its release repo's head
+as one private blob, replaced in place:
+
+```text
+calibration-tree-sources/<country>/releases-record.json
+```
+
+`src/calibration-tree-releases-record.ts` reads it:
+
+```ts
+import { readStoredReleasesRecord } from "@policyengine/calibration-tree/calibration-tree-releases-record";
+
+const stored = await readStoredReleasesRecord({ country: "us", token });
+```
+
+`stored.state` is one of:
+
+- `record`: `stored.record` is the file, checked by the rules of
+  `parseReleasesRecordBytes`, with `hfRepo`, `hfCommitSha`, `copiedAt` and the
+  file's `sha256`.
+- `no_record`: the repo had no `releases.json` at `hfCommitSha`.
+- `not_copied`: the collector has stored nothing for the country yet. This says
+  nothing about its repo, so a caller must not treat it as `no_record`.
+
+A stored copy that breaks these rules, and a failed read, throw. A read uses
+the store's cache unless it passes `consistent: true`, and the copy is written
+with a 60-second cache. `src/calibration-tree-releases-record-copy.ts` is the
+command the collector replaces the copy with. Its opening comment describes its
+two steps and its exit codes.
+
 ## Development
 
 ```bash

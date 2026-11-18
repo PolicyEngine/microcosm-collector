@@ -356,6 +356,8 @@ class Reconciliation:
                 bun="/usr/local/bin/bun",
                 run_command=run_latest_command,
             )
+        # A test of the copy step passes its own; the others don't watch it.
+        options.setdefault("copy_record", lambda _country: copied_record())
         produced = list(
             module.reconcile_calibration_trees(
                 country=country,

@@ -177,7 +177,8 @@ writer accepts, named `releases.json`. Its `build_id`, `release` and
 `licensed_data` are those of the build made current, and its `run_id` is the
 run that made the change (the collector doesn't read it). Its `commit` makes
 each change its own submission, so a later change back to the same build is
-processed again.
+processed again. The collector stores the `releases.json` at the repo's head
+after it handles the submission, not the submitted file.
 
 ### The roles the emitter sends
 

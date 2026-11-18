@@ -64,6 +64,15 @@ lock, a build made current while its tree is being built becomes the latest
 either way: its tree's publication reads the change, or the change's
 handler finds its tree.
 
+``copy_releases_record`` keeps the country's ``releases.json`` at the release
+repo's head in the tree store, as one private object per country, through the
+package's copy command. The reconcile command's release run does it first, and
+the ``releases-record`` handler after it has moved the latest. It takes no
+lock: it reads the stored object's ETag, then the head, and the write succeeds
+only while the ETag is unchanged, so an older execution cannot replace a newer
+copy. A repo without ``releases.json`` gets a copy that says so, and a record
+the rules refuse leaves the last accepted copy in place.
+
 The worker registers both handlers only where
 ``COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN`` is set (``registered_handlers``,
 which ``telemetry_collector.handlers`` reads), and they then need
@@ -118,6 +127,10 @@ PUBLICATION_SCRIPT = PACKAGE_DIRECTORY / "src" / "calibration-tree-publication.t
 LATEST_SCRIPT = PACKAGE_DIRECTORY / "src" / "calibration-tree-latest.ts"
 #: Prints the store's manifest; it only reads, with the publication's token.
 MANIFEST_READ_SCRIPT = PACKAGE_DIRECTORY / "src" / "calibration-tree-manifest-read.ts"
+#: Reads and replaces the stored copy of a country's releases.json.
+RELEASES_RECORD_COPY_SCRIPT = (
+    PACKAGE_DIRECTORY / "src" / "calibration-tree-releases-record-copy.ts"
+)
 
 #: The worker job's setting: the read-write token of this environment's
 #: calibration tree Blob store, a Secret Manager secret.
@@ -153,12 +166,20 @@ PUBLICATION_TIMEOUT_SECONDS = WORKER_TASK_TIMEOUT_SECONDS // 6
 # The latest command reads and writes only the manifest.
 LATEST_TIMEOUT_SECONDS = 5 * 60
 MANIFEST_READ_TIMEOUT_SECONDS = 5 * 60
+# Each step of the copy command reads or writes one small object.
+RELEASES_RECORD_COPY_TIMEOUT_SECONDS = 2 * 60
+#: How many times a copy starts again after another writer changed the object.
+RELEASES_RECORD_COPY_ATTEMPTS = 3
 MAX_MESSAGE_CHARACTERS = 500
 
 EXIT_UNBUILDABLE_INPUT = 2
 EXIT_ENTRY_REFUSED = 2
 #: The latest command's exit when the manifest records no tree for the build.
 EXIT_NOT_RECORDED = 2
+#: The copy command's exit when the package's rules refuse the record.
+EXIT_COPY_REFUSED = 2
+#: The copy command's exit when another writer changed the object first.
+EXIT_COPY_CONFLICT = 4
 
 #: The ``processed_by`` of the ``releases-record`` handler.
 LATEST_HANDLER = "calibration-tree-latest"
@@ -1086,6 +1107,184 @@ def follow_releases_record(
     )
 
 
+# Keeping a copy of releases.json --------------------------------------------------
+
+ReleasesRecordCopyOutcome = Literal["stored", "unchanged", "refused"]
+
+
+@dataclass(frozen=True)
+class CopiedReleasesRecord:
+    """What copying a country's ``releases.json`` into the tree store did."""
+
+    country: str
+    #: ``stored``: the copy now holds the head. ``unchanged``: it already did.
+    #: ``refused``: the head's record breaks the rules, so the copy stayed.
+    outcome: ReleasesRecordCopyOutcome
+    hf_repo: str
+    #: The release repo's head commit that was read.
+    hf_commit: str
+    #: Whether the copy holds a record (``False``: it says the repo has none);
+    #: ``None`` when it is unknown, as after a refusal.
+    has_record: bool | None
+    #: Why the record was refused.
+    reason: str | None = None
+
+    def result(self) -> dict[str, Any]:
+        """The fields a job's result and the reconcile command's step record."""
+
+        result: dict[str, Any] = {
+            "outcome": self.outcome,
+            "hf_repo": self.hf_repo,
+            "hf_commit": self.hf_commit,
+            "has_record": self.has_record,
+        }
+        if self.reason is not None:
+            result["reason"] = self.reason
+        return result
+
+
+def _stored_copy_version(
+    answer: Mapping[str, Any],
+) -> tuple[str | None, str | None, bool | None]:
+    """The ETag, commit and ``hasRecord`` the copy command's ``read`` printed."""
+
+    etag = answer.get("etag")
+    commit = answer.get("hfCommitSha")
+    has_record = answer.get("hasRecord")
+    if (
+        (etag is not None and not isinstance(etag, str))
+        or (commit is not None and not isinstance(commit, str))
+        or (has_record is not None and not isinstance(has_record, bool))
+    ):
+        raise CalibrationTreeCommandError(
+            "The releases.json copy command's answer does not describe a version."
+        )
+    return etag, commit, has_record
+
+
+def copy_releases_record(
+    country: str,
+    *,
+    blob_token: str,
+    reader: HuggingFaceReader,
+    bun: str = "bun",
+    run_command: CommandRunner = run_bun,
+) -> CopiedReleasesRecord:
+    """Store ``country``'s ``releases.json`` at its release repo's head.
+
+    Each attempt reads the stored object's version, then the head, and writes
+    only if that version is still the stored one. A write that succeeds
+    therefore saw the previous write's version before it read its head, so an
+    older execution cannot replace a newer copy, with no lock held. After
+    another writer's change the attempt starts again, and finds the head
+    already stored if that writer stored it.
+
+    A copy already at the head is left as it is. A repo without
+    ``releases.json`` gets a copy saying so. A record the rules refuse leaves
+    the last accepted copy in place (``refused``).
+
+    Raises ``ValueError`` for a country the collector does not list, before
+    reading anything. Any other exception is a failure calling again may get
+    past: ``HuggingFaceReadError`` for a failed read, with nothing written, and
+    ``CalibrationTreeCommandError`` when the copy command fails, runs out of
+    time or cannot start, or another writer kept changing the object.
+    """
+
+    if country not in RELEASE_REPOS:
+        raise ValueError(f"{country} is not a country the collector lists.")
+    repo = RELEASE_REPOS[country]
+
+    def run_copy_command(*arguments: str) -> subprocess.CompletedProcess[str]:
+        try:
+            return run_command(
+                [bun, "run", str(RELEASES_RECORD_COPY_SCRIPT), *arguments],
+                _publication_environment(blob_token),
+                RELEASES_RECORD_COPY_TIMEOUT_SECONDS,
+            )
+        except (subprocess.TimeoutExpired, OSError) as error:
+            raise CalibrationTreeCommandError(
+                f"The releases.json copy command did not finish: {error}"
+            ) from error
+
+    def failed(step: str, completed: subprocess.CompletedProcess[str]) -> Exception:
+        return CalibrationTreeCommandError(
+            f"The releases.json copy {step} exited with {completed.returncode}: "
+            f"{shortened_message(completed.stderr)}"
+        )
+
+    def copied(
+        outcome: ReleasesRecordCopyOutcome,
+        head: str,
+        has_record: bool | None,
+        reason: str | None = None,
+    ) -> CopiedReleasesRecord:
+        return CopiedReleasesRecord(
+            country=country,
+            outcome=outcome,
+            hf_repo=repo,
+            hf_commit=head,
+            has_record=has_record,
+            reason=reason,
+        )
+
+    with tempfile.TemporaryDirectory(
+        prefix="calibration-tree-releases-record-"
+    ) as directory:
+        request_path = Path(directory) / "copy.json"
+        record_path = Path(directory) / RELEASES_RECORD_PATH
+        for _attempt in range(RELEASES_RECORD_COPY_ATTEMPTS):
+            read = run_copy_command("read", country)
+            if read.returncode != 0:
+                raise failed("read", read)
+            etag, stored_commit, stored_has_record = _stored_copy_version(
+                _answer(read, "releases.json copy read")
+            )
+            # After the version, so that the write below can only follow it.
+            head = reader.head_commit(repo)
+            if stored_commit == head:
+                return copied("unchanged", head, stored_has_record)
+            try:
+                content = reader.read_file(repo, RELEASES_RECORD_PATH, head)
+            except HuggingFaceReadError as error:
+                if not is_missing_path(error):
+                    raise
+                content = None
+            if content is not None:
+                try:
+                    parse_releases_record(content)
+                except ReleasesRecordRefusedError as error:
+                    return copied("refused", head, None, shortened_message(str(error)))
+                record_path.write_bytes(content)
+            request_path.write_text(
+                json.dumps(
+                    {
+                        "country": country,
+                        "hfRepo": repo,
+                        "hfCommitSha": head,
+                        "expectedEtag": etag,
+                        "recordFile": None if content is None else str(record_path),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            written = run_copy_command("write", str(request_path))
+            if written.returncode == EXIT_COPY_CONFLICT:
+                continue
+            if written.returncode == EXIT_COPY_REFUSED:
+                return copied("refused", head, None, shortened_message(written.stderr))
+            if written.returncode != 0:
+                raise failed("write", written)
+            if _answer(written, "releases.json copy write").get("hfCommitSha") != head:
+                raise CalibrationTreeCommandError(
+                    f"The releases.json copy command's answer does not describe {head}."
+                )
+            return copied("stored", head, content is not None)
+    raise CalibrationTreeCommandError(
+        f"The stored releases.json of {country} was changed by another writer "
+        f"on each of {RELEASES_RECORD_COPY_ATTEMPTS} attempts."
+    )
+
+
 def calibration_tree_latest_handler(
     *,
     blob_token: str,
@@ -1105,8 +1304,10 @@ def calibration_tree_latest_handler(
     refuse, no current build of its default release, or a current build
     without a recorded tree. Such a tree's own publication reads this change
     and makes it the latest, unless the latest is newer, as after a rollback to
-    it (reprocessing this submission then moves the latest). Any failure
-    fails the attempt, so it runs again.
+    it (reprocessing this submission then moves the latest). It then stores
+    the head's ``releases.json`` (``copy_releases_record``), so that promotions
+    and withdrawals reach the stored copy without waiting for the reconcile
+    command. Any failure fails the attempt, so it runs again.
     """
 
     def move_latest(context: JobContext) -> dict[str, Any]:
@@ -1127,7 +1328,18 @@ def calibration_tree_latest_handler(
             bun=bun,
             run_command=run_command,
         )
-        return {"processed_by": LATEST_HANDLER, **followed.result()}
+        copied = copy_releases_record(
+            plan.country,
+            blob_token=blob_token,
+            reader=reader,
+            bun=bun,
+            run_command=run_command,
+        )
+        return {
+            "processed_by": LATEST_HANDLER,
+            **followed.result(),
+            "releases_record": copied.result(),
+        }
 
     return move_latest
 

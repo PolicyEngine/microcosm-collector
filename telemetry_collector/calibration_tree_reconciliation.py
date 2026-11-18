@@ -86,6 +86,20 @@ Cloud Run tries again. A release repo without ``releases.json``, a dry run
 and a lock wait that expires skip the step: the execution that held the
 lock runs its own step when its release builds end.
 
+**The stored releases.json.** A release run starts with one more step
+(``_Reconciliation.releases_record_step``): it calls ``copy_record``, which
+the operations command binds to ``calibration_trees.copy_releases_record``, so
+the tree store holds the country's ``releases.json`` at the release repo's
+head. The step comes before the run waits for its lock, so every release run
+passes it, whatever its builds do and however long another execution holds
+the lock, and a change of ``releases.json`` is not held back by a run that is
+building. It needs no lock: its write succeeds only if the stored object is
+the version read before the head was read. Its document,
+``{"releases_record": {...}}``, and the summary's ``releases_record`` say what
+it did, with ``CopiedReleasesRecord``'s fields. A failure leaves the run
+incomplete, so Cloud Run tries again, and the builds go on. A dry run skips
+the step and neither reads nor writes the object.
+
 **Locks.** Each kind is reconciled inside a Postgres session advisory lock of
 its own country and kind, held on one connection: an execution waits for it
 up to 15 minutes, so that one that started after an event lists Hugging Face
@@ -129,6 +143,7 @@ from telemetry_collector.calibration_trees import (
     RELEASE_REPOS,
     SAFE_IDENTIFIER,
     STAGING_REPOS,
+    CopiedReleasesRecord,
     FollowedLatest,
     TreeAlreadyStoredError,
     TreeCommands,
@@ -174,6 +189,14 @@ LatestStepSkipped = Literal["dry_run", "no_releases_record", "lock_wait_expired"
 #: ``calibration_trees.follow_releases_record`` for one country, with the
 #: worker job's Blob token, the manifest lock and the Hugging Face reader.
 FollowLatest = Callable[[str], FollowedLatest]
+#: What the step that stores releases.json did: what
+#: ``copy_releases_record`` answered, that it was not called, or that it raised.
+ReleasesRecordStepOutcome = Literal[
+    "stored", "unchanged", "refused", "skipped", "error"
+]
+#: ``calibration_trees.copy_releases_record`` for one country, with the worker
+#: job's Blob token and the Hugging Face reader.
+CopyReleasesRecord = Callable[[str], CopiedReleasesRecord]
 
 #: How long an execution waits for another one's lock on the same country
 #: and kind, and how often it tries.
@@ -260,6 +283,41 @@ class LatestStep:
 
     def to_json(self) -> dict[str, Any]:
         return {"latest": self.fields()}
+
+
+@dataclass(frozen=True)
+class ReleasesRecordStep:
+    """What a release run's first step did to the stored ``releases.json``.
+
+    ``copied`` is ``copy_releases_record``'s answer when it gave one.
+    ``skipped`` says why it was not called. ``error``: it raised, and the run
+    is incomplete.
+    """
+
+    country: str
+    outcome: ReleasesRecordStepOutcome
+    copied: CopiedReleasesRecord | None = None
+    skipped: Literal["dry_run"] | None = None
+    #: Why the step was skipped, or what it raised.
+    reason: str | None = None
+    #: A later run should try it again.
+    incomplete: bool = False
+
+    def fields(self) -> dict[str, Any]:
+        """The step as the summary's ``releases_record`` reports it."""
+
+        document: dict[str, Any] = {"country": self.country, "outcome": self.outcome}
+        if self.copied is not None:
+            document.update(self.copied.result())
+        if self.skipped is not None:
+            document["skipped"] = self.skipped
+        if self.reason is not None:
+            document["reason"] = self.reason
+        document["incomplete"] = self.incomplete
+        return document
+
+    def to_json(self) -> dict[str, Any]:
+        return {"releases_record": self.fields()}
 
 
 class SubmissionsInProgress(Protocol):
@@ -356,6 +414,7 @@ class _Reconciliation:
     commands: TreeCommands
     submissions: SubmissionsInProgress
     follow_latest: FollowLatest
+    copy_record: CopyReleasesRecord
     dry_run: bool
     clock: Callable[[], float]
     started: float
@@ -843,6 +902,31 @@ class _Reconciliation:
             order=(order_time, run_id),
         )
 
+    # The stored releases.json -------------------------------------------------
+
+    def releases_record_step(self) -> ReleasesRecordStep:
+        """Store the country's releases.json at the release repo's head."""
+
+        if self.dry_run:
+            return ReleasesRecordStep(
+                country=self.country,
+                outcome="skipped",
+                skipped="dry_run",
+                reason=f"A dry run does not store {RELEASES_RECORD_PATH}.",
+            )
+        try:
+            copied = self.copy_record(self.country)
+        except Exception as error:
+            return ReleasesRecordStep(
+                country=self.country,
+                outcome="error",
+                reason=_described(error),
+                incomplete=True,
+            )
+        return ReleasesRecordStep(
+            country=self.country, outcome=copied.outcome, copied=copied
+        )
+
     # The latest --------------------------------------------------------------
 
     def latest_skipped(self, skipped: LatestStepSkipped, reason: str) -> LatestStep:
@@ -973,14 +1057,17 @@ def reconcile_calibration_trees(
     submissions: SubmissionsInProgress,
     lock: ReconciliationLock,
     follow_latest: FollowLatest,
+    copy_record: CopyReleasesRecord,
     dry_run: bool = False,
     clock: Callable[[], float] = time.monotonic,
     time_limit_seconds: float = BUILD_TIME_LIMIT_SECONDS,
-) -> Iterator[ReconcileOutcome | LatestStep]:
+) -> Iterator[ReconcileOutcome | LatestStep | ReleasesRecordStep]:
     """Reconcile ``country``'s ``kinds``, in that order, yielding each outcome.
 
-    The release kind ends with its ``LatestStep``: ``follow_latest`` for the
-    country, called after the release builds and inside the release lock.
+    The release kind starts with its ``ReleasesRecordStep``: ``copy_record``
+    for the country, called before the release lock is waited for. It ends
+    with its ``LatestStep``: ``follow_latest`` for the country, called after
+    the release builds and inside the release lock.
 
     Raises ``ValueError`` for a country the collector doesn't build, a kind
     that is neither release nor staging, or staging for a country without a
@@ -1000,12 +1087,15 @@ def reconcile_calibration_trees(
         commands=commands,
         submissions=submissions,
         follow_latest=follow_latest,
+        copy_record=copy_record,
         dry_run=dry_run,
         clock=clock,
         started=clock(),
         time_limit_seconds=time_limit_seconds,
     )
     for kind in kinds:
+        if kind == "release":
+            yield reconciliation.releases_record_step()
         if dry_run:
             yield from reconciliation.reconcile_kind(kind)
             if kind == "release":
@@ -1037,7 +1127,7 @@ def reconcile_calibration_trees(
 
 
 def summarize(
-    outcomes: Iterable[ReconcileOutcome | LatestStep],
+    outcomes: Iterable[ReconcileOutcome | LatestStep | ReleasesRecordStep],
     *,
     country: str,
     kinds: Sequence[str],
@@ -1053,14 +1143,19 @@ def summarize(
     ``incomplete_sources`` lists those that are incomplete, a whole kind's
     with ``source_id`` ``None``. ``latest`` is the release run's latest step
     (``LatestStep.fields``), or ``None`` for a run without releases or one
-    that stopped before the step. The latest step is not counted in
-    ``outcomes``. When it is incomplete, so is the run, but it adds no entry
+    that stopped before the step. ``releases_record`` is the release run's
+    step that stores ``releases.json`` (``ReleasesRecordStep.fields``), or
+    ``None`` for a run without releases. Neither step is counted in
+    ``outcomes``. When one is incomplete, so is the run, but it adds no entry
     to ``incomplete_sources``.
     """
 
     listed = list(outcomes)
     builds = [outcome for outcome in listed if isinstance(outcome, ReconcileOutcome)]
     latest_steps = [outcome for outcome in listed if isinstance(outcome, LatestStep)]
+    record_steps = [
+        outcome for outcome in listed if isinstance(outcome, ReleasesRecordStep)
+    ]
     return {
         "country": country,
         "kinds": list(kinds),
@@ -1074,6 +1169,7 @@ def summarize(
             if outcome.incomplete
         ],
         "latest": latest_steps[-1].fields() if latest_steps else None,
+        "releases_record": record_steps[-1].fields() if record_steps else None,
     }
 
 
