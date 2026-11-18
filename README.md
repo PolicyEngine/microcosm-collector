@@ -1798,7 +1798,8 @@ for every country the collector lists:
    publication command, and runs with only `PATH`, `LANG` and the Blob token.
 3. **Results.** `current_build`, `build_artifact_id`, `made_latest` (the
    country's latest is that build's tree) and `latest_moved` (this attempt
-   changed it, so an attempt repeated after a failed copy reports `false`).
+   changed it, so an attempt repeated after an earlier one moved the latest
+   reports `false`).
    The latest is left as it is, and `latest_unchanged`
    says why, when the head has no `releases.json` (`no_releases_record`), one
    the rules refuse (`releases_record_refused`, with
