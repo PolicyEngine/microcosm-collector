@@ -502,6 +502,8 @@ class TreeAlreadyStoredError(TreeRefusedError):
     the tree schema version, country, kind, source ID and each source file's
     SHA-256. ``build_artifact_id`` is the stored tree's, and
     ``submitted_build_artifact_id`` the one this build's files give.
+    ``source_file_conflicts`` names the copies of original files found stored
+    with other bytes.
     """
 
     def __init__(
@@ -510,10 +512,12 @@ class TreeAlreadyStoredError(TreeRefusedError):
         *,
         build_artifact_id: str,
         submitted_build_artifact_id: str,
+        source_file_conflicts: Sequence[str] = (),
     ) -> None:
         super().__init__(message)
         self.build_artifact_id = build_artifact_id
         self.submitted_build_artifact_id = submitted_build_artifact_id
+        self.source_file_conflicts = tuple(source_file_conflicts)
 
 
 def stored_tree_of(
@@ -557,6 +561,26 @@ def stored_tree_of(
         if plan.kind == "staging" or stored_id == build_artifact_id:
             return stored_id
     return None
+
+
+def _refusal_source_file_conflicts(
+    completed: subprocess.CompletedProcess[str],
+) -> tuple[str, ...]:
+    """The copies a refused publication found stored with other bytes.
+
+    A refusal prints an answer only when there are some, so anything else
+    names none.
+    """
+
+    lines = completed.stdout.strip().splitlines()
+    try:
+        answer = json.loads(lines[-1]) if lines else None
+    except json.JSONDecodeError:
+        return ()
+    conflicts = answer.get("sourceFileConflicts") if isinstance(answer, dict) else None
+    if not isinstance(conflicts, list):
+        return ()
+    return tuple(file for file in conflicts if isinstance(file, str))
 
 
 def _answer(completed: subprocess.CompletedProcess[str], step: str) -> dict[str, Any]:
@@ -632,6 +656,8 @@ class PublishedTree:
     kept_parts: int
     uploaded_source_files: int
     kept_source_files: int
+    #: The copies left as stored because they hold other bytes.
+    source_file_conflicts: tuple[str, ...]
     made_latest: bool
     latest_decision: LatestDecision
 
@@ -724,6 +750,7 @@ def build_and_publish(
                     message,
                     build_artifact_id=stored_id,
                     submitted_build_artifact_id=submitted_id,
+                    source_file_conflicts=_refusal_source_file_conflicts(published),
                 )
         raise TreeRefusedError(message)
     if published.returncode != 0:
@@ -739,6 +766,7 @@ def build_and_publish(
         kept_parts=answer["keptParts"],
         uploaded_source_files=answer["uploadedSourceFiles"],
         kept_source_files=answer["keptSourceFiles"],
+        source_file_conflicts=tuple(answer["sourceFileConflicts"]),
         made_latest=answer["madeLatest"],
         latest_decision=latest,
     )
@@ -765,6 +793,12 @@ def read_store_manifest(commands: TreeCommands) -> dict[str, Any]:
 
 
 # The handler ----------------------------------------------------------------------
+
+
+def _conflict_fields(conflicts: Sequence[str]) -> dict[str, list[str]]:
+    """A job result's record of the copies stored with other bytes, if any."""
+
+    return {"source_file_conflicts": list(conflicts)} if conflicts else {}
 
 
 def calibration_tree_handler(
@@ -842,6 +876,7 @@ def calibration_tree_handler(
                     "kind": plan.kind,
                     "already_stored": True,
                     "made_latest": False,
+                    **_conflict_fields(error.source_file_conflicts),
                 }
             except TreeRefusedError as error:
                 raise SubmissionRejectedError(
@@ -856,6 +891,7 @@ def calibration_tree_handler(
             "uploaded_source_files": published.uploaded_source_files,
             "kept_source_files": published.kept_source_files,
             "made_latest": published.made_latest,
+            **_conflict_fields(published.source_file_conflicts),
         }
         latest = published.latest_decision
         if latest.skipped is not None:

@@ -17,9 +17,12 @@
 //
 // Each copy and part is read from disk and checked against the worker's record
 // of its raw bytes before anything is uploaded. One already stored with the
-// same bytes is kept; one stored with other bytes stops the publication. The
-// copies go first and the tree's index last, so a build the manifest lists has
-// its copies, and a run that failed part way can run again. The manifest is
+// same bytes is kept. A part stored with other bytes stops the publication. A
+// copy stored with other bytes is kept as well, and the answer names it: the
+// first copy of a build's file stands, and because the build ID does not cover
+// every copied file, a difference must not stop a valid tree. The copies go
+// first and the tree's index last, so a build the manifest lists has its
+// copies, and a run that failed part way can run again. The manifest is
 // created only if it is still absent, and an
 // existing one is replaced only if its ETag is still the one read, so a
 // manifest another writer changed is never overwritten. The manifest is read
@@ -32,13 +35,13 @@
 // 0. The other exit codes:
 //
 //   1  the request could not be followed: no token, a malformed request, or a
-//      part on disk that differs from the worker's record;
+//      part or copy on disk that differs from the worker's record;
 //   2  the build is refused: another build is already recorded for the same
 //      release or staged run, or the same build with other content (another
 //      submission of the same files, whose index records another time or
-//      label), or a staging build was to become the latest release, or a
-//      copy of an original file is stored with other bytes; running again on
-//      the same tree cannot help;
+//      label), or a staging build was to become the latest release; running
+//      again on the same tree cannot help. When copies differed before the
+//      refusal, it first prints one JSON line naming them;
 //   3  anything else, including a manifest another writer changed meanwhile,
 //      one read without an ETag or with a weak one, and any error from the
 //      store; running again may succeed.
@@ -86,7 +89,10 @@ const SHA256_RE = /^[0-9a-f]{64}$/;
 export class CalibrationTreePublicationRequestError extends Error {}
 
 /** The build is refused; nothing in the manifest changed. */
-export class CalibrationTreeEntryRefusedError extends Error {}
+export class CalibrationTreeEntryRefusedError extends Error {
+  /** The build's copies found stored with other bytes before the refusal. */
+  sourceFileConflicts: CalibrationTreeSourceFile[] = [];
+}
 
 /**
  * The manifest cannot be replaced safely: another writer changed it after it
@@ -140,7 +146,10 @@ export interface CalibrationTreePublicationResult {
   uploadedParts: number;
   keptParts: number;
   uploadedSourceFiles: number;
+  /** Copies already stored with the same bytes. */
   keptSourceFiles: number;
+  /** Copies left as stored, because they hold other bytes. */
+  sourceFileConflicts: CalibrationTreeSourceFile[];
   madeLatest: boolean;
 }
 
@@ -337,14 +346,14 @@ function sourceFilesOnDisk(request: CalibrationTreePublicationRequest): SourceFi
   });
 }
 
-// A stored copy must hold the same original bytes, and an uploaded one is read
-// back.
+// A copy already stored stays as it is, whatever it holds, and an uploaded one
+// is read back.
 async function uploadSourceFile(
   sourceFile: SourceFileOnDisk,
   request: CalibrationTreePublicationRequest,
   token: string,
   client: CalibrationTreeBlobClient,
-): Promise<boolean> {
+): Promise<"uploaded" | "kept" | "conflict"> {
   const stored = () =>
     readCalibrationTreeSourceFile({
       country: request.country,
@@ -355,14 +364,7 @@ async function uploadSourceFile(
       client,
     });
   const existing = await stored();
-  if (existing) {
-    if (existing.sha256 !== sourceFile.sha256) {
-      throw new CalibrationTreeEntryRefusedError(
-        `The copy of an original file at ${sourceFile.path} already exists with different content.`,
-      );
-    }
-    return false;
-  }
+  if (existing) return existing.sha256 === sourceFile.sha256 ? "kept" : "conflict";
   await client.put(sourceFile.path, Buffer.from(sourceFile.compressed), {
     access: "private",
     token,
@@ -375,7 +377,7 @@ async function uploadSourceFile(
   if (uploaded?.sha256 !== sourceFile.sha256) {
     throw new Error(`Uploaded copy of an original file at ${sourceFile.path} failed verification.`);
   }
-  return true;
+  return "uploaded";
 }
 
 // As the package's uploadCalibrationTreeFile: an existing part must hold the
@@ -509,23 +511,41 @@ export async function publishBuiltCalibrationTree(options: {
   const parts = partsOnDisk(request);
   const ordered = [...parts.filter((part) => part.part !== "index"), ...parts.filter((part) => part.part === "index")];
   let uploadedSourceFiles = 0;
+  let keptSourceFiles = 0;
+  const sourceFileConflicts: CalibrationTreeSourceFile[] = [];
   for (const sourceFile of sourceFiles) {
-    if (await uploadSourceFile(sourceFile, request, token, client)) uploadedSourceFiles += 1;
+    const outcome = await uploadSourceFile(sourceFile, request, token, client);
+    if (outcome === "uploaded") uploadedSourceFiles += 1;
+    else if (outcome === "kept") keptSourceFiles += 1;
+    else sourceFileConflicts.push(sourceFile.file);
   }
   let uploadedParts = 0;
-  for (const part of ordered) {
-    if (await uploadPart(part, request, token, client)) uploadedParts += 1;
+  let madeLatest: boolean;
+  try {
+    for (const part of ordered) {
+      if (await uploadPart(part, request, token, client)) uploadedParts += 1;
+    }
+    madeLatest = await addManifestEntry(request, token, client);
+  } catch (error) {
+    if (error instanceof CalibrationTreeEntryRefusedError) error.sourceFileConflicts = sourceFileConflicts;
+    throw error;
   }
-  const madeLatest = await addManifestEntry(request, token, client);
   return {
     buildArtifactId: request.buildArtifactId,
     kind: request.manifestEntry.kind,
     uploadedParts,
     keptParts: parts.length - uploadedParts,
     uploadedSourceFiles,
-    keptSourceFiles: sourceFiles.length - uploadedSourceFiles,
+    keptSourceFiles,
+    sourceFileConflicts,
     madeLatest,
   };
+}
+
+/** The JSON line a refused build prints when its copies differed, or null. */
+export function calibrationTreePublicationRefusalAnswer(error: unknown): string | null {
+  if (!(error instanceof CalibrationTreeEntryRefusedError) || error.sourceFileConflicts.length === 0) return null;
+  return JSON.stringify({ sourceFileConflicts: error.sourceFileConflicts });
 }
 
 /** The exit code for an error that stopped the publication. */
@@ -560,6 +580,8 @@ export async function calibrationTreePublicationMain(
     console.log(JSON.stringify(result));
     return 0;
   } catch (error) {
+    const refusalAnswer = calibrationTreePublicationRefusalAnswer(error);
+    if (refusalAnswer !== null) console.log(refusalAnswer);
     console.error(error instanceof Error ? error.message : String(error));
     return calibrationTreePublicationExitCode(error);
   }
