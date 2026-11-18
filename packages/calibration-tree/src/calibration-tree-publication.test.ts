@@ -348,6 +348,22 @@ test("a staged run's tree is replaced when the publication asks for it", async (
   for (const file of first.worker.files) expect(store.blobs.has(file.path)).toBe(true);
 });
 
+test("a replacement that returns to a stored build brings back that build's tree", async () => {
+  const store = new InMemoryBlobStore();
+  const first = builtTree("staging", undefined, { createdAt: "2026-10-19T09:41:07.000Z" });
+  await publish(store, first);
+  const release = goldenReleaseInputs()["uk-release"];
+  await publishReplacing(store, builtTree("staging", `${release.diagnosticsText}\n`));
+  const returned = builtTree("staging", undefined, { createdAt: "2026-11-01T00:00:00.000Z" });
+  expect(returned.worker.buildArtifactId).toBe(first.worker.buildArtifactId);
+
+  const published = await publishReplacing(store, returned).catch((error: unknown) => error);
+
+  expect(published).not.toBeInstanceOf(Error);
+  expect(store.manifest()?.countries.uk?.builds as unknown).toEqual([first.worker.manifestEntry]);
+  expect((published as { uploadedParts: number }).uploadedParts).toBe(0);
+});
+
 test("only a staged run's tree can be asked to replace another", () => {
   const tree = builtTree("release");
 

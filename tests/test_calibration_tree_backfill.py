@@ -347,15 +347,18 @@ class StandInBun:
                     "folderFingerprint": run["folderFingerprint"],
                     "hfCommitSha": request["hfCommitSha"],
                     "files": sorted(contents),
+                    "omittedFiles": run.get("omittedFiles", []),
                     "treeCheck": previous.get("treeCheck"),
                 }
                 answer["runs"][run_id] = {"uploaded": len(contents), "kept": 0}
             for check in request["treeChecks"]:
                 if check["runId"] in self.copied_runs:
                     self.copied_runs[check["runId"]]["treeCheck"] = {
-                        "folderFingerprint": check["folderFingerprint"],
-                        "buildArtifactId": check["buildArtifactId"],
+                        name: value for name, value in check.items() if name != "runId"
                     }
+            for run_id in request.get("removedRunIds", []):
+                if run_id in self.copied_runs:
+                    self.copied_runs[run_id]["removedAt"] = "2026-11-19T12:00:00Z"
         return subprocess.CompletedProcess(argv, 0, json.dumps(answer), "")
 
     def _build(

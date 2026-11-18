@@ -134,14 +134,25 @@ function schema1Run(status: string, updatedAt: string, fingerprint = FINGERPRINT
   };
 }
 
-function publicationRequest(country: string, runs: unknown[], treeChecks: unknown[] = []) {
-  return { country, hfRepo: HF_REPO, hfCommitSha: HF_COMMIT, runs, treeChecks };
+function publicationRequest(
+  country: string,
+  runs: unknown[],
+  treeChecks: unknown[] = [],
+  removedRunIds: string[] = [],
+) {
+  return { country, hfRepo: HF_REPO, hfCommitSha: HF_COMMIT, runs, treeChecks, removedRunIds };
 }
 
-async function publish(store: InMemoryBlobStore, country: string, runs: unknown[], treeChecks: unknown[] = []) {
+async function publish(
+  store: InMemoryBlobStore,
+  country: string,
+  runs: unknown[],
+  treeChecks: unknown[] = [],
+  removedRunIds: string[] = [],
+) {
   const { parseStagingRunFilesPublication, publishStagingRunFiles } = await command();
   return publishStagingRunFiles({
-    request: parseStagingRunFilesPublication(publicationRequest(country, runs, treeChecks)),
+    request: parseStagingRunFilesPublication(publicationRequest(country, runs, treeChecks, removedRunIds)),
     token: TOKEN,
     client: store.client(),
     now: () => new Date(NOW),
@@ -227,6 +238,101 @@ test("a run's tree check is kept when its files are copied again, and set on req
   await publish(store, "us", [schema1Run("running", "2026-11-18T11:00:00Z", OTHER_FINGERPRINT)]);
 
   expect(store.json(stagingRunFilesIndexPath("us")).runs[SCHEMA_1_RUN].treeCheck.buildArtifactId).toBe(BUILD_ID);
+});
+
+test("a tree check can record why the run has no new tree", async () => {
+  const { stagingRunFilesIndexPath } = await runFiles();
+  const store = new InMemoryBlobStore();
+  const check = {
+    runId: SCHEMA_1_RUN,
+    folderFingerprint: FINGERPRINT,
+    buildArtifactId: null,
+    outcome: "unbuildable",
+    reason: "The worker refused the files.",
+  };
+
+  await publish(store, "us", [schema1Run("failed", "2026-11-18T10:00:00Z")], [check]);
+
+  expect(store.json(stagingRunFilesIndexPath("us")).runs[SCHEMA_1_RUN].treeCheck).toEqual({
+    folderFingerprint: FINGERPRINT,
+    buildArtifactId: null,
+    outcome: "unbuildable",
+    reason: "The worker refused the files.",
+  });
+});
+
+test("a run removed from Hugging Face leaves the readers and returns with its folder", async () => {
+  const { loadCopiedStagingRun, loadCopiedStagingRuns, stagingRunFilesIndexPath } = await runFiles();
+  const store = new InMemoryBlobStore();
+  const request = { country: "us" as const, token: TOKEN, client: store.client() };
+  await publish(store, "us", [schema1Run("failed", "2026-11-18T10:00:00Z")]);
+
+  await publish(store, "us", [], [], [SCHEMA_1_RUN]);
+
+  expect(store.json(stagingRunFilesIndexPath("us")).runs[SCHEMA_1_RUN].removedAt).toBe(NOW);
+  expect((await loadCopiedStagingRuns(request)).runs).toEqual([]);
+  expect(await loadCopiedStagingRun({ ...request, runId: SCHEMA_1_RUN })).toBeNull();
+
+  await publish(store, "us", [schema1Run("failed", "2026-11-18T10:00:00Z")]);
+
+  expect(store.json(stagingRunFilesIndexPath("us")).runs[SCHEMA_1_RUN].removedAt).toBeUndefined();
+  expect((await loadCopiedStagingRuns(request)).runs.map((run: { run_id: string }) => run.run_id)).toEqual([
+    SCHEMA_1_RUN,
+  ]);
+});
+
+test("a file too large to copy is named, so a reader can tell it from an absent one", async () => {
+  const { loadCopiedStagingRun, stagingRunFilesIndexPath } = await runFiles();
+  const store = new InMemoryBlobStore();
+  await publish(store, "uk", [{ ...structuredRun(), omittedFiles: ["calibration_progress.json"] }]);
+
+  expect(store.json(stagingRunFilesIndexPath("uk")).runs[STRUCTURED_RUN].omittedFiles).toEqual([
+    "calibration_progress.json",
+  ]);
+  const copied = await loadCopiedStagingRun({
+    country: "uk",
+    runId: STRUCTURED_RUN,
+    token: TOKEN,
+    client: store.client(),
+  });
+  expect(copied?.omitted_files).toEqual(["calibration_progress.json"]);
+});
+
+test("malformed optional files read as absent, as the Hugging Face reader takes them", async () => {
+  const { loadCopiedStagingRun } = await runFiles();
+  const store = new InMemoryBlobStore();
+  const run = structuredRun();
+  run.files.push(localFile("calibration_progress.json", "not json"), localFile("reform_validation.json", "[]"));
+  await publish(store, "uk", [run]);
+
+  const copied = await loadCopiedStagingRun({
+    country: "uk",
+    runId: STRUCTURED_RUN,
+    token: TOKEN,
+    client: store.client(),
+  });
+
+  expect(copied?.calibration_progress).toBeNull();
+  expect(copied?.reform_validation).toBeNull();
+});
+
+test("a list entry reads progress only where the Hugging Face reader does", async () => {
+  const { stagingRunFilesIndexPath } = await runFiles();
+  const store = new InMemoryBlobStore();
+  const structured = structuredRun();
+  structured.files[1] = localFile("progress.json", "not json");
+  const schema1 = schema1Run("running", "2026-11-18T10:00:00Z");
+  schema1.files[1] = localFile("progress.json", "not json");
+
+  await publish(store, "us", [schema1]);
+  await publish(store, "uk", [structured]);
+
+  const usRecord = store.json(stagingRunFilesIndexPath("us")).runs[SCHEMA_1_RUN];
+  expect(usRecord.problem).toBeNull();
+  expect(usRecord.summary.status).toBeNull();
+  const ukRecord = store.json(stagingRunFilesIndexPath("uk")).runs[STRUCTURED_RUN];
+  expect(ukRecord.problem).toBeNull();
+  expect(ukRecord.summary.status).toBe("failed");
 });
 
 test("a tree check for a run without a copy changes nothing", async () => {
