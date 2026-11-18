@@ -2158,6 +2158,23 @@ def test_a_failed_latest_step_still_updates_the_stored_copy() -> None:
     assert runner.call("record copy write")["record"] == record
 
 
+def test_when_the_latest_and_the_copy_both_fail_the_job_reports_the_latest() -> None:
+    record = releases_record()
+    runner = RecordingRunner(
+        latest_exit=3,
+        latest_stderr="the latest could not be moved",
+        record_copy_write_exit=3,
+    )
+    submission = accepted_releases_record(record)
+
+    outcome = submission.run(latest_handler_with(runner, uk_release_repo(record)))
+
+    assert outcome is JobOutcome.RETRY
+    assert "record copy write" in runner.events
+    error = submission.submissions._jobs[submission.job_id]["last_error"]
+    assert "the latest could not be moved" in error["message"]
+
+
 def test_a_failed_copy_returns_the_releases_record_job_for_another_attempt() -> None:
     record = releases_record()
     runner = RecordingRunner(record_copy_write_exit=3)
