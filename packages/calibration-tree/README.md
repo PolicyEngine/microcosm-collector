@@ -77,8 +77,8 @@ copy. `readCalibrationTreeSourceFile` returns the original bytes instead.
 
 ## Copies of staging run files
 
-The collector's webhook-queued job keeps private copies of the files the
-dashboard reads for every staging run:
+The collector's webhook-queued job and backfill keep private copies of the files
+the dashboard reads for staging runs:
 
 ```text
 staging-run-files/<country>/index.json

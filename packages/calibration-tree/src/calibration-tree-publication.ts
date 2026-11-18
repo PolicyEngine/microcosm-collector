@@ -13,14 +13,18 @@
 //     "bundleDirectory": "<the worker's output directory>",
 //     "worker": <the worker's printed result>,
 //     "makeLatest": false,
+//     "reuseStoredTree": true,
 //     "replaceStagingRun": true
 //   }
 //
-// replaceStagingRun is optional, and only for a staging build: its entry then
-// takes the place of the run's earlier tree in the manifest, whose parts stay
-// stored. A build ID that already has a stored index is that same set of files,
-// so its stored tree comes back as it was, with its own commit and time, and no
-// part is uploaded. Without the option another tree of the same run is refused.
+// The last two are optional, and only for a staging build. With
+// reuseStoredTree, a build ID that already has a stored index is that same set
+// of files, so its stored tree is used as it is, with its own commit and time,
+// and no part is uploaded; the answer's restoredTree says what it records. This
+// recovers a tree an earlier attempt stored without its manifest entry.
+// replaceStagingRun also implies it, and makes the build's entry take the place
+// of the run's earlier tree in the manifest, whose parts stay stored. Without
+// replaceStagingRun another tree of the same run is refused.
 //
 // Each copy and part is read from disk and checked against the worker's record
 // of its raw bytes before anything is uploaded. One already stored with the
@@ -61,7 +65,7 @@ import { get, put } from "@vercel/blob";
 
 import {
   calibrationTreePartPath,
-  type CalibrationTreeBuild,
+  parseCalibrationTreeIndex,
   type CalibrationTreePart,
 } from "./calibration-tree-artifact";
 import {
@@ -150,6 +154,7 @@ export interface CalibrationTreePublicationRequest {
   sourceFiles: CalibrationTreePublicationSourceFile[];
   manifestEntry: CalibrationTreeManifestEntry;
   makeLatest: boolean;
+  reuseStoredTree: boolean;
   replaceStagingRun: boolean;
 }
 
@@ -164,6 +169,8 @@ export interface CalibrationTreePublicationResult {
   /** Copies left as stored, because they hold other bytes. */
   sourceFileConflicts: CalibrationTreeSourceFile[];
   madeLatest: boolean;
+  /** What the stored tree records, when one was used instead of this build's. */
+  restoredTree?: Pick<CalibrationTreeManifestEntry, "hfCommitSha" | "createdAt" | "label">;
 }
 
 type JsonObject = Record<string, unknown>;
@@ -251,7 +258,7 @@ function publicationSourceFiles(
 export function parseCalibrationTreePublicationRequest(value: unknown): CalibrationTreePublicationRequest {
   const request = requestObject(value, "The request");
   const unknown = Object.keys(request).filter(
-    (field) => !["bundleDirectory", "worker", "makeLatest", "replaceStagingRun"].includes(field),
+    (field) => !["bundleDirectory", "worker", "makeLatest", "reuseStoredTree", "replaceStagingRun"].includes(field),
   );
   if (unknown.length > 0) {
     throw new CalibrationTreePublicationRequestError(`The request has unknown fields: ${unknown.join(", ")}.`);
@@ -262,6 +269,10 @@ export function parseCalibrationTreePublicationRequest(value: unknown): Calibrat
   const replaceStagingRun = request.replaceStagingRun ?? false;
   if (typeof replaceStagingRun !== "boolean") {
     throw new CalibrationTreePublicationRequestError("replaceStagingRun must be true or false.");
+  }
+  const reuseStoredTree = request.reuseStoredTree ?? false;
+  if (typeof reuseStoredTree !== "boolean") {
+    throw new CalibrationTreePublicationRequestError("reuseStoredTree must be true or false.");
   }
   const bundleDirectory = requestString(request, "bundleDirectory", "bundleDirectory");
   const worker = requestObject(request.worker, "worker");
@@ -305,6 +316,9 @@ export function parseCalibrationTreePublicationRequest(value: unknown): Calibrat
   if (replaceStagingRun && manifestEntry.kind !== "staging") {
     throw new CalibrationTreePublicationRequestError("Only a staging build can replace a run's tree.");
   }
+  if (reuseStoredTree && manifestEntry.kind !== "staging") {
+    throw new CalibrationTreePublicationRequestError("Only a staging build can set reuseStoredTree.");
+  }
   return {
     bundleDirectory,
     country,
@@ -313,6 +327,7 @@ export function parseCalibrationTreePublicationRequest(value: unknown): Calibrat
     sourceFiles,
     manifestEntry,
     makeLatest: request.makeLatest,
+    reuseStoredTree,
     replaceStagingRun,
   };
 }
@@ -542,7 +557,10 @@ async function storedTreeEntry(
   });
   if (!stored) return null;
   const text = await calibrationTreeBlobText(stored.stream);
-  const { build } = JSON.parse(text) as { build: CalibrationTreeBuild };
+  const { build, buildArtifactId } = parseCalibrationTreeIndex(JSON.parse(text));
+  if (buildArtifactId !== request.buildArtifactId) {
+    throw new Error(`The index stored for build ${request.buildArtifactId} names build ${buildArtifactId}.`);
+  }
   return {
     ...request.manifestEntry,
     label: build.label,
@@ -576,8 +594,11 @@ export async function publishBuiltCalibrationTree(options: {
   }
   let uploadedParts = 0;
   let madeLatest: boolean;
+  let storedEntry: CalibrationTreeManifestEntry | null = null;
   try {
-    const storedEntry = request.replaceStagingRun ? await storedTreeEntry(request, token, client) : null;
+    if (request.reuseStoredTree || request.replaceStagingRun) {
+      storedEntry = await storedTreeEntry(request, token, client);
+    }
     if (!storedEntry) {
       for (const part of ordered) {
         if (await uploadPart(part, request, token, client)) uploadedParts += 1;
@@ -601,6 +622,15 @@ export async function publishBuiltCalibrationTree(options: {
     keptSourceFiles,
     sourceFileConflicts,
     madeLatest,
+    ...(storedEntry
+      ? {
+        restoredTree: {
+          hfCommitSha: storedEntry.hfCommitSha,
+          createdAt: storedEntry.createdAt,
+          label: storedEntry.label,
+        },
+      }
+      : {}),
   };
 }
 

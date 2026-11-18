@@ -1,7 +1,7 @@
 """Copies of the staging run files the dashboard reads.
 
 The ``reconcile-calibration-trees`` command keeps a private copy of these files
-for every staging run. The tree package's ``staging-run-files-command.ts``, run
+for each staging run it covers. The tree package's ``staging-run-files-command.ts``, run
 as its own Bun process with the Blob token, stores them at
 ``staging-run-files/<country>/`` beside one index per country, which records
 each run's files, what they say and the state of its folder they came from.

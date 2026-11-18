@@ -91,6 +91,7 @@ export interface StagingRunFilesTreeCheck {
   buildArtifactId: string | null;
   outcome: StagingRunTreeOutcome | null;
   reason: string | null;
+  sourceFileConflicts: string[];
 }
 
 export interface StagingRunFilesPublication {
@@ -176,11 +177,16 @@ function publicationTreeCheck(value: unknown): StagingRunFilesTreeCheck {
   if (reason !== null && typeof reason !== "string") {
     throw new StagingRunFilesRequestError("A tree check's reason must be a string.");
   }
+  const sourceFileConflicts = (check.sourceFileConflicts ?? []) as unknown;
+  if (!Array.isArray(sourceFileConflicts) || !sourceFileConflicts.every((file) => typeof file === "string")) {
+    throw new StagingRunFilesRequestError("A tree check's sourceFileConflicts must be a list of names.");
+  }
   return {
     ...runIdentity(check, "A tree check"),
     buildArtifactId,
     outcome: outcome as StagingRunTreeOutcome | null,
     reason,
+    sourceFileConflicts,
   };
 }
 
@@ -216,10 +222,10 @@ function parsedDocument(bytes: Uint8Array, name: string): unknown {
   }
 }
 
-// The run's list entry: a structured run's manifest, else its progress, else
-// its runs.json row, else a schema-1 manifest. The Hugging Face reader prefers a
-// schema-1 run's row, which repeats its progress. As there, a structured run's
-// progress is not read, and a progress file that isn't a JSON object is absent.
+// The run's list entry, by the Hugging Face reader's rules: a structured run's
+// manifest, else its runs.json row, else its progress, else a schema-1 manifest.
+// Progress is read only in that last case, and a progress file that isn't a JSON
+// object is absent. The job passes a row when it has read runs.json.
 function describedRun(
   runId: string,
   files: ReadonlyMap<StagingRunFileName, Uint8Array>,
@@ -239,12 +245,14 @@ function describedRun(
         return { summary: summaryFromManifest(runId, manifest), problem: null };
       }
     }
+    if (indexRow) {
+      return { summary: parseStagingRunIndex({ schema_version: 1, runs: [indexRow] })[0], problem: null };
+    }
     const progressDocument = stagingJsonObjectOrNull(files.get("progress.json") ?? null);
     const progress = progressDocument && parseStagingProgress(progressDocument);
     validateStagingRunConsistency(runId, { progress });
     let summary: StagingRunSummary;
     if (progress) summary = summaryFromProgress(runId, progress);
-    else if (indexRow) summary = parseStagingRunIndex({ schema_version: 1, runs: [indexRow] })[0];
     else if (manifest) summary = summaryFromManifest(runId, manifest);
     else summary = summaryFromProgress(runId, null);
     return { summary, problem: null };
@@ -339,6 +347,7 @@ export async function publishStagingRunFiles(options: {
       folderFingerprint: check.folderFingerprint,
       buildArtifactId: check.buildArtifactId,
       ...(check.outcome ? { outcome: check.outcome, reason: check.reason } : {}),
+      ...(check.sourceFileConflicts.length ? { sourceFileConflicts: check.sourceFileConflicts } : {}),
     };
     index.runs[check.runId] = { ...index.runs[check.runId], treeCheck };
   }

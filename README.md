@@ -2256,7 +2256,7 @@ Each build's outcome:
 | `ineligible` | a release folder without diagnostics, or whose release manifest is absent or names another build; a staging run without calibration diagnostics: a schema-1 folder without `calibration_diagnostics.json`, a structured run that declares neither diagnostics nor a staged dataset, a staged-dataset receipt of a skipped, failed or disabled staging, or a bundle that records no diagnostics file with a SHA-256 | yes |
 | `unbuildable` | the worker refused the files (exit 2), or a staging run's documents are incompatible: a run manifest that isn't a JSON object, names another run or has an unsupported schema, and the backfill's own checks of a run's files, such as declared or recorded diagnostics that are absent or differ from their SHA-256 | yes |
 | `too_large` | a file is over 256 MiB | yes |
-| `refused` | the publication refused the build (exit 2), and the store holds no tree for it as `already_stored` describes | yes |
+| `refused` | the publication refused the build (exit 2), and the store holds no tree for it as `already_stored` describes, or the tree could not replace the run's stored one | yes |
 | `no_releases_record` | the release repo has no `releases.json`; nothing is built | yes |
 | `releases_record_refused` | `releases.json` breaks the record's rules; nothing is built | yes |
 | `error` | a Hugging Face failure, the store's manifest could not be read, a Bun exit 1 or 3, or a timeout | no |
@@ -2313,8 +2313,8 @@ past builds again".
 - A repo without `releases.json` builds nothing: its tags and pointer files
   are not read. BE is to publish with `releases.json` before the
   switch-over.
-- A staging run whose tree ended `unbuildable`, `too_large` or `refused` is
-  not tried again until its folder or stored build changes, or
+- A staging run whose tree ended `ineligible`, `unbuildable`, `too_large` or
+  `refused` is not tried again until its folder or stored build changes, or
   `--include-older-runs` is passed. One left at `submission_in_progress`, in an
   `error` or `deferred` is looked at again on each execution.
 - A copied run's list entry is worked out when its files are copied, so a later
@@ -2334,15 +2334,11 @@ past builds again".
 - An execution stopped by the worker job's one-hour task timeout leaves its
   request row without `finished_at` or `summary`.
 - A publication that fails or runs out of time after uploading a tree's
-  index but before writing the manifest leaves that index without a
-  manifest entry. Another writer of the same build ID whose index differs is
-  then refused at that part while the manifest shows no tree for it, so a
-  submission in that position is rejected. A release build's or a
-  submission's own retry builds the same index and stores the tree. A staging
-  build of this command doesn't: its index records the staging repo's head,
-  so once that moves, the run is `refused`, and stays so until its folder
-  changes, `--include-older-runs` retries it and a later attempt succeeds, or
-  a submission with another build ID stores a tree for it.
+  index but before writing the manifest leaves that index without a manifest
+  entry. A staging build of this command then uses the stored tree under the
+  same build ID. Another writer of the same build ID whose index differs is
+  refused at that part, so a submission in that position is rejected. A release
+  build's or a submission's own retry builds the same index and stores the tree.
 - Builds are ordered by the time they are published with (the progress's
   `updated_at`, else the run manifest's), then by run ID. The publisher
   orders its staging listing by each run's summary `updated_at`, then

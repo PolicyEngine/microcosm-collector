@@ -976,10 +976,12 @@ def build_and_publish_source(
     commands: TreeCommands,
     *,
     replace_staged_run: bool = False,
+    reuse_stored_tree: bool = False,
 ) -> PublishedTree:
     """Download the build's files into a new directory, then build and publish it.
 
-    ``replace_staged_run`` makes the tree replace its staged run's earlier one.
+    ``replace_staged_run`` makes the tree replace its staged run's earlier one,
+    and ``reuse_stored_tree`` uses a tree already stored under its build ID.
     """
 
     with tempfile.TemporaryDirectory(prefix="calibration-tree-backfill-") as directory:
@@ -1010,6 +1012,7 @@ def build_and_publish_source(
             directory=build_directory,
             commands=commands,
             replace_staged_run=replace_staged_run,
+            reuse_stored_tree=reuse_stored_tree,
         )
 
 

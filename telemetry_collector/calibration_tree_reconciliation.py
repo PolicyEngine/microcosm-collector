@@ -61,9 +61,11 @@ Python:
   recording no diagnostics (``SourceWithoutDiagnosticsError``). A run whose
   documents can't be read, or whose declared or recorded diagnostics are absent
   or differ, is ``unbuildable`` on its own, and the other runs continue. A
-  settled result, final refusals included, is kept in the run's record, so the
-  tree is looked at again only when the folder or the stored build changes, or
-  for a refusal when ``include_older_runs`` asks. A run whose folder is gone
+  settled result, final refusals included, is kept in the run's record after
+  each build, so the tree is looked at again only when the folder or the stored
+  build changes, or for a refusal when ``include_older_runs`` asks. A tree an
+  earlier attempt stored under the same build ID is used as it is. A run whose
+  folder is gone
   from the listing is marked removed, and readers leave it out until the folder
   returns.
 
@@ -214,6 +216,8 @@ LOCK_POLL_SECONDS: Final = 5.0
 JOB_COVERS_RUNS_FROM: Final = datetime(2026, 11, 19, tzinfo=UTC)
 #: The submissions that still build their own tree.
 IN_PROGRESS_STATUSES: Final = ("queued", "processing")
+#: Outcomes of a staging tree that took a build, after which results are saved.
+_BUILD_ATTEMPTED: Final = frozenset({"built", "unbuildable", "refused"})
 _RUN_MANIFEST_FILE: Final = "run_manifest.json"
 _PROGRESS_FILE: Final = "progress.json"
 #: The roles a staging tree is built from, by the name its index records them
@@ -430,7 +434,7 @@ class _Reconciliation:
     #: What became of each staging run's files in this execution.
     run_copies: dict[str, _RunCopy] = field(default_factory=dict)
     #: The settled tree results to record in the runs' copies.
-    tree_checks: list[dict[str, str | None]] = field(default_factory=list)
+    tree_checks: list[dict[str, Any]] = field(default_factory=list)
     #: Copied runs whose folders are gone from the staging repo.
     removed_run_ids: list[str] = field(default_factory=list)
     staging_commit: str | None = None
@@ -467,6 +471,12 @@ class _Reconciliation:
         for item in planned:
             outcome = item if isinstance(item, ReconcileOutcome) else self.build(item)
             yield self.with_run_files(outcome)
+            if (
+                kind == "staging"
+                and isinstance(item, _Planned)
+                and outcome.outcome in _BUILD_ATTEMPTED
+            ):
+                yield from self.record_tree_checks()
         if kind == "staging":
             yield from self.record_tree_checks()
 
@@ -511,12 +521,15 @@ class _Reconciliation:
                 ),
                 incomplete=True,
             )
+            return
+        self.tree_checks.clear()
+        self.removed_run_ids = []
 
     def run_files_request(
         self,
         repo: str,
         runs: Sequence[Mapping[str, Any]],
-        tree_checks: Sequence[Mapping[str, str | None]],
+        tree_checks: Sequence[Mapping[str, Any]],
     ) -> dict[str, Any]:
         return {
             "country": self.country,
@@ -1007,6 +1020,7 @@ class _Reconciliation:
                 hf_repo=repo,
                 hf_commit=head,
                 reason=check.get("reason"),
+                source_file_conflicts=check.get("sourceFileConflicts"),
             )
         return (
             None if build is None else self.stored_run_outcome(repo, run.run_id, build)
@@ -1223,7 +1237,7 @@ class _Reconciliation:
 
         if self.dry_run or folder_fingerprint is None:
             return
-        check: dict[str, str | None] = {
+        check: dict[str, Any] = {
             "runId": run_id,
             "folderFingerprint": folder_fingerprint,
             "buildArtifactId": build_artifact_id,
@@ -1231,6 +1245,8 @@ class _Reconciliation:
         if final_outcome is not None:
             check["outcome"] = final_outcome.outcome
             check["reason"] = final_outcome.reason
+            if final_outcome.source_file_conflicts:
+                check["sourceFileConflicts"] = final_outcome.source_file_conflicts
         self.tree_checks.append(check)
 
     def settle_plan(
@@ -1375,6 +1391,7 @@ class _Reconciliation:
                 self.reader,
                 self.commands,
                 replace_staged_run=replaced is not None,
+                reuse_stored_tree=kind == "staging",
             )
         except (SourceUnbuildableError, TreeUnbuildableError) as error:
             return self.settle_plan(
@@ -1420,7 +1437,7 @@ class _Reconciliation:
         self.settle_tree(
             entry.source_id, planned.folder_fingerprint, published.build_artifact_id
         )
-        return outcome(
+        built = outcome(
             "built",
             replaced_build_artifact_id=replaced,
             build_artifact_id=published.build_artifact_id,
@@ -1429,6 +1446,15 @@ class _Reconciliation:
             uploaded_source_files=published.uploaded_source_files,
             kept_source_files=published.kept_source_files,
             source_file_conflicts=list(published.source_file_conflicts),
+        )
+        restored = published.restored_tree
+        if restored is None:
+            return built
+        return replace(
+            built,
+            hf_commit=restored.get("hfCommitSha"),
+            created_at=restored.get("createdAt"),
+            label=restored.get("label"),
         )
 
 

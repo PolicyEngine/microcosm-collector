@@ -1,6 +1,6 @@
 // The stored copies of staging run files. The collector's webhook-queued job
-// copies the files the dashboard reads for every run in a country's Hugging
-// Face staging repository to private blobs:
+// and backfill copy the files the dashboard reads for the runs in a country's
+// Hugging Face staging repository to private blobs:
 //
 //   staging-run-files/<country>/index.json
 //   staging-run-files/<country>/runs/<run ID>/<SHA-256 of the file>.gz
@@ -74,6 +74,8 @@ export interface StagingRunTreeCheck {
   /** Why that state has no new tree, when it was final. */
   outcome?: StagingRunTreeOutcome;
   reason?: string | null;
+  /** The build's source-file copies found stored with other bytes. */
+  sourceFileConflicts?: string[];
 }
 
 export interface StagingRunRecord {
