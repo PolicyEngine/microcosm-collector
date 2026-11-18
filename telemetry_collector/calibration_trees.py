@@ -67,7 +67,7 @@ handler finds its tree.
 ``copy_releases_record`` keeps the country's ``releases.json`` at the release
 repo's head in the tree store, as one private object per country, through the
 package's copy command. The reconcile command's release run does it first, and
-the ``releases-record`` handler after it has moved the latest. It takes no
+the ``releases-record`` handler after it has tried to move the latest. It takes no
 lock: it reads the stored object's ETag, then the head, and the write succeeds
 only while the ETag is unchanged, so an older execution cannot replace a newer
 copy. A repo without ``releases.json`` gets a copy that says so, and a record
@@ -88,7 +88,7 @@ import re
 import subprocess
 import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC
 from functools import partial
@@ -1362,9 +1362,10 @@ def calibration_tree_latest_handler(
     and makes it the latest, unless the latest is newer, as after a rollback to
     it (reprocessing this submission then moves the latest). It then stores
     the head's ``releases.json`` (``copy_releases_record``), even if moving the
-    latest failed, so that promotions and withdrawals reach the stored copy
+    latest failed, so that a change Microcosm submits reaches the stored copy
     without waiting for the reconcile command. Any failure fails the attempt,
-    so it runs again.
+    so it runs again. When both steps fail, the attempt reports the latest's
+    failure.
     """
 
     def move_latest(context: JobContext) -> dict[str, Any]:
@@ -1377,6 +1378,14 @@ def calibration_tree_latest_handler(
             }
         [record_file] = context.files("releases_record")
         check_submitted_record(plan, b"".join(context.read_chunks(record_file["name"])))
+        copy_record = partial(
+            copy_releases_record,
+            plan.country,
+            blob_token=blob_token,
+            reader=reader,
+            bun=bun,
+            run_command=run_command,
+        )
         try:
             followed = follow_releases_record(
                 plan.country,
@@ -1386,16 +1395,13 @@ def calibration_tree_latest_handler(
                 bun=bun,
                 run_command=run_command,
             )
-        finally:
-            # The copy does not depend on the latest, so a failure to move it
-            # does not hold the copy back.
-            copied = copy_releases_record(
-                plan.country,
-                blob_token=blob_token,
-                reader=reader,
-                bun=bun,
-                run_command=run_command,
-            )
+        except Exception:
+            # The copy does not depend on the latest, so it is still tried.
+            # The attempt fails either way, and reports the latest's failure.
+            with suppress(Exception):
+                copy_record()
+            raise
+        copied = copy_record()
         return {
             "processed_by": LATEST_HANDLER,
             **followed.result(),

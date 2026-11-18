@@ -5,7 +5,8 @@ set -euo pipefail
 # and the tree package's production install: its tree worker must build a
 # small staged run's tree, its publication command must start and, given no
 # Blob token, refuse to run as a request error (exit 1), and so must its latest
-# command, with its token message, which shows the command ships in the image.
+# and releases.json copy commands, with their token message, which shows they
+# ship in the image.
 # Run from the repo root by ci.yml after the image build:
 #
 #   bash tools/check-calibration-tree-image.sh IMAGE

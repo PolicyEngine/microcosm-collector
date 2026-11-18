@@ -1767,8 +1767,8 @@ reconcile command's `already_stored`.
 The image holds Bun 1.4.2, copied from the official image by digest, and the
 package's production install, without its tests, fixtures and test support.
 CI checks the built image with `tools/check-calibration-tree-image.sh`, which
-builds a small staged run's tree inside it and runs the publication and latest
-commands without a token, which must each refuse to run.
+builds a small staged run's tree inside it and runs the publication, latest and
+`releases.json` copy commands without a token, which must each refuse to run.
 
 ### Moving the latest when releases.json changes
 
@@ -1797,8 +1797,9 @@ for every country the collector lists:
    It writes only the manifest, with the same compare-and-swap as the
    publication command, and runs with only `PATH`, `LANG` and the Blob token.
 3. **Results.** `current_build`, `build_artifact_id`, `made_latest` (the
-   country's latest is that build's tree) and `latest_moved` (this
-   submission changed it). The latest is left as it is, and `latest_unchanged`
+   country's latest is that build's tree) and `latest_moved` (this attempt
+   changed it, so an attempt repeated after a failed copy reports `false`).
+   The latest is left as it is, and `latest_unchanged`
    says why, when the head has no `releases.json` (`no_releases_record`), one
    the rules refuse (`releases_record_refused`, with
    `latest_unchanged_reason`), no current build of its default release
@@ -1809,7 +1810,8 @@ for every country the collector lists:
    `releases.json` at the repo's head ("Keeping each country's releases.json").
    The result's `releases_record` says what that did (`outcome`, `hf_repo`,
    `hf_commit`, `has_record`, and `reason` for a refused record). A failure
-   fails the attempt, so it runs again.
+   fails the attempt, so it runs again. When steps 2 and 4 both fail, the
+   attempt reports step 2's failure.
 
 Step 2 is `calibration_trees.follow_releases_record(country, ...)`, which
 builds nothing and takes the lock itself, so another collector job can call
@@ -1841,9 +1843,11 @@ from, and when it was copied. `@policyengine/calibration-tree` reads it with
 
 `calibration_trees.copy_releases_record` stores it. A release run of the
 `reconcile-calibration-trees` command does so first, and the `releases-record`
-handler does so after it has moved the latest, so promotions and withdrawals
-reach the copy without waiting for the 10-minute window. A failure leaves the
-run incomplete or fails the handler's attempt, and either runs again.
+handler does so after it has tried to move the latest, so a change Microcosm
+submits reaches the copy without waiting for the 10-minute window. A change that
+leaves its release without a current build sends no submission, so it reaches
+the copy through the next release run. A failure leaves the run incomplete or
+fails the handler's attempt, and either runs again.
 
 | The release repo at its head | The stored copy | Result |
 |---|---|---|
