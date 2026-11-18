@@ -607,16 +607,13 @@ function emptyOutputDirectory(outputDirectory: string): void {
 }
 
 interface CompressedSourceFile {
-  record: CalibrationTreeWorkerSourceFile;
+  record: Omit<CalibrationTreeWorkerSourceFile, "path">;
   compressed: Uint8Array;
 }
 
 // Every file the request names, as it is on disk: the copies are of the bytes,
 // which a tree's digests, taken over decoded text, may not match exactly.
-function compressSourceFiles(
-  request: CalibrationTreeWorkerRequest,
-  buildArtifactId: string,
-): CompressedSourceFile[] {
+function compressSourceFiles(request: CalibrationTreeWorkerRequest): CompressedSourceFile[] {
   return CALIBRATION_TREE_SOURCE_FILES.flatMap((file) => {
     const artifact = request.artifacts[file];
     if (!artifact) return [];
@@ -627,7 +624,6 @@ function compressSourceFiles(
         file,
         name: CALIBRATION_TREE_SOURCE_FILE_NAMES[file],
         sourcePath: artifact.path,
-        path: calibrationTreeSourceFilePath(request.country, buildArtifactId, file),
         sha256: createHash("sha256").update(bytes).digest("hex"),
         rawBytes: bytes.byteLength,
         gzipBytes: compressed.byteLength,
@@ -644,9 +640,17 @@ export function runCalibrationTreeWorker(
 ): CalibrationTreeWorkerResult {
   checkConfiguredSizeLimits();
   emptyOutputDirectory(outputDirectory);
+  // Before the build, whose peak memory this stays out of, and so before
+  // anything is written: an unreadable file writes nothing.
+  const compressedSourceFiles = compressSourceFiles(request);
   const bundle = buildCalibrationTreeWorkerBundle(request);
-  // Read before anything is written, so an unreadable file writes nothing.
-  const sourceFiles = compressSourceFiles(request, bundle.index.buildArtifactId);
+  const sourceFiles = compressedSourceFiles.map(({ record, compressed }) => ({
+    record: {
+      ...record,
+      path: calibrationTreeSourceFilePath(request.country, bundle.index.buildArtifactId, record.file),
+    },
+    compressed,
+  }));
   const outputs = [
     ...bundle.files.map((file) => ({ path: file.path, compressed: file.compressed })),
     ...sourceFiles.map(({ record, compressed }) => ({ path: record.path, compressed })),

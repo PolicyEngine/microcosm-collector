@@ -1391,6 +1391,7 @@ class _Reconciliation:
                             f"Build {error.submitted_build_artifact_id} could not "
                             f"replace stored build {error.build_artifact_id}: {error}"
                         ),
+                        source_file_conflicts=list(error.source_file_conflicts),
                     ),
                 )
             # A submission (or another writer) stored a tree for this build
@@ -1407,7 +1408,12 @@ class _Reconciliation:
             )
         except TreeRefusedError as error:
             return self.settle_plan(
-                planned, outcome("refused", reason=shortened_message(str(error)))
+                planned,
+                outcome(
+                    "refused",
+                    reason=shortened_message(str(error)),
+                    source_file_conflicts=list(error.source_file_conflicts),
+                ),
             )
         except Exception as error:
             return outcome("error", reason=_described(error), incomplete=True)
