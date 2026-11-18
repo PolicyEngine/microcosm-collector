@@ -1,8 +1,8 @@
 """Reconcile a country's calibration trees with its Hugging Face repos.
 
 ``python -m telemetry_collector.operations reconcile-calibration-trees
---country <cc> [--kind release|staging] [--request-id <task ID>] [--dry-run]``
-compares the country's builds on Hugging Face with the collector's tree
+--country <cc> [--kind release|staging] [--request-id <task ID>] [--dry-run]
+[--include-older-runs]`` compares the country's builds on Hugging Face with the collector's tree
 store and builds what the store lacks. A Cloud Task that
 ``POST /v1/calibration-tree-builds`` queues runs it as an execution of the
 worker job (``telemetry_collector.calibration_tree_builds``); an operator can
@@ -24,8 +24,13 @@ Python:
   without ``releases.json`` is ``no_releases_record`` and builds nothing; its
   tags and pointer files are not read. A ``releases.json`` the rules refuse is
   ``releases_record_refused`` and builds nothing.
-- **Staging:** every run of the staging repo's ``runs/<id>/`` folders, whatever
-  its status. A folder is a run when it holds ``run_manifest.json``, or, beside
+- **Staging:** the runs of the staging repo's ``runs/<id>/`` folders that this
+  command covers, whatever their status. It covers a run that has a copy
+  already, or whose folder last changed at or after ``JOB_COVERS_RUNS_FROM``,
+  or a folder Hugging Face gives no last commit for; any other run is
+  ``older_run``, left to the backfill's go-aheads, which run this command with
+  ``include_older_runs``. Together they leave no run out. A folder is a run
+  when it holds ``run_manifest.json``, or, beside
   a schema-1 ``runs.json``, when it holds ``progress.json`` or the index lists
   it; any other folder is ``not_a_run``. ``runs.json`` is read only when a
   folder has no run manifest. One that isn't JSON, or isn't a JSON object, is no
@@ -182,6 +187,7 @@ ReconcileOutcomeKind = Literal[
     "releases_record_refused",
     "lock_wait_expired",
     "not_a_run",
+    "older_run",
 ]
 #: What became of a staging run's copied files.
 RunFilesOutcome = Literal["copied", "unchanged", "would_copy", "deferred", "error"]
@@ -199,6 +205,9 @@ FollowLatest = Callable[[str], FollowedLatest]
 #: and kind, and how often it tries.
 LOCK_WAIT_SECONDS: Final = 15 * 60
 LOCK_POLL_SECONDS: Final = 5.0
+#: The webhook-queued job covers staging runs changed from this time on. Older
+#: runs reach the store through the backfill's go-aheads.
+JOB_COVERS_RUNS_FROM: Final = datetime(2026, 11, 19, tzinfo=UTC)
 #: The submissions that still build their own tree.
 IN_PROGRESS_STATUSES: Final = ("queued", "processing")
 _RUN_MANIFEST_FILE: Final = "run_manifest.json"
@@ -411,6 +420,8 @@ class _Reconciliation:
     clock: Callable[[], float]
     started: float
     time_limit_seconds: float
+    #: Also cover staging runs older than ``JOB_COVERS_RUNS_FROM``.
+    include_older_runs: bool = False
     listings: Listings = field(init=False)
     #: What became of each staging run's files in this execution.
     run_copies: dict[str, _RunCopy] = field(default_factory=dict)
@@ -772,6 +783,40 @@ class _Reconciliation:
                     index_row=None if index is None else index.get(run_id),
                 )
             )
+        try:
+            older_run_ids = self.runs_left_to_the_backfill(
+                repo, head, runs, copied_runs
+            )
+        except Exception as error:
+            return [
+                *finished,
+                self.outcome(
+                    "staging",
+                    "error",
+                    hf_repo=repo,
+                    hf_commit=head,
+                    reason=(
+                        "The run folders' last commits could not be read: "
+                        f"{_described(error)}"
+                    ),
+                    incomplete=True,
+                ),
+            ]
+        finished.extend(
+            self.outcome(
+                "staging",
+                "older_run",
+                source_id=run_id,
+                hf_repo=repo,
+                hf_commit=head,
+                reason=(
+                    "Its folder last changed before "
+                    f"{JOB_COVERS_RUNS_FROM.date()}; the backfill covers it."
+                ),
+            )
+            for run_id in sorted(older_run_ids)
+        )
+        runs = [run for run in runs if run.run_id not in older_run_ids]
         self.copy_run_files(repo, head, runs, copied_runs)
         planned: list[_Planned] = []
         for run in runs:
@@ -789,6 +834,30 @@ class _Reconciliation:
                 finished.append(result)
         planned.sort(key=lambda planned_build: planned_build.order, reverse=True)
         return [*finished, *planned]
+
+    def runs_left_to_the_backfill(
+        self,
+        repo: str,
+        head: str,
+        runs: Sequence[_StagingRun],
+        copied_runs: Mapping[str, Mapping[str, Any]],
+    ) -> set[str]:
+        """The runs without a copy whose folders last changed before the job's
+        start. A folder with no last commit is covered, so that it is not lost."""
+
+        uncopied = [run.run_id for run in runs if run.run_id not in copied_runs]
+        if self.include_older_runs or not uncopied:
+            return set()
+        last_commits = self.reader.last_commits(repo, "runs", head)
+        older: set[str] = set()
+        for run_id in uncopied:
+            last_commit = last_commits.get(f"runs/{run_id}")
+            if (
+                last_commit is not None
+                and _instant(last_commit.date) < JOB_COVERS_RUNS_FROM
+            ):
+                older.add(run_id)
+        return older
 
     def copy_run_files(
         self,
@@ -1284,6 +1353,7 @@ def reconcile_calibration_trees(
     dry_run: bool = False,
     clock: Callable[[], float] = time.monotonic,
     time_limit_seconds: float = BUILD_TIME_LIMIT_SECONDS,
+    include_older_runs: bool = False,
 ) -> Iterator[ReconcileOutcome | LatestStep]:
     """Reconcile ``country``'s ``kinds``, in that order, yielding each outcome.
 
@@ -1312,6 +1382,7 @@ def reconcile_calibration_trees(
         clock=clock,
         started=clock(),
         time_limit_seconds=time_limit_seconds,
+        include_older_runs=include_older_runs,
     )
     for kind in kinds:
         if dry_run:

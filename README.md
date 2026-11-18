@@ -2138,8 +2138,9 @@ and an older image has no `reconcile-calibration-trees` command.
 
 **The command.** `python -m telemetry_collector.operations
 reconcile-calibration-trees --country <cc> [--kind release|staging]
-[--request-id <task ID>] [--dry-run]` reads the country's repos at their
-head commit with the GitHub Actions publisher's listing rules ported to
+[--request-id <task ID>] [--dry-run] [--include-older-runs]` reads the
+country's repos at their head commit with the GitHub Actions publisher's
+listing rules ported to
 Python. Without `--kind` it covers both kinds, or only releases for BE.
 
 - **Release:** every build the release repo's `releases.json` lists,
@@ -2152,8 +2153,13 @@ Python. Without `--kind` it covers both kinds, or only releases for BE.
   its `release_manifest.json` must name the same release and build. Its tree
   records the record's `published_at` as `toISOString` writes it. The current
   default build is built first.
-- **Staging:** every run in the staging repo's `runs/<id>/` folders, whatever
-  its status. A folder is a run when it holds `run_manifest.json`, or, beside
+- **Staging:** the runs in the staging repo's `runs/<id>/` folders that the
+  command covers, whatever their status. The webhook-queued job covers a run
+  that already has a copy or whose folder last changed on or after 2026-11-19
+  (`JOB_COVERS_RUNS_FROM`). Any other run is `older_run` and is left to the
+  backfill's go-aheads, which pass `--include-older-runs`, so the two together
+  leave no run out. `--include-older-runs` can't be used with `--request-id`.
+  A folder is a run when it holds `run_manifest.json`, or, beside
   a schema-1 `runs.json`, when it holds `progress.json` or that file lists it.
   Any other folder is `not_a_run`, and nothing is read from it. `runs.json` is
   read only when a folder has no run manifest. One that isn't JSON, or isn't a
@@ -2239,6 +2245,7 @@ Each build's outcome:
 | `already_stored` | the store holds it, or gained a tree for it while it was built (a release build's with the same build ID, or any of the same staged run), so its publication was refused | yes |
 | `submission_in_progress` | a `queued` or `processing` submission of its folder builds it | yes |
 | `not_a_run` | a folder under `runs/` with no run documents | yes |
+| `older_run` | a run without a copy whose folder last changed before the job's start date, left to the backfill | yes |
 | `ineligible` | a release folder without diagnostics, or whose release manifest is absent or names another build; a staging run without calibration diagnostics: a schema-1 folder without `calibration_diagnostics.json`, a structured run that declares neither diagnostics nor a staged dataset, a staged-dataset receipt of a skipped, failed or disabled staging, or a bundle that records no diagnostics file with a SHA-256 | yes |
 | `unbuildable` | the worker refused the files (exit 2), or a staging run's documents are incompatible: a run manifest that isn't a JSON object, names another run or has an unsupported schema, and the backfill's own checks of a run's files, such as declared or recorded diagnostics that are absent or differ from their SHA-256 | yes |
 | `too_large` | a file is over 256 MiB | yes |
