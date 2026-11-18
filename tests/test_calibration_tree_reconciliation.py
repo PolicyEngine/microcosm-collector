@@ -1612,6 +1612,34 @@ def test_a_tree_stored_meanwhile_from_the_same_file_is_already_stored() -> None:
     assert older.incomplete is False
 
 
+def test_a_built_outcome_says_what_became_of_the_build_s_copies() -> None:
+    reconciliation = us_release_reconciliation()
+    reconciliation.bun.source_file_conflicts[CURRENT_ID] = ["reformValidation"]
+
+    outcomes = reconciliation.run()
+
+    document = outcome_of(outcomes, CURRENT_ID).to_json()
+    assert document.get("uploaded_source_files") == 1
+    assert document.get("kept_source_files") == 0
+    assert document.get("source_file_conflicts") == ["reformValidation"]
+
+
+def test_a_tree_stored_meanwhile_still_names_a_copy_that_differs() -> None:
+    reconciliation = us_release_reconciliation()
+    same_build = build_id("us", "release", OLDER_ID)
+    reconciliation.bun = StoredMeanwhile(
+        stored_meanwhile={OLDER_ID: stored_release(OLDER_ID, same_build)}
+    )
+    reconciliation.bun.publication_exits[OLDER_ID] = 2
+    reconciliation.bun.source_file_conflicts[OLDER_ID] = ["parentBuildManifest"]
+
+    outcomes = reconciliation.run()
+
+    older = outcome_of(outcomes, OLDER_ID)
+    assert older.outcome == "already_stored"
+    assert older.to_json().get("source_file_conflicts") == ["parentBuildManifest"]
+
+
 def test_a_tree_stored_meanwhile_from_another_file_stays_refused() -> None:
     # Guard: refused before and after the change.
     reconciliation = us_release_reconciliation()

@@ -197,6 +197,8 @@ class RecordingRunner:
     latest_stdout: str | None = None
     #: Raised instead of running the latest command, when set.
     latest_raises: BaseException | None = None
+    #: The copies of original files the publication finds stored with other bytes.
+    source_file_conflicts: list[str] = field(default_factory=list)
     events: list[str] = field(default_factory=list)
     calls: list[dict[str, Any]] = field(default_factory=list)
 
@@ -261,13 +263,16 @@ class RecordingRunner:
             "keptParts": 0,
             "uploadedSourceFiles": 2,
             "keptSourceFiles": 1,
+            "sourceFileConflicts": self.source_file_conflicts,
             "madeLatest": False,
         }
+        stdout = ""
+        if self.publication_exit == 0:
+            stdout = json.dumps(published)
+        elif self.publication_exit == 2 and self.source_file_conflicts:
+            stdout = json.dumps({"sourceFileConflicts": self.source_file_conflicts})
         return subprocess.CompletedProcess(
-            argv,
-            self.publication_exit,
-            json.dumps(published) if self.publication_exit == 0 else "",
-            self.publication_stderr,
+            argv, self.publication_exit, stdout, self.publication_stderr
         )
 
     def call(self, step: str) -> dict[str, Any]:
@@ -634,6 +639,35 @@ def test_a_built_tree_is_published_under_the_lock_and_recorded_as_the_result() -
         "kept_source_files": 1,
         "made_latest": False,
     }
+
+
+def test_a_copy_stored_with_other_bytes_is_named_in_the_result() -> None:
+    submission = accepted(STAGED)
+    runner = RecordingRunner(source_file_conflicts=["reformValidation"])
+
+    outcome = submission.run(handler_with(runner))
+
+    assert outcome is JobOutcome.FINISHED
+    assert submission.record().result.get("source_file_conflicts") == [
+        "reformValidation"
+    ]
+
+
+def test_a_tree_already_stored_still_names_a_copy_that_differs() -> None:
+    submission = accepted(STAGED)
+    runner = RecordingRunner(
+        publication_exit=2,
+        publication_stderr="Immutable calibration tree part already exists.",
+        stored_manifest=stored_tree("staging"),
+        source_file_conflicts=["parentBuildManifest"],
+    )
+
+    outcome = submission.run(handler_with(runner))
+
+    assert outcome is JobOutcome.FINISHED
+    result = submission.record().result
+    assert result["already_stored"] is True
+    assert result.get("source_file_conflicts") == ["parentBuildManifest"]
 
 
 def test_files_the_builder_refuses_reject_the_submission() -> None:

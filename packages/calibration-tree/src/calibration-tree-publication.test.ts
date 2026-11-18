@@ -230,6 +230,7 @@ test("a built tree's parts are uploaded from disk and the manifest is created wi
     keptParts: 0,
     uploadedSourceFiles: 1,
     keptSourceFiles: 0,
+    sourceFileConflicts: [],
     madeLatest: false,
   });
 });
@@ -507,17 +508,41 @@ test("after a failed part, no entry is recorded and publishing again keeps the c
   expect(store.manifest()?.countries.uk?.builds as unknown).toEqual([tree.worker.manifestEntry]);
 });
 
-test("a stored copy with other bytes refuses the build before any part", async () => {
+test("a stored copy with other bytes is kept and named, and the rest is published", async () => {
   const store = new InMemoryBlobStore();
-  const tree = builtTree("staging");
-  const [diagnostics] = sourceFilesOf(tree);
+  const tree = builtTree("release", undefined, { extraFiles: EXTRA_FILES });
+  const [diagnostics, ...others] = sourceFilesOf(tree);
+  const storedCopy = Bun.gzipSync(new TextEncoder().encode("{}"));
+  store.store(diagnostics.path, storedCopy);
+
+  const published = await publish(store, tree);
+
+  expect(published).toMatchObject({
+    uploadedSourceFiles: others.length,
+    keptSourceFiles: 0,
+    sourceFileConflicts: ["calibrationDiagnostics"],
+  });
+  expect(store.blobs.get(diagnostics.path)?.bytes).toEqual(storedCopy);
+  for (const file of others) expect(store.blobs.has(file.path)).toBe(true);
+  expect(store.manifest()?.countries.uk?.builds as unknown).toEqual([tree.worker.manifestEntry]);
+});
+
+test("a refused build still names the copies that differed", async () => {
+  expect(typeof publication.calibrationTreePublicationRefusalAnswer).toBe("function");
+  const store = new InMemoryBlobStore();
+  await publish(store, builtTree("staging"));
+  const resubmitted = builtTree("staging", undefined, { createdAt: "2026-11-02T08:00:00.000Z" });
+  const [diagnostics] = sourceFilesOf(resubmitted);
   store.store(diagnostics.path, Bun.gzipSync(new TextEncoder().encode("{}")));
 
-  const refusal = await publish(store, tree).catch((error: unknown) => error);
+  const refusal = await publish(store, resubmitted).catch((error: unknown) => error);
 
   expect(refusal).toBeInstanceOf(publication.CalibrationTreeEntryRefusedError);
-  expect(store.puts).toEqual([]);
-  expect(store.manifest()).toBeNull();
+  expect(publication.calibrationTreePublicationRefusalAnswer(refusal))
+    .toBe(JSON.stringify({ sourceFileConflicts: ["calibrationDiagnostics"] }));
+  expect(publication.calibrationTreePublicationRefusalAnswer(new publication.CalibrationTreeEntryRefusedError("x")))
+    .toBeNull();
+  expect(publication.calibrationTreePublicationRefusalAnswer(new Error("x"))).toBeNull();
 });
 
 test("a copy that does not read back as written stops the publication", async () => {

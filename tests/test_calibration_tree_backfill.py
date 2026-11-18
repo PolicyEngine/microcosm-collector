@@ -271,6 +271,8 @@ class StandInBun:
     #: (step, source ID) pairs whose process runs out of time.
     timed_out: set[tuple[str, str]] = field(default_factory=set)
     latest_not_moved: set[str] = field(default_factory=set)
+    #: Each source's copies the publication finds stored with other bytes.
+    source_file_conflicts: dict[str, list[str]] = field(default_factory=dict)
     clock: ManualClock | None = None
     seconds_per_build: float = 0.0
     events: list[str] = field(default_factory=list)
@@ -358,6 +360,7 @@ class StandInBun:
         if ("publication", source) in self.timed_out:
             raise subprocess.TimeoutExpired(list(argv), timeout)
         exit_code = self.publication_exits.get(source, 0)
+        conflicts = self.source_file_conflicts.get(source, [])
         answer = {
             "buildArtifactId": worker["buildArtifactId"],
             "kind": worker["manifestEntry"]["kind"],
@@ -365,14 +368,20 @@ class StandInBun:
             "keptParts": 0,
             "uploadedSourceFiles": 1,
             "keptSourceFiles": 0,
+            "sourceFileConflicts": conflicts,
             "madeLatest": publication["makeLatest"]
             and source not in self.latest_not_moved
             and self._at_least_as_new_as_latest(worker),
         }
+        stdout = ""
+        if exit_code == 0:
+            stdout = json.dumps(answer)
+        elif exit_code == 2 and conflicts:
+            stdout = json.dumps({"sourceFileConflicts": conflicts})
         return subprocess.CompletedProcess(
             argv,
             exit_code,
-            json.dumps(answer) if exit_code == 0 else "",
+            stdout,
             "" if exit_code == 0 else f"The publication stopped on {source}.",
         )
 
@@ -874,6 +883,46 @@ def test_a_release_folder_s_extra_original_files_reach_the_worker() -> None:
     assert built["inputs"].get("reformValidation") == REFORM_VALIDATION
     assert built["request"]["artifacts"]["reformValidation"]["path"] == (
         f"{folder}/reform_validation.json"
+    )
+
+
+def test_a_built_outcome_says_what_became_of_the_build_s_copies() -> None:
+    backfill = us_backfill(
+        [release_entry(US_RELEASE)],
+        files={(US_RELEASES, RELEASE_COMMIT): release_folder(US_RELEASE)},
+    )
+    backfill.bun.source_file_conflicts[US_RELEASE] = ["reformValidation"]
+
+    [outcome] = backfill.run()
+
+    document = outcome.to_json()
+    assert document.get("uploaded_source_files") == 1
+    assert document.get("kept_source_files") == 0
+    assert document.get("source_file_conflicts") == ["reformValidation"]
+
+
+def test_a_copied_file_over_its_limit_is_left_out_and_the_tree_is_built(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(backfill_module(), "MAX_COPIED_FILE_BYTES", 4, raising=False)
+    folder = f"releases/{US_RELEASE}"
+    backfill = us_backfill(
+        [release_entry(US_RELEASE)],
+        files={
+            (US_RELEASES, RELEASE_COMMIT): {
+                **release_folder(US_RELEASE),
+                f"{folder}/reform_validation.json": REFORM_VALIDATION,
+            }
+        },
+    )
+
+    [outcome] = backfill.run()
+
+    assert outcome.outcome == "built"
+    built = backfill.bun.build_of(US_RELEASE)
+    assert "reformValidation" not in built["request"]["artifacts"]
+    assert f"{folder}/reform_validation.json" not in (
+        backfill.hugging_face.downloaded_paths()
     )
 
 
