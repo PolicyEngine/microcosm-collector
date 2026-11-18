@@ -1569,9 +1569,9 @@ def stored_entry(kind: str, source_id: str, build_artifact_id: str) -> dict[str,
 
 
 def test_a_tree_stored_meanwhile_from_the_same_file_is_already_stored() -> None:
-    # A submission of the older build publishes its tree from the same
-    # calibration diagnostics (the same build ID) while this run builds it, so
-    # this run's publication is refused with exit 2.
+    # A submission of the older build publishes its tree from the same files
+    # (the same build ID) while this run builds it, so this run's publication
+    # is refused with exit 2.
     reconciliation = us_release_reconciliation()
     same_build = build_id("us", "release", OLDER_ID)
     reconciliation.bun = StoredMeanwhile(
@@ -1605,9 +1605,9 @@ def test_a_tree_stored_meanwhile_from_another_file_stays_refused() -> None:
 
 
 def test_a_staged_run_stored_meanwhile_from_other_files_is_already_stored() -> None:
-    # The run's submission stores its tree, built from its diagnostics and
-    # build manifest (another build ID), while this run builds it from the
-    # diagnostics alone. The store keeps one tree per staged run.
+    # The run's submission stores its tree, built from other files (another
+    # build ID), while this run builds it from the run's folder. The store
+    # keeps one tree per staged run.
     reconciliation = us_staging_reconciliation(structured_staging_run(RUN_ID))
     reconciliation.bun = StoredMeanwhile(
         stored_meanwhile={RUN_ID: stored_entry("staging", RUN_ID, "c" * 64)}

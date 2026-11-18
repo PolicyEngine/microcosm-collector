@@ -56,9 +56,9 @@ arrives later finds the tree this command stored and succeeds as
 ``already_stored`` (``calibration_trees.TreeAlreadyStoredError``), and a
 build whose submission stores its tree while this command builds it is
 ``already_stored`` here too: a release build's tree with the same build ID,
-or any tree of the same staged run (this command builds a staged bundle from
-its diagnostics alone, its submission from its diagnostics and build
-manifest).
+or any tree of the same staged run, which this command may build from other
+files than its submission's: a staged bundle from its diagnostics alone, and
+any other run from its ``runs/<id>/`` folder.
 
 **Building.** With the backfill's steps (``release_source``,
 ``staging_source`` and ``build_and_publish_source``): one build at a time,

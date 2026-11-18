@@ -1711,10 +1711,13 @@ from the submission; only the latest build is decided from Hugging Face.
     build ID, whose index records another time or label. A tree's build ID
     is a hash of the tree schema version, country, kind, source ID and each
     source file's SHA-256;
-  - for a staged run, a tree of the same run with any build ID. The
-    reconcile command builds a staged bundle from its diagnostics alone,
-    while its submission also sends its build manifest, so their build IDs
-    differ, and the manifest keeps one tree per staged run.
+  - for a staged run, a tree of the same run with any build ID. The manifest
+    keeps one tree per staged run, and the reconcile command may have built
+    it from other files than the submission's: a staged bundle from its
+    diagnostics alone, while its submission also sends its build manifest,
+    and any other run from its `runs/<id>/` folder, possibly with another
+    diagnostics file. The stored tree is kept, and the submission's own tree
+    is not stored; two different build IDs in the result show this.
 
   The submission then succeeds, with `already_stored: true`, the stored
   tree's `build_artifact_id`, the `submitted_build_artifact_id` its own files
@@ -2285,10 +2288,13 @@ past builds again".
   request row without `finished_at` or `summary`.
 - A publication that fails or runs out of time after uploading a tree's
   index but before writing the manifest leaves that index without a
-  manifest entry. Another writer of the same release build is then refused
-  at that part while the manifest shows no tree for it, so a submission in
-  that position is still rejected, although the first writer's retry later
-  stores the tree.
+  manifest entry. Another writer of the same build ID whose index differs is
+  then refused at that part while the manifest shows no tree for it, so a
+  submission in that position is rejected. A release build's or a
+  submission's own retry builds the same index and stores the tree. A staging
+  build of this command doesn't: its index records the staging repo's head,
+  so once that moves, the run is `refused` on every later execution, until a
+  submission with another build ID stores a tree for it.
 - Builds are ordered by the time they are published with (the progress's
   `updated_at`, else the run manifest's), then by run ID. The publisher
   orders its staging listing by each run's summary `updated_at`, then

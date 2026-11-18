@@ -711,10 +711,10 @@ def test_a_refused_tree_already_stored_from_the_same_diagnostics_succeeds(
 
 
 def test_a_refused_staged_run_already_stored_from_other_files_succeeds() -> None:
-    # The reconcile command builds a staged bundle from its diagnostics alone,
-    # while the submission also sends its build manifest, so the stored tree
-    # has another build ID. The store keeps one tree per staged run, so the
-    # submission's tree could never be stored; it succeeds and names both IDs.
+    # The reconcile command can build a staged run from other files than its
+    # submission's, so the stored tree has another build ID. The store keeps
+    # one tree per staged run, so the submission's tree could never be stored;
+    # it succeeds and names both IDs.
     submission = accepted(STAGED)
     runner = RecordingRunner(
         publication_exit=2,

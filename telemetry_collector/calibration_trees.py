@@ -37,9 +37,11 @@ the backfill or another submission) succeeds without a tree of its own
 manifest then shows a tree for the same build: for a release build, one with
 the same build ID, a hash of the schema version, country, kind, source ID and
 each source file's SHA-256, whose index records another time or label; for a
-staged run, one with any build ID, since the reconcile command builds a staged
-bundle from its diagnostics alone while the submission also sends its build
-manifest. Its result says ``already_stored`` and names both build IDs, and it
+staged run, one with any build ID, since the manifest keeps one tree per staged
+run and the reconcile command may have built it from other files: a staged
+bundle from its diagnostics alone, and any other run from its ``runs/<id>/``
+folder. The stored tree is then kept, and the submission's own tree is not
+stored. Its result says ``already_stored`` and names both build IDs, and it
 moves no latest: the reconcile command ends each release run, after its
 builds, by making the latest follow ``releases.json``. Any other refused tree
 still rejects the submission.
@@ -511,10 +513,11 @@ def stored_tree_of(
     build ID its files give: an entry of ``plan``'s country, of kind
     ``release``, for its release build (``releaseId``), with that build ID.
     A staged run counts as stored with any build ID: an entry of kind
-    ``staging`` for its run (``stagingRunId``). The reconcile command builds a
-    staged bundle from its diagnostics alone, while its submission also sends
-    its build manifest, so the two build IDs differ, and the manifest keeps
-    one tree per staged run, so the second could never be stored.
+    ``staging`` for its run (``stagingRunId``). The manifest keeps one tree per
+    staged run, so a second could never be stored, and the reconcile command
+    may have built the run from other files than its submission's: a staged
+    bundle from its diagnostics alone, and any other run from its
+    ``runs/<id>/`` folder.
     """
 
     countries = manifest.get("countries")
@@ -810,11 +813,12 @@ def calibration_tree_handler(
                     "calibration_tree_unbuildable", str(error)
                 ) from error
             except TreeAlreadyStoredError as error:
-                # Another writer stored this tree from the same files first:
-                # the submission's tree is in the store, so it succeeds. It
-                # moves no latest; the reconcile command's latest step and
-                # the releases-record handler make the latest follow
-                # releases.json.
+                # Another writer stored a tree for this build first, so the
+                # store has the build's tree and the submission succeeds. For
+                # a staged run that tree may have another build ID; the result
+                # names both. It moves no latest; the reconcile command's
+                # latest step and the releases-record handler make the latest
+                # follow releases.json.
                 return {
                     "processed_by": "calibration-tree",
                     "build_artifact_id": error.build_artifact_id,
