@@ -2248,7 +2248,7 @@ Each build's outcome:
 | Outcome | Means | Final |
 |---|---|---|
 | `would_build` | a dry run would build it | |
-| `built` | built and published, never as the latest | yes |
+| `built` | built and published, never as the latest; a tree already stored under its build ID is used instead, and the outcome reports that tree's commit, time and label | yes |
 | `already_stored` | the store holds it, or gained a tree for it while it was built (a release build's with the same build ID, or any of the same staged run), so its publication was refused | yes |
 | `submission_in_progress` | a `queued` or `processing` submission of its folder builds it | yes |
 | `not_a_run` | a folder under `runs/` with no run documents | yes |
@@ -2281,8 +2281,10 @@ the worker job has, and stops with a message naming a missing one.
 
 **Running it by hand.** As an execution of the worker job, by someone who
 may run it with overridden arguments. First the dry run, which reads the
-Hugging Face listings and the store's manifest, downloads no diagnostics,
-builds nothing and takes no lock:
+Hugging Face listings, the run documents it needs to plan, the store's manifest,
+the index of copied run files and the indexes of stored staging trees. It copies
+and builds nothing and takes no lock. It downloads no diagnostics stored with
+LFS or declared with a digest:
 
 ```bash
 gcloud run jobs execute <worker job> --project <project> --region <region> \
@@ -2322,9 +2324,13 @@ past builds again".
 - The original-file copies a tree stores are those present when it was built. A
   later `reform_validation.json` or `parent_build_manifest.json` does not
   rebuild the tree; `staging-run-files/` keeps `reform_validation.json` current.
-- `runs.json` decides only whether a folder without a run manifest is a run,
-  and gives the list entry of such a run with no `progress.json`. If it can't
-  be read, only those folders are an `error`, and every other run continues.
+- `runs.json` is read only when some folder has no run manifest. It decides
+  whether such a folder is a run. When it has been read, a schema-1 run's row
+  gives that run's list entry before `progress.json`; otherwise the entry comes
+  from `progress.json`. If it can't be read, only the folders without a run
+  manifest are an `error`, and every other run continues.
+- A recorded refusal is matched to the whole run folder, so a run that keeps
+  committing while its tree is refused is built again after each change.
 - A schema-1 `runs.json` with a `schema_name`, or whose `runs` isn't a list, is
   taken as no `runs.json`, and a malformed row of one is skipped.
 - A build skipped as `submission_in_progress` is not built later if that

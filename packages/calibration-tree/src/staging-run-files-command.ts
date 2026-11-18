@@ -222,10 +222,10 @@ function parsedDocument(bytes: Uint8Array, name: string): unknown {
   }
 }
 
-// The run's list entry, by the Hugging Face reader's rules: a structured run's
-// manifest, else its runs.json row, else its progress, else a schema-1 manifest.
-// Progress is read only in that last case, and a progress file that isn't a JSON
-// object is absent. The job passes a row when it has read runs.json.
+// The run's list entry: a structured run's manifest, else its runs.json row,
+// else its progress, else a schema-1 manifest, which the Hugging Face reader does
+// not fall back to. A progress file that isn't a JSON object is absent. The job
+// passes a row only when it has read runs.json.
 function describedRun(
   runId: string,
   files: ReadonlyMap<StagingRunFileName, Uint8Array>,
