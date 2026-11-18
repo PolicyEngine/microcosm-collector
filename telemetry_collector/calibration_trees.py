@@ -168,7 +168,7 @@ LATEST_TIMEOUT_SECONDS = 5 * 60
 MANIFEST_READ_TIMEOUT_SECONDS = 5 * 60
 # Each step of the copy command reads or writes one small object.
 RELEASES_RECORD_COPY_TIMEOUT_SECONDS = 2 * 60
-#: How many times a copy starts again after another writer changed the object.
+#: How many attempts a copy makes while other writers keep changing the object.
 RELEASES_RECORD_COPY_ATTEMPTS = 3
 MAX_MESSAGE_CHARACTERS = 500
 
@@ -180,6 +180,9 @@ EXIT_NOT_RECORDED = 2
 EXIT_COPY_REFUSED = 2
 #: The copy command's exit when another writer changed the object first.
 EXIT_COPY_CONFLICT = 4
+
+#: Hugging Face's error code for a file its revision does not hold.
+_MISSING_FILE_ERROR_CODE = "EntryNotFound"
 
 #: The ``processed_by`` of the ``releases-record`` handler.
 LATEST_HANDLER = "calibration-tree-latest"
@@ -1216,8 +1219,10 @@ def copy_releases_record(
     already stored if that writer stored it.
 
     A copy already at the head is left as it is. A repo without
-    ``releases.json`` gets a copy saying so. A record the rules refuse leaves
-    the last accepted copy in place (``refused``).
+    ``releases.json`` gets a copy saying so; only Hugging Face's
+    ``EntryNotFound`` says that, because such a copy stays until the next
+    commit. A record the rules refuse leaves the last accepted copy in place
+    (``refused``).
 
     Raises ``ValueError`` for a country the collector does not list, before
     reading anything. Any other exception is a failure calling again may get
@@ -1282,7 +1287,7 @@ def copy_releases_record(
             try:
                 content = reader.read_file(repo, RELEASES_RECORD_PATH, head)
             except HuggingFaceReadError as error:
-                if not is_missing_path(error):
+                if error.error_code != _MISSING_FILE_ERROR_CODE:
                     raise
                 content = None
             if content is not None:
@@ -1341,9 +1346,10 @@ def calibration_tree_latest_handler(
     without a recorded tree. Such a tree's own publication reads this change
     and makes it the latest, unless the latest is newer, as after a rollback to
     it (reprocessing this submission then moves the latest). It then stores
-    the head's ``releases.json`` (``copy_releases_record``), so that promotions
-    and withdrawals reach the stored copy without waiting for the reconcile
-    command. Any failure fails the attempt, so it runs again.
+    the head's ``releases.json`` (``copy_releases_record``), even if moving the
+    latest failed, so that promotions and withdrawals reach the stored copy
+    without waiting for the reconcile command. Any failure fails the attempt,
+    so it runs again.
     """
 
     def move_latest(context: JobContext) -> dict[str, Any]:
@@ -1356,21 +1362,25 @@ def calibration_tree_latest_handler(
             }
         [record_file] = context.files("releases_record")
         check_submitted_record(plan, b"".join(context.read_chunks(record_file["name"])))
-        followed = follow_releases_record(
-            plan.country,
-            blob_token=blob_token,
-            manifest_lock=manifest_lock,
-            reader=reader,
-            bun=bun,
-            run_command=run_command,
-        )
-        copied = copy_releases_record(
-            plan.country,
-            blob_token=blob_token,
-            reader=reader,
-            bun=bun,
-            run_command=run_command,
-        )
+        try:
+            followed = follow_releases_record(
+                plan.country,
+                blob_token=blob_token,
+                manifest_lock=manifest_lock,
+                reader=reader,
+                bun=bun,
+                run_command=run_command,
+            )
+        finally:
+            # The copy does not depend on the latest, so a failure to move it
+            # does not hold the copy back.
+            copied = copy_releases_record(
+                plan.country,
+                blob_token=blob_token,
+                reader=reader,
+                bun=bun,
+                run_command=run_command,
+            )
         return {
             "processed_by": LATEST_HANDLER,
             **followed.result(),

@@ -1803,6 +1803,11 @@ for every country the collector lists:
    (`no_current_build`), or a current build the manifest records no tree for
    (`no_recorded_tree`). A failed read or any other failure of the latest
    command fails the attempt, so it runs again.
+4. **The stored copy.** Whether or not step 2 succeeded, it stores the
+   `releases.json` at the repo's head ("Keeping each country's releases.json").
+   The result's `releases_record` says what that did (`outcome`, `hf_repo`,
+   `hf_commit`, `has_record`, and `reason` for a refused record). A failure
+   fails the attempt, so it runs again.
 
 Step 2 is `calibration_trees.follow_releases_record(country, ...)`, which
 builds nothing and takes the lock itself, so another collector job can call
@@ -1841,7 +1846,7 @@ run incomplete or fails the handler's attempt, and either runs again.
 | The release repo at its head | The stored copy | Result |
 |---|---|---|
 | A valid `releases.json` | Replaced, unless already at that commit | `stored` or `unchanged` |
-| No `releases.json` | Replaced by one with `record` null, so a reader can tell the repo has none | `stored` or `unchanged` |
+| No `releases.json` (Hugging Face's `EntryNotFound`) | Replaced by one with `record` null, so a reader can tell the repo has none | `stored` or `unchanged` |
 | A `releases.json` the record's rules refuse | The last accepted copy stays | `refused` |
 | A read that fails | Stays as it is | a failure, which runs again |
 
@@ -1849,14 +1854,16 @@ run incomplete or fails the handler's attempt, and either runs again.
 reads the stored object's ETag, then the repo's head, and its write succeeds
 only while the object still has that ETag, or, for a first copy, while there is
 still none. A write that succeeds therefore saw the previous write's version
-before it read its head. An execution whose write is refused starts again, up
-to three times, and finds the head already stored if the other writer stored
-it. This relies on Hugging Face's head reads not going backward, as following
+before it read its head. An execution whose write is refused starts again, for
+at most three attempts in all, and finds the head already stored if the other
+writer stored it. This relies on Hugging Face's head reads not going backward, as following
 `releases.json` does.
 
-A commit that leaves `releases.json` unchanged still updates the copy's commit
-and time, so they say when the copy was last checked. A country gets its first
-copy when a release run or a `releases-record` submission next runs for it.
+A newer head replaces the copy even when `releases.json` did not change, so the
+copy's commit is the newest head an execution found, and `copiedAt` is when that
+execution wrote it. An execution that finds the copy already at the head writes
+nothing. A country gets its first copy when a release run or a
+`releases-record` submission next runs for it.
 
 ### Backfilling calibration trees from Hugging Face
 

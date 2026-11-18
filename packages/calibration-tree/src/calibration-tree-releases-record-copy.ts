@@ -45,11 +45,7 @@ import { BlobPreconditionFailedError, get, put } from "@vercel/blob";
 import { readFileSync } from "node:fs";
 
 import type { CalibrationTreeBlobClient } from "./calibration-tree-blob";
-import {
-  CALIBRATION_TREE_PUBLICATION_TOKEN_VARIABLE,
-  CALIBRATION_TREE_WEAK_ETAG_MESSAGE,
-  isWeakEtag,
-} from "./calibration-tree-publication";
+import { CALIBRATION_TREE_PUBLICATION_TOKEN_VARIABLE, isWeakEtag } from "./calibration-tree-publication";
 import {
   isHfCommitSha,
   isHfRepo,
@@ -159,7 +155,9 @@ export async function readReleasesRecordCopyVersion(options: {
   }
   const etag = result.blob.etag;
   if (!etag) throw new Error(`${path} was read without an ETag, so it cannot be replaced safely.`);
-  if (isWeakEtag(etag)) throw new Error(CALIBRATION_TREE_WEAK_ETAG_MESSAGE);
+  if (isWeakEtag(etag)) {
+    throw new Error(`${path} was read with a weak ETag, which no conditional write matches.`);
+  }
   const text = await new Response(result.stream).text();
   try {
     const stored = parseStoredReleasesRecord(text, country);
