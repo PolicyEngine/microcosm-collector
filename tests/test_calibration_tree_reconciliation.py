@@ -1603,6 +1603,100 @@ def test_a_file_only_the_stored_tree_has_does_not_replace_it() -> None:
     assert reconciliation.bun.steps("build") == []
 
 
+def test_a_staging_build_may_use_a_tree_stored_under_its_build_id() -> None:
+    reconciliation = both_kinds()
+
+    reconciliation.run(kinds=["release", "staging"])
+
+    assert reconciliation.bun.publication_of(RUN_ID)["publication"].get(
+        "reuseStoredTree"
+    )
+    assert (
+        "reuseStoredTree"
+        not in (reconciliation.bun.publication_of(CURRENT_ID)["publication"])
+    )
+
+
+def test_a_restored_tree_is_reported_as_it_is_stored() -> None:
+    reconciliation = us_staging_reconciliation(structured_staging_run(RUN_ID))
+    reconciliation.bun.restored_trees[RUN_ID] = {
+        "hfCommitSha": "a" * 40,
+        "createdAt": "2026-10-01T00:00:00.000Z",
+        "label": "the-stored-label",
+    }
+
+    [outcome] = reconciliation.run(kinds=["staging"])
+
+    assert outcome.outcome == "built"
+    assert outcome.hf_commit == "a" * 40
+    assert outcome.created_at == "2026-10-01T00:00:00.000Z"
+    assert outcome.label == "the-stored-label"
+
+
+def test_a_repeated_refusal_still_names_the_copies_that_differ() -> None:
+    reconciliation = us_staging_reconciliation(structured_staging_run(RUN_ID))
+    reconciliation.bun.publication_exits[RUN_ID] = 2
+    reconciliation.bun.source_file_conflicts[RUN_ID] = ["reformValidation"]
+    [first] = reconciliation.run(kinds=["staging"])
+    assert first.source_file_conflicts == ["reformValidation"]
+
+    [second] = reconciliation.run(kinds=["staging"])
+
+    assert second.outcome == "refused"
+    assert second.source_file_conflicts == ["reformValidation"]
+    assert len(reconciliation.bun.steps("build")) == 1
+
+
+def test_a_changed_stored_build_reopens_a_recorded_refusal() -> None:
+    reconciliation = us_staging_reconciliation(structured_staging_run(RUN_ID))
+    reconciliation.bun.worker_exits[RUN_ID] = 2
+    reconciliation.run(kinds=["staging"])
+    stored_tree(reconciliation, RUN_ID, {"calibrationDiagnostics": DIAGNOSTICS})
+
+    [outcome] = reconciliation.run(kinds=["staging"])
+
+    assert outcome.outcome == "already_stored"
+
+
+def test_tree_results_are_saved_after_each_build() -> None:
+    reconciliation = us_staging_reconciliation(
+        {**structured_staging_run(RUN_ID), **structured_staging_run(OTHER_RUN_ID)}
+    )
+
+    reconciliation.run(kinds=["staging"])
+
+    steps = [
+        call["step"]
+        for call in reconciliation.bun.calls
+        if call["step"] == "build"
+        or (call["step"] == "run files publish" and call["request"]["treeChecks"])
+    ]
+    assert steps == ["build", "run files publish", "build", "run files publish"]
+
+
+def test_tree_results_and_removals_are_saved_together() -> None:
+    gone = structured_staging_run(OTHER_RUN_ID)
+    reconciliation = us_staging_reconciliation(
+        {**structured_staging_run(RUN_ID), **gone}
+    )
+    reconciliation.run(kinds=["staging"])
+    remember_built_trees(reconciliation)
+    dataset = reconciliation.hugging_face.datasets[US_STAGING]
+    for run_file in gone:
+        del dataset.files[run_file]
+    at_head(
+        reconciliation.hugging_face,
+        US_STAGING,
+        structured_staging_run(RUN_ID, status="failed"),
+    )
+
+    reconciliation.run(kinds=["staging"])
+
+    assert reconciliation.bun.copied_runs[OTHER_RUN_ID].get("removedAt")
+    record = reconciliation.bun.copied_runs[RUN_ID]
+    assert record["treeCheck"]["folderFingerprint"] == record["folderFingerprint"]
+
+
 def test_a_new_tree_does_not_ask_to_replace_anything() -> None:
     reconciliation = us_staging_reconciliation(structured_staging_run(RUN_ID))
 

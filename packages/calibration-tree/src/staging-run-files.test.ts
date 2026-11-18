@@ -247,8 +247,9 @@ test("a tree check can record why the run has no new tree", async () => {
     runId: SCHEMA_1_RUN,
     folderFingerprint: FINGERPRINT,
     buildArtifactId: null,
-    outcome: "unbuildable",
-    reason: "The worker refused the files.",
+    outcome: "refused",
+    reason: "The publication refused the tree.",
+    sourceFileConflicts: ["reformValidation"],
   };
 
   await publish(store, "us", [schema1Run("failed", "2026-11-18T10:00:00Z")], [check]);
@@ -256,8 +257,9 @@ test("a tree check can record why the run has no new tree", async () => {
   expect(store.json(stagingRunFilesIndexPath("us")).runs[SCHEMA_1_RUN].treeCheck).toEqual({
     folderFingerprint: FINGERPRINT,
     buildArtifactId: null,
-    outcome: "unbuildable",
-    reason: "The worker refused the files.",
+    outcome: "refused",
+    reason: "The publication refused the tree.",
+    sourceFileConflicts: ["reformValidation"],
   });
 });
 
@@ -333,6 +335,22 @@ test("a list entry reads progress only where the Hugging Face reader does", asyn
   const ukRecord = store.json(stagingRunFilesIndexPath("uk")).runs[STRUCTURED_RUN];
   expect(ukRecord.problem).toBeNull();
   expect(ukRecord.summary.status).toBe("failed");
+});
+
+test("a schema-1 run's runs.json row comes before its progress, as in the Hugging Face reader", async () => {
+  const { stagingRunFilesIndexPath } = await runFiles();
+  const store = new InMemoryBlobStore();
+  const run = schema1Run("running", "2026-11-18T10:00:00Z");
+  run.files[1] = localFile("progress.json", JSON.stringify({ schema_version: 1 }));
+
+  await publish(store, "us", [
+    { ...run, indexRow: { run_id: SCHEMA_1_RUN, candidate_release_id: "candidate-3", status: "passed" } },
+  ]);
+
+  const { summary, problem } = store.json(stagingRunFilesIndexPath("us")).runs[SCHEMA_1_RUN];
+  expect(problem).toBeNull();
+  expect(summary.status).toBe("passed");
+  expect(summary.candidate_release_id).toBe("candidate-3");
 });
 
 test("a tree check for a run without a copy changes nothing", async () => {

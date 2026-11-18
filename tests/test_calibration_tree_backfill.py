@@ -280,6 +280,8 @@ class StandInBun:
     tree_sources: dict[str, dict[str, Any]] = field(default_factory=dict)
     #: Exit codes for the run-file command's actions.
     run_file_exits: dict[str, int] = field(default_factory=dict)
+    #: What the publication reports of a stored tree it used, by source.
+    restored_trees: dict[str, dict[str, Any]] = field(default_factory=dict)
     clock: ManualClock | None = None
     seconds_per_build: float = 0.0
     events: list[str] = field(default_factory=list)
@@ -440,6 +442,8 @@ class StandInBun:
             and source not in self.latest_not_moved
             and self._at_least_as_new_as_latest(worker),
         }
+        if source in self.restored_trees:
+            answer["restoredTree"] = self.restored_trees[source]
         stdout = ""
         if exit_code == 0:
             stdout = json.dumps(answer)

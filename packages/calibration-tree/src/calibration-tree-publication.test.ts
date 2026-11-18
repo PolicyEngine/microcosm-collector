@@ -143,7 +143,12 @@ interface BuiltTree {
 function builtTree(
   kind: "staging" | "release",
   diagnosticsText?: string,
-  options: { build?: string; createdAt?: string; extraFiles?: Record<string, { name: string; text: string }> } = {},
+  options: {
+    build?: string;
+    createdAt?: string;
+    hfCommitSha?: string;
+    extraFiles?: Record<string, { name: string; text: string }>;
+  } = {},
 ): BuiltTree {
   const release = goldenReleaseInputs()["uk-release"];
   const build = options.build ?? RUN_ID;
@@ -159,7 +164,7 @@ function builtTree(
   const shared = {
     country: "uk",
     hfRepo: microcosmRepo("uk"),
-    hfCommitSha: release.hfCommitSha,
+    hfCommitSha: options.hfCommitSha ?? release.hfCommitSha,
     createdAt: options.createdAt ?? "2026-10-19T09:41:07.000Z",
     artifacts: {
       calibrationDiagnostics: {
@@ -354,7 +359,10 @@ test("a replacement that returns to a stored build brings back that build's tree
   await publish(store, first);
   const release = goldenReleaseInputs()["uk-release"];
   await publishReplacing(store, builtTree("staging", `${release.diagnosticsText}\n`));
-  const returned = builtTree("staging", undefined, { createdAt: "2026-11-01T00:00:00.000Z" });
+  const returned = builtTree("staging", undefined, {
+    createdAt: "2026-11-01T00:00:00.000Z",
+    hfCommitSha: "f".repeat(40),
+  });
   expect(returned.worker.buildArtifactId).toBe(first.worker.buildArtifactId);
 
   const published = await publishReplacing(store, returned).catch((error: unknown) => error);
@@ -362,6 +370,61 @@ test("a replacement that returns to a stored build brings back that build's tree
   expect(published).not.toBeInstanceOf(Error);
   expect(store.manifest()?.countries.uk?.builds as unknown).toEqual([first.worker.manifestEntry]);
   expect((published as { uploadedParts: number }).uploadedParts).toBe(0);
+  expect((published as { restoredTree?: unknown }).restoredTree).toEqual({
+    hfCommitSha: first.worker.manifestEntry.hfCommitSha,
+    createdAt: first.worker.manifestEntry.createdAt,
+    label: first.worker.manifestEntry.label,
+  });
+});
+
+async function publishReusing(store: InMemoryBlobStore, tree: BuiltTree) {
+  return publication.publishBuiltCalibrationTree({
+    request: publication.parseCalibrationTreePublicationRequest({
+      bundleDirectory: tree.bundleDirectory,
+      worker: tree.worker,
+      makeLatest: false,
+      reuseStoredTree: true,
+    }),
+    token: TOKEN,
+    client: store.client(),
+  });
+}
+
+test("a staged run's publication uses the tree a failed attempt left stored", async () => {
+  const store = new InMemoryBlobStore();
+  const first = builtTree("staging");
+  store.failingPuts.add(CALIBRATION_TREE_MANIFEST_PATH);
+  await publish(store, first).catch(() => undefined);
+  store.failingPuts.clear();
+  expect(store.manifest()).toBeNull();
+  const retried = builtTree("staging", undefined, { hfCommitSha: "f".repeat(40) });
+
+  const published = await publishReusing(store, retried).catch((error: unknown) => error);
+
+  expect(published).not.toBeInstanceOf(Error);
+  expect(store.manifest()?.countries.uk?.builds as unknown).toEqual([first.worker.manifestEntry]);
+  expect((published as { uploadedParts: number }).uploadedParts).toBe(0);
+});
+
+test("using a stored tree does not let another build take a run's place", async () => {
+  const store = new InMemoryBlobStore();
+  await publish(store, builtTree("staging"));
+  const manifestBefore = store.manifest();
+  const release = goldenReleaseInputs()["uk-release"];
+
+  const refusal = await publishReusing(store, builtTree("staging", `${release.diagnosticsText}\n`))
+    .catch((error: unknown) => error);
+
+  expect(refusal).toBeInstanceOf(publication.CalibrationTreeEntryRefusedError);
+  expect(store.manifest()).toEqual(manifestBefore);
+});
+
+test("only a staged run's publication can use a stored tree", async () => {
+  const refusal = await publishReusing(new InMemoryBlobStore(), builtTree("release"))
+    .catch((error: unknown) => error);
+
+  expect(refusal).toBeInstanceOf(publication.CalibrationTreePublicationRequestError);
+  expect(String(refusal)).toContain("reuseStoredTree");
 });
 
 test("only a staged run's tree can be asked to replace another", () => {
