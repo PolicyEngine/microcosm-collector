@@ -96,6 +96,10 @@ ROLE_RULES: dict[str, dict[str, RoleRule]] = {
         "build_manifest": RoleRule(0, 1, 64 * MEBIBYTE),
         "release_manifest": RoleRule(0, 1, 64 * MEBIBYTE),
         "demographics": RoleRule(0, 1, 64 * MEBIBYTE),
+        # Stored with the build's other original files; no tree is built from
+        # them.
+        "parent_build_manifest": RoleRule(0, 1, 64 * MEBIBYTE),
+        "reform_validation": RoleRule(0, 1, 64 * MEBIBYTE),
     },
     "orrery-inputs": {
         "schema": RoleRule(1, 1, 64 * MEBIBYTE),

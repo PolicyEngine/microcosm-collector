@@ -45,6 +45,36 @@ followed, 2 when the builder refuses the files, so another run on the same
 files cannot help, and 3 for anything else: a size limit that is not a
 positive integer, or an unexpected error such as a defect in the builder.
 
+## A build's original files
+
+When the worker builds a tree it also writes a gzip copy of each file its
+request names, and the publication command uploads the copies to private blobs
+before the tree's parts:
+
+```text
+calibration-tree-sources/<country>/<build ID>/<file name>.gz
+```
+
+The files are the diagnostics, `build_manifest.json`, `release_manifest.json`,
+`demographics.json`, `parent_build_manifest.json` and `reform_validation.json`.
+A build that lacks one has no copy of it, and neither does a build whose file
+over 64 MiB was read from Hugging Face.
+`src/calibration-tree-source-files.ts` reads them:
+
+```ts
+import { readCalibrationTreeSourceJson } from "@policyengine/calibration-tree/calibration-tree-source-files";
+
+const manifest = await readCalibrationTreeSourceJson({
+  country: "us",
+  buildArtifactId,
+  file: "buildManifest",
+  token,
+});
+```
+
+It returns the parsed `payload` and the file's `sha256`, or `null` without a
+copy. `readCalibrationTreeSourceFile` returns the original bytes instead.
+
 ## Development
 
 ```bash

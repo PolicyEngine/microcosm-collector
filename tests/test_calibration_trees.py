@@ -197,6 +197,10 @@ class RecordingRunner:
     latest_stdout: str | None = None
     #: Raised instead of running the latest command, when set.
     latest_raises: BaseException | None = None
+    #: The copies of original files the publication finds stored with other bytes.
+    source_file_conflicts: list[str] = field(default_factory=list)
+    #: Printed by the publication in place of its usual output, when set.
+    publication_stdout: str | None = None
     events: list[str] = field(default_factory=list)
     calls: list[dict[str, Any]] = field(default_factory=list)
 
@@ -259,13 +263,20 @@ class RecordingRunner:
             "kind": "staging",
             "uploadedParts": 7,
             "keptParts": 0,
+            "uploadedSourceFiles": 2,
+            "keptSourceFiles": 1,
+            "sourceFileConflicts": self.source_file_conflicts,
             "madeLatest": False,
         }
+        stdout = ""
+        if self.publication_exit == 0:
+            stdout = json.dumps(published)
+        elif self.publication_exit == 2 and self.source_file_conflicts:
+            stdout = json.dumps({"sourceFileConflicts": self.source_file_conflicts})
+        if self.publication_stdout is not None:
+            stdout = self.publication_stdout
         return subprocess.CompletedProcess(
-            argv,
-            self.publication_exit,
-            json.dumps(published) if self.publication_exit == 0 else "",
-            self.publication_stderr,
+            argv, self.publication_exit, stdout, self.publication_stderr
         )
 
     def call(self, step: str) -> dict[str, Any]:
@@ -564,6 +575,51 @@ def test_a_release_build_s_request_names_its_build_folder() -> None:
     assert publication["makeLatest"] is True
 
 
+#: Each original file only a build's folder held until submissions carried it:
+#: its role, its name and the worker request's name for it.
+EXTRA_ORIGINAL_FILES = (
+    ("parent_build_manifest", "parent_build_manifest.json", "parentBuildManifest"),
+    ("reform_validation", "reform_validation.json", "reformValidation"),
+)
+
+
+def released_with_extra_original_files() -> Accepted:
+    submission = calibration_submission()
+    submission["provenance"] = dict(RELEASED)
+    contents = dict(CONTENTS)
+    for role, name, _ in EXTRA_ORIGINAL_FILES:
+        assert role in ROLE_RULES["calibration-diagnostics"]
+        contents[name] = json.dumps({"file": name}).encode()
+        submission["files"].append(
+            {"name": name, "role": role, "size": 1, "sha256": "0" * 64}
+        )
+    return accepted_submission(submission, contents)
+
+
+def test_a_submission_s_extra_original_files_reach_the_tree_worker() -> None:
+    runner = RecordingRunner()
+
+    outcome = released_with_extra_original_files().run(handler_with(runner))
+
+    assert outcome is JobOutcome.FINISHED
+    artifacts = runner.call("build")["inputs"]["request.json"]["artifacts"]
+    folder = f"releases/{UK_DEFAULT_RELEASE}/{RUN_ID}"
+    for _, name, artifact in EXTRA_ORIGINAL_FILES:
+        assert artifacts[artifact]["path"] == f"{folder}/{name}"
+        assert Path(artifacts[artifact]["file"]).name == name
+
+
+def test_a_submission_without_them_names_neither_and_lists_no_folder() -> None:
+    hugging_face = uk_release_repo(record=None)
+    runner = RecordingRunner()
+
+    accepted(RELEASED).run(handler_with(runner, hugging_face=hugging_face))
+
+    artifacts = runner.call("build")["inputs"]["request.json"]["artifacts"]
+    assert not {artifact for _, _, artifact in EXTRA_ORIGINAL_FILES} & set(artifacts)
+    assert not any("/tree/" in request.url.path for request in hugging_face.requests)
+
+
 def test_a_built_tree_is_published_under_the_lock_and_recorded_as_the_result() -> None:
     submission = accepted(STAGED)
     runner = RecordingRunner()
@@ -583,8 +639,39 @@ def test_a_built_tree_is_published_under_the_lock_and_recorded_as_the_result() -
         "kind": "staging",
         "uploaded_parts": 7,
         "kept_parts": 0,
+        "uploaded_source_files": 2,
+        "kept_source_files": 1,
         "made_latest": False,
     }
+
+
+def test_a_copy_stored_with_other_bytes_is_named_in_the_result() -> None:
+    submission = accepted(STAGED)
+    runner = RecordingRunner(source_file_conflicts=["reformValidation"])
+
+    outcome = submission.run(handler_with(runner))
+
+    assert outcome is JobOutcome.FINISHED
+    assert submission.record().result.get("source_file_conflicts") == [
+        "reformValidation"
+    ]
+
+
+def test_a_tree_already_stored_still_names_a_copy_that_differs() -> None:
+    submission = accepted(STAGED)
+    runner = RecordingRunner(
+        publication_exit=2,
+        publication_stderr="Immutable calibration tree part already exists.",
+        stored_manifest=stored_tree("staging"),
+        source_file_conflicts=["parentBuildManifest"],
+    )
+
+    outcome = submission.run(handler_with(runner))
+
+    assert outcome is JobOutcome.FINISHED
+    result = submission.record().result
+    assert result["already_stored"] is True
+    assert result.get("source_file_conflicts") == ["parentBuildManifest"]
 
 
 def test_files_the_builder_refuses_reject_the_submission() -> None:
@@ -628,6 +715,42 @@ def test_an_entry_the_manifest_refuses_rejects_the_submission() -> None:
     assert submission.record().rejection == {
         "code": "calibration_tree_refused",
         "message": "Calibration source already resolves to another build.",
+    }
+
+
+def test_a_rejected_tree_names_the_copies_that_differ() -> None:
+    submission = accepted(STAGED)
+    runner = RecordingRunner(
+        publication_exit=2,
+        publication_stderr="Calibration source already resolves to another build.",
+        source_file_conflicts=["reformValidation"],
+    )
+
+    submission.run(handler_with(runner))
+
+    assert submission.record().status == "rejected"
+    rejection = submission.record().rejection
+    assert rejection["code"] == "calibration_tree_refused"
+    assert "reformValidation" in rejection["message"]
+    assert "already resolves to another build" in rejection["message"]
+
+
+@pytest.mark.parametrize(
+    "printed",
+    ["not json", "[]", '{"sourceFileConflicts": "reformValidation"}', ""],
+)
+def test_a_refusal_s_other_output_names_no_copies(printed: str) -> None:
+    submission = accepted(STAGED)
+    message = "Calibration source already resolves to another build."
+    runner = RecordingRunner(
+        publication_exit=2, publication_stderr=message, publication_stdout=printed
+    )
+
+    submission.run(handler_with(runner))
+
+    assert submission.record().rejection == {
+        "code": "calibration_tree_refused",
+        "message": message,
     }
 
 

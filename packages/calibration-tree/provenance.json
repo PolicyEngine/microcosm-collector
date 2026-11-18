@@ -3,7 +3,7 @@
   "commit": "4d129fbc6931e0e6862febd4f28ca421fb94b24a",
   "directory": "frontend/packages/calibration-tree",
   "changed": {
-    "package.json": "Publishable from this repository: not private, with a license, the repository, public access, the published files, the worker's, the publication command's, the latest command's and the manifest read's exports and their scripts. Its version is 0.1.2.",
+    "package.json": "Publishable from this repository: not private, with a license, the repository, public access, the published files, the worker's, the publication command's, the latest command's and the manifest read's exports and their scripts, and the stored original files' reader's export. Its version is 0.1.3.",
     "src/calibration-tree-blob.ts": "A consistent manifest read asks for the manifest uncompressed, so its ETag is the strong one that Vercel Blob's conditional writes compare, not the weak one a compressed response carries.",
     "src/countries.ts": "Its comments drop the microdata stack's former product name; its code matches the copy.",
     "src/historical-weight-summary.test.ts": "One test finds the September local-area weight summary by its build folder.",
@@ -30,6 +30,8 @@
     "src/calibration-tree-manifest-read.ts",
     "src/calibration-tree-publication.test.ts",
     "src/calibration-tree-publication.ts",
+    "src/calibration-tree-source-files.test.ts",
+    "src/calibration-tree-source-files.ts",
     "src/calibration-tree-worker.test.ts",
     "src/calibration-tree-worker.ts",
     "src/npm-package.test.ts",

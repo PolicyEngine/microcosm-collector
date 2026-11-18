@@ -1629,6 +1629,21 @@ for the same release build or staged run, or the same build was already
 recorded from another submission of the same files, whose index records
 another time or label.
 
+The worker also writes a gzip copy of each original file its request names:
+the diagnostics, `build_manifest.json`, `release_manifest.json`,
+`demographics.json`, `parent_build_manifest.json` and
+`reform_validation.json`. The tree is built from the first four only; the last
+two are copied unread and do not change its build ID. The publication command
+uploads the copies first, to private blobs at
+`calibration-tree-sources/<country>/<build ID>/<file name>.gz`, then the parts
+with the index last, then the manifest entry, so a build it records has a
+copy of every file it was given and a failed run can run again. Builds stored
+before this have no copies until the backfill adds them. The first copy of a build's
+file stands: one already stored is kept, and if it holds other bytes the tree
+is still published and the answer names the file in `sourceFileConflicts`, so a
+difference in a file the build ID does not cover never stops a valid tree.
+`src/calibration-tree-source-files.ts` reads the copies.
+
 ### Building trees from submissions
 
 The worker job builds a calibration tree from each `calibration-diagnostics`
@@ -1642,7 +1657,9 @@ read. Without the token, submissions stay in intake storage and can be
 reprocessed later. With it, the worker job also needs
 `COLLECTOR_HF_READ_TOKEN`, which the deploy mounts beside it, and stops with
 a message naming that variable without it. A tree's files and provenance come
-from the submission; only the latest build is decided from Hugging Face.
+from the submission; only the latest build is decided from Hugging Face. The
+submission's `parent_build_manifest` and `reform_validation` files, when it has
+them, are stored with the build's other original files.
 
 - **Which tree.** A build folder, `releases/<release>/<build>`, gives a release
   tree whose release ID is `<release>/<build>`; its `release` and `build_id`
@@ -1696,7 +1713,11 @@ from the submission; only the latest build is decided from Hugging Face.
   inside a Postgres transaction lock (`pg_advisory_xact_lock`), so the
   collector's writers change the manifest one at a time.
 - **Results.** A published tree's result names its build ID, kind, how many
-  parts were uploaded or already stored, and whether it became the latest.
+  parts and copies of original files were uploaded or already stored, and
+  whether it became the latest. `source_file_conflicts`, present only when
+  there are some, names the copies left as stored because they hold other
+  bytes; a result with `already_stored` names them too, and a rejection's
+  message does.
   The worker refusing the files (`calibration_tree_unbuildable`), or the
   build being refused when the store holds no tree for it (below;
   `calibration_tree_refused`: another build already recorded for the same
@@ -1835,6 +1856,10 @@ release|staging` limit what it backfills.
   `calibration_diagnostics.json`, and `build_manifest.json`,
   `release_manifest.json` and `demographics.json` when the folder lists them
   (null otherwise, as the GitHub Actions publisher's optional reads are).
+  `parent_build_manifest.json` and `reform_validation.json` are read when a
+  release or run folder lists them, and only stored as copies. That includes
+  the run folder of a run whose tree comes from its staged bundle. One over 64
+  MiB is left out, and the tree is still built.
 - A staging build, by the rules of the tree package's staging readers that
   locate its files, and only those:
   - in the staging repo, `runs/<id>/run_manifest.json` and `progress.json`,

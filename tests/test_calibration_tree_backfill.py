@@ -71,6 +71,10 @@ MINUTE = 60.0
 RECORD_REPO_KEY = "repo" + "sitory"
 
 
+PARENT_BUILD_MANIFEST = b'{"build_id": "the-parent-build"}'
+REFORM_VALIDATION = b'{"schema_version": 1, "reforms": []}'
+
+
 def backfill_module() -> ModuleType:
     if importlib.util.find_spec(BACKFILL_MODULE) is None:
         pytest.fail(f"{BACKFILL_MODULE} does not exist yet.")
@@ -267,6 +271,8 @@ class StandInBun:
     #: (step, source ID) pairs whose process runs out of time.
     timed_out: set[tuple[str, str]] = field(default_factory=set)
     latest_not_moved: set[str] = field(default_factory=set)
+    #: Each source's copies the publication finds stored with other bytes.
+    source_file_conflicts: dict[str, list[str]] = field(default_factory=dict)
     clock: ManualClock | None = None
     seconds_per_build: float = 0.0
     events: list[str] = field(default_factory=list)
@@ -354,19 +360,28 @@ class StandInBun:
         if ("publication", source) in self.timed_out:
             raise subprocess.TimeoutExpired(list(argv), timeout)
         exit_code = self.publication_exits.get(source, 0)
+        conflicts = self.source_file_conflicts.get(source, [])
         answer = {
             "buildArtifactId": worker["buildArtifactId"],
             "kind": worker["manifestEntry"]["kind"],
             "uploadedParts": 7,
             "keptParts": 0,
+            "uploadedSourceFiles": 1,
+            "keptSourceFiles": 0,
+            "sourceFileConflicts": conflicts,
             "madeLatest": publication["makeLatest"]
             and source not in self.latest_not_moved
             and self._at_least_as_new_as_latest(worker),
         }
+        stdout = ""
+        if exit_code == 0:
+            stdout = json.dumps(answer)
+        elif exit_code == 2 and conflicts:
+            stdout = json.dumps({"sourceFileConflicts": conflicts})
         return subprocess.CompletedProcess(
             argv,
             exit_code,
-            json.dumps(answer) if exit_code == 0 else "",
+            stdout,
             "" if exit_code == 0 else f"The publication stopped on {source}.",
         )
 
@@ -846,6 +861,104 @@ def test_optional_files_a_release_folder_lacks_are_null_and_a_null_time_is_kept(
     ]
 
 
+def test_a_release_folder_s_extra_original_files_reach_the_worker() -> None:
+    build = release_entry(US_RELEASE)
+    folder = f"releases/{US_RELEASE}"
+    backfill = us_backfill(
+        [build],
+        files={
+            (US_RELEASES, RELEASE_COMMIT): {
+                **release_folder(US_RELEASE),
+                f"{folder}/parent_build_manifest.json": PARENT_BUILD_MANIFEST,
+                f"{folder}/reform_validation.json": REFORM_VALIDATION,
+            }
+        },
+    )
+
+    [outcome] = backfill.run()
+
+    assert outcome.outcome == "built"
+    built = backfill.bun.build_of(US_RELEASE)
+    assert built["inputs"].get("parentBuildManifest") == PARENT_BUILD_MANIFEST
+    assert built["inputs"].get("reformValidation") == REFORM_VALIDATION
+    assert built["request"]["artifacts"]["reformValidation"]["path"] == (
+        f"{folder}/reform_validation.json"
+    )
+
+
+def test_a_built_outcome_says_what_became_of_the_build_s_copies() -> None:
+    backfill = us_backfill(
+        [release_entry(US_RELEASE)],
+        files={(US_RELEASES, RELEASE_COMMIT): release_folder(US_RELEASE)},
+    )
+    backfill.bun.source_file_conflicts[US_RELEASE] = ["reformValidation"]
+
+    [outcome] = backfill.run()
+
+    document = outcome.to_json()
+    assert document.get("uploaded_source_files") == 1
+    assert document.get("kept_source_files") == 0
+    assert document.get("source_file_conflicts") == ["reformValidation"]
+
+
+def test_a_refused_outcome_names_the_copies_that_differ() -> None:
+    backfill = us_backfill(
+        [release_entry(US_RELEASE)],
+        files={(US_RELEASES, RELEASE_COMMIT): release_folder(US_RELEASE)},
+    )
+    backfill.bun.publication_exits[US_RELEASE] = 2
+    backfill.bun.source_file_conflicts[US_RELEASE] = ["reformValidation"]
+
+    [outcome] = backfill.run()
+
+    assert outcome.outcome == "refused"
+    assert outcome.to_json().get("source_file_conflicts") == ["reformValidation"]
+
+
+def test_a_copied_file_over_its_limit_is_left_out_and_the_tree_is_built(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(backfill_module(), "MAX_COPIED_FILE_BYTES", 4, raising=False)
+    folder = f"releases/{US_RELEASE}"
+    backfill = us_backfill(
+        [release_entry(US_RELEASE)],
+        files={
+            (US_RELEASES, RELEASE_COMMIT): {
+                **release_folder(US_RELEASE),
+                f"{folder}/reform_validation.json": REFORM_VALIDATION,
+            }
+        },
+    )
+
+    [outcome] = backfill.run()
+
+    assert outcome.outcome == "built"
+    built = backfill.bun.build_of(US_RELEASE)
+    assert "reformValidation" not in built["request"]["artifacts"]
+    assert f"{folder}/reform_validation.json" not in (
+        backfill.hugging_face.downloaded_paths()
+    )
+
+
+def test_a_staging_run_folder_s_reform_validation_reaches_the_worker() -> None:
+    run = staging_entry(RUN_ID)
+    backfill = us_backfill(
+        [run],
+        files={
+            (US_STAGING, STAGING_COMMIT): {
+                **schema_1_run(RUN_ID),
+                f"runs/{RUN_ID}/reform_validation.json": REFORM_VALIDATION,
+            }
+        },
+    )
+
+    [outcome] = backfill.run()
+
+    assert outcome.outcome == "built"
+    inputs = backfill.bun.build_of(RUN_ID)["inputs"]
+    assert inputs.get("reformValidation") == REFORM_VALIDATION
+
+
 def test_the_request_is_the_one_worker_request_makes_for_the_same_plan() -> None:
     tag = release_entry(US_TAG, release_directory=US_RELEASE)
     backfill = us_backfill(
@@ -998,6 +1111,47 @@ def test_a_staged_bundle_recorded_in_the_release_repo_is_read_from_its_folder() 
     assert backfill.hugging_face.downloaded_paths() == [
         f"staged/{RUN_ID}/microcosm_us_2025.diagnostics.json"
     ]
+
+
+def test_a_run_with_a_staged_dataset_copies_the_files_in_its_run_folder() -> None:
+    diagnostics_name = "microcosm_us_2025.diagnostics.json"
+    receipt = json.dumps(
+        {
+            "status": "uploaded",
+            "run_id": RUN_ID,
+            RECORD_REPO_KEY: US_RELEASES,
+            "prefix": f"staged/{RUN_ID}",
+            "revision": BUNDLE_COMMIT,
+            "files": {diagnostics_name: {"sha256": sha256(DIAGNOSTICS)}},
+        }
+    ).encode()
+    folder = f"runs/{RUN_ID}"
+    backfill = us_backfill(
+        [staging_entry(RUN_ID)],
+        files={
+            (US_STAGING, STAGING_COMMIT): {
+                **structured_run(RUN_ID, {"staged_dataset": receipt}),
+                f"{folder}/parent_build_manifest.json": PARENT_BUILD_MANIFEST,
+                f"{folder}/reform_validation.json": REFORM_VALIDATION,
+                # Not a file this run's tree is built from.
+                f"{folder}/build_manifest.json": BUILD_MANIFEST,
+            },
+            (US_RELEASES, BUNDLE_COMMIT): {
+                f"staged/{RUN_ID}/{diagnostics_name}": DIAGNOSTICS,
+            },
+        },
+    )
+
+    [outcome] = backfill.run()
+
+    assert outcome.outcome == "built"
+    build = backfill.bun.build_of(RUN_ID)
+    assert build["inputs"].get("parentBuildManifest") == PARENT_BUILD_MANIFEST
+    assert build["inputs"].get("reformValidation") == REFORM_VALIDATION
+    assert "buildManifest" not in build["inputs"]
+    assert build["request"]["artifacts"]["reformValidation"]["path"] == (
+        f"{folder}/reform_validation.json"
+    )
 
 
 def test_a_staged_bundle_a_run_s_receipt_names_is_read_from_the_release_repo() -> None:

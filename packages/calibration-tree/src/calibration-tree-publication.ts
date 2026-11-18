@@ -1,6 +1,7 @@
-// Publishes a tree the calibration tree worker wrote to disk: uploads each of
-// its gzip parts to the part's immutable path, then adds the build's entry to
-// the manifest with a compare-and-swap. The collector runs it as its own Bun
+// Publishes a tree the calibration tree worker wrote to disk: uploads the gzip
+// copies of the build's original files, then each of the tree's gzip parts to
+// the part's immutable path, then adds the build's entry to the manifest with
+// a compare-and-swap. The collector runs it as its own Bun
 // process, after the worker and under its one manifest lock:
 //
 //   bun run src/calibration-tree-publication.ts PUBLICATION.json
@@ -14,10 +15,16 @@
 //     "makeLatest": false
 //   }
 //
-// Each part is read from disk and checked against the worker's record of its
-// raw bytes before anything is uploaded. A part already stored with the same
-// bytes is kept; one stored with other bytes stops the publication. The index
-// goes last. The manifest is created only if it is still absent, and an
+// Each copy and part is read from disk and checked against the worker's record
+// of its raw bytes before anything is uploaded. One already stored with the
+// same bytes is kept. A part stored with other bytes stops the publication. A
+// copy stored with other bytes is kept as well, and the answer names it: the
+// first copy of a build's file stands, and because the build ID does not cover
+// every copied file, a difference must not stop a valid tree. The copies go
+// first and the tree's index last, so a build this command records in the
+// manifest has a copy of every file it was given, and a run that failed part
+// way can run again. The manifest is
+// created only if it is still absent, and an
 // existing one is replaced only if its ETag is still the one read, so a
 // manifest another writer changed is never overwritten. The manifest is read
 // uncompressed, because Vercel Blob gives a compressed response the weak form
@@ -29,12 +36,13 @@
 // 0. The other exit codes:
 //
 //   1  the request could not be followed: no token, a malformed request, or a
-//      part on disk that differs from the worker's record;
+//      part or copy on disk that differs from the worker's record;
 //   2  the build is refused: another build is already recorded for the same
 //      release or staged run, or the same build with other content (another
 //      submission of the same files, whose index records another time or
 //      label), or a staging build was to become the latest release; running
-//      again on the same tree cannot help;
+//      again on the same tree cannot help. When copies differed before the
+//      refusal, it first prints one JSON line naming them;
 //   3  anything else, including a manifest another writer changed meanwhile,
 //      one read without an ETag or with a weak one, and any error from the
 //      store; running again may succeed.
@@ -60,6 +68,12 @@ import {
   type CalibrationTreeManifest,
   type CalibrationTreeManifestEntry,
 } from "./calibration-tree-manifest";
+import {
+  calibrationTreeSourceFilePath,
+  isCalibrationTreeSourceFile,
+  readCalibrationTreeSourceFile,
+  type CalibrationTreeSourceFile,
+} from "./calibration-tree-source-files";
 import { isCountry, type MicrocosmCountry } from "./countries";
 
 export const CALIBRATION_TREE_PUBLICATION_EXIT_REQUEST_ERROR = 1;
@@ -76,7 +90,10 @@ const SHA256_RE = /^[0-9a-f]{64}$/;
 export class CalibrationTreePublicationRequestError extends Error {}
 
 /** The build is refused; nothing in the manifest changed. */
-export class CalibrationTreeEntryRefusedError extends Error {}
+export class CalibrationTreeEntryRefusedError extends Error {
+  /** The build's copies found stored with other bytes before the refusal. */
+  sourceFileConflicts: CalibrationTreeSourceFile[] = [];
+}
 
 /**
  * The manifest cannot be replaced safely: another writer changed it after it
@@ -106,11 +123,20 @@ export interface CalibrationTreePublicationPart {
   rawBytes: number;
 }
 
+/** The worker's gzip copy of one of the build's original files. */
+export interface CalibrationTreePublicationSourceFile {
+  file: CalibrationTreeSourceFile;
+  path: string;
+  sha256: string;
+  rawBytes: number;
+}
+
 export interface CalibrationTreePublicationRequest {
   bundleDirectory: string;
   country: MicrocosmCountry;
   buildArtifactId: string;
   files: CalibrationTreePublicationPart[];
+  sourceFiles: CalibrationTreePublicationSourceFile[];
   manifestEntry: CalibrationTreeManifestEntry;
   makeLatest: boolean;
 }
@@ -120,6 +146,11 @@ export interface CalibrationTreePublicationResult {
   kind: CalibrationTreeManifestEntry["kind"];
   uploadedParts: number;
   keptParts: number;
+  uploadedSourceFiles: number;
+  /** Copies already stored with the same bytes. */
+  keptSourceFiles: number;
+  /** Copies left as stored, because they hold other bytes. */
+  sourceFileConflicts: CalibrationTreeSourceFile[];
   madeLatest: boolean;
 }
 
@@ -162,6 +193,48 @@ function publicationPart(value: unknown, country: MicrocosmCountry, buildArtifac
   return { part, path, sha256, rawBytes: rawBytes as number };
 }
 
+function publicationSourceFile(
+  value: unknown,
+  country: MicrocosmCountry,
+  buildArtifactId: string,
+): CalibrationTreePublicationSourceFile {
+  const entry = requestObject(value, "worker.sourceFiles[]");
+  const file = entry.file;
+  if (!isCalibrationTreeSourceFile(file)) {
+    throw new CalibrationTreePublicationRequestError(`worker.sourceFiles[] names an unknown file ${String(file)}.`);
+  }
+  const path = requestString(entry, "path", "worker.sourceFiles[].path");
+  const sha256 = requestString(entry, "sha256", "worker.sourceFiles[].sha256");
+  const rawBytes = entry.rawBytes;
+  const expectedPath = calibrationTreeSourceFilePath(country, buildArtifactId, file);
+  if (path !== expectedPath) {
+    throw new CalibrationTreePublicationRequestError(`Source file ${file} must be stored at ${expectedPath}.`);
+  }
+  if (!SHA256_RE.test(sha256) || !Number.isSafeInteger(rawBytes) || (rawBytes as number) < 0) {
+    throw new CalibrationTreePublicationRequestError(`Source file ${file} needs a SHA-256 and a raw size.`);
+  }
+  return { file, path, sha256, rawBytes: rawBytes as number };
+}
+
+// A build always has its diagnostics, and at most one copy of each file.
+function publicationSourceFiles(
+  value: unknown,
+  country: MicrocosmCountry,
+  buildArtifactId: string,
+): CalibrationTreePublicationSourceFile[] {
+  if (!Array.isArray(value)) {
+    throw new CalibrationTreePublicationRequestError("worker.sourceFiles must list the build's original files.");
+  }
+  const sourceFiles = value.map((entry) => publicationSourceFile(entry, country, buildArtifactId));
+  const named = sourceFiles.map((sourceFile) => sourceFile.file);
+  if (new Set(named).size !== named.length || !named.includes("calibrationDiagnostics")) {
+    throw new CalibrationTreePublicationRequestError(
+      "worker.sourceFiles must hold the diagnostics, and each file at most once.",
+    );
+  }
+  return sourceFiles;
+}
+
 /** Checks a publication request read from JSON. */
 export function parseCalibrationTreePublicationRequest(value: unknown): CalibrationTreePublicationRequest {
   const request = requestObject(value, "The request");
@@ -189,6 +262,7 @@ export function parseCalibrationTreePublicationRequest(value: unknown): Calibrat
   if (files.filter((file) => file.part === "index").length !== 1) {
     throw new CalibrationTreePublicationRequestError("worker.files must hold exactly one index.");
   }
+  const sourceFiles = publicationSourceFiles(worker.sourceFiles, country, buildArtifactId);
   const manifestEntry = requestObject(worker.manifestEntry, "worker.manifestEntry") as unknown as CalibrationTreeManifestEntry;
   // The manifest's own rules, checked before anything is uploaded: a
   // malformed entry is a defect in the request, not a refusal of the build.
@@ -210,7 +284,15 @@ export function parseCalibrationTreePublicationRequest(value: unknown): Calibrat
   ) {
     throw new CalibrationTreePublicationRequestError("worker.manifestEntry does not describe the tree's index.");
   }
-  return { bundleDirectory, country, buildArtifactId, files, manifestEntry, makeLatest: request.makeLatest };
+  return {
+    bundleDirectory,
+    country,
+    buildArtifactId,
+    files,
+    sourceFiles,
+    manifestEntry,
+    makeLatest: request.makeLatest,
+  };
 }
 
 interface PartOnDisk extends CalibrationTreePublicationPart {
@@ -237,6 +319,66 @@ function partsOnDisk(request: CalibrationTreePublicationRequest): PartOnDisk[] {
     }
     return { ...file, compressed, serialized: new TextDecoder("utf-8").decode(raw) };
   });
+}
+
+interface SourceFileOnDisk extends CalibrationTreePublicationSourceFile {
+  compressed: Uint8Array;
+}
+
+// Like the parts, every copy is checked before anything is uploaded.
+function sourceFilesOnDisk(request: CalibrationTreePublicationRequest): SourceFileOnDisk[] {
+  return request.sourceFiles.map((sourceFile) => {
+    let compressed: Uint8Array;
+    let raw: Uint8Array;
+    try {
+      compressed = new Uint8Array(readFileSync(join(request.bundleDirectory, sourceFile.path)));
+      raw = new Uint8Array(gunzipSync(compressed));
+    } catch (error) {
+      throw new CalibrationTreePublicationRequestError(
+        `Source file ${sourceFile.file} could not be read from ${request.bundleDirectory}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (raw.byteLength !== sourceFile.rawBytes || createHash("sha256").update(raw).digest("hex") !== sourceFile.sha256) {
+      throw new CalibrationTreePublicationRequestError(
+        `Source file ${sourceFile.file} on disk differs from the worker's record.`,
+      );
+    }
+    return { ...sourceFile, compressed };
+  });
+}
+
+// A copy already stored stays as it is, whatever it holds, and an uploaded one
+// is read back.
+async function uploadSourceFile(
+  sourceFile: SourceFileOnDisk,
+  request: CalibrationTreePublicationRequest,
+  token: string,
+  client: CalibrationTreeBlobClient,
+): Promise<"uploaded" | "kept" | "conflict"> {
+  const stored = () =>
+    readCalibrationTreeSourceFile({
+      country: request.country,
+      buildArtifactId: request.buildArtifactId,
+      file: sourceFile.file,
+      token,
+      consistent: true,
+      client,
+    });
+  const existing = await stored();
+  if (existing) return existing.sha256 === sourceFile.sha256 ? "kept" : "conflict";
+  await client.put(sourceFile.path, Buffer.from(sourceFile.compressed), {
+    access: "private",
+    token,
+    addRandomSuffix: false,
+    multipart: true,
+    contentType: "application/gzip",
+    cacheControlMaxAge: IMMUTABLE_CACHE_SECONDS,
+  });
+  const uploaded = await stored();
+  if (uploaded?.sha256 !== sourceFile.sha256) {
+    throw new Error(`Uploaded copy of an original file at ${sourceFile.path} failed verification.`);
+  }
+  return "uploaded";
 }
 
 // As the package's uploadCalibrationTreeFile: an existing part must hold the
@@ -359,27 +501,52 @@ async function addManifestEntry(
 
 const DEFAULT_CLIENT: CalibrationTreeBlobClient = { get, put };
 
-/** Uploads a built tree and records it in the manifest. */
+/** Uploads a build's file copies and tree, then records it in the manifest. */
 export async function publishBuiltCalibrationTree(options: {
   request: CalibrationTreePublicationRequest;
   token: string;
   client?: CalibrationTreeBlobClient;
 }): Promise<CalibrationTreePublicationResult> {
   const { request, token, client = DEFAULT_CLIENT } = options;
+  const sourceFiles = sourceFilesOnDisk(request);
   const parts = partsOnDisk(request);
   const ordered = [...parts.filter((part) => part.part !== "index"), ...parts.filter((part) => part.part === "index")];
-  let uploadedParts = 0;
-  for (const part of ordered) {
-    if (await uploadPart(part, request, token, client)) uploadedParts += 1;
+  let uploadedSourceFiles = 0;
+  let keptSourceFiles = 0;
+  const sourceFileConflicts: CalibrationTreeSourceFile[] = [];
+  for (const sourceFile of sourceFiles) {
+    const outcome = await uploadSourceFile(sourceFile, request, token, client);
+    if (outcome === "uploaded") uploadedSourceFiles += 1;
+    else if (outcome === "kept") keptSourceFiles += 1;
+    else sourceFileConflicts.push(sourceFile.file);
   }
-  const madeLatest = await addManifestEntry(request, token, client);
+  let uploadedParts = 0;
+  let madeLatest: boolean;
+  try {
+    for (const part of ordered) {
+      if (await uploadPart(part, request, token, client)) uploadedParts += 1;
+    }
+    madeLatest = await addManifestEntry(request, token, client);
+  } catch (error) {
+    if (error instanceof CalibrationTreeEntryRefusedError) error.sourceFileConflicts = sourceFileConflicts;
+    throw error;
+  }
   return {
     buildArtifactId: request.buildArtifactId,
     kind: request.manifestEntry.kind,
     uploadedParts,
     keptParts: parts.length - uploadedParts,
+    uploadedSourceFiles,
+    keptSourceFiles,
+    sourceFileConflicts,
     madeLatest,
   };
+}
+
+/** The JSON line a refused build prints when its copies differed, or null. */
+export function calibrationTreePublicationRefusalAnswer(error: unknown): string | null {
+  if (!(error instanceof CalibrationTreeEntryRefusedError) || error.sourceFileConflicts.length === 0) return null;
+  return JSON.stringify({ sourceFileConflicts: error.sourceFileConflicts });
 }
 
 /** The exit code for an error that stopped the publication. */
@@ -393,6 +560,7 @@ export function calibrationTreePublicationExitCode(error: unknown): number {
 export async function calibrationTreePublicationMain(
   argv: string[],
   environment: Record<string, string | undefined> = process.env,
+  client: CalibrationTreeBlobClient = DEFAULT_CLIENT,
 ): Promise<number> {
   try {
     if (argv.length !== 1) {
@@ -410,10 +578,16 @@ export async function calibrationTreePublicationMain(
         `The request ${argv[0]} could not be read as JSON: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
-    const result = await publishBuiltCalibrationTree({ request: parseCalibrationTreePublicationRequest(parsed), token });
+    const result = await publishBuiltCalibrationTree({
+      request: parseCalibrationTreePublicationRequest(parsed),
+      token,
+      client,
+    });
     console.log(JSON.stringify(result));
     return 0;
   } catch (error) {
+    const refusalAnswer = calibrationTreePublicationRefusalAnswer(error);
+    if (refusalAnswer !== null) console.log(refusalAnswer);
     console.error(error instanceof Error ? error.message : String(error));
     return calibrationTreePublicationExitCode(error);
   }

@@ -429,6 +429,28 @@ def test_every_build_releases_json_lists_is_built_the_current_default_first() ->
     assert set(request["artifacts"]) >= {"calibrationDiagnostics", "releaseManifest"}
 
 
+def test_a_build_folder_s_extra_original_files_reach_the_worker() -> None:
+    parent_manifest = b'{"build_id": "the-parent-build"}'
+    reform_validation = b'{"schema_version": 1, "reforms": []}'
+    folder = f"releases/{US_RELEASE}/{CURRENT_BUILD}"
+    reconciliation = us_release_reconciliation(
+        folders={
+            **build_folder(US_RELEASE, OLDER_BUILD),
+            **build_folder(US_RELEASE, CURRENT_BUILD),
+            f"{folder}/parent_build_manifest.json": parent_manifest,
+            f"{folder}/reform_validation.json": reform_validation,
+        }
+    )
+
+    reconciliation.run()
+
+    inputs = reconciliation.bun.build_of(CURRENT_ID)["inputs"]
+    assert inputs.get("parentBuildManifest") == parent_manifest
+    assert inputs.get("reformValidation") == reform_validation
+    older_inputs = reconciliation.bun.build_of(OLDER_ID)["inputs"]
+    assert "parentBuildManifest" not in older_inputs
+
+
 def test_nothing_this_command_publishes_moves_the_latest() -> None:
     reconciliation = us_release_reconciliation()
 
@@ -1588,6 +1610,46 @@ def test_a_tree_stored_meanwhile_from_the_same_file_is_already_stored() -> None:
     older = outcome_of(outcomes, OLDER_ID)
     assert older.build_artifact_id == same_build
     assert older.incomplete is False
+
+
+def test_a_built_outcome_says_what_became_of_the_build_s_copies() -> None:
+    reconciliation = us_release_reconciliation()
+    reconciliation.bun.source_file_conflicts[CURRENT_ID] = ["reformValidation"]
+
+    outcomes = reconciliation.run()
+
+    document = outcome_of(outcomes, CURRENT_ID).to_json()
+    assert document.get("uploaded_source_files") == 1
+    assert document.get("kept_source_files") == 0
+    assert document.get("source_file_conflicts") == ["reformValidation"]
+
+
+def test_a_refused_outcome_names_the_copies_that_differ() -> None:
+    reconciliation = us_release_reconciliation()
+    reconciliation.bun.publication_exits[OLDER_ID] = 2
+    reconciliation.bun.source_file_conflicts[OLDER_ID] = ["reformValidation"]
+
+    outcomes = reconciliation.run()
+
+    older = outcome_of(outcomes, OLDER_ID)
+    assert older.outcome == "refused"
+    assert older.to_json().get("source_file_conflicts") == ["reformValidation"]
+
+
+def test_a_tree_stored_meanwhile_still_names_a_copy_that_differs() -> None:
+    reconciliation = us_release_reconciliation()
+    same_build = build_id("us", "release", OLDER_ID)
+    reconciliation.bun = StoredMeanwhile(
+        stored_meanwhile={OLDER_ID: stored_release(OLDER_ID, same_build)}
+    )
+    reconciliation.bun.publication_exits[OLDER_ID] = 2
+    reconciliation.bun.source_file_conflicts[OLDER_ID] = ["parentBuildManifest"]
+
+    outcomes = reconciliation.run()
+
+    older = outcome_of(outcomes, OLDER_ID)
+    assert older.outcome == "already_stored"
+    assert older.to_json().get("source_file_conflicts") == ["parentBuildManifest"]
 
 
 def test_a_tree_stored_meanwhile_from_another_file_stays_refused() -> None:

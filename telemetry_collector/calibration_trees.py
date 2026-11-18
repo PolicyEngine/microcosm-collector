@@ -15,6 +15,10 @@ one Postgres transaction lock, so collector writers add to the manifest one
 at a time. ``build_and_publish`` is that build and publication, shared with
 the backfill (``telemetry_collector.calibration_tree_backfill``), which asks
 for the latest from production's manifest rather than from ``releases.json``.
+The worker also writes a gzip copy of each of the build's original files, the
+two the tree is not built from (``parent_build_manifest`` and
+``reform_validation``) included, and the publication uploads the copies before
+the tree's parts and manifest entry.
 
 The tree's files and provenance come from the submission. The publication
 time recorded in the tree is the submission's ``accepted_at``, so
@@ -171,6 +175,11 @@ _ARTIFACTS = {
     "release_manifest": "releaseManifest",
     "demographics": "demographics",
 }
+# Original files the worker only copies; a request names them when present.
+_COPIED_ARTIFACTS = {
+    "parent_build_manifest": "parentBuildManifest",
+    "reform_validation": "reformValidation",
+}
 
 
 @dataclass(frozen=True)
@@ -290,12 +299,15 @@ def plan_tree_build(
 def worker_request(plan: TreeBuildPlan, files: Mapping[str, Path]) -> dict[str, Any]:
     """The Bun worker's request: ``files`` maps each role to its local copy.
 
-    Each file is named by its path in the dataset, from ``plan.paths``.
+    Each file is named by its path in the dataset, from ``plan.paths``. The
+    four files a tree is built from are always named, as null when absent; the
+    files the worker only copies are named when present.
     """
 
+    artifact_names = {**_ARTIFACTS, **_COPIED_ARTIFACTS}
     artifacts: dict[str, Any] = dict.fromkeys(_ARTIFACTS.values())
     for role, local_path in files.items():
-        artifacts[_ARTIFACTS[role]] = {
+        artifacts[artifact_names[role]] = {
             "path": plan.paths[role],
             "file": str(local_path),
         }
@@ -477,7 +489,15 @@ class TreeUnbuildableError(Exception):
 
 
 class TreeRefusedError(Exception):
-    """The publication command refused the build (exit 2); another run cannot help."""
+    """The publication command refused the build (exit 2); another run cannot help.
+
+    ``source_file_conflicts`` names the copies of original files it found
+    stored with other bytes before the refusal.
+    """
+
+    def __init__(self, message: str, *, source_file_conflicts: Sequence[str] = ()):
+        super().__init__(message)
+        self.source_file_conflicts = tuple(source_file_conflicts)
 
 
 class TreeAlreadyStoredError(TreeRefusedError):
@@ -498,8 +518,9 @@ class TreeAlreadyStoredError(TreeRefusedError):
         *,
         build_artifact_id: str,
         submitted_build_artifact_id: str,
+        source_file_conflicts: Sequence[str] = (),
     ) -> None:
-        super().__init__(message)
+        super().__init__(message, source_file_conflicts=source_file_conflicts)
         self.build_artifact_id = build_artifact_id
         self.submitted_build_artifact_id = submitted_build_artifact_id
 
@@ -545,6 +566,26 @@ def stored_tree_of(
         if plan.kind == "staging" or stored_id == build_artifact_id:
             return stored_id
     return None
+
+
+def _refusal_source_file_conflicts(
+    completed: subprocess.CompletedProcess[str],
+) -> tuple[str, ...]:
+    """The copies a refused publication found stored with other bytes.
+
+    A refusal prints an answer only when there are some, so anything else
+    names none.
+    """
+
+    lines = completed.stdout.strip().splitlines()
+    try:
+        answer = json.loads(lines[-1]) if lines else None
+    except json.JSONDecodeError:
+        return ()
+    conflicts = answer.get("sourceFileConflicts") if isinstance(answer, dict) else None
+    if not isinstance(conflicts, list):
+        return ()
+    return tuple(file for file in conflicts if isinstance(file, str))
 
 
 def _answer(completed: subprocess.CompletedProcess[str], step: str) -> dict[str, Any]:
@@ -618,6 +659,10 @@ class PublishedTree:
     kind: str
     uploaded_parts: int
     kept_parts: int
+    uploaded_source_files: int
+    kept_source_files: int
+    #: The copies left as stored because they hold other bytes.
+    source_file_conflicts: tuple[str, ...]
     made_latest: bool
     latest_decision: LatestDecision
 
@@ -700,6 +745,7 @@ def build_and_publish(
         )
     if published.returncode == EXIT_ENTRY_REFUSED:
         message = shortened_message(published.stderr)
+        conflicts = _refusal_source_file_conflicts(published)
         submitted_id = worker_answer.get("buildArtifactId")
         if isinstance(submitted_id, str):
             stored_id = stored_tree_of(
@@ -710,8 +756,9 @@ def build_and_publish(
                     message,
                     build_artifact_id=stored_id,
                     submitted_build_artifact_id=submitted_id,
+                    source_file_conflicts=conflicts,
                 )
-        raise TreeRefusedError(message)
+        raise TreeRefusedError(message, source_file_conflicts=conflicts)
     if published.returncode != 0:
         raise CalibrationTreeCommandError(
             f"The tree publication exited with {published.returncode}: "
@@ -723,6 +770,9 @@ def build_and_publish(
         kind=answer["kind"],
         uploaded_parts=answer["uploadedParts"],
         kept_parts=answer["keptParts"],
+        uploaded_source_files=answer["uploadedSourceFiles"],
+        kept_source_files=answer["keptSourceFiles"],
+        source_file_conflicts=tuple(answer["sourceFileConflicts"]),
         made_latest=answer["madeLatest"],
         latest_decision=latest,
     )
@@ -749,6 +799,21 @@ def read_store_manifest(commands: TreeCommands) -> dict[str, Any]:
 
 
 # The handler ----------------------------------------------------------------------
+
+
+def _conflict_fields(conflicts: Sequence[str]) -> dict[str, list[str]]:
+    """A job result's record of the copies stored with other bytes, if any."""
+
+    return {"source_file_conflicts": list(conflicts)} if conflicts else {}
+
+
+def _refusal_message(error: TreeRefusedError) -> str:
+    """A rejection's message, naming first any copies stored with other bytes."""
+
+    if not error.source_file_conflicts:
+        return str(error)
+    names = ", ".join(error.source_file_conflicts)
+    return shortened_message(f"The stored copies of {names} hold other bytes. {error}")
 
 
 def calibration_tree_handler(
@@ -826,10 +891,11 @@ def calibration_tree_handler(
                     "kind": plan.kind,
                     "already_stored": True,
                     "made_latest": False,
+                    **_conflict_fields(error.source_file_conflicts),
                 }
             except TreeRefusedError as error:
                 raise SubmissionRejectedError(
-                    "calibration_tree_refused", str(error)
+                    "calibration_tree_refused", _refusal_message(error)
                 ) from error
         result: dict[str, Any] = {
             "processed_by": "calibration-tree",
@@ -837,7 +903,10 @@ def calibration_tree_handler(
             "kind": published.kind,
             "uploaded_parts": published.uploaded_parts,
             "kept_parts": published.kept_parts,
+            "uploaded_source_files": published.uploaded_source_files,
+            "kept_source_files": published.kept_source_files,
             "made_latest": published.made_latest,
+            **_conflict_fields(published.source_file_conflicts),
         }
         latest = published.latest_decision
         if latest.skipped is not None:
