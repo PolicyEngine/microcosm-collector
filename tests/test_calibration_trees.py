@@ -11,7 +11,9 @@ read from a stand-in for Hugging Face under the same lock, names it as its
 default release's current build. A ``releases-record`` submission, which
 Microcosm sends after a change made a build current, moves the latest to the
 build the head's ``releases.json`` names, through the package's latest
-command, which the runner also stands in for.
+command, which the runner also stands in for. That handler and the reconcile
+command keep a copy of the head's ``releases.json`` in the tree store, through
+the package's copy command, which ``StoredRecordCopy`` stands in for.
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ import runpy
 import subprocess
 import threading
 import warnings
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -179,7 +181,9 @@ class RecordingRunner:
     """Stands in for the Bun processes, recording what each one is given.
 
     The worker is ``build``, the publication command ``publication``, the
-    latest command ``latest`` and the store's manifest read ``manifest read``.
+    latest command ``latest``, the store's manifest read ``manifest read`` and
+    the copy command of ``releases.json`` ``record copy read`` and ``record
+    copy write``.
     """
 
     build_exit: int = 0
@@ -197,6 +201,7 @@ class RecordingRunner:
     latest_stdout: str | None = None
     #: Raised instead of running the latest command, when set.
     latest_raises: BaseException | None = None
+    record_copy_write_exit: int = 0
     events: list[str] = field(default_factory=list)
     calls: list[dict[str, Any]] = field(default_factory=list)
 
@@ -205,6 +210,8 @@ class RecordingRunner:
     ) -> subprocess.CompletedProcess[str]:
         if argv[2].endswith("calibration-tree-latest.ts"):
             step = "latest"
+        elif argv[2].endswith("calibration-tree-releases-record-copy.ts"):
+            step = f"record copy {argv[3]}"
         elif argv[2].endswith("publication.ts"):
             step = "publication"
         elif argv[2].endswith("calibration-tree-manifest-read.ts"):
@@ -220,6 +227,34 @@ class RecordingRunner:
         self.calls.append(
             {"step": step, "argv": list(argv), "env": dict(env), "inputs": inputs}
         )
+        if step == "record copy read":
+            version = {
+                "country": argv[4],
+                "etag": None,
+                "hfCommitSha": None,
+                "hasRecord": None,
+            }
+            return subprocess.CompletedProcess(argv, 0, json.dumps(version), "")
+        if step == "record copy write":
+            request = inputs["copy.json"]
+            record_file = request["recordFile"]
+            self.calls[-1]["record"] = (
+                None if record_file is None else Path(record_file).read_bytes()
+            )
+            written = {
+                "country": request["country"],
+                "hfCommitSha": request["hfCommitSha"],
+                "hasRecord": record_file is not None,
+                "sha256": None,
+                "etag": '"etag-1"',
+            }
+            succeeded = self.record_copy_write_exit == 0
+            return subprocess.CompletedProcess(
+                argv,
+                self.record_copy_write_exit,
+                json.dumps(written) if succeeded else "",
+                "" if succeeded else "The store could not be written.",
+            )
         if step == "manifest read":
             manifest = self.stored_manifest or {"schemaVersion": 6, "countries": {}}
             read = self.manifest_read_exit == 0
@@ -1179,6 +1214,14 @@ LATEST_RESULT_KEYS = {
     "build_artifact_id",
     "made_latest",
     "latest_moved",
+    "releases_record",
+}
+#: What the handler's copy of the head's releases.json reports.
+STORED_UK_RECORD = {
+    "outcome": "stored",
+    "hf_repo": UK_RELEASE_REPO,
+    "hf_commit": "c" * 40,
+    "has_record": True,
 }
 
 
@@ -1283,6 +1326,10 @@ def test_a_releases_record_moves_the_latest_to_the_current_build_under_the_lock(
         *HEAD_READS,
         "latest",
         "lock released",
+        # The copy of releases.json follows, outside the manifest lock.
+        "record copy read",
+        *HEAD_READS,
+        "record copy write",
     ]
     latest = runner.call("latest")
     assert latest["argv"][:3] == [
@@ -1307,6 +1354,7 @@ def test_a_releases_record_moves_the_latest_to_the_current_build_under_the_lock(
         "build_artifact_id": "b" * 64,
         "made_latest": True,
         "latest_moved": True,
+        "releases_record": STORED_UK_RECORD,
     }
 
 
@@ -1389,6 +1437,7 @@ def test_a_current_build_without_a_recorded_tree_leaves_the_latest() -> None:
         "latest_unchanged": "no_recorded_tree",
         "latest_unchanged_reason": "The manifest records no uk release build "
         f"{UK_DEFAULT_RELEASE}/{RUN_ID}.",
+        "releases_record": STORED_UK_RECORD,
     }
 
 
@@ -1658,6 +1707,376 @@ def test_a_be_releases_record_without_releases_json_at_the_head_leaves_the_lates
     assert submission.record().status == "succeeded"
     assert submission.record().result["latest_unchanged"] == "no_releases_record"
     assert "latest" not in runner.events
+    # The stored copy now says the repo has no record at its head.
+    assert submission.record().result["releases_record"]["has_record"] is False
+    assert runner.call("record copy write")["record"] is None
+
+
+# The stored copy of releases.json -----------------------------------------------
+
+COPY_COMMAND = "calibration-tree-releases-record-copy.ts"
+HEAD = "c" * 40
+NEWER_HEAD = "d" * 40
+STORED_ETAG = '"etag-stored"'
+
+
+@dataclass
+class StoredRecordCopy:
+    """Stands in for the package's copy command and the one object it keeps.
+
+    A write succeeds only when its ``expectedEtag`` is the object's ETag, as
+    the store's conditional write does; otherwise it exits 4.
+    """
+
+    commit: str | None = None
+    etag: str | None = None
+    has_record: bool | None = None
+    record: bytes | None = None
+    read_exit: int = 0
+    read_stdout: str | None = None
+    #: Exit codes for the next writes, before the store is consulted.
+    write_exits: list[int] = field(default_factory=list)
+    write_stdout: str | None = None
+    #: Runs once, during the next write, as another execution would.
+    before_write: Callable[[], None] | None = None
+    raises: BaseException | None = None
+    events: list[str] = field(default_factory=list)
+    writes: list[dict[str, Any]] = field(default_factory=list)
+    calls: list[dict[str, Any]] = field(default_factory=list)
+    versions: int = 0
+
+    def __call__(
+        self, argv: Sequence[str], env: Mapping[str, str], timeout: float
+    ) -> subprocess.CompletedProcess[str]:
+        assert Path(argv[2]).name == COPY_COMMAND
+        self.calls.append({"argv": list(argv), "env": dict(env), "timeout": timeout})
+        if self.raises is not None:
+            raise self.raises
+        if argv[3] == "read":
+            return self._read(argv)
+        assert argv[3] == "write"
+        return self._write(argv)
+
+    def _read(self, argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        self.events.append("store read")
+        version = {
+            "country": argv[4],
+            "etag": self.etag,
+            "hfCommitSha": self.commit,
+            "hasRecord": self.has_record,
+        }
+        stdout = json.dumps(version) if self.read_stdout is None else self.read_stdout
+        return subprocess.CompletedProcess(argv, self.read_exit, stdout, "read failed")
+
+    def _write(self, argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        self.events.append("store write")
+        request = json.loads(Path(argv[4]).read_text())
+        record_file = request["recordFile"]
+        record = None if record_file is None else Path(record_file).read_bytes()
+        self.writes.append({**request, "record": record})
+        hook, self.before_write = self.before_write, None
+        if hook is not None:
+            hook()
+        if self.write_exits:
+            exit_code = self.write_exits.pop(0)
+            if exit_code != 0:
+                return subprocess.CompletedProcess(argv, exit_code, "", "write failed")
+        if request["expectedEtag"] != self.etag:
+            return subprocess.CompletedProcess(argv, 4, "", "The copy changed.")
+        self.versions += 1
+        self.etag = f'"etag-{self.versions}"'
+        self.commit = request["hfCommitSha"]
+        self.has_record = record is not None
+        self.record = record
+        written = {
+            "country": request["country"],
+            "hfCommitSha": self.commit,
+            "hasRecord": self.has_record,
+            "sha256": None,
+            "etag": self.etag,
+        }
+        stdout = json.dumps(written) if self.write_stdout is None else self.write_stdout
+        return subprocess.CompletedProcess(argv, 0, stdout, "")
+
+
+def copy_with(
+    store: StoredRecordCopy, hugging_face: FakeHuggingFace, country: str = "uk"
+) -> Any:
+    """``copy_releases_record`` for ``country``, against the stand-ins."""
+
+    module = trees()
+    assert hasattr(module, "copy_releases_record")
+    return module.copy_releases_record(
+        country,
+        blob_token=BLOB_TOKEN,
+        reader=HuggingFaceReader(
+            HuggingFaceReadSettings(token=READ_TOKEN), client=hugging_face.client()
+        ),
+        bun="/usr/local/bin/bun",
+        run_command=store,
+    )
+
+
+def test_the_first_copy_holds_the_head_s_exact_bytes() -> None:
+    record = releases_record() + b"\n\n"
+    store = StoredRecordCopy()
+
+    copied = copy_with(store, uk_release_repo(record))
+
+    assert copied.result() == STORED_UK_RECORD
+    [write] = store.writes
+    assert write["country"] == "uk"
+    assert write["hfRepo"] == UK_RELEASE_REPO
+    assert write["hfCommitSha"] == HEAD
+    assert write["expectedEtag"] is None
+    assert write["record"] == record
+    assert (store.commit, store.record) == (HEAD, record)
+
+
+def test_the_copy_command_gets_only_the_store_s_token() -> None:
+    store = StoredRecordCopy()
+
+    copy_with(store, uk_release_repo(releases_record()))
+
+    script = str(trees().PACKAGE_DIRECTORY / "src" / COPY_COMMAND)
+    assert store.calls[0]["argv"] == ["/usr/local/bin/bun", "run", script, "read", "uk"]
+    assert store.calls[1]["argv"][:4] == ["/usr/local/bin/bun", "run", script, "write"]
+    for call in store.calls:
+        assert call["env"]["CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN"] == BLOB_TOKEN
+        assert set(call["env"]) == {
+            "PATH",
+            "LANG",
+            "CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN",
+        }
+
+
+def test_the_stored_version_is_read_before_the_head() -> None:
+    # The order that stops an older execution: a write that succeeds saw the
+    # previous write's version before it read the head.
+    store = StoredRecordCopy()
+    hugging_face = uk_release_repo(releases_record())
+    record_reads_in(store.events, hugging_face)
+
+    copy_with(store, hugging_face)
+
+    assert store.events == ["store read", *HEAD_READS, "store write"]
+
+
+def test_a_copy_already_at_the_head_is_left_as_it_is() -> None:
+    store = StoredRecordCopy(commit=HEAD, etag=STORED_ETAG, has_record=True)
+    hugging_face = uk_release_repo(releases_record())
+    record_reads_in(store.events, hugging_face)
+
+    copied = copy_with(store, hugging_face)
+
+    assert copied.result() == {**STORED_UK_RECORD, "outcome": "unchanged"}
+    assert store.events == ["store read", f"read /api/datasets/{UK_RELEASE_REPO}"]
+    assert store.writes == []
+
+
+def test_a_newer_head_replaces_only_the_version_read_even_with_the_same_file() -> None:
+    record = releases_record()
+    store = StoredRecordCopy(commit=NEWER_HEAD, etag=STORED_ETAG, has_record=True)
+
+    copied = copy_with(store, uk_release_repo(record))
+
+    assert copied.outcome == "stored"
+    assert [write["expectedEtag"] for write in store.writes] == [STORED_ETAG]
+    assert store.commit == HEAD
+
+
+def test_a_repo_without_releases_json_gets_a_copy_saying_so() -> None:
+    store = StoredRecordCopy(commit=NEWER_HEAD, etag=STORED_ETAG, has_record=True)
+
+    copied = copy_with(store, release_repo(BE_RELEASE_REPO, None), "be")
+
+    assert copied.result() == {
+        "outcome": "stored",
+        "hf_repo": BE_RELEASE_REPO,
+        "hf_commit": HEAD,
+        "has_record": False,
+    }
+    assert store.writes[0]["recordFile"] is None
+    assert store.has_record is False
+
+
+def test_a_record_the_rules_refuse_leaves_the_last_accepted_copy() -> None:
+    store = StoredRecordCopy(commit=NEWER_HEAD, etag=STORED_ETAG, has_record=True)
+    refused = releases_record(withdrawn=(RUN_ID,))
+
+    copied = copy_with(store, uk_release_repo(refused))
+
+    result = copied.result()
+    assert "withdrawn" in result.pop("reason")
+    assert result == {
+        "outcome": "refused",
+        "hf_repo": UK_RELEASE_REPO,
+        "hf_commit": HEAD,
+        "has_record": None,
+    }
+    assert store.writes == []
+    assert (store.commit, store.etag) == (NEWER_HEAD, STORED_ETAG)
+
+
+def test_a_record_the_package_refuses_leaves_the_last_accepted_copy() -> None:
+    store = StoredRecordCopy(commit=NEWER_HEAD, etag=STORED_ETAG, write_exits=[2])
+
+    copied = copy_with(store, uk_release_repo(releases_record()))
+
+    assert copied.outcome == "refused"
+    assert copied.reason == "write failed"
+    assert store.commit == NEWER_HEAD
+
+
+def test_an_older_execution_cannot_replace_a_newer_copy() -> None:
+    older = releases_record()
+    newer = releases_record(withdrawn=(), builds=(RUN_ID, OTHER_BUILD))
+    hugging_face = uk_release_repo(older)
+    dataset = hugging_face.datasets[UK_RELEASE_REPO]
+    store = StoredRecordCopy()
+
+    def newer_execution_finishes_first() -> None:
+        dataset.head_commit = NEWER_HEAD
+        dataset.files["releases.json"] = newer
+        assert copy_with(store, hugging_face).outcome == "stored"
+
+    store.before_write = newer_execution_finishes_first
+
+    copied = copy_with(store, hugging_face)
+
+    # The older execution's write was refused, and it then found the newer
+    # copy already at the head.
+    assert copied.outcome == "unchanged"
+    assert copied.hf_commit == NEWER_HEAD
+    assert (store.commit, store.record) == (NEWER_HEAD, newer)
+
+
+def test_after_a_conflict_the_copy_starts_again_from_the_new_version() -> None:
+    newer = releases_record(builds=(RUN_ID, OTHER_BUILD))
+    hugging_face = uk_release_repo(releases_record())
+    dataset = hugging_face.datasets[UK_RELEASE_REPO]
+    store = StoredRecordCopy()
+
+    def another_writer_stores_the_old_head() -> None:
+        store.commit, store.etag, store.has_record = HEAD, STORED_ETAG, True
+        dataset.head_commit = NEWER_HEAD
+        dataset.files["releases.json"] = newer
+
+    store.before_write = another_writer_stores_the_old_head
+
+    copied = copy_with(store, hugging_face)
+
+    assert copied.outcome == "stored"
+    assert copied.hf_commit == NEWER_HEAD
+    assert [write["expectedEtag"] for write in store.writes] == [None, STORED_ETAG]
+    assert (store.commit, store.record) == (NEWER_HEAD, newer)
+
+
+def test_a_copy_that_keeps_conflicting_raises_for_another_attempt() -> None:
+    store = StoredRecordCopy(write_exits=[4, 4, 4, 4])
+
+    with pytest.raises(trees().CalibrationTreeCommandError, match="another writer"):
+        copy_with(store, uk_release_repo(releases_record()))
+
+    assert len(store.writes) == 3
+    assert store.commit is None
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"read_exit": 3},
+        {"read_exit": 1},
+        {"read_stdout": "not json"},
+        {"read_stdout": '{"etag": 1, "hfCommitSha": null, "hasRecord": null}'},
+        {"read_stdout": '{"etag": null, "hfCommitSha": 1, "hasRecord": null}'},
+        {"read_stdout": '{"etag": null, "hfCommitSha": null, "hasRecord": 1}'},
+        {"write_exits": [3]},
+        {"write_exits": [1]},
+        {"write_stdout": "not json"},
+        {"write_stdout": '{"hfCommitSha": "another commit"}'},
+        {"raises": subprocess.TimeoutExpired(["bun"], 120)},
+        {"raises": FileNotFoundError("bun")},
+    ],
+    ids=[
+        "read-store-error",
+        "read-request-error",
+        "read-no-json",
+        "read-bad-etag",
+        "read-bad-commit",
+        "read-bad-has-record",
+        "write-store-error",
+        "write-request-error",
+        "write-no-json",
+        "write-another-commit",
+        "timeout",
+        "bun-missing",
+    ],
+)
+def test_a_copy_command_that_fails_raises_for_another_attempt(
+    settings: dict[str, Any],
+) -> None:
+    store = StoredRecordCopy(**settings)
+
+    with pytest.raises(trees().CalibrationTreeCommandError):
+        copy_with(store, uk_release_repo(releases_record()))
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [("forced", 503), ("file", (500, None)), ("file", (404, "RevisionNotFound"))],
+    ids=["head-503", "file-500", "file-404-revision"],
+)
+def test_a_failed_hugging_face_read_writes_nothing(answer: tuple[str, Any]) -> None:
+    hugging_face = uk_release_repo(releases_record())
+    where, value = answer
+    if where == "forced":
+        hugging_face.datasets[UK_RELEASE_REPO].forced_status = value
+    else:
+        hugging_face.datasets[UK_RELEASE_REPO].file_answers["releases.json"] = value
+    store = StoredRecordCopy(commit=NEWER_HEAD, etag=STORED_ETAG, has_record=True)
+
+    with pytest.raises(HuggingFaceReadError):
+        copy_with(store, hugging_face)
+
+    assert store.writes == []
+    assert store.commit == NEWER_HEAD
+
+
+def test_copying_for_a_country_the_collector_does_not_list_is_refused() -> None:
+    store = StoredRecordCopy()
+    hugging_face = uk_release_repo(releases_record())
+
+    with pytest.raises(ValueError, match="fr is not a country the collector lists"):
+        copy_with(store, hugging_face, "fr")
+
+    assert store.calls == []
+    assert hugging_face.requests == []
+
+
+def test_a_releases_record_submission_copies_the_head_not_what_it_carried() -> None:
+    submitted = releases_record(builds=(RUN_ID, OTHER_BUILD))
+    head_record = releases_record(current=OTHER_BUILD, builds=(RUN_ID, OTHER_BUILD))
+    runner = RecordingRunner()
+    submission = accepted_releases_record(submitted)
+
+    submission.run(latest_handler_with(runner, uk_release_repo(head_record)))
+
+    assert submission.record().status == "succeeded"
+    assert runner.call("record copy write")["record"] == head_record
+
+
+def test_a_failed_copy_returns_the_releases_record_job_for_another_attempt() -> None:
+    record = releases_record()
+    runner = RecordingRunner(record_copy_write_exit=3)
+    submission = accepted_releases_record(record)
+
+    outcome = submission.run(latest_handler_with(runner, uk_release_repo(record)))
+
+    assert outcome is JobOutcome.RETRY
+    assert submission.record().status == "queued"
+    # The latest had already moved, and moving it again changes nothing.
+    assert "latest" in runner.events
 
 
 # Following releases.json without a submission -----------------------------------

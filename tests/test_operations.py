@@ -802,6 +802,7 @@ def test_the_reconcile_command_prints_one_document_per_entry_then_the_summary(
             "incomplete": False,
             "incomplete_sources": [],
             "latest": None,
+            "releases_record": None,
         }
     }
 
@@ -903,6 +904,93 @@ def test_a_latest_step_that_failed_makes_the_command_exit_1(
     summary = json.loads(capsys.readouterr().out.splitlines()[-1])["summary"]
     assert summary["incomplete"] is True
     assert summary["latest"]["outcome"] == "error"
+
+
+def releases_record_step(**fields: Any) -> Any:
+    """A US release run's step that copies releases.json."""
+
+    reconciliation = imported_module(RECONCILIATION_MODULE)
+    assert hasattr(reconciliation, "ReleasesRecordStep")
+    return reconciliation.ReleasesRecordStep(country="us", **fields)
+
+
+def test_a_release_run_prints_its_copy_step_and_its_summary_reports_it(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert hasattr(calibration_trees, "CopiedReleasesRecord")
+    step = releases_record_step(
+        outcome="stored",
+        copied=calibration_trees.CopiedReleasesRecord(
+            country="us",
+            outcome="stored",
+            hf_repo="policyengine/populace-us",
+            hf_commit="c" * 40,
+            has_record=True,
+        ),
+    )
+    stand_in_reconciliation(monkeypatch, [step, BUILT_RELEASE])
+
+    exit_status = operations.main(
+        [RECONCILE_COMMAND, "--country", "us", "--kind", "release"]
+    )
+
+    assert exit_status == 0
+    printed = [json.loads(text) for text in capsys.readouterr().out.splitlines()]
+    expected_step = {
+        "country": "us",
+        "outcome": "stored",
+        "hf_repo": "policyengine/populace-us",
+        "hf_commit": "c" * 40,
+        "has_record": True,
+        "incomplete": False,
+    }
+    assert printed[0] == {"releases_record": expected_step}
+    assert printed[-1]["summary"]["releases_record"] == expected_step
+    assert printed[-1]["summary"]["outcomes"] == {"built": 1}
+
+
+def test_a_copy_step_that_failed_makes_the_command_exit_1(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    step = releases_record_step(outcome="error", reason="boom", incomplete=True)
+    stand_in_reconciliation(monkeypatch, [step, BUILT_RELEASE])
+
+    exit_status = operations.main(
+        [RECONCILE_COMMAND, "--country", "us", "--kind", "release"]
+    )
+
+    assert exit_status == 1
+    summary = json.loads(capsys.readouterr().out.splitlines()[-1])["summary"]
+    assert summary["incomplete"] is True
+    assert summary["releases_record"]["outcome"] == "error"
+
+
+def test_the_reconcile_command_copies_releases_json_with_the_worker_job_s_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    given = stand_in_reconciliation(monkeypatch, [])
+    copies: list[tuple[str, dict[str, Any]]] = []
+
+    def recorded_copy(country: str, **options: Any) -> str:
+        copies.append((country, options))
+        return "copied"
+
+    monkeypatch.setattr(
+        calibration_trees, "copy_releases_record", recorded_copy, raising=False
+    )
+
+    operations.main([RECONCILE_COMMAND, "--country", "us", "--kind", "release"])
+
+    copy_record = given.get("copy_record")
+    assert callable(copy_record), "The command passes no copy_record."
+    assert copy_record("us") == "copied"
+    [(country, options)] = copies
+    assert country == "us"
+    assert (
+        options["blob_token"]
+        == (RECONCILE_ENVIRONMENT["COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN"])
+    )
+    assert isinstance(options["reader"], HuggingFaceReader)
 
 
 def test_the_reconcile_command_follows_releases_json_with_the_worker_job_s_tokens(
