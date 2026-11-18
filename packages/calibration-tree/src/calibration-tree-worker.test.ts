@@ -128,6 +128,30 @@ function writtenFiles(outputDirectory: string): string[] {
     .sort();
 }
 
+const SOURCE_FILE_FOLDER = "calibration-tree-sources/";
+
+// The tree's own parts among the written files, without the original files'
+// copies.
+function writtenTreeParts(outputDirectory: string): string[] {
+  return writtenFiles(outputDirectory).filter((path) => !path.startsWith(SOURCE_FILE_FOLDER));
+}
+
+// Adds files to a request's artifacts, written beside its other inputs.
+function addArtifacts(
+  requestPath: string,
+  inputDirectory: string,
+  folder: string,
+  files: Record<string, { name: string; text: string }>,
+): void {
+  const request = JSON.parse(readFileSync(requestPath, "utf8")) as { artifacts: Record<string, unknown> };
+  for (const [artifact, { name, text }] of Object.entries(files)) {
+    const file = join(inputDirectory, name);
+    writeFileSync(file, text);
+    request.artifacts[artifact] = { path: `${folder}/${name}`, file };
+  }
+  writeFileSync(requestPath, JSON.stringify(request));
+}
+
 // What the golden record keeps of a part, computed from the bytes on disk.
 function writtenFileRecord(outputDirectory: string, part: string, path: string): GoldenFileRecord {
   const compressed = new Uint8Array(readFileSync(join(outputDirectory, path)));
@@ -147,6 +171,15 @@ interface WorkerSummary {
   index: { path: string; sha256: string; rawBytes: number; gzipBytes: number };
   files: Array<{ part: string; path: string; sha256: string; rawBytes: number; gzipBytes: number }>;
   manifestEntry?: Record<string, unknown>;
+  sourceFiles?: Array<{
+    file: string;
+    name: string;
+    sourcePath: string;
+    path: string;
+    sha256: string;
+    rawBytes: number;
+    gzipBytes: number;
+  }>;
 }
 
 for (const name of RELEASE_CASES) {
@@ -172,7 +205,7 @@ for (const name of RELEASE_CASES) {
         rawBytes: index.rawBytes,
         gzipBytes: index.gzipBytes,
       });
-      expect(writtenFiles(outputDirectory)).toEqual(expected.files.map((file) => file.path).sort());
+      expect(writtenTreeParts(outputDirectory)).toEqual(expected.files.map((file) => file.path).sort());
       for (const file of expected.files) {
         const header = readFileSync(join(outputDirectory, file.path)).subarray(0, GZIP_HEADER_WITHOUT_OS.length);
         expect([...header]).toEqual(GZIP_HEADER_WITHOUT_OS);
@@ -336,6 +369,90 @@ test("a staged bundle's tree is a staging build of its run, with the requested l
     createdAt: STAGED_ACCEPTED_AT,
     updatedAt: STAGED_ACCEPTED_AT,
   });
+});
+
+test("the worker writes a gzip copy of each original file and the tree stays the same", () => {
+  const release = goldenReleaseInputs()["uk-release"];
+  const { requestPath, inputDirectory } = releaseRequest(release);
+  const folder = `releases/${release.releaseId}`;
+  const parentManifest = '{"build_id":"the-parent-build"}';
+  // The copies are bytes: the worker does not parse these two files.
+  const reformValidation = "not parsed, so this need not be JSON";
+  addArtifacts(requestPath, inputDirectory, folder, {
+    parentBuildManifest: { name: "parent_build_manifest.json", text: parentManifest },
+    reformValidation: { name: "reform_validation.json", text: reformValidation },
+  });
+  const outputDirectory = join(temporaryDirectory(), "trees");
+
+  const run = runWorker(requestPath, outputDirectory);
+
+  expect({ exitCode: run.exitCode, stderr: run.stderr }).toEqual({ exitCode: 0, stderr: "" });
+  const summary = JSON.parse(run.stdout) as WorkerSummary;
+  const expectedTree = recorded.sources["uk-release"];
+  expect(summary.buildArtifactId).toBe(expectedTree.buildArtifactId);
+  expect(summary.files).toEqual(expectedTree.files.map(({ deflateSha256: _, ...file }) => file));
+  expect(writtenTreeParts(outputDirectory)).toEqual(expectedTree.files.map((file) => file.path).sort());
+  const originals = [
+    { file: "calibrationDiagnostics", name: "calibration_diagnostics.json", text: release.diagnosticsText },
+    ...(release.releaseManifestText == null
+      ? []
+      : [{ file: "releaseManifest", name: "release_manifest.json", text: release.releaseManifestText }]),
+    { file: "parentBuildManifest", name: "parent_build_manifest.json", text: parentManifest },
+    { file: "reformValidation", name: "reform_validation.json", text: reformValidation },
+  ];
+  expect(summary.sourceFiles?.map((copy) => copy.file)).toEqual(originals.map((original) => original.file));
+  for (const original of originals) {
+    const copy = summary.sourceFiles?.find((sourceFile) => sourceFile.file === original.file);
+    const bytes = new TextEncoder().encode(original.text);
+    expect(copy).toMatchObject({
+      name: original.name,
+      sourcePath: `${folder}/${original.name}`,
+      path: `calibration-tree-sources/uk/${summary.buildArtifactId}/${original.name}.gz`,
+      sha256: sha256(bytes),
+      rawBytes: bytes.byteLength,
+    });
+    const compressed = readFileSync(join(outputDirectory, copy!.path));
+    expect(copy!.gzipBytes).toBe(compressed.byteLength);
+    expect(new Uint8Array(gunzipSync(compressed))).toEqual(bytes);
+  }
+});
+
+test("a diagnostics file is copied under its fixed name, whatever the build called it", () => {
+  const { requestPath } = stagingRequest();
+  const request = JSON.parse(readFileSync(requestPath, "utf8")) as {
+    artifacts: { calibrationDiagnostics: { path: string; file: string } };
+  };
+  const sourcePath = `staged/${STAGED_RUN_ID}/microcosm_uk.diagnostics.json`;
+  request.artifacts.calibrationDiagnostics.path = sourcePath;
+  writeFileSync(requestPath, JSON.stringify(request));
+  const outputDirectory = join(temporaryDirectory(), "trees");
+
+  const run = runWorker(requestPath, outputDirectory);
+
+  expect({ exitCode: run.exitCode, stderr: run.stderr }).toEqual({ exitCode: 0, stderr: "" });
+  const summary = JSON.parse(run.stdout) as WorkerSummary;
+  expect(summary.sourceFiles?.map(({ file, name, sourcePath: path }) => ({ file, name, path }))).toEqual([
+    { file: "calibrationDiagnostics", name: "calibration_diagnostics.json", path: sourcePath },
+  ]);
+  expect(summary.sourceFiles?.[0].path)
+    .toBe(`calibration-tree-sources/uk/${summary.buildArtifactId}/calibration_diagnostics.json.gz`);
+});
+
+test("an original file that cannot be read is a request error and nothing is written", () => {
+  const { requestPath, inputDirectory } = releaseRequest(goldenReleaseInputs()["uk-release"]);
+  const request = JSON.parse(readFileSync(requestPath, "utf8")) as { artifacts: Record<string, unknown> };
+  request.artifacts.reformValidation = {
+    path: "releases/some-release/reform_validation.json",
+    file: join(inputDirectory, "missing.json"),
+  };
+  writeFileSync(requestPath, JSON.stringify(request));
+  const outputDirectory = join(temporaryDirectory(), "trees");
+
+  const run = runWorker(requestPath, outputDirectory);
+
+  expect(run.exitCode).toBe(EXIT_REQUEST_ERROR);
+  expect(run.stderr).toContain("releases/some-release/reform_validation.json could not be read");
+  expect(writtenFiles(outputDirectory)).toEqual([]);
 });
 
 test("the same staging request writes the same tree again, so reprocessing changes nothing", () => {

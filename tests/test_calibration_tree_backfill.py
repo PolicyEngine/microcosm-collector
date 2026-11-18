@@ -71,6 +71,10 @@ MINUTE = 60.0
 RECORD_REPO_KEY = "repo" + "sitory"
 
 
+PARENT_BUILD_MANIFEST = b'{"build_id": "the-parent-build"}'
+REFORM_VALIDATION = b'{"schema_version": 1, "reforms": []}'
+
+
 def backfill_module() -> ModuleType:
     if importlib.util.find_spec(BACKFILL_MODULE) is None:
         pytest.fail(f"{BACKFILL_MODULE} does not exist yet.")
@@ -359,6 +363,8 @@ class StandInBun:
             "kind": worker["manifestEntry"]["kind"],
             "uploadedParts": 7,
             "keptParts": 0,
+            "uploadedSourceFiles": 1,
+            "keptSourceFiles": 0,
             "madeLatest": publication["makeLatest"]
             and source not in self.latest_not_moved
             and self._at_least_as_new_as_latest(worker),
@@ -844,6 +850,50 @@ def test_optional_files_a_release_folder_lacks_are_null_and_a_null_time_is_kept(
     assert backfill.hugging_face.downloaded_paths() == [
         f"releases/{US_RELEASE}/calibration_diagnostics.json"
     ]
+
+
+def test_a_release_folder_s_extra_original_files_reach_the_worker() -> None:
+    build = release_entry(US_RELEASE)
+    folder = f"releases/{US_RELEASE}"
+    backfill = us_backfill(
+        [build],
+        files={
+            (US_RELEASES, RELEASE_COMMIT): {
+                **release_folder(US_RELEASE),
+                f"{folder}/parent_build_manifest.json": PARENT_BUILD_MANIFEST,
+                f"{folder}/reform_validation.json": REFORM_VALIDATION,
+            }
+        },
+    )
+
+    [outcome] = backfill.run()
+
+    assert outcome.outcome == "built"
+    built = backfill.bun.build_of(US_RELEASE)
+    assert built["inputs"].get("parentBuildManifest") == PARENT_BUILD_MANIFEST
+    assert built["inputs"].get("reformValidation") == REFORM_VALIDATION
+    assert built["request"]["artifacts"]["reformValidation"]["path"] == (
+        f"{folder}/reform_validation.json"
+    )
+
+
+def test_a_staging_run_folder_s_reform_validation_reaches_the_worker() -> None:
+    run = staging_entry(RUN_ID)
+    backfill = us_backfill(
+        [run],
+        files={
+            (US_STAGING, STAGING_COMMIT): {
+                **schema_1_run(RUN_ID),
+                f"runs/{RUN_ID}/reform_validation.json": REFORM_VALIDATION,
+            }
+        },
+    )
+
+    [outcome] = backfill.run()
+
+    assert outcome.outcome == "built"
+    inputs = backfill.bun.build_of(RUN_ID)["inputs"]
+    assert inputs.get("reformValidation") == REFORM_VALIDATION
 
 
 def test_the_request_is_the_one_worker_request_makes_for_the_same_plan() -> None:

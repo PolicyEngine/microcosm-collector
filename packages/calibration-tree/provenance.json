@@ -30,6 +30,7 @@
     "src/calibration-tree-manifest-read.ts",
     "src/calibration-tree-publication.test.ts",
     "src/calibration-tree-publication.ts",
+    "src/calibration-tree-source-files.test.ts",
     "src/calibration-tree-worker.test.ts",
     "src/calibration-tree-worker.ts",
     "src/npm-package.test.ts",

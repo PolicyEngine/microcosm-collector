@@ -51,6 +51,10 @@ interface RecordedPut {
 class InMemoryBlobStore {
   readonly blobs = new Map<string, StoredBlob>();
   readonly puts: RecordedPut[] = [];
+  readonly putOptions = new Map<string, Record<string, unknown>>();
+  // Paths whose writes fail, and paths whose writes store other bytes.
+  readonly failingPuts = new Set<string>();
+  readonly corruptedPuts = new Set<string>();
   private written = 0;
   beforeManifestWrite: (() => void) | null = null;
   // Set to answer the manifest's reads with this ETag instead of its own.
@@ -87,9 +91,15 @@ class InMemoryBlobStore {
     const put = async (
       pathname: string,
       body: string | Buffer,
-      options: { allowOverwrite?: boolean; ifMatch?: string },
+      options: { allowOverwrite?: boolean; ifMatch?: string } & Record<string, unknown>,
     ) => {
       this.puts.push({ pathname, allowOverwrite: options.allowOverwrite, ifMatch: options.ifMatch });
+      this.putOptions.set(pathname, options);
+      if (this.failingPuts.has(pathname)) throw new Error("The store refused the write.");
+      if (this.corruptedPuts.has(pathname)) {
+        this.store(pathname, Bun.gzipSync(new TextEncoder().encode("other bytes")));
+        return { pathname };
+      }
       if (pathname === CALIBRATION_TREE_MANIFEST_PATH) this.beforeManifestWrite?.();
       const existing = this.blobs.get(pathname);
       if (existing && !options.allowOverwrite) {
@@ -111,12 +121,20 @@ class InMemoryBlobStore {
   }
 }
 
+interface BuiltSourceFile {
+  file: string;
+  path: string;
+  sha256: string;
+  rawBytes: number;
+}
+
 interface BuiltTree {
   bundleDirectory: string;
   worker: {
     buildArtifactId: string;
     files: Array<{ part: string; path: string; sha256: string; rawBytes: number }>;
     manifestEntry: Record<string, unknown>;
+    sourceFiles?: BuiltSourceFile[];
   };
 }
 
@@ -125,13 +143,19 @@ interface BuiltTree {
 function builtTree(
   kind: "staging" | "release",
   diagnosticsText?: string,
-  options: { build?: string; createdAt?: string } = {},
+  options: { build?: string; createdAt?: string; extraFiles?: Record<string, { name: string; text: string }> } = {},
 ): BuiltTree {
   const release = goldenReleaseInputs()["uk-release"];
   const build = options.build ?? RUN_ID;
   const inputDirectory = temporaryDirectory();
   writeFileSync(join(inputDirectory, "calibration_diagnostics.json"), diagnosticsText ?? release.diagnosticsText);
   const folder = kind === "staging" ? `staged/${RUN_ID}` : `releases/${release.releaseId}/${build}`;
+  const extraArtifacts = Object.fromEntries(
+    Object.entries(options.extraFiles ?? {}).map(([artifact, { name, text }]) => {
+      writeFileSync(join(inputDirectory, name), text);
+      return [artifact, { path: `${folder}/${name}`, file: join(inputDirectory, name) }];
+    }),
+  );
   const shared = {
     country: "uk",
     hfRepo: microcosmRepo("uk"),
@@ -145,6 +169,7 @@ function builtTree(
       buildManifest: null,
       releaseManifest: null,
       demographics: null,
+      ...extraArtifacts,
     },
   };
   const request = kind === "staging"
@@ -203,6 +228,8 @@ test("a built tree's parts are uploaded from disk and the manifest is created wi
     kind: "staging",
     uploadedParts: tree.worker.files.length,
     keptParts: 0,
+    uploadedSourceFiles: 1,
+    keptSourceFiles: 0,
     madeLatest: false,
   });
 });
@@ -411,6 +438,146 @@ test("a manifest read without an ETag is never written over", async () => {
   );
 
   expect(store.blobs.get(CALIBRATION_TREE_MANIFEST_PATH)?.bytes).toEqual(manifestBefore);
+});
+
+const EXTRA_FILES = {
+  parentBuildManifest: { name: "parent_build_manifest.json", text: '{"build_id":"the-parent-build"}' },
+  reformValidation: { name: "reform_validation.json", text: '{"schema_version":1,"reforms":[]}' },
+};
+
+function sourceFilesOf(tree: BuiltTree): BuiltSourceFile[] {
+  expect(tree.worker.sourceFiles?.length ?? 0).toBeGreaterThan(0);
+  return tree.worker.sourceFiles!;
+}
+
+test("a build's original files are stored privately before any part of its tree", async () => {
+  const store = new InMemoryBlobStore();
+  const tree = builtTree("release", undefined, { extraFiles: EXTRA_FILES });
+  const sourceFiles = sourceFilesOf(tree);
+  expect(sourceFiles.map((file) => file.file)).toEqual([
+    "calibrationDiagnostics",
+    "parentBuildManifest",
+    "reformValidation",
+  ]);
+
+  const published = await publish(store, tree);
+
+  const written = store.puts.map((put) => put.pathname);
+  expect(written.slice(0, sourceFiles.length)).toEqual(sourceFiles.map((file) => file.path));
+  expect(written.at(-1)).toBe(CALIBRATION_TREE_MANIFEST_PATH);
+  for (const file of sourceFiles) {
+    expect(store.blobs.get(file.path)?.bytes)
+      .toEqual(new Uint8Array(readFileSync(join(tree.bundleDirectory, file.path))));
+    expect(store.putOptions.get(file.path)).toMatchObject({
+      access: "private",
+      addRandomSuffix: false,
+      contentType: "application/gzip",
+    });
+    expect(store.putOptions.get(file.path)?.allowOverwrite).toBeUndefined();
+  }
+  expect(published).toMatchObject({ uploadedSourceFiles: 3, keptSourceFiles: 0 });
+});
+
+test("an original file that cannot be stored stops the publication before any part", async () => {
+  const store = new InMemoryBlobStore();
+  const tree = builtTree("staging");
+  const [diagnostics] = sourceFilesOf(tree);
+  store.failingPuts.add(diagnostics.path);
+
+  await expect(publish(store, tree)).rejects.toThrow("The store refused the write.");
+
+  expect(store.puts.map((put) => put.pathname)).toEqual([diagnostics.path]);
+  expect(store.manifest()).toBeNull();
+});
+
+test("after a failed part, no entry is recorded and publishing again keeps the copies and finishes", async () => {
+  const store = new InMemoryBlobStore();
+  const tree = builtTree("staging");
+  const [firstPart] = tree.worker.files;
+  sourceFilesOf(tree);
+  store.failingPuts.add(firstPart.path);
+
+  await expect(publish(store, tree)).rejects.toThrow("The store refused the write.");
+  expect(store.manifest()).toBeNull();
+  store.failingPuts.clear();
+
+  const published = await publish(store, tree);
+
+  expect(published).toMatchObject({ uploadedSourceFiles: 0, keptSourceFiles: 1 });
+  expect(store.manifest()?.countries.uk?.builds as unknown).toEqual([tree.worker.manifestEntry]);
+});
+
+test("a stored copy with other bytes refuses the build before any part", async () => {
+  const store = new InMemoryBlobStore();
+  const tree = builtTree("staging");
+  const [diagnostics] = sourceFilesOf(tree);
+  store.store(diagnostics.path, Bun.gzipSync(new TextEncoder().encode("{}")));
+
+  const refusal = await publish(store, tree).catch((error: unknown) => error);
+
+  expect(refusal).toBeInstanceOf(publication.CalibrationTreeEntryRefusedError);
+  expect(store.puts).toEqual([]);
+  expect(store.manifest()).toBeNull();
+});
+
+test("a copy that does not read back as written stops the publication", async () => {
+  const store = new InMemoryBlobStore();
+  const tree = builtTree("staging");
+  const [diagnostics] = sourceFilesOf(tree);
+  store.corruptedPuts.add(diagnostics.path);
+
+  await expect(publish(store, tree)).rejects.toThrow(/failed verification/);
+
+  expect(store.manifest()).toBeNull();
+});
+
+test("a resubmission of a stored build still stores a copy the build lacks", async () => {
+  const store = new InMemoryBlobStore();
+  await publish(store, builtTree("staging"));
+  const resubmitted = builtTree("staging", undefined, { createdAt: "2026-11-02T08:00:00.000Z" });
+  const [diagnostics] = sourceFilesOf(resubmitted);
+  store.blobs.delete(diagnostics.path);
+
+  const refusal = await publish(store, resubmitted).catch((error: unknown) => error);
+
+  expect(refusal).toBeInstanceOf(publication.CalibrationTreeEntryRefusedError);
+  expect(store.blobs.has(diagnostics.path)).toBe(true);
+});
+
+test("a copy on disk that differs from the worker's record stops the publication before anything is uploaded", async () => {
+  const store = new InMemoryBlobStore();
+  const tree = builtTree("staging");
+  const [diagnostics] = sourceFilesOf(tree);
+  writeFileSync(join(tree.bundleDirectory, diagnostics.path), Bun.gzipSync(new TextEncoder().encode("{}")));
+
+  await expect(publish(store, tree)).rejects.toBeInstanceOf(publication.CalibrationTreePublicationRequestError);
+
+  expect(store.puts).toEqual([]);
+});
+
+test("a worker's answer must describe the build's original files", () => {
+  const tree = builtTree("staging");
+  const [diagnostics] = sourceFilesOf(tree);
+  const malformed: unknown[] = [
+    undefined,
+    [],
+    [{ ...diagnostics, file: "unknownFile" }],
+    [{ ...diagnostics, file: "buildManifest" }],
+    [{ ...diagnostics, path: CALIBRATION_TREE_MANIFEST_PATH }],
+    [{ ...diagnostics, sha256: "not-a-digest" }],
+    [{ ...diagnostics, rawBytes: -1 }],
+    [diagnostics, diagnostics],
+  ];
+
+  for (const sourceFiles of malformed) {
+    expect(() =>
+      publication.parseCalibrationTreePublicationRequest({
+        bundleDirectory: tree.bundleDirectory,
+        worker: { ...tree.worker, sourceFiles },
+        makeLatest: false,
+      })
+    ).toThrow(publication.CalibrationTreePublicationRequestError);
+  }
 });
 
 test("a malformed manifest entry is a request error, found before anything is uploaded", () => {

@@ -259,6 +259,8 @@ class RecordingRunner:
             "kind": "staging",
             "uploadedParts": 7,
             "keptParts": 0,
+            "uploadedSourceFiles": 2,
+            "keptSourceFiles": 1,
             "madeLatest": False,
         }
         return subprocess.CompletedProcess(
@@ -564,6 +566,51 @@ def test_a_release_build_s_request_names_its_build_folder() -> None:
     assert publication["makeLatest"] is True
 
 
+#: Each original file only a build's folder held until submissions carried it:
+#: its role, its name and the worker request's name for it.
+EXTRA_ORIGINAL_FILES = (
+    ("parent_build_manifest", "parent_build_manifest.json", "parentBuildManifest"),
+    ("reform_validation", "reform_validation.json", "reformValidation"),
+)
+
+
+def released_with_extra_original_files() -> Accepted:
+    submission = calibration_submission()
+    submission["provenance"] = dict(RELEASED)
+    contents = dict(CONTENTS)
+    for role, name, _ in EXTRA_ORIGINAL_FILES:
+        assert role in ROLE_RULES["calibration-diagnostics"]
+        contents[name] = json.dumps({"file": name}).encode()
+        submission["files"].append(
+            {"name": name, "role": role, "size": 1, "sha256": "0" * 64}
+        )
+    return accepted_submission(submission, contents)
+
+
+def test_a_submission_s_extra_original_files_reach_the_tree_worker() -> None:
+    runner = RecordingRunner()
+
+    outcome = released_with_extra_original_files().run(handler_with(runner))
+
+    assert outcome is JobOutcome.FINISHED
+    artifacts = runner.call("build")["inputs"]["request.json"]["artifacts"]
+    folder = f"releases/{UK_DEFAULT_RELEASE}/{RUN_ID}"
+    for _, name, artifact in EXTRA_ORIGINAL_FILES:
+        assert artifacts[artifact]["path"] == f"{folder}/{name}"
+        assert Path(artifacts[artifact]["file"]).name == name
+
+
+def test_a_submission_without_them_names_neither_and_lists_no_folder() -> None:
+    hugging_face = uk_release_repo(record=None)
+    runner = RecordingRunner()
+
+    accepted(RELEASED).run(handler_with(runner, hugging_face=hugging_face))
+
+    artifacts = runner.call("build")["inputs"]["request.json"]["artifacts"]
+    assert not {artifact for _, _, artifact in EXTRA_ORIGINAL_FILES} & set(artifacts)
+    assert not any("/tree/" in request.url.path for request in hugging_face.requests)
+
+
 def test_a_built_tree_is_published_under_the_lock_and_recorded_as_the_result() -> None:
     submission = accepted(STAGED)
     runner = RecordingRunner()
@@ -583,6 +630,8 @@ def test_a_built_tree_is_published_under_the_lock_and_recorded_as_the_result() -
         "kind": "staging",
         "uploaded_parts": 7,
         "kept_parts": 0,
+        "uploaded_source_files": 2,
+        "kept_source_files": 1,
         "made_latest": False,
     }
 

@@ -429,6 +429,28 @@ def test_every_build_releases_json_lists_is_built_the_current_default_first() ->
     assert set(request["artifacts"]) >= {"calibrationDiagnostics", "releaseManifest"}
 
 
+def test_a_build_folder_s_extra_original_files_reach_the_worker() -> None:
+    parent_manifest = b'{"build_id": "the-parent-build"}'
+    reform_validation = b'{"schema_version": 1, "reforms": []}'
+    folder = f"releases/{US_RELEASE}/{CURRENT_BUILD}"
+    reconciliation = us_release_reconciliation(
+        folders={
+            **build_folder(US_RELEASE, OLDER_BUILD),
+            **build_folder(US_RELEASE, CURRENT_BUILD),
+            f"{folder}/parent_build_manifest.json": parent_manifest,
+            f"{folder}/reform_validation.json": reform_validation,
+        }
+    )
+
+    reconciliation.run()
+
+    inputs = reconciliation.bun.build_of(CURRENT_ID)["inputs"]
+    assert inputs.get("parentBuildManifest") == parent_manifest
+    assert inputs.get("reformValidation") == reform_validation
+    older_inputs = reconciliation.bun.build_of(OLDER_ID)["inputs"]
+    assert "parentBuildManifest" not in older_inputs
+
+
 def test_nothing_this_command_publishes_moves_the_latest() -> None:
     reconciliation = us_release_reconciliation()
 

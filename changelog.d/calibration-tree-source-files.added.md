@@ -1,0 +1,1 @@
+When the collector builds a calibration tree, it also stores private gzip copies of the build's original files, and `calibration-diagnostics` submissions may carry `parent_build_manifest.json` and `reform_validation.json`. `@policyengine/calibration-tree` 0.1.3 has a reader for the copies.

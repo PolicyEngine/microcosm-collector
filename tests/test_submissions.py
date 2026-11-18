@@ -115,6 +115,53 @@ def test_accepts_calibration_diagnostics_with_optional_manifest() -> None:
     ]
 
 
+ORIGINAL_FILE_ROLES = [
+    ("parent_build_manifest", "parent_build_manifest.json"),
+    ("reform_validation", "reform_validation.json"),
+]
+ORIGINAL_FILE_LIMIT = 64 * 1024 * 1024
+
+
+def original_file(role: str, name: str, size: int = 512) -> dict[str, Any]:
+    return {"name": name, "role": role, "size": size, "sha256": "e" * 64}
+
+
+@pytest.mark.parametrize(("role", "name"), ORIGINAL_FILE_ROLES)
+def test_calibration_diagnostics_may_carry_the_build_s_other_original_files(
+    role: str, name: str
+) -> None:
+    assert role in ROLE_RULES["calibration-diagnostics"]
+    submission = calibration_submission()
+    submission["files"].append(original_file(role, name, ORIGINAL_FILE_LIMIT))
+
+    request = SubmissionRequest.model_validate(submission)
+
+    assert request.files[-1].role == role
+
+
+@pytest.mark.parametrize(("role", "name"), ORIGINAL_FILE_ROLES)
+def test_an_original_file_over_its_limit_is_refused(role: str, name: str) -> None:
+    submission = calibration_submission()
+    submission["files"].append(original_file(role, name, ORIGINAL_FILE_LIMIT + 1))
+
+    with pytest.raises(ValidationError, match=f"exceeds the {role} limit"):
+        SubmissionRequest.model_validate(submission)
+
+
+@pytest.mark.parametrize(("role", "name"), ORIGINAL_FILE_ROLES)
+def test_a_submission_holds_at_most_one_of_each_original_file(
+    role: str, name: str
+) -> None:
+    submission = calibration_submission()
+    submission["files"] += [
+        original_file(role, name),
+        original_file(role, f"second-{name}"),
+    ]
+
+    with pytest.raises(ValidationError, match=f"at most 1 {role}"):
+        SubmissionRequest.model_validate(submission)
+
+
 def test_accepts_orrery_inputs_without_huggingface_provenance() -> None:
     request = SubmissionRequest.model_validate(orrery_submission())
 
