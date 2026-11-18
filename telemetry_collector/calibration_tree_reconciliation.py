@@ -61,8 +61,11 @@ Python:
   recording no diagnostics (``SourceWithoutDiagnosticsError``). A run whose
   documents can't be read, or whose declared or recorded diagnostics are absent
   or differ, is ``unbuildable`` on its own, and the other runs continue. A
-  settled result is kept in the run's record, so the tree is looked at again
-  only when the folder or the stored build changes.
+  settled result, final refusals included, is kept in the run's record, so the
+  tree is looked at again only when the folder or the stored build changes, or
+  for a refusal when ``include_older_runs`` asks. A run whose folder is gone
+  from the listing is marked removed, and readers leave it out until the folder
+  returns.
 
 A build whose folder (``releases/<release>/<build>`` or ``staged/<run>``) a
 ``queued`` or ``processing`` ``calibration-diagnostics`` submission holds is
@@ -109,9 +112,10 @@ up to 15 minutes, so that one that started after an event lists Hugging Face
 only after any earlier one has finished; past the wait the kind is
 ``lock_wait_expired`` and the run incomplete. The store's manifest is read
 once for each kind, inside its lock, with the package's read-only manifest
-read. A dry run takes no lock, downloads no diagnostics or run files, builds and
-stores nothing, reports ``would_build`` and ``would_copy`` and skips the latest
-step.
+read. A dry run takes no lock, copies no run files, builds and stores nothing,
+reports ``would_build`` and ``would_copy`` and skips the latest step. It reads
+the documents it needs to plan, and no diagnostics stored with LFS or declared
+with a digest.
 """
 
 from __future__ import annotations
@@ -427,6 +431,8 @@ class _Reconciliation:
     run_copies: dict[str, _RunCopy] = field(default_factory=dict)
     #: The settled tree results to record in the runs' copies.
     tree_checks: list[dict[str, str | None]] = field(default_factory=list)
+    #: Copied runs whose folders are gone from the staging repo.
+    removed_run_ids: list[str] = field(default_factory=list)
     staging_commit: str | None = None
 
     def __post_init__(self) -> None:
@@ -485,7 +491,7 @@ class _Reconciliation:
     def record_tree_checks(self) -> Iterator[ReconcileOutcome]:
         """Keep this execution's settled tree results in the runs' copies."""
 
-        if self.dry_run or not self.tree_checks:
+        if self.dry_run or not (self.tree_checks or self.removed_run_ids):
             return
         repo = STAGING_REPOS[self.country]
         try:
@@ -518,6 +524,7 @@ class _Reconciliation:
             "hfCommitSha": self.staging_commit,
             "runs": list(runs),
             "treeChecks": list(tree_checks),
+            "removedRunIds": [] if runs else self.removed_run_ids,
         }
 
     # Releases ----------------------------------------------------------------
@@ -727,6 +734,11 @@ class _Reconciliation:
                 )
             ]
         folders = staging_run_files.run_folders(listed)
+        self.removed_run_ids = sorted(
+            run_id
+            for run_id, record in copied_runs.items()
+            if run_id not in folders and not record.get("removedAt")
+        )
         # A schema-1 runs.json makes a folder without a run manifest a run,
         # and only such a folder needs it.
         index: dict[str, Mapping[str, Any]] | None = None
@@ -830,8 +842,15 @@ class _Reconciliation:
             result = self.staging_run(repo, head, run, build)
             if isinstance(result, _Planned):
                 planned.append(result)
-            else:
-                finished.append(result)
+                continue
+            finished.append(result)
+            if result.outcome == "unbuildable":
+                self.settle_tree(
+                    run.run_id,
+                    run.folder.fingerprint,
+                    build.get("buildArtifactId") if build else None,
+                    result,
+                )
         planned.sort(key=lambda planned_build: planned_build.order, reverse=True)
         return [*finished, *planned]
 
@@ -871,7 +890,11 @@ class _Reconciliation:
         changed: list[_StagingRun] = []
         for run in runs:
             record = copied_runs.get(run.run_id)
-            if record and record.get("folderFingerprint") == run.folder.fingerprint:
+            if (
+                record
+                and not record.get("removedAt")
+                and record.get("folderFingerprint") == run.folder.fingerprint
+            ):
                 self.run_copies[run.run_id] = _RunCopy("unchanged")
             elif self.dry_run:
                 self.run_copies[run.run_id] = _RunCopy(
@@ -918,8 +941,13 @@ class _Reconciliation:
                 return
         for run_request in requested:
             run_id = run_request["runId"]
+            omitted = run_request["omittedFiles"]
             self.run_copies[run_id] = _RunCopy(
-                "copied", files=answer.get(run_id, {}).get("uploaded")
+                "copied",
+                files=answer.get(run_id, {}).get("uploaded"),
+                reason=(
+                    f"Too large to copy: {', '.join(omitted)}." if omitted else None
+                ),
             )
 
     def downloaded_run(
@@ -930,8 +958,10 @@ class _Reconciliation:
         folder = root / str(number)
         folder.mkdir()
         files: list[dict[str, str]] = []
+        omitted: list[str] = []
         for position, (name, listed) in enumerate(run.folder.copied_files.items()):
             if listed.size > MAX_COPIED_FILE_BYTES:
+                omitted.append(name)
                 continue
             destination = folder / str(position)
             self.reader.download_file(
@@ -945,6 +975,7 @@ class _Reconciliation:
             "folderFingerprint": run.folder.fingerprint,
             "indexRow": run.index_row,
             "files": files,
+            "omittedFiles": omitted,
         }
 
     def settled_outcome(
@@ -965,15 +996,20 @@ class _Reconciliation:
             or check.get("buildArtifactId") != stored_id
         ):
             return None
-        if build is not None:
-            return self.stored_run_outcome(repo, run.run_id, build)
-        return self.outcome(
-            "staging",
-            "ineligible",
-            source_id=run.run_id,
-            hf_repo=repo,
-            hf_commit=head,
-            reason="Staging run has no calibration diagnostics; its folder is unchanged.",
+        recorded = check.get("outcome")
+        if recorded is not None:
+            if self.include_older_runs:
+                return None
+            return self.outcome(
+                "staging",
+                recorded,
+                source_id=run.run_id,
+                hf_repo=repo,
+                hf_commit=head,
+                reason=check.get("reason"),
+            )
+        return (
+            None if build is None else self.stored_run_outcome(repo, run.run_id, build)
         )
 
     def stored_run_outcome(
@@ -1175,17 +1211,41 @@ class _Reconciliation:
                 return True
         return False
 
-    def settle_tree(self, planned: _Planned, build_artifact_id: str | None) -> None:
-        """Remember that this state of the run's folder needs no further look."""
+    def settle_tree(
+        self,
+        run_id: str,
+        folder_fingerprint: str | None,
+        build_artifact_id: str | None,
+        final_outcome: ReconcileOutcome | None = None,
+    ) -> None:
+        """Remember that this state of the run's folder needs no further look,
+        with the outcome to repeat when it ended without a new tree."""
 
-        if not self.dry_run and planned.folder_fingerprint is not None:
-            self.tree_checks.append(
-                {
-                    "runId": planned.entry.source_id,
-                    "folderFingerprint": planned.folder_fingerprint,
-                    "buildArtifactId": build_artifact_id,
-                }
-            )
+        if self.dry_run or folder_fingerprint is None:
+            return
+        check: dict[str, str | None] = {
+            "runId": run_id,
+            "folderFingerprint": folder_fingerprint,
+            "buildArtifactId": build_artifact_id,
+        }
+        if final_outcome is not None:
+            check["outcome"] = final_outcome.outcome
+            check["reason"] = final_outcome.reason
+        self.tree_checks.append(check)
+
+    def settle_plan(
+        self, planned: _Planned, final_outcome: ReconcileOutcome
+    ) -> ReconcileOutcome:
+        """Remember a planned run's final outcome, and return it."""
+
+        stored = planned.stored_build
+        self.settle_tree(
+            planned.entry.source_id,
+            planned.folder_fingerprint,
+            stored.get("buildArtifactId") if stored else None,
+            final_outcome,
+        )
+        return final_outcome
 
     # The latest --------------------------------------------------------------
 
@@ -1253,24 +1313,28 @@ class _Reconciliation:
                 else staging_source(entry, self.reader, self.listings)
             )
         except SourceWithoutDiagnosticsError as error:
-            stored_id = (
-                planned.stored_build.get("buildArtifactId")
-                if planned.stored_build
-                else None
-            )
-            self.settle_tree(planned, stored_id)
             if planned.stored_build is not None:
+                self.settle_tree(
+                    entry.source_id,
+                    planned.folder_fingerprint,
+                    planned.stored_build.get("buildArtifactId"),
+                )
                 return self.stored_run_outcome(
                     entry.hf_repo, entry.source_id, planned.stored_build
                 )
-            return outcome(
-                "ineligible",
-                reason=shortened_message(
-                    f"Staging run has no calibration diagnostics: {error}"
+            return self.settle_plan(
+                planned,
+                outcome(
+                    "ineligible",
+                    reason=shortened_message(
+                        f"Staging run has no calibration diagnostics: {error}"
+                    ),
                 ),
             )
         except SourceUnbuildableError as error:
-            return outcome("unbuildable", reason=shortened_message(str(error)))
+            return self.settle_plan(
+                planned, outcome("unbuildable", reason=shortened_message(str(error)))
+            )
         except Exception as error:
             return outcome("error", reason=_described(error), incomplete=True)
         replaced: str | None = None
@@ -1281,7 +1345,7 @@ class _Reconciliation:
                 return outcome("error", reason=_described(error), incomplete=True)
             stored_id = planned.stored_build.get("buildArtifactId")
             if not differs:
-                self.settle_tree(planned, stored_id)
+                self.settle_tree(entry.source_id, planned.folder_fingerprint, stored_id)
                 return self.stored_run_outcome(
                     entry.hf_repo, entry.source_id, planned.stored_build
                 )
@@ -1293,11 +1357,14 @@ class _Reconciliation:
             if source_file.listed.size > limit
         ]
         if oversized:
-            return outcome(
-                "too_large",
-                reason=(
-                    f"{oversized[0].path} is {oversized[0].size} bytes, over the "
-                    f"{limit}-byte limit."
+            return self.settle_plan(
+                planned,
+                outcome(
+                    "too_large",
+                    reason=(
+                        f"{oversized[0].path} is {oversized[0].size} bytes, over the "
+                        f"{limit}-byte limit."
+                    ),
                 ),
             )
         if self.dry_run:
@@ -1310,8 +1377,22 @@ class _Reconciliation:
                 replace_staged_run=replaced is not None,
             )
         except (SourceUnbuildableError, TreeUnbuildableError) as error:
-            return outcome("unbuildable", reason=shortened_message(str(error)))
+            return self.settle_plan(
+                planned, outcome("unbuildable", reason=shortened_message(str(error)))
+            )
         except TreeAlreadyStoredError as error:
+            if replaced is not None:
+                # The tree found is the one that was to be replaced.
+                return self.settle_plan(
+                    planned,
+                    outcome(
+                        "refused",
+                        reason=shortened_message(
+                            f"Build {error.submitted_build_artifact_id} could not "
+                            f"replace stored build {error.build_artifact_id}: {error}"
+                        ),
+                    ),
+                )
             # A submission (or another writer) stored a tree for this build
             # while it was being built.
             return outcome(
@@ -1325,10 +1406,14 @@ class _Reconciliation:
                 source_file_conflicts=list(error.source_file_conflicts),
             )
         except TreeRefusedError as error:
-            return outcome("refused", reason=shortened_message(str(error)))
+            return self.settle_plan(
+                planned, outcome("refused", reason=shortened_message(str(error)))
+            )
         except Exception as error:
             return outcome("error", reason=_described(error), incomplete=True)
-        self.settle_tree(planned, published.build_artifact_id)
+        self.settle_tree(
+            entry.source_id, planned.folder_fingerprint, published.build_artifact_id
+        )
         return outcome(
             "built",
             replaced_build_artifact_id=replaced,

@@ -18,7 +18,9 @@
 //
 // replaceStagingRun is optional, and only for a staging build: its entry then
 // takes the place of the run's earlier tree in the manifest, whose parts stay
-// stored. Without it another tree of the same run is refused.
+// stored. A build ID that already has a stored index is that same set of files,
+// so its stored tree comes back as it was, with its own commit and time, and no
+// part is uploaded. Without the option another tree of the same run is refused.
 //
 // Each copy and part is read from disk and checked against the worker's record
 // of its raw bytes before anything is uploaded. One already stored with the
@@ -56,7 +58,11 @@ import { join } from "node:path";
 import { gunzipSync } from "node:zlib";
 import { get, put } from "@vercel/blob";
 
-import { calibrationTreePartPath, type CalibrationTreePart } from "./calibration-tree-artifact";
+import {
+  calibrationTreePartPath,
+  type CalibrationTreeBuild,
+  type CalibrationTreePart,
+} from "./calibration-tree-artifact";
 import {
   calibrationTreeBlobText,
   getCalibrationTreeBlob,
@@ -518,6 +524,36 @@ async function addManifestEntry(
 
 const DEFAULT_CLIENT: CalibrationTreeBlobClient = { get, put };
 
+// The manifest entry of the tree already stored under this build ID, if any.
+// The index goes last, so a stored index means every part is stored.
+async function storedTreeEntry(
+  request: CalibrationTreePublicationRequest,
+  token: string,
+  client: CalibrationTreeBlobClient,
+): Promise<CalibrationTreeManifestEntry | null> {
+  const stored = await getCalibrationTreeBlob({
+    country: request.country,
+    buildArtifactId: request.buildArtifactId,
+    part: "index",
+    token,
+    consistent: true,
+    client,
+  });
+  if (!stored) return null;
+  const text = await calibrationTreeBlobText(stored.stream);
+  const { build } = JSON.parse(text) as { build: CalibrationTreeBuild };
+  return {
+    ...request.manifestEntry,
+    label: build.label,
+    hfRepo: build.hfRepo ?? request.manifestEntry.hfRepo,
+    hfCommitSha: build.hfCommitSha ?? request.manifestEntry.hfCommitSha,
+    createdAt: build.createdAt,
+    updatedAt: build.createdAt,
+    indexSha256: createHash("sha256").update(text).digest("hex"),
+    indexBytes: Buffer.byteLength(text),
+  };
+}
+
 /** Uploads a build's file copies and tree, then records it in the manifest. */
 export async function publishBuiltCalibrationTree(options: {
   request: CalibrationTreePublicationRequest;
@@ -540,10 +576,17 @@ export async function publishBuiltCalibrationTree(options: {
   let uploadedParts = 0;
   let madeLatest: boolean;
   try {
-    for (const part of ordered) {
-      if (await uploadPart(part, request, token, client)) uploadedParts += 1;
+    const storedEntry = request.replaceStagingRun ? await storedTreeEntry(request, token, client) : null;
+    if (!storedEntry) {
+      for (const part of ordered) {
+        if (await uploadPart(part, request, token, client)) uploadedParts += 1;
+      }
     }
-    madeLatest = await addManifestEntry(request, token, client);
+    madeLatest = await addManifestEntry(
+      storedEntry ? { ...request, manifestEntry: storedEntry } : request,
+      token,
+      client,
+    );
   } catch (error) {
     if (error instanceof CalibrationTreeEntryRefusedError) error.sourceFileConflicts = sourceFileConflicts;
     throw error;

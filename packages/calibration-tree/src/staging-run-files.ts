@@ -62,11 +62,18 @@ export interface StagingRunFileRecord {
   hfBlobId: string;
 }
 
+export const STAGING_RUN_TREE_OUTCOMES = ["ineligible", "unbuildable", "too_large", "refused"] as const;
+
+export type StagingRunTreeOutcome = (typeof STAGING_RUN_TREE_OUTCOMES)[number];
+
 /** The last time the job found a run's tree settled for a state of its folder. */
 export interface StagingRunTreeCheck {
   folderFingerprint: string;
-  /** The tree that state has; null for a run without diagnostics. */
+  /** The tree that state has; null for a run without one. */
   buildArtifactId: string | null;
+  /** Why that state has no new tree, when it was final. */
+  outcome?: StagingRunTreeOutcome;
+  reason?: string | null;
 }
 
 export interface StagingRunRecord {
@@ -79,7 +86,11 @@ export interface StagingRunRecord {
   /** Why the run's documents break the staging contract, if they do. */
   problem: string | null;
   files: Partial<Record<StagingRunFileName, StagingRunFileRecord>>;
+  /** Files the run has that were too large to copy. */
+  omittedFiles?: StagingRunFileName[];
   treeCheck: StagingRunTreeCheck | null;
+  /** When the job found the run's folder gone from Hugging Face. */
+  removedAt?: string;
 }
 
 export interface StagingRunFilesIndex {
@@ -199,7 +210,7 @@ export async function loadCopiedStagingRuns(options: {
   client?: BlobReader;
 }): Promise<CopiedStagingRuns> {
   const { index } = await readStagingRunFilesIndex(options);
-  const records = Object.values(index.runs);
+  const records = Object.values(index.runs).filter((record) => !record.removedAt);
   return {
     available: true,
     source_repo: index.hfRepo,
@@ -229,21 +240,22 @@ export interface CopiedStagingRun {
   calibration_progress: JsonObject | null;
   events: JsonObject[];
   reform_validation: JsonObject | null;
-  /** The staged bundle receipt, with the digest its run manifest declares. */
+  /** The staged bundle receipt, with the digest of the stored file. */
   staged_dataset: { payload: JsonObject; sha256: string } | null;
+  /** Files the run has that were too large to copy. */
+  omitted_files: StagingRunFileName[];
 }
 
-function jsonObject(bytes: Uint8Array, name: string): JsonObject {
-  let parsed: unknown;
+// As the Hugging Face reader's stagingJsonOrNull: a file that isn't a JSON
+// object reads as absent.
+export function stagingJsonObjectOrNull(bytes: Uint8Array | null): JsonObject | null {
+  if (!bytes) return null;
   try {
-    parsed = JSON.parse(new TextDecoder().decode(bytes));
+    const parsed: unknown = JSON.parse(new TextDecoder().decode(bytes));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as JsonObject) : null;
   } catch {
-    throw new Error(`${name} is not valid JSON.`);
+    return null;
   }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error(`${name} must be a JSON object.`);
-  }
-  return parsed as JsonObject;
 }
 
 /** One run's copied documents, parsed as the Hugging Face reader parses them; null without a copy. */
@@ -255,7 +267,7 @@ export async function loadCopiedStagingRun(options: {
 }): Promise<CopiedStagingRun | null> {
   const { index } = await readStagingRunFilesIndex(options);
   const record = Object.hasOwn(index.runs, options.runId) ? index.runs[options.runId] : null;
-  if (!record) return null;
+  if (!record || record.removedAt) return null;
   const read = async (name: StagingRunFileName): Promise<Uint8Array | null> => {
     const file = record.files[name];
     return file ? readStagingRunFile({ record: file, token: options.token, client: options.client }) : null;
@@ -263,10 +275,13 @@ export async function loadCopiedStagingRun(options: {
   const [manifest, progress, events, calibration, reformValidation, stagedDataset] = await Promise.all(
     STAGING_RUN_FILE_NAMES.map(read),
   );
-  const runManifest = manifest && parseStagingManifest(jsonObject(manifest, "run_manifest.json"));
-  const parsedProgress = progress && parseStagingProgress(jsonObject(progress, "progress.json"));
-  const calibrationProgress = calibration &&
-    parseStagingCalibrationProgress(jsonObject(calibration, "calibration_progress.json"));
+  const manifestDocument = stagingJsonObjectOrNull(manifest);
+  const progressDocument = stagingJsonObjectOrNull(progress);
+  const calibrationDocument = stagingJsonObjectOrNull(calibration);
+  const receipt = stagingJsonObjectOrNull(stagedDataset);
+  const runManifest = manifestDocument && parseStagingManifest(manifestDocument);
+  const parsedProgress = progressDocument && parseStagingProgress(progressDocument);
+  const calibrationProgress = calibrationDocument && parseStagingCalibrationProgress(calibrationDocument);
   const parsedEvents = parseStagingEvents(events && new TextDecoder().decode(events));
   validateStagingRunConsistency(record.runId, {
     progress: parsedProgress,
@@ -284,10 +299,11 @@ export async function loadCopiedStagingRun(options: {
     run_manifest: runManifest,
     calibration_progress: calibrationProgress,
     events: parsedEvents,
-    reform_validation: reformValidation && jsonObject(reformValidation, "reform_validation.json"),
-    staged_dataset: stagedDataset && {
-      payload: jsonObject(stagedDataset, "artifacts/staged_dataset.json"),
+    reform_validation: stagingJsonObjectOrNull(reformValidation),
+    staged_dataset: receipt && {
+      payload: receipt,
       sha256: record.files["artifacts/staged_dataset.json"]!.sha256,
     },
+    omitted_files: record.omittedFiles ?? [],
   };
 }

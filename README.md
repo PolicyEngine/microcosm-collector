@@ -2175,8 +2175,10 @@ Python. Without `--kind` it covers both kinds, or only releases for BE.
   folder is compared by a fingerprint of its files' paths and git blob IDs from
   the listing the command already reads, so an unchanged run costs no Hugging
   Face request. Runs are stored ten at a time, and no batch starts after 40
-  minutes, so a later execution carries on from what is stored. The copies hold
-  what the files say. The job works out no status of its own: an unfinished
+  minutes, so a later execution carries on from what is stored. A run whose
+  folder has gone from the listing is marked removed, and the package's readers
+  leave it out until the folder returns. A file over 64 MiB is named in the run's
+  record instead of being copied. The copies hold what the files say. The job works out no status of its own: an unfinished
   run's status comes from telemetry when a page is requested.
 - **Trees of staging runs.** A run with calibration diagnostics has a tree,
   whatever its status, built the newest first. Its label is its candidate
@@ -2184,7 +2186,9 @@ Python. Without `--kind` it covers both kinds, or only releases for BE.
   run manifest's. A stored tree stays while the diagnostics and manifests the
   run has now match the SHA-256 values its index records. When one differs or
   is new, the tree is built again and replaces the stored one in the manifest;
-  the old parts stay stored. A file only the stored tree has does not count.
+  the old parts stay stored. If the files return to a state that already has a
+  stored tree, that tree comes back as it was. A file only the stored tree has
+  does not count.
 - A build whose folder (`releases/<release>/<build>` or `staged/<run>`) a
   `queued` or `processing` `calibration-diagnostics` submission holds is
   `submission_in_progress`: the submission builds it. A submission that
@@ -2306,9 +2310,15 @@ past builds again".
 - A repo without `releases.json` builds nothing: its tags and pointer files
   are not read. BE is to publish with `releases.json` before the
   switch-over.
-- A staging run whose tree ended `unbuildable`, `too_large`, `refused`,
-  `submission_in_progress` or in an `error` has no settled result, so its
-  documents are read again on each execution.
+- A staging run whose tree ended `unbuildable`, `too_large` or `refused` is
+  not tried again until its folder or stored build changes, or
+  `--include-older-runs` is passed. One left at `submission_in_progress`, in an
+  `error` or `deferred` is looked at again on each execution.
+- A copied run's list entry is worked out when its files are copied, so a later
+  change to the package's parsers reaches it when its folder next changes.
+- The original-file copies a tree stores are those present when it was built. A
+  later `reform_validation.json` or `parent_build_manifest.json` does not
+  rebuild the tree; `staging-run-files/` keeps `reform_validation.json` current.
 - `runs.json` decides only whether a folder without a run manifest is a run,
   and gives the list entry of such a run with no `progress.json`. If it can't
   be read, only those folders are an `error`, and every other run continues.
@@ -2327,8 +2337,9 @@ past builds again".
   submission in that position is rejected. A release build's or a
   submission's own retry builds the same index and stores the tree. A staging
   build of this command doesn't: its index records the staging repo's head,
-  so once that moves, the run is `refused` on every later execution, until a
-  submission with another build ID stores a tree for it.
+  so once that moves, the run is `refused`, and stays so until its folder
+  changes, `--include-older-runs` retries it and a later attempt succeeds, or
+  a submission with another build ID stores a tree for it.
 - Builds are ordered by the time they are published with (the progress's
   `updated_at`, else the run manifest's), then by run ID. The publisher
   orders its staging listing by each run's summary `updated_at`, then

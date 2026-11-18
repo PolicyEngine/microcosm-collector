@@ -48,11 +48,15 @@ import {
   readStagingRunFile,
   readStagingRunFilesIndex,
   STAGING_RUN_ID,
+  STAGING_RUN_TREE_OUTCOMES,
+  stagingJsonObjectOrNull,
   stagingRunFilePath,
   stagingRunFilesIndexPath,
   type StagingRunFileName,
   type StagingRunFileRecord,
   type StagingRunFilesIndex,
+  type StagingRunTreeCheck,
+  type StagingRunTreeOutcome,
 } from "./staging-run-files";
 
 export const STAGING_RUN_FILES_EXIT_REQUEST_ERROR = 1;
@@ -78,12 +82,15 @@ export interface StagingRunFilesPublicationRun {
   /** The run's row in a schema-1 runs.json, if it has one. */
   indexRow: unknown;
   files: StagingRunFilesPublicationFile[];
+  omittedFiles: StagingRunFileName[];
 }
 
 export interface StagingRunFilesTreeCheck {
   runId: string;
   folderFingerprint: string;
   buildArtifactId: string | null;
+  outcome: StagingRunTreeOutcome | null;
+  reason: string | null;
 }
 
 export interface StagingRunFilesPublication {
@@ -92,6 +99,8 @@ export interface StagingRunFilesPublication {
   hfCommitSha: string;
   runs: StagingRunFilesPublicationRun[];
   treeChecks: StagingRunFilesTreeCheck[];
+  /** Runs whose folders the job no longer finds on Hugging Face. */
+  removedRunIds: string[];
 }
 
 type JsonRecord = Record<string, unknown>;
@@ -146,7 +155,11 @@ function publicationRun(value: unknown): StagingRunFilesPublicationRun {
   if (new Set(files.map((file) => file.name)).size !== files.length) {
     throw new StagingRunFilesRequestError("A run names a file twice.");
   }
-  return { ...runIdentity(run, "A run"), indexRow: run.indexRow ?? null, files };
+  const omittedFiles = (run.omittedFiles ?? []) as unknown;
+  if (!Array.isArray(omittedFiles) || !omittedFiles.every(isStagingRunFileName)) {
+    throw new StagingRunFilesRequestError("A run's omittedFiles must name copied run files.");
+  }
+  return { ...runIdentity(run, "A run"), indexRow: run.indexRow ?? null, files, omittedFiles };
 }
 
 function publicationTreeCheck(value: unknown): StagingRunFilesTreeCheck {
@@ -155,7 +168,20 @@ function publicationTreeCheck(value: unknown): StagingRunFilesTreeCheck {
   if (buildArtifactId !== null && (typeof buildArtifactId !== "string" || !isSha256(buildArtifactId))) {
     throw new StagingRunFilesRequestError("A tree check's buildArtifactId is not a build ID.");
   }
-  return { ...runIdentity(check, "A tree check"), buildArtifactId };
+  const outcome = check.outcome ?? null;
+  if (outcome !== null && !(STAGING_RUN_TREE_OUTCOMES as readonly unknown[]).includes(outcome)) {
+    throw new StagingRunFilesRequestError(`${String(outcome)} is not a final tree outcome.`);
+  }
+  const reason = check.reason ?? null;
+  if (reason !== null && typeof reason !== "string") {
+    throw new StagingRunFilesRequestError("A tree check's reason must be a string.");
+  }
+  return {
+    ...runIdentity(check, "A tree check"),
+    buildArtifactId,
+    outcome: outcome as StagingRunTreeOutcome | null,
+    reason,
+  };
 }
 
 /** Checks a publication request read from JSON. */
@@ -173,6 +199,12 @@ export function parseStagingRunFilesPublication(value: unknown): StagingRunFiles
     hfCommitSha,
     runs: requestList(request, "runs").map(publicationRun),
     treeChecks: requestList(request, "treeChecks").map(publicationTreeCheck),
+    removedRunIds: (request.removedRunIds === undefined ? [] : requestList(request, "removedRunIds")).map((runId) => {
+      if (typeof runId !== "string" || !STAGING_RUN_ID.test(runId)) {
+        throw new StagingRunFilesRequestError("removedRunIds must hold run IDs.");
+      }
+      return runId;
+    }),
   };
 }
 
@@ -184,8 +216,10 @@ function parsedDocument(bytes: Uint8Array, name: string): unknown {
   }
 }
 
-// The run's list entry, by the Hugging Face reader's rules: a structured run's
-// manifest, else its progress, else its runs.json row.
+// The run's list entry: a structured run's manifest, else its progress, else
+// its runs.json row, else a schema-1 manifest. The Hugging Face reader prefers a
+// schema-1 run's row, which repeats its progress. As there, a structured run's
+// progress is not read, and a progress file that isn't a JSON object is absent.
 function describedRun(
   runId: string,
   files: ReadonlyMap<StagingRunFileName, Uint8Array>,
@@ -193,18 +227,23 @@ function describedRun(
 ): { summary: StagingRunSummary; problem: string | null } {
   try {
     const manifestBytes = files.get("run_manifest.json");
-    const progressBytes = files.get("progress.json");
     const manifest = manifestBytes
       ? parseStagingManifest(parsedDocument(manifestBytes, "run_manifest.json"))
       : null;
-    const progress = progressBytes ? parseStagingProgress(parsedDocument(progressBytes, "progress.json")) : null;
-    if (manifest && manifest.run_id !== runId) {
-      throw new Error(`run_manifest.json names run ${String(manifest.run_id)}, not ${runId}.`);
+    if (manifest) {
+      if (manifest.run_id !== runId) {
+        throw new Error(`run_manifest.json names run ${String(manifest.run_id)}, not ${runId}.`);
+      }
+      validateStagingRunConsistency(runId, { runManifest: manifest });
+      if (isStructuredStagingDocument(manifest)) {
+        return { summary: summaryFromManifest(runId, manifest), problem: null };
+      }
     }
-    validateStagingRunConsistency(runId, { progress, runManifest: manifest });
+    const progressDocument = stagingJsonObjectOrNull(files.get("progress.json") ?? null);
+    const progress = progressDocument && parseStagingProgress(progressDocument);
+    validateStagingRunConsistency(runId, { progress });
     let summary: StagingRunSummary;
-    if (manifest && isStructuredStagingDocument(manifest)) summary = summaryFromManifest(runId, manifest);
-    else if (progress) summary = summaryFromProgress(runId, progress);
+    if (progress) summary = summaryFromProgress(runId, progress);
     else if (indexRow) summary = parseStagingRunIndex({ schema_version: 1, runs: [indexRow] })[0];
     else if (manifest) summary = summaryFromManifest(runId, manifest);
     else summary = summaryFromProgress(runId, null);
@@ -289,16 +328,22 @@ export async function publishStagingRunFiles(options: {
       folderFingerprint: run.folderFingerprint,
       ...describedRun(run.runId, contents, run.indexRow),
       files,
+      ...(run.omittedFiles.length ? { omittedFiles: run.omittedFiles } : {}),
       treeCheck: previous?.treeCheck ?? null,
     };
     result.runs[run.runId] = { uploaded, kept };
   }
   for (const check of request.treeChecks) {
     if (!Object.hasOwn(index.runs, check.runId)) continue;
-    index.runs[check.runId] = {
-      ...index.runs[check.runId],
-      treeCheck: { folderFingerprint: check.folderFingerprint, buildArtifactId: check.buildArtifactId },
+    const treeCheck: StagingRunTreeCheck = {
+      folderFingerprint: check.folderFingerprint,
+      buildArtifactId: check.buildArtifactId,
+      ...(check.outcome ? { outcome: check.outcome, reason: check.reason } : {}),
     };
+    index.runs[check.runId] = { ...index.runs[check.runId], treeCheck };
+  }
+  for (const runId of request.removedRunIds) {
+    if (Object.hasOwn(index.runs, runId)) index.runs[runId] = { ...index.runs[runId], removedAt: copiedAt };
   }
   await client.put(stagingRunFilesIndexPath(country), JSON.stringify(index), {
     access: "private",
