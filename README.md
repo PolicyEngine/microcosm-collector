@@ -2299,28 +2299,14 @@ past builds again".
 - A repo without `releases.json` builds nothing: its tags and pointer files
   are not read. BE is to publish with `releases.json` before the
   switch-over.
-- A staging run reads the manifests of every run the store lacks, including
-  runs that will never be final.
-- The publisher reads `runs.json` only when a listed run's manifest is
-  schema 1. This command never reads a stored run's manifest, so it reads
-  `runs.json` whenever a run the store lacks has a schema-1 manifest or
-  none. In a staging repo with a schema-1 `runs.json` and no schema-1 run
-  manifest, a folder without a manifest is therefore a run here and not for
-  the publisher.
-- If `runs.json` can't be read, only the runs that depend on it are an
-  `error`: each run the store lacks with a schema-1 manifest or none, whose
-  status, or for a folder without a run manifest whether it is a run, may
-  come from `runs.json`. The structured runs are still built. Where the
-  publisher reads `runs.json`, an error answer other than 404 stops its
-  whole staging listing, and a request that gets no answer counts as no
-  `runs.json`. A `runs.json` that isn't JSON, or isn't a JSON object, is no
-  `runs.json` for both.
-- A schema-1 `runs.json` that the publisher's `parseStagingRunIndex`
-  refuses, one with a `schema_name` or whose `runs` isn't a list, is taken
-  here as no `runs.json`, and a malformed row of one is skipped. The
-  publisher's staging listing stops at either.
-- The command reads the `progress.json` of every schema-1 run that
-  `runs.json` doesn't list. The publisher reads at most 50 of them.
+- A staging run whose tree ended `unbuildable`, `too_large`, `refused`,
+  `submission_in_progress` or in an `error` has no settled result, so its
+  documents are read again on each execution.
+- `runs.json` decides only whether a folder without a run manifest is a run,
+  and gives the list entry of such a run with no `progress.json`. If it can't
+  be read, only those folders are an `error`, and every other run continues.
+- A schema-1 `runs.json` with a `schema_name`, or whose `runs` isn't a list, is
+  taken as no `runs.json`, and a malformed row of one is skipped.
 - A build skipped as `submission_in_progress` is not built later if that
   submission then fails or is rejected: the outcome is final, so it waits
   for the next request for its country and kind, or for the submission to
