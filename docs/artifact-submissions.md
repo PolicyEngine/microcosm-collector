@@ -162,7 +162,8 @@ recorded something it ignored.
 | `releases-record` | `releases_record` | exactly 1 | 4 MiB | `releases-record` handler (the README's "Moving the latest when releases.json changes") |
 
 The calibration roles are the files the calibration-tree publisher reads for a
-build today. The Orrery roles are the inputs the projection needs
+build today, and `parent_build_manifest` and `reform_validation`, which are only
+stored as copies. The Orrery roles are the inputs the projection needs
 (`orrery_json_from_schema(schema, execution=overlay)`), plus the native evidence
 files that stay in private intake storage. Intake checks each file's role,
 count and size, not its name; the Orrery graph handler rejects a submission

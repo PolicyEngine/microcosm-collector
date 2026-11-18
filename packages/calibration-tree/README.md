@@ -57,7 +57,8 @@ calibration-tree-sources/<country>/<build ID>/<file name>.gz
 
 The files are the diagnostics, `build_manifest.json`, `release_manifest.json`,
 `demographics.json`, `parent_build_manifest.json` and `reform_validation.json`.
-A build that lacks one has no copy of it.
+A build that lacks one has no copy of it, and neither does a build whose file
+over 64 MiB was read from Hugging Face.
 `src/calibration-tree-source-files.ts` reads them:
 
 ```ts
