@@ -15,6 +15,10 @@ one Postgres transaction lock, so collector writers add to the manifest one
 at a time. ``build_and_publish`` is that build and publication, shared with
 the backfill (``telemetry_collector.calibration_tree_backfill``), which asks
 for the latest from production's manifest rather than from ``releases.json``.
+The worker also writes a gzip copy of each of the build's original files, the
+two the tree is not built from (``parent_build_manifest`` and
+``reform_validation``) included, and the publication uploads the copies before
+the tree's parts and manifest entry.
 
 The tree's files and provenance come from the submission. The publication
 time recorded in the tree is the submission's ``accepted_at``, so
@@ -171,6 +175,11 @@ _ARTIFACTS = {
     "release_manifest": "releaseManifest",
     "demographics": "demographics",
 }
+# Original files the worker only copies; a request names them when present.
+_COPIED_ARTIFACTS = {
+    "parent_build_manifest": "parentBuildManifest",
+    "reform_validation": "reformValidation",
+}
 
 
 @dataclass(frozen=True)
@@ -290,12 +299,15 @@ def plan_tree_build(
 def worker_request(plan: TreeBuildPlan, files: Mapping[str, Path]) -> dict[str, Any]:
     """The Bun worker's request: ``files`` maps each role to its local copy.
 
-    Each file is named by its path in the dataset, from ``plan.paths``.
+    Each file is named by its path in the dataset, from ``plan.paths``. The
+    four files a tree is built from are always named, as null when absent; the
+    files the worker only copies are named when present.
     """
 
+    artifact_names = {**_ARTIFACTS, **_COPIED_ARTIFACTS}
     artifacts: dict[str, Any] = dict.fromkeys(_ARTIFACTS.values())
     for role, local_path in files.items():
-        artifacts[_ARTIFACTS[role]] = {
+        artifacts[artifact_names[role]] = {
             "path": plan.paths[role],
             "file": str(local_path),
         }
@@ -618,6 +630,8 @@ class PublishedTree:
     kind: str
     uploaded_parts: int
     kept_parts: int
+    uploaded_source_files: int
+    kept_source_files: int
     made_latest: bool
     latest_decision: LatestDecision
 
@@ -723,6 +737,8 @@ def build_and_publish(
         kind=answer["kind"],
         uploaded_parts=answer["uploadedParts"],
         kept_parts=answer["keptParts"],
+        uploaded_source_files=answer["uploadedSourceFiles"],
+        kept_source_files=answer["keptSourceFiles"],
         made_latest=answer["madeLatest"],
         latest_decision=latest,
     )
@@ -837,6 +853,8 @@ def calibration_tree_handler(
             "kind": published.kind,
             "uploaded_parts": published.uploaded_parts,
             "kept_parts": published.kept_parts,
+            "uploaded_source_files": published.uploaded_source_files,
+            "kept_source_files": published.kept_source_files,
             "made_latest": published.made_latest,
         }
         latest = published.latest_decision

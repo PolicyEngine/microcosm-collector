@@ -153,6 +153,8 @@ recorded something it ignored.
 | | `build_manifest` | 0 or 1 | 64 MiB | |
 | | `release_manifest` | 0 or 1 | 64 MiB | |
 | | `demographics` | 0 or 1 | 64 MiB | |
+| | `parent_build_manifest` | 0 or 1 | 64 MiB | stored as a copy; no tree is built from it |
+| | `reform_validation` | 0 or 1 | 64 MiB | stored as a copy; no tree is built from it |
 | `orrery-inputs` | `schema` | exactly 1 | 64 MiB | Orrery graph handler (see "Orrery graph files") |
 | | `execution_overlay` | exactly 1 | 32 MiB | |
 | | `upstream` | 0 or more | 64 MiB | |
@@ -198,7 +200,9 @@ file has a role in the bundle hand-over, named in emitter#27's
 A bundle gives a `calibration-diagnostics` submission when it has a
 `calibration_diagnostics` file, and an `orrery-inputs` submission when it has
 both an `orrery_schema` and an `execution_overlay` file. Its other files, such
-as the dataset and its sidecars, are not submitted.
+as the dataset and its sidecars, are not submitted. The contract accepts
+`parent_build_manifest` and `reform_validation` files, which the emitter does
+not send yet.
 
 ### The emitter's earlier Orrery publication roles
 

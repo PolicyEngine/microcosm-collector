@@ -20,7 +20,9 @@
 //       "calibrationDiagnostics": {"path": "<path in the dataset>", "file": "<local file>"},
 //       "buildManifest": {...} or null,
 //       "releaseManifest": {...} or null,
-//       "demographics": {...} or null
+//       "demographics": {...} or null,
+//       "parentBuildManifest": {...}, only when the build has one,
+//       "reformValidation": {...}, only when the build has one
 //     }
 //   }
 //
@@ -33,6 +35,11 @@
 //     "label": "<the candidate release, or the run id when it names none>",
 //     "hfRepo": ..., "hfCommitSha": ..., "createdAt": ..., "artifacts": {...}
 //   }
+//
+// Beside the tree, the worker writes a gzip copy of every file the request
+// names, at the path the publication command uploads it to. The tree is built
+// from the first four only: the last two are copied unread and do not change
+// the build ID.
 //
 // A release bundle is built exactly as the publisher's `publishRelease` builds
 // it from the same files, commit and publication time, so both write the same
@@ -61,10 +68,17 @@
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createHash } from "node:crypto";
+import { gzipSync } from "node:zlib";
 
 import { CALIBRATION_TREE_SCHEMA_VERSION, type CalibrationTreeSourceArtifact } from "./calibration-tree-artifact";
 import { buildCalibrationTreeBundle, type CalibrationTreeBundle } from "./calibration-tree-bundle";
 import type { CalibrationTreeManifestEntry } from "./calibration-tree-manifest";
+import {
+  CALIBRATION_TREE_SOURCE_FILE_NAMES,
+  CALIBRATION_TREE_SOURCE_FILES,
+  calibrationTreeSourceFilePath,
+  type CalibrationTreeSourceFile,
+} from "./calibration-tree-source-files";
 import { isCountry, type MicrocosmCountry } from "./countries";
 import { assertSafeReleaseId, buildCalibration, InvalidReleaseIdError } from "./latest-artifact";
 import { CalibrationTreeArtifactSizeError, enforceConfiguredSizeLimits } from "./publish-calibration-tree";
@@ -80,6 +94,11 @@ export const CALIBRATION_TREE_WORKER_EXIT_WORKER_ERROR = 3;
 
 const ARTIFACT_NAMES = ["calibrationDiagnostics", "buildManifest", "releaseManifest", "demographics"] as const;
 type ArtifactName = (typeof ARTIFACT_NAMES)[number];
+// Copied beside the tree, never read to build it; a request may leave them out.
+const COPIED_ARTIFACT_NAMES = ["parentBuildManifest", "reformValidation"] as const;
+type CopiedArtifactName = (typeof COPIED_ARTIFACT_NAMES)[number];
+// Level 9 made sampled diagnostics files only about 3% smaller.
+const SOURCE_FILE_GZIP_LEVEL = 6;
 const REQUEST_FIELDS = [
   "kind",
   "country",
@@ -120,6 +139,8 @@ export interface CalibrationTreeWorkerArtifacts {
   buildManifest: CalibrationTreeWorkerArtifact | null;
   releaseManifest: CalibrationTreeWorkerArtifact | null;
   demographics: CalibrationTreeWorkerArtifact | null;
+  parentBuildManifest?: CalibrationTreeWorkerArtifact | null;
+  reformValidation?: CalibrationTreeWorkerArtifact | null;
 }
 
 export interface CalibrationTreeWorkerReleaseRequest {
@@ -158,6 +179,21 @@ export interface CalibrationTreeWorkerPart {
   gzipBytes: number;
 }
 
+/** The gzip copy of one of the build's original files. */
+export interface CalibrationTreeWorkerSourceFile {
+  file: CalibrationTreeSourceFile;
+  /** The name it is stored under. */
+  name: string;
+  /** The file's path in the Hugging Face dataset. */
+  sourcePath: string;
+  /** Where the copy is written, and uploaded to. */
+  path: string;
+  /** The SHA-256 of the original bytes. */
+  sha256: string;
+  rawBytes: number;
+  gzipBytes: number;
+}
+
 export interface CalibrationTreeWorkerResult {
   country: MicrocosmCountry;
   /** The release id for a release; the label for a staged run. */
@@ -168,6 +204,7 @@ export interface CalibrationTreeWorkerResult {
   buildArtifactId: string;
   index: Omit<CalibrationTreeWorkerPart, "part">;
   files: CalibrationTreeWorkerPart[];
+  sourceFiles: CalibrationTreeWorkerSourceFile[];
   /** The entry the publisher would add to the manifest for this build. */
   manifestEntry: CalibrationTreeManifestEntry;
 }
@@ -260,7 +297,10 @@ function releaseFolder(value: JsonObject, field: string): string {
   return text;
 }
 
-function workerArtifact(value: unknown, name: ArtifactName): CalibrationTreeWorkerArtifact | null {
+function workerArtifact(
+  value: unknown,
+  name: ArtifactName | CopiedArtifactName,
+): CalibrationTreeWorkerArtifact | null {
   if (value === null && name !== "calibrationDiagnostics") return null;
   const artifact = requestObject(value, `artifacts.${name}`);
   onlyFields(artifact, ["path", "file"], `artifacts.${name}`);
@@ -301,7 +341,7 @@ export function parseCalibrationTreeWorkerRequest(value: unknown): CalibrationTr
   }
   const createdAt = publicationTime(request.createdAt);
   const artifactFields = requestObject(request.artifacts, "artifacts");
-  onlyFields(artifactFields, ARTIFACT_NAMES, "artifacts");
+  onlyFields(artifactFields, [...ARTIFACT_NAMES, ...COPIED_ARTIFACT_NAMES], "artifacts");
   for (const name of ARTIFACT_NAMES) {
     if (!(name in artifactFields)) {
       throw new CalibrationTreeWorkerRequestError(`artifacts.${name} is required (null when absent).`);
@@ -312,6 +352,8 @@ export function parseCalibrationTreeWorkerRequest(value: unknown): CalibrationTr
     buildManifest: workerArtifact(artifactFields.buildManifest, "buildManifest"),
     releaseManifest: workerArtifact(artifactFields.releaseManifest, "releaseManifest"),
     demographics: workerArtifact(artifactFields.demographics, "demographics"),
+    parentBuildManifest: workerArtifact(artifactFields.parentBuildManifest ?? null, "parentBuildManifest"),
+    reformValidation: workerArtifact(artifactFields.reformValidation ?? null, "reformValidation"),
   };
   if (request.kind === "staging") {
     return {
@@ -342,20 +384,22 @@ interface ReadArtifact {
   source: CalibrationTreeSourceArtifact;
 }
 
-// The publisher hashes and parses Response.text(): UTF-8, with a leading
-// byte-order mark dropped and invalid bytes replaced. TextDecoder's defaults
-// decode the same way, so a file gives the publisher's digest and document.
-function readArtifact(artifact: CalibrationTreeWorkerArtifact | null): ReadArtifact | null {
-  if (artifact == null) return null;
-  let bytes: Uint8Array;
+function readArtifactBytes(artifact: CalibrationTreeWorkerArtifact): Uint8Array {
   try {
-    bytes = readFileSync(artifact.file);
+    return readFileSync(artifact.file);
   } catch (error) {
     throw new CalibrationTreeWorkerRequestError(
       `${artifact.path} could not be read from ${artifact.file}: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
-  const text = new TextDecoder("utf-8").decode(bytes);
+}
+
+// The publisher hashes and parses Response.text(): UTF-8, with a leading
+// byte-order mark dropped and invalid bytes replaced. TextDecoder's defaults
+// decode the same way, so a file gives the publisher's digest and document.
+function readArtifact(artifact: CalibrationTreeWorkerArtifact | null): ReadArtifact | null {
+  if (artifact == null) return null;
+  const text = new TextDecoder("utf-8").decode(readArtifactBytes(artifact));
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
@@ -562,7 +606,38 @@ function emptyOutputDirectory(outputDirectory: string): void {
   }
 }
 
-/** Builds the requested tree and writes its parts; returns what was written. */
+interface CompressedSourceFile {
+  record: CalibrationTreeWorkerSourceFile;
+  compressed: Uint8Array;
+}
+
+// Every file the request names, as it is on disk: the copies are of the bytes,
+// which a tree's digests, taken over decoded text, may not match exactly.
+function compressSourceFiles(
+  request: CalibrationTreeWorkerRequest,
+  buildArtifactId: string,
+): CompressedSourceFile[] {
+  return CALIBRATION_TREE_SOURCE_FILES.flatMap((file) => {
+    const artifact = request.artifacts[file];
+    if (!artifact) return [];
+    const bytes = readArtifactBytes(artifact);
+    const compressed = gzipSync(bytes, { level: SOURCE_FILE_GZIP_LEVEL });
+    return [{
+      record: {
+        file,
+        name: CALIBRATION_TREE_SOURCE_FILE_NAMES[file],
+        sourcePath: artifact.path,
+        path: calibrationTreeSourceFilePath(request.country, buildArtifactId, file),
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+        rawBytes: bytes.byteLength,
+        gzipBytes: compressed.byteLength,
+      },
+      compressed,
+    }];
+  });
+}
+
+/** Builds the requested tree and writes its parts and the build's file copies. */
 export function runCalibrationTreeWorker(
   request: CalibrationTreeWorkerRequest,
   outputDirectory: string,
@@ -570,10 +645,16 @@ export function runCalibrationTreeWorker(
   checkConfiguredSizeLimits();
   emptyOutputDirectory(outputDirectory);
   const bundle = buildCalibrationTreeWorkerBundle(request);
-  for (const file of bundle.files) {
-    const destination = join(outputDirectory, file.path);
+  // Read before anything is written, so an unreadable file writes nothing.
+  const sourceFiles = compressSourceFiles(request, bundle.index.buildArtifactId);
+  const outputs = [
+    ...bundle.files.map((file) => ({ path: file.path, compressed: file.compressed })),
+    ...sourceFiles.map(({ record, compressed }) => ({ path: record.path, compressed })),
+  ];
+  for (const output of outputs) {
+    const destination = join(outputDirectory, output.path);
     mkdirSync(dirname(destination), { recursive: true });
-    writeFileSync(destination, file.compressed, { flag: "wx" });
+    writeFileSync(destination, output.compressed, { flag: "wx" });
   }
   const files = bundle.files.map((file) => ({
     part: file.part,
@@ -592,6 +673,7 @@ export function runCalibrationTreeWorker(
     buildArtifactId: bundle.index.buildArtifactId,
     index,
     files,
+    sourceFiles: sourceFiles.map(({ record }) => record),
     manifestEntry: manifestEntry(request, bundle, index),
   };
 }

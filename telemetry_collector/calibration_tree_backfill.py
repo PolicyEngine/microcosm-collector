@@ -26,8 +26,10 @@ continues.
 releaseId>/`` at its commit: ``calibration_diagnostics.json``, and
 ``build_manifest.json``, ``release_manifest.json`` and ``demographics.json``
 when the folder lists them (null otherwise, as the GitHub Actions
-publisher's optional reads are). A staging build follows only the rules of
-the tree package's staging readers that locate its files:
+publisher's optional reads are). ``parent_build_manifest.json`` and
+``reform_validation.json`` are read too when a release or run folder lists
+them; the tree worker only stores copies of those two. A staging build follows
+only the rules of the tree package's staging readers that locate its files:
 
 - in the staging repo, its ``runs/<id>/run_manifest.json`` and
   ``progress.json`` (read to plan, not built from) say where its
@@ -175,11 +177,17 @@ _RELEASE_FILES: Final = (
     ("build_manifest", "build_manifest.json"),
     ("release_manifest", "release_manifest.json"),
     ("demographics", "demographics.json"),
+    # Only copied: no tree is built from these two.
+    ("parent_build_manifest", "parent_build_manifest.json"),
+    ("reform_validation", "reform_validation.json"),
 )
 # A staging run's other files, in its run folder.
 _STAGING_RUN_FILES: Final = (
     ("build_manifest", "build_manifest.json"),
     ("release_manifest", "release_manifest.json"),
+    # Only copied: no tree is built from these two.
+    ("parent_build_manifest", "parent_build_manifest.json"),
+    ("reform_validation", "reform_validation.json"),
 )
 _STAGED_BUNDLE_DIAGNOSTICS: Final = "calibration_diagnostics.json"
 _STAGED_BUNDLE_STEM_DIAGNOSTICS_SUFFIX: Final = ".diagnostics.json"

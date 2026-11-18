@@ -1629,6 +1629,18 @@ for the same release build or staged run, or the same build was already
 recorded from another submission of the same files, whose index records
 another time or label.
 
+The worker also writes a gzip copy of each original file its request names:
+the diagnostics, `build_manifest.json`, `release_manifest.json`,
+`demographics.json`, `parent_build_manifest.json` and
+`reform_validation.json`. The tree is built from the first four only; the last
+two are copied unread and do not change its build ID. The publication command
+uploads the copies first, to private blobs at
+`calibration-tree-sources/<country>/<build ID>/<file name>.gz`, then the parts
+with the index last, then the manifest entry, so a build the manifest lists
+has its copies and a failed run can run again. A copy already stored with the
+same bytes is kept, and one stored with other bytes refuses the build (exit
+2). `src/calibration-tree-source-files.ts` reads the copies.
+
 ### Building trees from submissions
 
 The worker job builds a calibration tree from each `calibration-diagnostics`
@@ -1642,7 +1654,9 @@ read. Without the token, submissions stay in intake storage and can be
 reprocessed later. With it, the worker job also needs
 `COLLECTOR_HF_READ_TOKEN`, which the deploy mounts beside it, and stops with
 a message naming that variable without it. A tree's files and provenance come
-from the submission; only the latest build is decided from Hugging Face.
+from the submission; only the latest build is decided from Hugging Face. The
+submission's `parent_build_manifest` and `reform_validation` files, when it has
+them, are stored with the build's other original files.
 
 - **Which tree.** A build folder, `releases/<release>/<build>`, gives a release
   tree whose release ID is `<release>/<build>`; its `release` and `build_id`
@@ -1835,6 +1849,8 @@ release|staging` limit what it backfills.
   `calibration_diagnostics.json`, and `build_manifest.json`,
   `release_manifest.json` and `demographics.json` when the folder lists them
   (null otherwise, as the GitHub Actions publisher's optional reads are).
+  `parent_build_manifest.json` and `reform_validation.json` are read when a
+  release or run folder lists them, and only stored as copies.
 - A staging build, by the rules of the tree package's staging readers that
   locate its files, and only those:
   - in the staging repo, `runs/<id>/run_manifest.json` and `progress.json`,
