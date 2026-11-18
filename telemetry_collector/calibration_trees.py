@@ -31,6 +31,21 @@ without moving the latest, and the result says why (``latest_skipped``).
 Staging trees never become the latest. The publication command still moves
 the latest only to a build at least as new as the current latest.
 
+A submission whose tree another writer stored first (the reconcile command,
+the backfill or another submission) succeeds without a tree of its own
+(``TreeAlreadyStoredError``). The publication refuses it, and the store's
+manifest then shows a tree for the same build: for a release build, one with
+the same build ID, a hash of the schema version, country, kind, source ID and
+each source file's SHA-256, whose index records another time or label; for a
+staged run, one with any build ID, since the manifest keeps one tree per staged
+run and the reconcile command may have built it from other files: a staged
+bundle from its diagnostics alone, and any other run from its ``runs/<id>/``
+folder. The stored tree is then kept, and the submission's own tree is not
+stored. Its result says ``already_stored`` and names both build IDs, and it
+moves no latest: the reconcile command ends each release run, after its
+builds, by making the latest follow ``releases.json``. Any other refused tree
+still rejects the submission.
+
 When a published build is made current later, with
 ``microcosm-publish-release-build --promote``, no tree is built. Microcosm
 then submits the repo's new ``releases.json`` as a ``releases-record``
@@ -65,7 +80,7 @@ from dataclasses import dataclass, field
 from datetime import UTC
 from functools import partial
 from pathlib import Path
-from typing import Any, Final, Literal
+from typing import Any, Literal
 
 import sqlalchemy as sa
 
@@ -74,6 +89,12 @@ from telemetry_collector.huggingface_read import (
     HuggingFaceReadError,
     HuggingFaceReadSettings,
     is_missing_path,
+)
+from telemetry_collector.releases_record import (
+    RELEASES_RECORD_PATH,
+    SAFE_IDENTIFIER,
+    ReleasesRecordRefusedError,
+    parse_releases_record,
 )
 from telemetry_collector.submission_store import SubmissionRecord
 from telemetry_collector.submissions import INTAKE_ONLY_HANDLER
@@ -138,9 +159,9 @@ EXIT_NOT_RECORDED = 2
 #: The ``processed_by`` of the ``releases-record`` handler.
 LATEST_HANDLER = "calibration-tree-latest"
 
-_SEGMENT = r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
-#: A release, build or run name: one path segment that cannot leave its folder.
-SAFE_IDENTIFIER: Final = re.compile(_SEGMENT)
+# A release, build or run name (releases_record.SAFE_IDENTIFIER): one path
+# segment that cannot leave its folder.
+_SEGMENT = SAFE_IDENTIFIER.pattern
 _RELEASE_FOLDER = re.compile(rf"releases/(?P<release>{_SEGMENT})/(?P<build>{_SEGMENT})")
 _STAGED_FOLDER = re.compile(rf"staged/(?P<run>{_SEGMENT})")
 # The submission's roles, as the worker's request names them.
@@ -296,32 +317,8 @@ def worker_request(plan: TreeBuildPlan, files: Mapping[str, Path]) -> dict[str, 
 
 
 # releases.json ----------------------------------------------------------------
-
-#: The record of a release repo's builds, read by the latest rule.
-RELEASES_RECORD_PATH: Final = "releases.json"
-#: The largest releases.json the record's writer accepts.
-MAX_RELEASES_RECORD_BYTES: Final = 4 * 1024 * 1024
-_ROLE_IDENTIFIER: Final = re.compile(r"[a-z][a-z0-9_]{0,63}")
-_RECORD_KEYS: Final = frozenset({"default", "releases", "schema_version"})
-_RELEASE_KEYS: Final = frozenset({"builds", "current", "role"})
-_BUILD_KEYS: Final = frozenset({"published_at", "withdrawn"})
-
-
-class ReleasesRecordRefusedError(ValueError):
-    """A releases.json that breaks the record's rules."""
-
-
-def _refuse_record(message: str) -> ReleasesRecordRefusedError:
-    return ReleasesRecordRefusedError(f"{RELEASES_RECORD_PATH}: {message}")
-
-
-def _is_safe_identifier(value: object) -> bool:
-    return isinstance(value, str) and SAFE_IDENTIFIER.fullmatch(value) is not None
-
-
-def _reject_constant(constant: str) -> None:
-    # JSON.parse refuses NaN and Infinity, which Python's json reads.
-    raise ValueError(f"{constant} is not JSON.")
+# The record's one parser is telemetry_collector.releases_record, which the
+# reconcile command's release listing uses too.
 
 
 @dataclass(frozen=True)
@@ -354,72 +351,15 @@ def releases_record_currents(content: bytes) -> ReleasesRecordCurrents:
     document, without exactly its keys or ``schema_version`` 1, with a release
     or build name that is not a safe identifier, a role that is not one, a
     malformed build, a ``current`` that is not a listed build or is withdrawn,
-    or a ``default`` that is not a listed release.
+    or a ``default`` that is not a listed release
+    (``releases_record.parse_releases_record``).
     """
 
-    if len(content) > MAX_RELEASES_RECORD_BYTES:
-        raise _refuse_record(f"larger than {MAX_RELEASES_RECORD_BYTES} bytes.")
-    try:
-        # As TextDecoder reads it: invalid UTF-8 refused, a leading BOM dropped.
-        document = json.loads(
-            content.decode("utf-8-sig"), parse_constant=_reject_constant
-        )
-    except (ValueError, RecursionError):
-        # RecursionError: nested more deeply than the decoder goes.
-        raise _refuse_record("not a readable JSON document.") from None
-    if not isinstance(document, dict) or set(document) != _RECORD_KEYS:
-        raise _refuse_record("must have exactly default, releases, schema_version.")
-    schema_version = document["schema_version"]
-    if isinstance(schema_version, bool) or schema_version != 1:
-        raise _refuse_record("schema_version must be 1.")
-    releases = document["releases"]
-    if not isinstance(releases, dict):
-        raise _refuse_record("releases must be an object.")
-    for release, entry in releases.items():
-        if not _is_safe_identifier(release):
-            raise _refuse_record("a release name is not a safe identifier.")
-        if not isinstance(entry, dict) or set(entry) != _RELEASE_KEYS:
-            raise _refuse_record(f"release {release} must have builds, current, role.")
-        role = entry["role"]
-        if not isinstance(role, str) or _ROLE_IDENTIFIER.fullmatch(role) is None:
-            raise _refuse_record(f"release {release} has an invalid role.")
-        if entry["current"] is not None and not isinstance(entry["current"], str):
-            raise _refuse_record(f"release {release} current must be a build or null.")
-        builds = entry["builds"]
-        if not isinstance(builds, dict):
-            raise _refuse_record(f"release {release} builds must be an object.")
-        for build, build_entry in builds.items():
-            if not _is_safe_identifier(build):
-                raise _refuse_record("a build name is not a safe identifier.")
-            if (
-                not isinstance(build_entry, dict)
-                or set(build_entry) != _BUILD_KEYS
-                or not isinstance(build_entry["published_at"], str)
-                or not build_entry["published_at"]
-                or not isinstance(build_entry["withdrawn"], bool)
-            ):
-                raise _refuse_record(f"build {build} of {release} is malformed.")
-    default = document["default"]
-    if default is not None and not isinstance(default, str):
-        raise _refuse_record("default must be a release name or null.")
-    if default is not None and default not in releases:
-        raise _refuse_record(f"default {default} is not listed.")
-    for release, entry in releases.items():
-        current = entry["current"]
-        if current is None:
-            continue
-        if current not in entry["builds"]:
-            raise _refuse_record(f"current build {current} of {release} is not listed.")
-        if entry["builds"][current]["withdrawn"]:
-            raise _refuse_record(f"current build {current} of {release} is withdrawn.")
-    current_builds = {release: entry["current"] for release, entry in releases.items()}
-    default_build = (
-        None
-        if default is None or current_builds[default] is None
-        else f"{default}/{current_builds[default]}"
-    )
+    record = parse_releases_record(content)
+    current = record.current_default_build
     return ReleasesRecordCurrents(
-        default_build=default_build, current_builds=current_builds
+        default_build=None if current is None else current.build_id,
+        current_builds=dict(record.current_builds),
     )
 
 
@@ -540,6 +480,73 @@ class TreeRefusedError(Exception):
     """The publication command refused the build (exit 2); another run cannot help."""
 
 
+class TreeAlreadyStoredError(TreeRefusedError):
+    """The publication refused a build whose tree the store already holds.
+
+    Another writer (the reconcile command, the backfill or another submission)
+    published a tree for the same build first, and the publication refused
+    this one: its index records another time or label, or, for a staged run,
+    the other tree was built from other files. A tree's build ID is a hash of
+    the tree schema version, country, kind, source ID and each source file's
+    SHA-256. ``build_artifact_id`` is the stored tree's, and
+    ``submitted_build_artifact_id`` the one this build's files give.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        build_artifact_id: str,
+        submitted_build_artifact_id: str,
+    ) -> None:
+        super().__init__(message)
+        self.build_artifact_id = build_artifact_id
+        self.submitted_build_artifact_id = submitted_build_artifact_id
+
+
+def stored_tree_of(
+    manifest: Mapping[str, Any], plan: TreeBuildPlan, build_artifact_id: str
+) -> str | None:
+    """The build ID of the tree ``manifest`` holds for ``plan``'s build, if any.
+
+    A release build counts as stored only with ``build_artifact_id``, the
+    build ID its files give: an entry of ``plan``'s country, of kind
+    ``release``, for its release build (``releaseId``), with that build ID.
+    A staged run counts as stored with any build ID: an entry of kind
+    ``staging`` for its run (``stagingRunId``). The manifest keeps one tree per
+    staged run, so a second could never be stored, and the reconcile command
+    may have built the run from other files than its submission's: a staged
+    bundle from its diagnostics alone, and any other run from its
+    ``runs/<id>/`` folder.
+    """
+
+    countries = manifest.get("countries")
+    country = countries.get(plan.country) if isinstance(countries, Mapping) else None
+    builds = country.get("builds") if isinstance(country, Mapping) else None
+    if not isinstance(builds, list):
+        return None
+    source_field, source_id = (
+        ("releaseId", plan.release_id)
+        if plan.kind == "release"
+        else ("stagingRunId", plan.run_id)
+    )
+    if source_id is None:
+        return None
+    for entry in builds:
+        if (
+            not isinstance(entry, Mapping)
+            or entry.get("kind") != plan.kind
+            or entry.get(source_field) != source_id
+        ):
+            continue
+        stored_id = entry.get("buildArtifactId")
+        if not isinstance(stored_id, str):
+            continue
+        if plan.kind == "staging" or stored_id == build_artifact_id:
+            return stored_id
+    return None
+
+
 def _answer(completed: subprocess.CompletedProcess[str], step: str) -> dict[str, Any]:
     lines = completed.stdout.strip().splitlines()
     try:
@@ -637,6 +644,14 @@ def build_and_publish(
     any other failure raises ``CalibrationTreeCommandError``, and a timeout
     ``subprocess.TimeoutExpired``. Whatever ``decide_latest`` raises is
     raised before anything is published.
+
+    After a publication exit 2, the store's manifest is read, outside the
+    lock: if it holds a tree for this build (``stored_tree_of``: a release
+    build with the worker's build ID, a staged run with any), the refusal is
+    ``TreeAlreadyStoredError``, a ``TreeRefusedError``. A manifest read that
+    fails raises as it does (``CalibrationTreeCommandError``, or
+    ``subprocess.TimeoutExpired`` or ``OSError``), as it can't tell, so an
+    attempt is tried again.
     """
 
     request_path = directory / "request.json"
@@ -684,7 +699,19 @@ def build_and_publish(
             PUBLICATION_TIMEOUT_SECONDS,
         )
     if published.returncode == EXIT_ENTRY_REFUSED:
-        raise TreeRefusedError(shortened_message(published.stderr))
+        message = shortened_message(published.stderr)
+        submitted_id = worker_answer.get("buildArtifactId")
+        if isinstance(submitted_id, str):
+            stored_id = stored_tree_of(
+                read_store_manifest(commands), plan, submitted_id
+            )
+            if stored_id is not None:
+                raise TreeAlreadyStoredError(
+                    message,
+                    build_artifact_id=stored_id,
+                    submitted_build_artifact_id=submitted_id,
+                )
+        raise TreeRefusedError(message)
     if published.returncode != 0:
         raise CalibrationTreeCommandError(
             f"The tree publication exited with {published.returncode}: "
@@ -785,6 +812,21 @@ def calibration_tree_handler(
                 raise SubmissionRejectedError(
                     "calibration_tree_unbuildable", str(error)
                 ) from error
+            except TreeAlreadyStoredError as error:
+                # Another writer stored a tree for this build first, so the
+                # store has the build's tree and the submission succeeds. For
+                # a staged run that tree may have another build ID; the result
+                # names both. It moves no latest; the reconcile command's
+                # latest step and the releases-record handler make the latest
+                # follow releases.json.
+                return {
+                    "processed_by": "calibration-tree",
+                    "build_artifact_id": error.build_artifact_id,
+                    "submitted_build_artifact_id": error.submitted_build_artifact_id,
+                    "kind": plan.kind,
+                    "already_stored": True,
+                    "made_latest": False,
+                }
             except TreeRefusedError as error:
                 raise SubmissionRejectedError(
                     "calibration_tree_refused", str(error)

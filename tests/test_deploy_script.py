@@ -7,6 +7,7 @@ import subprocess
 import urllib.parse
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import pytest
 
@@ -2180,3 +2181,204 @@ def test_huggingface_check_job_is_not_changed_when_its_secret_is_missing(
     assert [
         logged.split(" <")[1] for logged in command_log.read_text().splitlines()
     ] == ["secrets>"]
+
+
+# The callers that may queue calibration tree builds
+
+#: The Vercel projects and environments whose Vercel OIDC tokens may queue
+#: calibration tree builds: optional, and only beside the three settings
+#: above. Placeholders, not the real projects' values.
+TREE_BUILD_CALLERS_SETTINGS = {
+    "VERCEL_OIDC_TREE_BUILD_CALLERS": "prj_dashboard:production"
+}
+COLLECTOR_TREE_BUILD_CALLERS_SETTING = "TELEMETRY_VERCEL_OIDC_TREE_BUILD_CALLERS"
+TREE_BUILD_CALLERS_REFUSAL = (
+    "VERCEL_OIDC_TREE_BUILD_CALLERS is not a whitespace-separated list of "
+    "<project ID>:<environment> entries.\n"
+)
+
+
+def collector_tree_build_callers(settings: dict[str, str]) -> Any:
+    reader = getattr(vercel_oidc(), "tree_build_callers_from_environment", None)
+    if reader is None:
+        pytest.fail(f"{VERCEL_OIDC_MODULE} has no tree_build_callers_from_environment.")
+    return reader(settings)
+
+
+@pytest.mark.parametrize("deployment_environment", ["staging", "production"])
+def test_require_configuration_accepts_tree_build_callers_beside_the_three_settings(
+    deployment_environment: str,
+) -> None:
+    configuration = {
+        **complete_configuration(deployment_environment),
+        **VERCEL_OIDC_SETTINGS,
+        **TREE_BUILD_CALLERS_SETTINGS,
+    }
+
+    result = run_deploy("require-configuration", environment=configuration)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_require_configuration_refuses_tree_build_callers_without_the_three_settings() -> (
+    None
+):
+    configuration = {
+        **complete_configuration("production"),
+        **TREE_BUILD_CALLERS_SETTINGS,
+    }
+
+    result = run_deploy("require-configuration", environment=configuration)
+
+    assert result.returncode == 1
+    assert result.stderr == (
+        "Missing telemetry deployment configuration: "
+        "VERCEL_OIDC_TEAM_SLUG VERCEL_OIDC_TEAM_ID VERCEL_OIDC_READERS\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "prj_dashboard:production",
+        "prj_dashboard:preview prj_other:production",
+        "  prj_dashboard:production\r\n",
+        "prj_dashboard:preview\x1fprj_other:production",
+        "",
+        " \r\n",
+        "prj_dashboard",
+        "prj_dashboard:staging",
+        "prj_dashboard:Production",
+        "prj_dashboard:production,prj_other:preview",
+        "prj_" + "d" * 65 + ":production",
+        "team_example:production",
+        "*",
+    ],
+)
+def test_require_configuration_refuses_exactly_the_callers_the_collector_refuses(
+    value: str,
+) -> None:
+    collector_settings = {
+        **{
+            COLLECTOR_VERCEL_OIDC_SETTING_NAMES[name]: setting_value
+            for name, setting_value in VERCEL_OIDC_SETTINGS.items()
+        },
+        COLLECTOR_TREE_BUILD_CALLERS_SETTING: value,
+    }
+    try:
+        collector_tree_build_callers(collector_settings)
+    except RuntimeError:
+        collector_accepts = False
+    else:
+        collector_accepts = True
+    configuration = {
+        **complete_configuration("production"),
+        **VERCEL_OIDC_SETTINGS,
+        "VERCEL_OIDC_TREE_BUILD_CALLERS": value,
+    }
+
+    result = run_deploy("require-configuration", environment=configuration)
+
+    if collector_accepts:
+        assert result.returncode == 0, result.stderr
+    else:
+        assert result.returncode == 1
+        assert result.stderr == TREE_BUILD_CALLERS_REFUSAL
+
+
+@pytest.mark.parametrize("with_callers", [False, True])
+@pytest.mark.parametrize(
+    ("deploy_command", "maintenance_mode"),
+    [("deploy-maintenance", "1"), ("deploy-candidate", "0")],
+)
+def test_service_revisions_get_the_tree_build_callers_only_when_they_are_set(
+    tmp_path: Path, deploy_command: str, maintenance_mode: str, with_callers: bool
+) -> None:
+    command_log = tmp_path / "commands.log"
+    install_command_stub(tmp_path, "gcloud", LOGGING_GCLOUD)
+    environment = {
+        **service_deploy_environment(tmp_path, command_log, "production"),
+        **VERCEL_OIDC_SETTINGS,
+        "VERCEL_OIDC_TREE_BUILD_CALLERS": (
+            "prj_dashboard:production\r\n  prj_other:preview\n" if with_callers else ""
+        ),
+    }
+
+    result = run_deploy(deploy_command, environment=environment)
+
+    assert result.returncode == 0, result.stderr
+    settings = logged_setting_values(command_log.read_text())
+    if with_callers:
+        assert settings[COLLECTOR_TREE_BUILD_CALLERS_SETTING] == (
+            "prj_dashboard:production prj_other:preview"
+        )
+        assert collector_tree_build_callers(settings) == frozenset(
+            {
+                vercel_oidc().VercelOidcReader("prj_dashboard", "production"),
+                vercel_oidc().VercelOidcReader("prj_other", "preview"),
+            }
+        )
+    else:
+        assert COLLECTOR_TREE_BUILD_CALLERS_SETTING not in settings
+    # The read settings are passed either way.
+    assert (
+        settings["TELEMETRY_VERCEL_OIDC_READERS"]
+        == VERCEL_OIDC_SETTINGS["VERCEL_OIDC_READERS"]
+    )
+    assert f"TELEMETRY_MAINTENANCE_MODE={maintenance_mode}" in command_log.read_text()
+
+
+@pytest.mark.parametrize(
+    "deploy_command", ["configure-worker-job", "configure-recovery-job"]
+)
+def test_the_jobs_never_get_the_tree_build_callers(
+    tmp_path: Path, deploy_command: str
+) -> None:
+    command_log = tmp_path / "commands.log"
+    install_command_stub(tmp_path, "gcloud", LOGGING_GCLOUD)
+    environment = {
+        **job_deploy_environment(tmp_path, command_log, "production"),
+        **VERCEL_OIDC_SETTINGS,
+        **TREE_BUILD_CALLERS_SETTINGS,
+    }
+
+    result = run_deploy(deploy_command, environment=environment)
+
+    assert result.returncode == 0, result.stderr
+    assert "TREE_BUILD_CALLERS" not in command_log.read_text()
+    assert "prj_dashboard" not in command_log.read_text()
+
+
+def test_the_orrery_read_service_never_gets_the_tree_build_callers(
+    tmp_path: Path,
+) -> None:
+    command_log = tmp_path / "commands.log"
+    install_command_stub(tmp_path, "gcloud", IAM_POLICY_GCLOUD)
+    environment = {
+        **read_service_deploy_environment(tmp_path, command_log, "production"),
+        **VERCEL_OIDC_SETTINGS,
+        **TREE_BUILD_CALLERS_SETTINGS,
+    }
+
+    result = run_deploy("deploy-orrery-read-service", environment=environment)
+
+    assert result.returncode == 0, result.stderr
+    assert "TREE_BUILD_CALLERS" not in read_service_deploy_line(command_log)
+
+
+def test_the_deploy_script_reads_the_callers_with_the_readers_pattern() -> None:
+    script = DEPLOY_SCRIPT.read_text()
+    collector_tree_build_callers(
+        {
+            **{
+                COLLECTOR_VERCEL_OIDC_SETTING_NAMES[name]: value
+                for name, value in VERCEL_OIDC_SETTINGS.items()
+            },
+            COLLECTOR_TREE_BUILD_CALLERS_SETTING: "prj_dashboard:production",
+        }
+    )
+
+    assert "VERCEL_OIDC_TREE_BUILD_CALLERS" in script
+    assert deploy_script_pattern("VERCEL_OIDC_READER_PATTERN") == (
+        vercel_oidc().READER_PATTERN
+    )

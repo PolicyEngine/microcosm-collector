@@ -178,14 +178,17 @@ def plan_for(submission_provenance: Mapping[str, Any]) -> Any:
 class RecordingRunner:
     """Stands in for the Bun processes, recording what each one is given.
 
-    The worker is ``build``, the publication command ``publication`` and the
-    latest command ``latest``.
+    The worker is ``build``, the publication command ``publication``, the
+    latest command ``latest`` and the store's manifest read ``manifest read``.
     """
 
     build_exit: int = 0
     build_stderr: str = ""
     publication_exit: int = 0
     publication_stderr: str = ""
+    #: The store's manifest as the manifest read prints it; empty by default.
+    stored_manifest: dict[str, Any] | None = None
+    manifest_read_exit: int = 0
     latest_exit: int = 0
     latest_stderr: str = ""
     #: The latest command's answer; by default it moved the latest.
@@ -204,6 +207,8 @@ class RecordingRunner:
             step = "latest"
         elif argv[2].endswith("publication.ts"):
             step = "publication"
+        elif argv[2].endswith("calibration-tree-manifest-read.ts"):
+            step = "manifest read"
         else:
             step = "build"
         self.events.append(step)
@@ -215,6 +220,15 @@ class RecordingRunner:
         self.calls.append(
             {"step": step, "argv": list(argv), "env": dict(env), "inputs": inputs}
         )
+        if step == "manifest read":
+            manifest = self.stored_manifest or {"schemaVersion": 6, "countries": {}}
+            read = self.manifest_read_exit == 0
+            return subprocess.CompletedProcess(
+                argv,
+                self.manifest_read_exit,
+                json.dumps(manifest) if read else "",
+                "" if read else "The store could not be read.",
+            )
         if step == "build":
             worker_result = {"buildArtifactId": "a" * 64, "files": []}
             return subprocess.CompletedProcess(
@@ -615,6 +629,169 @@ def test_an_entry_the_manifest_refuses_rejects_the_submission() -> None:
         "code": "calibration_tree_refused",
         "message": "Calibration source already resolves to another build.",
     }
+
+
+def stored_tree(
+    kind: str,
+    *,
+    build_artifact_id: str = "a" * 64,
+    source_id: str | None = None,
+    recorded_kind: str | None = None,
+) -> dict[str, Any]:
+    """The store's manifest holding one UK tree, as the manifest read prints it.
+
+    By default the tree is the one the stand-in worker builds for ``RELEASED``
+    or ``STAGED``: the same build ID, a hash of the source files it was built
+    from, and the same release build or staged run. It records another commit
+    and publication time, as the reconcile command records a build it reads
+    from Hugging Face before the submission arrives. ``recorded_kind``
+    replaces only the entry's ``kind``.
+    """
+
+    if source_id is None:
+        source_id = f"{UK_DEFAULT_RELEASE}/{RUN_ID}" if kind == "release" else RUN_ID
+    entry = {
+        "buildArtifactId": build_artifact_id,
+        "kind": recorded_kind or kind,
+        "sourceId": source_id,
+        "label": source_id if kind == "release" else UK_DEFAULT_RELEASE,
+        "releaseId": source_id if kind == "release" else None,
+        "stagingRunId": source_id if kind == "staging" else None,
+        "hfRepo": UK_RELEASE_REPO,
+        "hfCommitSha": "f" * 40,
+        "treeSchemaVersion": 6,
+        "indexSha256": "e" * 64,
+        "indexBytes": 1000,
+        "createdAt": "2026-10-19T08:33:23Z",
+        "updatedAt": "2026-10-19T08:33:23Z",
+    }
+    return {
+        "schemaVersion": 6,
+        "countries": {"uk": {"latestReleaseBuildArtifactId": None, "builds": [entry]}},
+    }
+
+
+@pytest.mark.parametrize(
+    ("submission_provenance", "kind"),
+    [(STAGED, "staging"), (RELEASED, "release")],
+    ids=["staging", "release"],
+)
+def test_a_refused_tree_already_stored_from_the_same_diagnostics_succeeds(
+    submission_provenance: Mapping[str, Any], kind: str
+) -> None:
+    # Another writer (the reconcile command, the backfill or another
+    # submission) stored this build's tree from the same files first, with
+    # another time or label in its index, so the publication refuses this one
+    # with exit 2.
+    submission = accepted(submission_provenance)
+    runner = RecordingRunner(
+        publication_exit=2,
+        publication_stderr=(
+            "Immutable calibration tree part already exists with different content."
+        ),
+        stored_manifest=stored_tree(kind),
+    )
+
+    outcome = submission.run(handler_with(runner))
+
+    assert outcome is JobOutcome.FINISHED
+    assert submission.record().status == "succeeded"
+    assert submission.record().rejection is None
+    assert submission.record().result == {
+        "processed_by": "calibration-tree",
+        "build_artifact_id": "a" * 64,
+        "submitted_build_artifact_id": "a" * 64,
+        "kind": kind,
+        "already_stored": True,
+        "made_latest": False,
+    }
+    # The store's manifest is read once the publication has refused the
+    # build, after the manifest lock is released.
+    assert runner.events[-3:] == ["publication", "lock released", "manifest read"]
+
+
+def test_a_refused_staged_run_already_stored_from_other_files_succeeds() -> None:
+    # The reconcile command can build a staged run from other files than its
+    # submission's, so the stored tree has another build ID. The store keeps
+    # one tree per staged run, so the submission's tree could never be stored;
+    # it succeeds and names both IDs.
+    submission = accepted(STAGED)
+    runner = RecordingRunner(
+        publication_exit=2,
+        publication_stderr="Calibration source already resolves to another build.",
+        stored_manifest=stored_tree("staging", build_artifact_id="c" * 64),
+    )
+
+    outcome = submission.run(handler_with(runner))
+
+    assert outcome is JobOutcome.FINISHED
+    assert submission.record().status == "succeeded"
+    assert submission.record().result == {
+        "processed_by": "calibration-tree",
+        "build_artifact_id": "c" * 64,
+        "submitted_build_artifact_id": "a" * 64,
+        "kind": "staging",
+        "already_stored": True,
+        "made_latest": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("submission_provenance", "stored"),
+    [
+        pytest.param(
+            RELEASED,
+            stored_tree("release", build_artifact_id="c" * 64),
+            id="release-other-build-id",
+        ),
+        pytest.param(
+            STAGED, stored_tree("staging", source_id=OTHER_BUILD), id="other-run"
+        ),
+        pytest.param(
+            STAGED,
+            stored_tree("staging", recorded_kind="release"),
+            id="other-kind",
+        ),
+        pytest.param(STAGED, None, id="nothing-stored"),
+        pytest.param(RELEASED, None, id="release-nothing-stored"),
+    ],
+)
+def test_a_refused_tree_is_rejected_unless_the_store_holds_it(
+    submission_provenance: Mapping[str, Any], stored: dict[str, Any] | None
+) -> None:
+    # Guards: these submissions are rejected before and after the change. A
+    # release build's tree counts as stored only with the same build ID.
+    submission = accepted(submission_provenance)
+    runner = RecordingRunner(
+        publication_exit=2,
+        publication_stderr="Calibration source already resolves to another build.",
+        stored_manifest=stored,
+    )
+
+    submission.run(handler_with(runner))
+
+    assert submission.record().status == "rejected"
+    assert submission.record().rejection == {
+        "code": "calibration_tree_refused",
+        "message": "Calibration source already resolves to another build.",
+    }
+
+
+def test_a_refused_tree_whose_store_cannot_be_read_is_tried_again() -> None:
+    # Whether the store holds the tree can't be told, so the attempt fails
+    # rather than rejecting a submission whose tree may be stored.
+    submission = accepted(STAGED)
+    runner = RecordingRunner(
+        publication_exit=2,
+        publication_stderr="Calibration source already resolves to another build.",
+        manifest_read_exit=3,
+    )
+
+    outcome = submission.run(handler_with(runner))
+
+    assert outcome is JobOutcome.RETRY
+    assert submission.record().status == "queued"
+    assert submission.record().rejection is None
 
 
 @pytest.mark.parametrize("publication_exit", [1, 3])

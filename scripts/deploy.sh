@@ -135,15 +135,35 @@ vercel_oidc_words() {
   printf '%s' "${words[*]-}"
 }
 
+# Fails naming the variable, never printing its value, unless each of its
+# words is a <project ID>:<environment> entry. An unset or blank variable has
+# no entries.
+check_vercel_oidc_entries() {
+  local name="$1"
+  local entries=()
+  local entry
+
+  if [[ -z "$(vercel_oidc_words "$name")" ]]; then
+    return 0
+  fi
+  IFS=' ' read -r -a entries <<< "$(vercel_oidc_words "$name")" || true
+  for entry in "${entries[@]}"; do
+    if [[ ! "$entry" =~ $VERCEL_OIDC_READER_PATTERN ]]; then
+      echo "${name} is not a whitespace-separated list of <project ID>:<environment> entries." >&2
+      return 1
+    fi
+  done
+}
+
 # Read API v2 accepts Vercel OIDC tokens only with all three settings, and
 # with none of them (unset or blank) it refuses every token. Fails naming each
 # missing setting when only some are set, or naming a malformed one, never
-# printing a value.
+# printing a value. VERCEL_OIDC_TREE_BUILD_CALLERS, the projects and
+# environments that may queue calibration tree builds, is optional too, but
+# needs all three, and is checked with the readers' pattern.
 check_vercel_oidc_configuration() {
   local missing=()
   local name
-  local readers=()
-  local reader
 
   for name in "${VERCEL_OIDC_VARIABLES[@]}"; do
     if [[ -z "$(vercel_oidc_words "$name")" ]]; then
@@ -151,6 +171,10 @@ check_vercel_oidc_configuration() {
     fi
   done
   if (( ${#missing[@]} == ${#VERCEL_OIDC_VARIABLES[@]} )); then
+    if [[ -n "$(vercel_oidc_words VERCEL_OIDC_TREE_BUILD_CALLERS)" ]]; then
+      echo "Missing telemetry deployment configuration: ${missing[*]}" >&2
+      return 1
+    fi
     return 0
   fi
   if (( ${#missing[@]} )); then
@@ -166,23 +190,22 @@ check_vercel_oidc_configuration() {
     echo "VERCEL_OIDC_TEAM_ID is not a valid Vercel team ID." >&2
     return 1
   fi
-  IFS=' ' read -r -a readers <<< "$(vercel_oidc_words VERCEL_OIDC_READERS)" || true
-  for reader in "${readers[@]}"; do
-    if [[ ! "$reader" =~ $VERCEL_OIDC_READER_PATTERN ]]; then
-      echo "VERCEL_OIDC_READERS is not a whitespace-separated list of <project ID>:<environment> entries." >&2
-      return 1
-    fi
-  done
+  check_vercel_oidc_entries VERCEL_OIDC_READERS || return 1
+  check_vercel_oidc_entries VERCEL_OIDC_TREE_BUILD_CALLERS || return 1
 }
 
 # The Vercel OIDC settings the service revisions get, each after a comma, or
-# nothing while none is set. The readers are passed separated by single
-# spaces: `--set-env-vars` splits its value at commas.
+# nothing while none is set; the calibration tree build callers only while
+# they are set. The readers and the callers are passed separated by single
+# spaces: `--set-env-vars` splits its value at commas. Only the service
+# revisions get these: no job and not the Orrery read service.
 service_vercel_oidc_settings() {
   check_vercel_oidc_configuration || return 1
 
   local readers
+  local callers
   readers="$(vercel_oidc_words VERCEL_OIDC_READERS)"
+  callers="$(vercel_oidc_words VERCEL_OIDC_TREE_BUILD_CALLERS)"
   if [[ -z "$readers" ]]; then
     return 0
   fi
@@ -190,6 +213,9 @@ service_vercel_oidc_settings() {
     "TELEMETRY_VERCEL_OIDC_TEAM_SLUG=$(vercel_oidc_words VERCEL_OIDC_TEAM_SLUG)" \
     "TELEMETRY_VERCEL_OIDC_TEAM_ID=$(vercel_oidc_words VERCEL_OIDC_TEAM_ID)" \
     "TELEMETRY_VERCEL_OIDC_READERS=${readers}"
+  if [[ -n "$callers" ]]; then
+    printf ',%s' "TELEMETRY_VERCEL_OIDC_TREE_BUILD_CALLERS=${callers}"
+  fi
 }
 
 # Each environment's worker job reads Hugging Face with that environment's

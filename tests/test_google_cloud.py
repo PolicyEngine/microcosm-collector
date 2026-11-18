@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 import io
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -357,3 +357,123 @@ def test_a_reader_without_a_signing_account_cannot_sign_uploads() -> None:
 
     with pytest.raises(RuntimeError, match="signing service account"):
         reader.sign_uploads([planned], lifetime_seconds=60)
+
+
+# Named, scheduled runs of the worker job with overridden arguments
+
+RECONCILE_TASK = "calibration-trees-uk-staging-2960000"
+RECONCILE_ARGUMENTS = [
+    "run",
+    "--no-sync",
+    "python",
+    "-m",
+    "telemetry_collector.operations",
+    "reconcile-calibration-trees",
+    "--country",
+    "uk",
+    "--kind",
+    "staging",
+    "--request-id",
+    RECONCILE_TASK,
+]
+RUN_AT = datetime(2026, 11, 13, 10, 10, tzinfo=UTC)
+
+
+def schedule_run(queue: CloudTasksWorkerQueue, **options: Any) -> bool:
+    method = getattr(queue, "schedule_run", None)
+    if method is None:
+        pytest.fail("CloudTasksWorkerQueue has no schedule_run yet.")
+    return method(
+        RECONCILE_TASK, run_at=RUN_AT, arguments=RECONCILE_ARGUMENTS, **options
+    )
+
+
+def test_a_scheduled_run_is_a_named_task_overriding_the_job_s_arguments() -> None:
+    session = StandInSession()
+
+    created = schedule_run(worker_queue(session))
+
+    assert created is True
+    [(url, body)] = session.requests
+    assert url == f"https://cloudtasks.googleapis.com/v2/{QUEUE}/tasks"
+    task = body["task"]
+    assert task["name"] == f"{QUEUE}/tasks/{RECONCILE_TASK}"
+    assert task["scheduleTime"] == "2026-11-13T10:10:00Z"
+    http_request = task["httpRequest"]
+    assert http_request["httpMethod"] == "POST"
+    assert http_request["url"] == f"https://run.googleapis.com/v2/{WORKER_JOB}:run"
+    assert http_request["headers"] == {"Content-Type": "application/json"}
+    # The same invoker account as every dispatch.
+    assert http_request["oauthToken"] == {
+        "serviceAccountEmail": INVOKER,
+        "scope": "https://www.googleapis.com/auth/cloud-platform",
+    }
+    assert json.loads(base64.b64decode(http_request["body"])) == {
+        "overrides": {
+            "containerOverrides": [{"args": RECONCILE_ARGUMENTS}],
+            "taskCount": 1,
+        }
+    }
+
+
+def test_a_scheduled_run_s_time_is_written_in_utc() -> None:
+    session = StandInSession()
+    queue = worker_queue(session)
+    method = getattr(queue, "schedule_run", None)
+    if method is None:
+        pytest.fail("CloudTasksWorkerQueue has no schedule_run yet.")
+
+    method(
+        RECONCILE_TASK,
+        run_at=RUN_AT.astimezone(timezone(timedelta(hours=-5))),
+        arguments=RECONCILE_ARGUMENTS,
+    )
+
+    assert session.requests[0][1]["task"]["scheduleTime"] == "2026-11-13T10:10:00Z"
+
+
+def test_a_scheduled_run_whose_task_exists_is_reported_as_not_created() -> None:
+    assert schedule_run(worker_queue(StandInSession(status_code=409))) is False
+
+
+@pytest.mark.parametrize(
+    "session",
+    [
+        StandInSession(status_code=503),
+        StandInSession(status_code=403),
+        StandInSession(status_code=400),
+        StandInSession(error=requests.ConnectionError("unreachable")),
+    ],
+)
+def test_a_scheduled_run_reports_an_unavailable_queue(session: StandInSession) -> None:
+    with pytest.raises(WorkerQueueUnavailableError):
+        schedule_run(worker_queue(session))
+
+
+@pytest.mark.parametrize(
+    "task_id", ["", "calibration trees", "calibration-trees/uk", "a" * 501]
+)
+def test_a_scheduled_run_refuses_a_task_id_cloud_tasks_would_not_accept(
+    task_id: str,
+) -> None:
+    session = StandInSession()
+    queue = worker_queue(session)
+    method = getattr(queue, "schedule_run", None)
+    if method is None:
+        pytest.fail("CloudTasksWorkerQueue has no schedule_run yet.")
+
+    with pytest.raises(ValueError):
+        method(task_id, run_at=RUN_AT, arguments=RECONCILE_ARGUMENTS)
+    assert session.requests == []
+
+
+def test_a_dispatch_still_overrides_only_the_job_id_variable() -> None:
+    session = StandInSession()
+
+    worker_queue(session).dispatch("job-0123", 1)
+
+    task = session.requests[0][1]["task"]
+    assert "scheduleTime" not in task
+    assert json.loads(base64.b64decode(task["httpRequest"]["body"]))["overrides"][
+        "containerOverrides"
+    ] == [{"env": [{"name": "COLLECTOR_WORKER_JOB_ID", "value": "job-0123"}]}]

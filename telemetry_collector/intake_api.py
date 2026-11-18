@@ -46,6 +46,12 @@ QUEUE_RETRY_AFTER_SECONDS = 30
 INTAKE_NOT_ENABLED_DETAIL = "Artifact intake is not enabled on this collector."
 SUBMISSION_PATHS = ("/v1/submissions", "/v1/submissions/{submission_path:path}")
 ALL_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"]
+#: Where the dashboard queues calibration tree builds
+#: (``telemetry_collector.calibration_tree_builds``).
+CALIBRATION_TREE_BUILDS_PATH = "/v1/calibration-tree-builds"
+CALIBRATION_TREE_BUILDS_NOT_ENABLED_DETAIL = (
+    "Calibration tree builds are not enabled on this collector."
+)
 
 
 class IntakeProblemError(Exception):
@@ -100,6 +106,32 @@ def intake_not_enabled_router() -> APIRouter:
 
     for path in SUBMISSION_PATHS:
         router.add_api_route(path, refuse, methods=ALL_METHODS, include_in_schema=False)
+    return router
+
+
+def calibration_tree_builds_not_enabled_router() -> APIRouter:
+    """Answer the calibration tree build path, outside the schema, while the
+    endpoint isn't mounted: intake is off, or no caller may queue builds.
+
+    It lives here, beside intake's own answer, so that a collector without
+    the endpoint never imports the tree build modules.
+    """
+
+    router = APIRouter()
+
+    def refuse() -> None:
+        raise IntakeProblemError(
+            404,
+            "calibration_tree_builds_not_enabled",
+            CALIBRATION_TREE_BUILDS_NOT_ENABLED_DETAIL,
+        )
+
+    router.add_api_route(
+        CALIBRATION_TREE_BUILDS_PATH,
+        refuse,
+        methods=ALL_METHODS,
+        include_in_schema=False,
+    )
     return router
 
 

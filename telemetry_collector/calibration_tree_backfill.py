@@ -256,6 +256,17 @@ class SourceUnbuildableError(Exception):
     """A build's files can't be found or don't match what records them."""
 
 
+class SourceWithoutDiagnosticsError(SourceUnbuildableError):
+    """A staging run with no calibration diagnostics to build from, where the
+    staging readers' ``resolveStagingCalibrationSource`` finds no source:
+    a schema-1 run folder without ``calibration_diagnostics.json``, a
+    structured run that declares neither diagnostics nor a staged dataset, a
+    staged-dataset receipt that records no landed bundle, or a bundle whose
+    receipt or folder holds no diagnostics file. The backfill reports it as
+    any other ``SourceUnbuildableError``; the reconcile command reports it
+    ``ineligible``, as the publisher's ``reconcileStagingBuilds`` does."""
+
+
 def _described(error: BaseException) -> str:
     return shortened_message(f"{type(error).__name__}: {error}")
 
@@ -545,7 +556,7 @@ class BuildSource:
     files: Mapping[str, SourceFile]
 
 
-class _Listings:
+class Listings:
     """Each folder's files by name, listed once per dataset and revision."""
 
     def __init__(self, reader: HuggingFaceReader) -> None:
@@ -570,7 +581,7 @@ class _Listings:
         return self._folders[key]
 
 
-def _read_json(
+def read_json(
     reader: HuggingFaceReader, dataset: str, path: str, revision: str
 ) -> tuple[dict[str, Any], bytes] | None:
     """A JSON object read whole, with its bytes, or ``None`` when it is absent."""
@@ -590,7 +601,7 @@ def _read_json(
     return document, content
 
 
-def _release_source(entry: ProductionEntry, listings: _Listings) -> BuildSource:
+def release_source(entry: ProductionEntry, listings: Listings) -> BuildSource:
     assert entry.release_directory is not None
     folder = f"releases/{entry.release_directory}"
     listed = listings.folder(entry.hf_repo, entry.hf_commit, folder)
@@ -723,7 +734,7 @@ def _staged_bundle_diagnostics_file(files: Mapping[str, Any] | None) -> str | No
 
 def _staged_bundle_source(
     entry: ProductionEntry,
-    listings: _Listings,
+    listings: Listings,
     *,
     dataset: str,
     revision: str,
@@ -734,7 +745,14 @@ def _staged_bundle_source(
     listed = listings.folder(dataset, revision, folder)
     name = file_name or _staged_bundle_diagnostics_file(listed)
     if name is None or name not in listed:
-        raise SourceUnbuildableError(
+        # A diagnostics file the receipt records but the folder lacks is a
+        # damaged bundle; a folder with none is a bundle without diagnostics.
+        error_class = (
+            SourceUnbuildableError
+            if file_name is not None
+            else SourceWithoutDiagnosticsError
+        )
+        raise error_class(
             f"{folder} holds no calibration diagnostics in {dataset} at {revision}."
         )
     diagnostics = SourceFile(dataset, revision, listed[name], declared_sha256)
@@ -759,14 +777,14 @@ def _staged_bundle_source(
 def _receipt_source(
     entry: ProductionEntry,
     reader: HuggingFaceReader,
-    listings: _Listings,
+    listings: Listings,
     receipt: tuple[str, str],
 ) -> BuildSource:
     """The staged bundle a run's ``staged_dataset`` receipt names."""
 
     run_id = entry.source_id
     receipt_path, receipt_sha256 = receipt
-    read = _read_json(reader, entry.hf_repo, receipt_path, entry.hf_commit)
+    read = read_json(reader, entry.hf_repo, receipt_path, entry.hf_commit)
     if read is None:
         raise SourceUnbuildableError(
             f"Run {run_id}'s staged dataset receipt is declared but absent."
@@ -778,7 +796,8 @@ def _receipt_source(
             "run manifest declares."
         )
     if delivery.get("status") not in _STAGED_BUNDLE_LANDED:
-        raise SourceUnbuildableError(
+        # A skipped, failed or disabled staging.
+        raise SourceWithoutDiagnosticsError(
             f"Run {run_id}'s staged dataset receipt records no staged bundle."
         )
     if delivery.get("run_id") != run_id:
@@ -809,7 +828,7 @@ def _receipt_source(
     declared = recorded.get(name) if recorded is not None and name else None
     digest = declared.get("sha256") if isinstance(declared, dict) else None
     if name is None or not _matches(_SHA256, digest):
-        raise SourceUnbuildableError(
+        raise SourceWithoutDiagnosticsError(
             f"Run {run_id}'s staged bundle records no calibration diagnostics with "
             "a SHA-256."
         )
@@ -824,8 +843,8 @@ def _receipt_source(
     )
 
 
-def _staging_source(
-    entry: ProductionEntry, reader: HuggingFaceReader, listings: _Listings
+def staging_source(
+    entry: ProductionEntry, reader: HuggingFaceReader, listings: Listings
 ) -> BuildSource:
     run_id = entry.source_id
     if entry.hf_repo == RELEASE_REPOS[entry.country]:
@@ -833,23 +852,24 @@ def _staging_source(
             entry, listings, dataset=entry.hf_repo, revision=entry.hf_commit
         )
     run_folder = f"runs/{run_id}"
-    run_manifest_read = _read_json(
+    run_manifest_read = read_json(
         reader, entry.hf_repo, f"{run_folder}/run_manifest.json", entry.hf_commit
     )
-    progress_read = _read_json(
+    progress_read = read_json(
         reader, entry.hf_repo, f"{run_folder}/progress.json", entry.hf_commit
     )
     run_manifest = None if run_manifest_read is None else run_manifest_read[0]
     progress = None if progress_read is None else progress_read[0]
     _check_run_documents(run_id, run_manifest, progress)
     diagnostics_sha256: str | None = None
-    if _is_structured(run_manifest):
+    structured = _is_structured(run_manifest)
+    if structured:
         assert run_manifest is not None
         artifacts = _declared_artifacts(run_manifest, run_id)
         if "calibration_diagnostics" not in artifacts:
             # A run that staged its dataset bundle carries its diagnostics there.
             if "staged_dataset" not in artifacts:
-                raise SourceUnbuildableError(
+                raise SourceWithoutDiagnosticsError(
                     f"Run {run_id}'s manifest declares neither calibration "
                     "diagnostics nor a staged dataset."
                 )
@@ -862,7 +882,12 @@ def _staging_source(
         entry.hf_repo, entry.hf_commit, diagnostics_folder
     ).get(diagnostics_name)
     if listed_diagnostics is None:
-        raise SourceUnbuildableError(
+        # Declared diagnostics that are absent are a damaged run; a schema-1
+        # run declares none, and a folder without them has none.
+        error_class = (
+            SourceUnbuildableError if structured else SourceWithoutDiagnosticsError
+        )
+        raise error_class(
             f"{diagnostics_path} is not in {entry.hf_repo} at {entry.hf_commit}."
         )
     files = {
@@ -895,7 +920,7 @@ def _staging_source(
 # Building --------------------------------------------------------------------------
 
 
-def _build(
+def build_and_publish_source(
     source: BuildSource, reader: HuggingFaceReader, commands: TreeCommands
 ) -> PublishedTree:
     """Download the build's files into a new directory, then build and publish it."""
@@ -931,7 +956,7 @@ def _build(
 class _Backfill:
     stored: StoredTrees
     reader: HuggingFaceReader
-    listings: _Listings
+    listings: Listings
     commands: TreeCommands
     dry_run: bool
     clock: Callable[[], float]
@@ -1035,9 +1060,9 @@ class _Backfill:
             )
         try:
             source = (
-                _release_source(source_entry, self.listings)
+                release_source(source_entry, self.listings)
                 if source_entry.kind == "release"
-                else _staging_source(source_entry, self.reader, self.listings)
+                else staging_source(source_entry, self.reader, self.listings)
             )
         except SourceUnbuildableError as error:
             return outcome("unbuildable", reason=shortened_message(str(error)))
@@ -1059,7 +1084,7 @@ class _Backfill:
         if self.dry_run:
             return outcome("would_build", reason=republished)
         try:
-            published = _build(source, self.reader, self.commands)
+            published = build_and_publish_source(source, self.reader, self.commands)
         except (SourceUnbuildableError, TreeUnbuildableError) as error:
             return outcome("unbuildable", reason=shortened_message(str(error)))
         except TreeRefusedError as error:
@@ -1140,7 +1165,7 @@ def backfill_calibration_trees(
     backfill = _Backfill(
         stored=stored,
         reader=reader,
-        listings=_Listings(reader),
+        listings=Listings(reader),
         commands=commands,
         dry_run=dry_run,
         clock=clock,

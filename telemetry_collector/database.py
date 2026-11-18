@@ -300,6 +300,56 @@ class OrreryGraphFile(Base):
     )
 
 
+#: The kinds of calibration tree build a request queues.
+CALIBRATION_TREE_BUILD_KINDS = ("release", "staging")
+
+
+class CalibrationTreeBuildRequest(Base):
+    """One queued calibration tree build: a Cloud Task per country, kind and
+    10-minute window (``telemetry_collector.calibration_tree_builds``).
+
+    The service writes the request columns and ``queued_at``; the worker job's
+    execution writes the rest.
+    """
+
+    __tablename__ = "calibration_tree_build_requests"
+    __table_args__ = (
+        CheckConstraint(_one_of("kind", CALIBRATION_TREE_BUILD_KINDS), name="kind"),
+    )
+
+    # The Cloud Task's ID, calibration-trees-<country>-<kind>-<window>.
+    task_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    country: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    first_requested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    last_requested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    request_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    # The Vercel project and environment of the last request's OIDC token.
+    last_caller_project_id: Mapped[str] = mapped_column(Text, nullable=False)
+    last_caller_environment: Mapped[str] = mapped_column(Text, nullable=False)
+    hf_repo: Mapped[str] = mapped_column(Text, nullable=False)
+    # Only recorded: the execution reads each repo at its head.
+    last_hf_ref: Mapped[str | None] = mapped_column(Text)
+    last_hf_commit: Mapped[str | None] = mapped_column(Text)
+    # When the task is scheduled to run: the end of its window.
+    not_before: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    # When Cloud Tasks first accepted the task; null until then.
+    queued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The worker job's execution (CLOUD_RUN_EXECUTION) and its attempts.
+    execution: Mapped[str | None] = mapped_column(Text)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False)
+    # The last attempt's start, and its finish and summary once it finished.
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    summary: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+
+
 Index("artifact_jobs_status_idx", ArtifactJob.status)
 Index(
     "telemetry_runs_country_registered_idx",

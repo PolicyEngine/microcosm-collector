@@ -10,6 +10,7 @@ import importlib
 import importlib.util
 import json
 import logging
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -817,3 +818,204 @@ def test_an_unknown_key_waits_for_a_fetch_up_to_ten_seconds() -> None:
     verifier, _, _ = verifier_serving(key_set_answer(SIGNING_JWK))
 
     assert getattr(verifier, "_fetch_wait_seconds", None) == 10
+
+
+# The callers that may queue calibration tree builds
+
+TREE_BUILD_CALLERS_SETTING = "TELEMETRY_VERCEL_OIDC_TREE_BUILD_CALLERS"
+
+
+def module_attribute(name: str) -> Any:
+    attribute = getattr(vercel_oidc(), name, None)
+    if attribute is None:
+        pytest.fail(f"{VERCEL_OIDC_MODULE} has no {name} yet.")
+    return attribute
+
+
+def tree_build_callers(environment: dict[str, str]) -> Any:
+    return module_attribute("tree_build_callers_from_environment")(environment)
+
+
+def caller_of(verifier: Any, token: str) -> Any:
+    caller = getattr(verifier, "caller", None)
+    if caller is None:
+        pytest.fail("VercelOidcVerifier has no caller method yet.")
+    return caller(token)
+
+
+@pytest.mark.parametrize("unset_value", [None, "", "  \n"])
+def test_without_the_callers_setting_no_project_may_queue_builds(
+    unset_value: str | None,
+) -> None:
+    environment = dict(SETTINGS_ENVIRONMENT)
+    if unset_value is not None:
+        environment[TREE_BUILD_CALLERS_SETTING] = unset_value
+
+    assert tree_build_callers(environment) is None
+
+
+def test_the_callers_setting_lists_projects_and_environments_apart_from_readers() -> (
+    None
+):
+    module = vercel_oidc()
+
+    callers = tree_build_callers(
+        {
+            **SETTINGS_ENVIRONMENT,
+            TREE_BUILD_CALLERS_SETTING: (
+                " prj_dashboard:production\nprj_other:preview\tprj_dashboard:production "
+            ),
+        }
+    )
+
+    assert callers == frozenset(
+        {
+            module.VercelOidcReader(DASHBOARD_PROJECT_ID, "production"),
+            module.VercelOidcReader(OTHER_PROJECT_ID, "preview"),
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "unset_names",
+    [
+        (TEAM_SLUG_SETTING,),
+        (TEAM_ID_SETTING,),
+        (READERS_SETTING,),
+        (TEAM_SLUG_SETTING, TEAM_ID_SETTING, READERS_SETTING),
+    ],
+)
+def test_the_callers_setting_needs_the_three_vercel_oidc_settings(
+    unset_names: tuple[str, ...],
+) -> None:
+    environment = {
+        **{
+            name: value
+            for name, value in SETTINGS_ENVIRONMENT.items()
+            if name not in unset_names
+        },
+        TREE_BUILD_CALLERS_SETTING: "prj_dashboard:production",
+    }
+
+    with pytest.raises(RuntimeError) as raised:
+        tree_build_callers(environment)
+
+    assert TREE_BUILD_CALLERS_SETTING in str(raised.value)
+    for name in unset_names:
+        assert name in str(raised.value)
+    assert "prj_dashboard" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "malformed_value",
+    [
+        "prj_dashboard",
+        "prj_dashboard:staging",
+        "prj_dashboard:Production",
+        "prj_:production",
+        "prj_dashboard:production,prj_other:preview",
+        "team_example:production",
+        "*",
+    ],
+)
+def test_a_malformed_callers_setting_stops_startup_naming_it_but_not_its_value(
+    malformed_value: str,
+) -> None:
+    with pytest.raises(RuntimeError) as raised:
+        tree_build_callers(
+            {**SETTINGS_ENVIRONMENT, TREE_BUILD_CALLERS_SETTING: malformed_value}
+        )
+
+    assert TREE_BUILD_CALLERS_SETTING in str(raised.value)
+    assert malformed_value not in str(raised.value)
+
+
+def test_the_callers_setting_uses_the_readers_pattern() -> None:
+    assert module_attribute("TREE_BUILD_CALLERS_SETTING") == TREE_BUILD_CALLERS_SETTING
+    readers_pattern = module_attribute("READER_PATTERN")
+    for entry in ["prj_dashboard:production", "prj_x:development", "prj_y:preview"]:
+        assert tree_build_callers(
+            {**SETTINGS_ENVIRONMENT, TREE_BUILD_CALLERS_SETTING: entry}
+        )
+        assert re.fullmatch(readers_pattern, entry)
+
+
+def test_the_collector_reads_its_callers_setting_when_it_starts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = vercel_oidc()
+    for name in [
+        *SETTINGS_ENVIRONMENT,
+        TREE_BUILD_CALLERS_SETTING,
+        SIGNING_KEY_VARIABLE,
+        INTAKE_SWITCH,
+    ]:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("TELEMETRY_JWT_SECRET", "x" * 32)
+    monkeypatch.setenv("TELEMETRY_READ_TOKEN", "y" * 24)
+    for name, value in SETTINGS_ENVIRONMENT.items():
+        monkeypatch.setenv(name, value)
+
+    settings = CollectorSettings.from_environment()
+    assert getattr(settings, "calibration_tree_build_callers", "missing") is None
+
+    monkeypatch.setenv(TREE_BUILD_CALLERS_SETTING, "prj_dashboard:production")
+
+    assert CollectorSettings.from_environment().calibration_tree_build_callers == (
+        frozenset({module.VercelOidcReader(DASHBOARD_PROJECT_ID, "production")})
+    )
+
+    for name in SETTINGS_ENVIRONMENT:
+        monkeypatch.delenv(name)
+    with pytest.raises(RuntimeError, match=TREE_BUILD_CALLERS_SETTING):
+        CollectorSettings.from_environment()
+
+
+@pytest.mark.parametrize("environment", ["preview", "production", "development"])
+def test_a_caller_s_token_gives_its_project_and_environment_without_the_readers(
+    environment: str,
+) -> None:
+    module = vercel_oidc()
+    verifier, _, _ = verifier_serving(key_set_answer(SIGNING_JWK))
+    token = dashboard_token(project_id=OTHER_PROJECT_ID, environment=environment)
+
+    caller = caller_of(verifier, token)
+
+    assert caller == module.VercelOidcReader(OTHER_PROJECT_ID, environment)
+    # The readers check stays in verify.
+    with pytest.raises(module.VercelOidcReaderNotAllowedError):
+        verifier.verify(token)
+
+
+def test_a_caller_s_token_of_another_team_is_refused_as_another_team_s() -> None:
+    verifier, _, _ = verifier_serving(key_set_answer(SIGNING_JWK))
+    team_error = module_attribute("VercelOidcTeamNotAllowedError")
+
+    with pytest.raises(team_error):
+        caller_of(verifier, dashboard_token(owner_id="team_other"))
+
+
+@pytest.mark.parametrize("case", sorted(INVALID_TOKENS))
+def test_a_caller_s_invalid_token_is_refused_as_invalid(case: str) -> None:
+    module = vercel_oidc()
+    verifier, _, _ = verifier_serving(key_set_answer(SIGNING_JWK))
+
+    with pytest.raises(module.InvalidVercelOidcTokenError):
+        caller_of(verifier, INVALID_TOKENS[case]())
+
+
+def test_a_caller_s_token_while_the_keys_cannot_be_read_is_unavailable() -> None:
+    module = vercel_oidc()
+    verifier, _, _ = verifier_serving(httpx.ConnectError("Vercel cannot be reached."))
+
+    with pytest.raises(module.VercelOidcKeysUnavailableError):
+        caller_of(verifier, dashboard_token())
+
+
+def test_verify_still_refuses_another_team_s_token_as_a_reader_refusal() -> None:
+    module = vercel_oidc()
+    verifier, _, _ = verifier_serving(key_set_answer(SIGNING_JWK))
+    module_attribute("VercelOidcTeamNotAllowedError")
+
+    with pytest.raises(module.VercelOidcReaderNotAllowedError):
+        verifier.verify(dashboard_token(owner_id="team_other"))
