@@ -2058,8 +2058,15 @@ def test_a_copy_command_that_fails_raises_for_another_attempt(
 
 @pytest.mark.parametrize(
     "answer",
-    [("forced", 503), ("file", (500, None)), ("file", (404, "RevisionNotFound"))],
-    ids=["head-503", "file-500", "file-404-revision"],
+    [
+        ("forced", 503),
+        ("file", (500, None)),
+        ("file", (404, "RevisionNotFound")),
+        # Only EntryNotFound says the file is missing. A copy saying the repo
+        # has no record would stay until the next commit.
+        ("file", (404, None)),
+    ],
+    ids=["head-503", "file-500", "file-404-revision", "file-404-without-a-code"],
 )
 def test_a_failed_hugging_face_read_writes_nothing(answer: tuple[str, Any]) -> None:
     hugging_face = uk_release_repo(releases_record())
@@ -2098,6 +2105,17 @@ def test_a_releases_record_submission_copies_the_head_not_what_it_carried() -> N
 
     assert submission.record().status == "succeeded"
     assert runner.call("record copy write")["record"] == head_record
+
+
+def test_a_failed_latest_step_still_updates_the_stored_copy() -> None:
+    record = releases_record()
+    runner = RecordingRunner(latest_exit=3, latest_stderr="store error")
+    submission = accepted_releases_record(record)
+
+    outcome = submission.run(latest_handler_with(runner, uk_release_repo(record)))
+
+    assert outcome is JobOutcome.RETRY
+    assert runner.call("record copy write")["record"] == record
 
 
 def test_a_failed_copy_returns_the_releases_record_job_for_another_attempt() -> None:
@@ -2416,6 +2434,8 @@ def run_tree_image_check(
     publication_exit: int,
     latest_exit: int = 1,
     latest_stderr: str = TOKEN_REFUSAL,
+    record_copy_exit: int = 1,
+    record_copy_stderr: str = TOKEN_REFUSAL,
 ) -> subprocess.CompletedProcess[str]:
     bin_directory = tmp_path / "bin"
     bin_directory.mkdir()
@@ -2431,6 +2451,10 @@ def run_tree_image_check(
         'if [[ "$*" == *calibration-tree-latest.ts* ]]; then\n'
         f"  printf '%s\\n' '{latest_stderr}' >&2\n"
         f"  exit {latest_exit}\n"
+        "fi\n"
+        'if [[ "$*" == *calibration-tree-releases-record-copy.ts* ]]; then\n'
+        f"  printf '%s\\n' '{record_copy_stderr}' >&2\n"
+        f"  exit {record_copy_exit}\n"
         "fi\n"
         f"exit {publication_exit}\n"
     )
@@ -2465,7 +2489,7 @@ def test_the_tree_image_check_passes_when_the_image_builds_a_tree(
 
     assert result.returncode == 0, result.stderr
     calls = (tmp_path / "docker-calls").read_text().splitlines()
-    assert len(calls) == 3
+    assert len(calls) == 4
     assert all(call.startswith("run --rm ") and IMAGE in call for call in calls)
     assert (
         "bun run /app/packages/calibration-tree/src/calibration-tree-worker.ts"
@@ -2483,6 +2507,12 @@ def test_the_tree_image_check_passes_when_the_image_builds_a_tree(
         in calls[2]
     )
     assert "BLOB" not in calls[2]
+    # And the command that replaces the stored releases.json.
+    assert (
+        "bun run /app/packages/calibration-tree/src/"
+        "calibration-tree-releases-record-copy.ts read us" in calls[3]
+    )
+    assert "BLOB" not in calls[3]
 
 
 @pytest.mark.parametrize(
@@ -2504,6 +2534,27 @@ def test_the_tree_image_check_fails_unless_the_latest_command_refuses(
 
     assert result.returncode != 0
     assert "latest command" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("record_copy_exit", "record_copy_stderr"),
+    [(0, ""), (1, "error: Module not found"), (3, TOKEN_REFUSAL)],
+    ids=["copy-ran", "copy-missing", "copy-other-exit"],
+)
+def test_the_tree_image_check_fails_unless_the_copy_command_refuses(
+    record_copy_exit: int, record_copy_stderr: str, tmp_path: Path
+) -> None:
+    result = run_tree_image_check(
+        tmp_path,
+        build_exit=0,
+        build_answer=BUILT_STAGING_TREE,
+        publication_exit=1,
+        record_copy_exit=record_copy_exit,
+        record_copy_stderr=record_copy_stderr,
+    )
+
+    assert result.returncode != 0
+    assert "releases.json copy command" in result.stderr
 
 
 @pytest.mark.parametrize(

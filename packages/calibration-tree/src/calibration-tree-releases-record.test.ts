@@ -524,6 +524,19 @@ test.each([["no", ""], ["a weak", 'W/"etag-1"']])("a copy read with %s ETag is a
   expect(command.releasesRecordCopyExitCode(error)).toBe(3);
 });
 
+test("a weak ETag's error names the stored copy, not the tree manifest", async () => {
+  const command = await copyCommand();
+  const store = new InMemoryBlobStore();
+  store.storeDocument();
+  store.answeredEtag = 'W/"etag-1"';
+
+  const error = await command.readReleasesRecordCopyVersion({ country: "us", token: TOKEN, client: store.client() })
+    .catch((caught: unknown) => caught);
+
+  expect((error as Error).message).toContain(STORED_PATH);
+  expect((error as Error).message).not.toContain("manifest");
+});
+
 // The command line ---------------------------------------------------------------
 
 async function printedBy(run: () => Promise<number>): Promise<{ exitCode: number; printed: unknown[] }> {
