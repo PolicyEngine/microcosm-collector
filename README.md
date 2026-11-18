@@ -1642,8 +1642,9 @@ the diagnostics, `build_manifest.json`, `release_manifest.json`,
 two are copied unread and do not change its build ID. The publication command
 uploads the copies first, to private blobs at
 `calibration-tree-sources/<country>/<build ID>/<file name>.gz`, then the parts
-with the index last, then the manifest entry, so a build the manifest lists
-has its copies and a failed run can run again. The first copy of a build's
+with the index last, then the manifest entry, so a build it records has a
+copy of every file it was given and a failed run can run again. Builds stored
+before this have no copies until the backfill adds them. The first copy of a build's
 file stands: one already stored is kept, and if it holds other bytes the tree
 is still published and the answer names the file in `sourceFileConflicts`, so a
 difference in a file the build ID does not cover never stops a valid tree.
@@ -1721,7 +1722,8 @@ them, are stored with the build's other original files.
   parts and copies of original files were uploaded or already stored, and
   whether it became the latest. `source_file_conflicts`, present only when
   there are some, names the copies left as stored because they hold other
-  bytes; a result with `already_stored` names them too.
+  bytes; a result with `already_stored` names them too, and a rejection's
+  message does.
   The worker refusing the files (`calibration_tree_unbuildable`), or the
   build being refused when the store holds no tree for it (below;
   `calibration_tree_refused`: another build already recorded for the same
@@ -1904,8 +1906,9 @@ release|staging` limit what it backfills.
   `release_manifest.json` and `demographics.json` when the folder lists them
   (null otherwise, as the GitHub Actions publisher's optional reads are).
   `parent_build_manifest.json` and `reform_validation.json` are read when a
-  release or run folder lists them, and only stored as copies. One over 64 MiB
-  is left out, and the tree is still built.
+  release or run folder lists them, and only stored as copies. That includes
+  the run folder of a run whose tree comes from its staged bundle. One over 64
+  MiB is left out, and the tree is still built.
 - A staging build, by the rules of the tree package's staging readers that
   locate its files, and only those:
   - in the staging repo, `runs/<id>/run_manifest.json` and `progress.json`,

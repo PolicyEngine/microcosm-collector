@@ -28,7 +28,8 @@ releaseId>/`` at its commit: ``calibration_diagnostics.json``, and
 when the folder lists them (null otherwise, as the GitHub Actions
 publisher's optional reads are). ``parent_build_manifest.json`` and
 ``reform_validation.json`` are read too when a release or run folder lists
-them, unless one is over ``MAX_COPIED_FILE_BYTES``; the tree worker only stores
+them, unless one is over ``MAX_COPIED_FILE_BYTES``, including the run folder of
+a run whose diagnostics come from its staged bundle; the tree worker only stores
 copies of those two. A staging build follows only the rules of the tree
 package's staging readers that locate its files:
 
@@ -105,7 +106,7 @@ import tempfile
 import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Final, Literal
@@ -131,6 +132,7 @@ from telemetry_collector.huggingface_read import (
     HuggingFaceReadError,
     is_missing_path,
 )
+from telemetry_collector.submissions import ROLE_RULES
 
 BackfillOutcomeKind = Literal[
     "would_build",
@@ -162,7 +164,9 @@ PRODUCTION_MANIFEST_TIME_LIMIT_SECONDS: Final = 2 * PRODUCTION_MANIFEST_TIMEOUT_
 MAX_SOURCE_FILE_BYTES: Final = 256 * 1024 * 1024
 #: The largest file only copied, the limit a submission's role has. A larger
 #: one is left out, so it never stops the build's tree.
-MAX_COPIED_FILE_BYTES: Final = 64 * 1024 * 1024
+MAX_COPIED_FILE_BYTES: Final = ROLE_RULES["calibration-diagnostics"][
+    "reform_validation"
+].maximum_file_bytes
 #: No build starts after this long, within the worker job's one-hour task.
 BUILD_TIME_LIMIT_SECONDS: Final = 40 * 60
 BUILD_KINDS: Final[tuple[BuildKind, ...]] = ("release", "staging")
@@ -176,24 +180,25 @@ _PUBLICATION_TIME: Final = re.compile(
 )
 # A release build folder's files, by the worker's role names; only the
 # diagnostics are required.
+# Files a build folder may hold that are only copied: no tree is built from them.
+_COPIED_FILES: Final = (
+    ("parent_build_manifest", "parent_build_manifest.json"),
+    ("reform_validation", "reform_validation.json"),
+)
+_COPIED_ROLES: Final = frozenset(role for role, _ in _COPIED_FILES)
 _RELEASE_FILES: Final = (
     ("calibration_diagnostics", "calibration_diagnostics.json"),
     ("build_manifest", "build_manifest.json"),
     ("release_manifest", "release_manifest.json"),
     ("demographics", "demographics.json"),
-    # Only copied: no tree is built from these two.
-    ("parent_build_manifest", "parent_build_manifest.json"),
-    ("reform_validation", "reform_validation.json"),
+    *_COPIED_FILES,
 )
 # A staging run's other files, in its run folder.
 _STAGING_RUN_FILES: Final = (
     ("build_manifest", "build_manifest.json"),
     ("release_manifest", "release_manifest.json"),
-    # Only copied: no tree is built from these two.
-    ("parent_build_manifest", "parent_build_manifest.json"),
-    ("reform_validation", "reform_validation.json"),
+    *_COPIED_FILES,
 )
-_COPIED_ROLES: Final = frozenset({"parent_build_manifest", "reform_validation"})
 _STAGED_BUNDLE_DIAGNOSTICS: Final = "calibration_diagnostics.json"
 _STAGED_BUNDLE_STEM_DIAGNOSTICS_SUFFIX: Final = ".diagnostics.json"
 _STAGED_BUNDLE_FILE_NAME: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,200}")
@@ -901,7 +906,26 @@ def staging_source(
                     f"Run {run_id}'s manifest declares neither calibration "
                     "diagnostics nor a staged dataset."
                 )
-            return _receipt_source(entry, reader, listings, artifacts["staged_dataset"])
+            bundle = _receipt_source(
+                entry, reader, listings, artifacts["staged_dataset"]
+            )
+            # The tree comes from the bundle, so only the copied files are
+            # taken from the run folder: others would change its build ID.
+            copied = _listed_source_files(
+                entry,
+                listings.folder(entry.hf_repo, entry.hf_commit, run_folder),
+                _COPIED_FILES,
+            )
+            return BuildSource(
+                plan=replace(
+                    bundle.plan,
+                    paths={
+                        **bundle.plan.paths,
+                        **{role: file.listed.path for role, file in copied.items()},
+                    },
+                ),
+                files={**bundle.files, **copied},
+            )
         diagnostics_path, diagnostics_sha256 = artifacts["calibration_diagnostics"]
     else:
         diagnostics_path = f"{run_folder}/calibration_diagnostics.json"
@@ -1114,7 +1138,11 @@ class _Backfill:
         except (SourceUnbuildableError, TreeUnbuildableError) as error:
             return outcome("unbuildable", reason=shortened_message(str(error)))
         except TreeRefusedError as error:
-            return outcome("refused", reason=shortened_message(str(error)))
+            return outcome(
+                "refused",
+                reason=shortened_message(str(error)),
+                source_file_conflicts=list(error.source_file_conflicts),
+            )
         except Exception as error:
             return outcome("error", reason=_described(error), incomplete=True)
         if published.made_latest:

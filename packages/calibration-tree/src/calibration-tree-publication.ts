@@ -21,8 +21,9 @@
 // copy stored with other bytes is kept as well, and the answer names it: the
 // first copy of a build's file stands, and because the build ID does not cover
 // every copied file, a difference must not stop a valid tree. The copies go
-// first and the tree's index last, so a build the manifest lists has its
-// copies, and a run that failed part way can run again. The manifest is
+// first and the tree's index last, so a build this command records in the
+// manifest has a copy of every file it was given, and a run that failed part
+// way can run again. The manifest is
 // created only if it is still absent, and an
 // existing one is replaced only if its ETag is still the one read, so a
 // manifest another writer changed is never overwritten. The manifest is read
@@ -559,6 +560,7 @@ export function calibrationTreePublicationExitCode(error: unknown): number {
 export async function calibrationTreePublicationMain(
   argv: string[],
   environment: Record<string, string | undefined> = process.env,
+  client: CalibrationTreeBlobClient = DEFAULT_CLIENT,
 ): Promise<number> {
   try {
     if (argv.length !== 1) {
@@ -576,7 +578,11 @@ export async function calibrationTreePublicationMain(
         `The request ${argv[0]} could not be read as JSON: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
-    const result = await publishBuiltCalibrationTree({ request: parseCalibrationTreePublicationRequest(parsed), token });
+    const result = await publishBuiltCalibrationTree({
+      request: parseCalibrationTreePublicationRequest(parsed),
+      token,
+      client,
+    });
     console.log(JSON.stringify(result));
     return 0;
   } catch (error) {

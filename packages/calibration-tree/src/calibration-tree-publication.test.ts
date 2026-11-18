@@ -2,7 +2,7 @@
 // immutable paths and its entry is added to the manifest with a
 // compare-and-swap, against an in-memory store that follows Vercel Blob's
 // rules for allowOverwrite and ifMatch.
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -543,6 +543,36 @@ test("a refused build still names the copies that differed", async () => {
   expect(publication.calibrationTreePublicationRefusalAnswer(new publication.CalibrationTreeEntryRefusedError("x")))
     .toBeNull();
   expect(publication.calibrationTreePublicationRefusalAnswer(new Error("x"))).toBeNull();
+});
+
+test("the command prints a refused build's differing copies before it exits", async () => {
+  const store = new InMemoryBlobStore();
+  await publish(store, builtTree("staging"));
+  const resubmitted = builtTree("staging", undefined, { createdAt: "2026-11-02T08:00:00.000Z" });
+  const [diagnostics] = sourceFilesOf(resubmitted);
+  store.store(diagnostics.path, Bun.gzipSync(new TextEncoder().encode("{}")));
+  const requestPath = join(temporaryDirectory(), "publication.json");
+  writeFileSync(requestPath, JSON.stringify({
+    bundleDirectory: resubmitted.bundleDirectory,
+    worker: resubmitted.worker,
+    makeLatest: false,
+  }));
+  const printed = spyOn(console, "log").mockImplementation(() => {});
+  const reported = spyOn(console, "error").mockImplementation(() => {});
+
+  try {
+    const exitCode = await publication.calibrationTreePublicationMain(
+      [requestPath],
+      { CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN: TOKEN },
+      store.client(),
+    );
+
+    expect(exitCode).toBe(publication.CALIBRATION_TREE_PUBLICATION_EXIT_ENTRY_REFUSED);
+    expect(printed.mock.calls).toEqual([[JSON.stringify({ sourceFileConflicts: ["calibrationDiagnostics"] })]]);
+  } finally {
+    printed.mockRestore();
+    reported.mockRestore();
+  }
 });
 
 test("a copy that does not read back as written stops the publication", async () => {

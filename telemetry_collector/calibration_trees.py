@@ -513,7 +513,15 @@ class TreeUnbuildableError(Exception):
 
 
 class TreeRefusedError(Exception):
-    """The publication command refused the build (exit 2); another run cannot help."""
+    """The publication command refused the build (exit 2); another run cannot help.
+
+    ``source_file_conflicts`` names the copies of original files it found
+    stored with other bytes before the refusal.
+    """
+
+    def __init__(self, message: str, *, source_file_conflicts: Sequence[str] = ()):
+        super().__init__(message)
+        self.source_file_conflicts = tuple(source_file_conflicts)
 
 
 class TreeAlreadyStoredError(TreeRefusedError):
@@ -526,8 +534,6 @@ class TreeAlreadyStoredError(TreeRefusedError):
     the tree schema version, country, kind, source ID and each source file's
     SHA-256. ``build_artifact_id`` is the stored tree's, and
     ``submitted_build_artifact_id`` the one this build's files give.
-    ``source_file_conflicts`` names the copies of original files found stored
-    with other bytes.
     """
 
     def __init__(
@@ -538,10 +544,9 @@ class TreeAlreadyStoredError(TreeRefusedError):
         submitted_build_artifact_id: str,
         source_file_conflicts: Sequence[str] = (),
     ) -> None:
-        super().__init__(message)
+        super().__init__(message, source_file_conflicts=source_file_conflicts)
         self.build_artifact_id = build_artifact_id
         self.submitted_build_artifact_id = submitted_build_artifact_id
-        self.source_file_conflicts = tuple(source_file_conflicts)
 
 
 def stored_tree_of(
@@ -764,6 +769,7 @@ def build_and_publish(
         )
     if published.returncode == EXIT_ENTRY_REFUSED:
         message = shortened_message(published.stderr)
+        conflicts = _refusal_source_file_conflicts(published)
         submitted_id = worker_answer.get("buildArtifactId")
         if isinstance(submitted_id, str):
             stored_id = stored_tree_of(
@@ -774,9 +780,9 @@ def build_and_publish(
                     message,
                     build_artifact_id=stored_id,
                     submitted_build_artifact_id=submitted_id,
-                    source_file_conflicts=_refusal_source_file_conflicts(published),
+                    source_file_conflicts=conflicts,
                 )
-        raise TreeRefusedError(message)
+        raise TreeRefusedError(message, source_file_conflicts=conflicts)
     if published.returncode != 0:
         raise CalibrationTreeCommandError(
             f"The tree publication exited with {published.returncode}: "
@@ -823,6 +829,15 @@ def _conflict_fields(conflicts: Sequence[str]) -> dict[str, list[str]]:
     """A job result's record of the copies stored with other bytes, if any."""
 
     return {"source_file_conflicts": list(conflicts)} if conflicts else {}
+
+
+def _refusal_message(error: TreeRefusedError) -> str:
+    """A rejection's message, naming first any copies stored with other bytes."""
+
+    if not error.source_file_conflicts:
+        return str(error)
+    names = ", ".join(error.source_file_conflicts)
+    return shortened_message(f"The stored copies of {names} hold other bytes. {error}")
 
 
 def calibration_tree_handler(
@@ -904,7 +919,7 @@ def calibration_tree_handler(
                 }
             except TreeRefusedError as error:
                 raise SubmissionRejectedError(
-                    "calibration_tree_refused", str(error)
+                    "calibration_tree_refused", _refusal_message(error)
                 ) from error
         result: dict[str, Any] = {
             "processed_by": "calibration-tree",

@@ -1042,7 +1042,11 @@ class _Reconciliation:
                 source_file_conflicts=list(error.source_file_conflicts),
             )
         except TreeRefusedError as error:
-            return outcome("refused", reason=shortened_message(str(error)))
+            return outcome(
+                "refused",
+                reason=shortened_message(str(error)),
+                source_file_conflicts=list(error.source_file_conflicts),
+            )
         except Exception as error:
             return outcome("error", reason=_described(error), incomplete=True)
         return outcome(

@@ -3,7 +3,8 @@
 // with, and its publication command uploads them, before the tree's parts, to
 // private blobs at calibration-tree-sources/<country>/<build ID>/<name>.gz. The
 // folder is apart from calibration-trees/, so nothing that lists or reads the
-// trees sees the copies. A file the build does not have has no copy.
+// trees sees the copies. A copy exists only for a file some attempt to publish
+// the build was given.
 import { get } from "@vercel/blob";
 import { createHash } from "node:crypto";
 import { gunzipSync } from "node:zlib";
