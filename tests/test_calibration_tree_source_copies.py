@@ -348,8 +348,9 @@ def test_a_build_with_only_its_other_copies_gets_the_two_copied_files() -> None:
         "parentBuildManifest": PARENT_BUILD_MANIFEST,
         "reformValidation": REFORM_VALIDATION,
     }
-    # The two copied files have no record in the tree, so it is not read.
-    assert copies.bun.steps("copies sources") == []
+    # The tree's index is read for any missing copy, so that a build whose tree
+    # is not stored is found before anything is downloaded.
+    assert len(copies.bun.steps("copies sources")) == 1
     assert sorted(copies.hugging_face.downloaded_paths()) == [
         f"releases/{US_TAG}/{name}" for name in COPIED_FILES
     ]
@@ -436,6 +437,18 @@ def test_a_tree_file_recorded_by_its_decoded_text_is_copied_as_its_bytes() -> No
     [outcome] = copies.run()
 
     assert outcome.outcome == "copied"
+    assert outcome.files["calibration_diagnostics.json"] == "copied"
+    [store] = copies.bun.steps("copies store")
+    assert store["contents"] == {"calibrationDiagnostics": DIAGNOSTICS_WITH_MARK}
+
+
+def test_a_marked_tree_file_stored_with_lfs_is_copied_by_a_real_run() -> None:
+    copies, _ = release_copies_with_marked_diagnostics()
+    diagnostics = f"releases/{US_TAG}/calibration_diagnostics.json"
+    copies.hugging_face.datasets[US_RELEASES].lfs_paths.add(diagnostics)
+
+    [outcome] = copies.run()
+
     assert outcome.files["calibration_diagnostics.json"] == "copied"
     [store] = copies.bun.steps("copies store")
     assert store["contents"] == {"calibrationDiagnostics": DIAGNOSTICS_WITH_MARK}
@@ -811,6 +824,21 @@ def test_a_build_whose_tree_the_store_does_not_hold_is_not_copied_and_final() ->
     assert outcome.outcome == "not_copied"
     assert outcome.reason
     assert outcome.incomplete is False
+    assert copies.bun.steps("copies store") == []
+
+
+@pytest.mark.parametrize("dry_run", [False, True], ids=["real-run", "dry-run"])
+def test_a_build_lacking_only_copied_files_without_a_stored_tree_is_not_copied(
+    dry_run: bool,
+) -> None:
+    copies, entry = release_copies(stored=stored_copies(TREE_FILES))
+    copies.bun.without_index.add(entry["buildArtifactId"])
+
+    [outcome] = copies.run(dry_run=dry_run)
+
+    assert outcome.outcome == "not_copied"
+    assert outcome.incomplete is False
+    assert copies.hugging_face.downloaded_paths() == []
     assert copies.bun.steps("copies store") == []
 
 

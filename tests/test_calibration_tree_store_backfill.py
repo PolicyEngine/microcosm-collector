@@ -301,7 +301,7 @@ def test_each_step_gets_the_time_the_execution_has_left(
 def test_the_time_left_is_never_below_zero(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    steps = StandInSteps(minutes={"staging": 30})
+    steps = StandInSteps(minutes={"releases_record": 15})
 
     run(monkeypatch, steps)
 
@@ -324,6 +324,26 @@ def test_no_staging_country_starts_after_the_time_limit(
     assert staging[0].reason
     # The copy step still runs, and defers each build itself.
     assert steps.given["source_files"][0]["time_limit_seconds"] == 0
+
+
+def test_a_staging_country_starts_only_with_time_left_for_its_lock_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The reconcile code may wait 15 minutes for its lock before it checks the
+    # time, so a country that starts later could pass the task's hour.
+    steps = StandInSteps(minutes={"staging": 21})
+
+    outcomes = run(monkeypatch, steps)
+
+    assert [options["country"] for options in steps.given["staging"]] == ["us"]
+    staging = [outcome for outcome in outcomes if isinstance(outcome, ReconcileOutcome)]
+    assert [(outcome.country, outcome.outcome) for outcome in staging] == [
+        ("uk", "deferred")
+    ]
+    assert "lock" in staging[0].reason
+    assert steps.given["source_files"][0]["time_limit_seconds"] == (
+        TIME_LIMIT - 21 * MINUTE
+    )
 
 
 def test_a_dry_run_covers_every_staging_country_whatever_the_time(
