@@ -86,12 +86,22 @@ def run_folders(listed: Iterable[DatasetFile]) -> dict[str, RunFolder]:
     }
 
 
+#: The command's exit when the store holds no index for the tree asked about.
+EXIT_NO_TREE: Final = 2
+
+
+class StoredTreeMissingError(CalibrationTreeCommandError):
+    """The store's manifest lists a tree whose index the store does not hold."""
+
+
 def _answer(commands: TreeCommands, arguments: list[str], timeout: float) -> Any:
     completed = commands.run_command(
         [commands.bun, "run", str(COMMAND_SCRIPT), *arguments],
         commands.publication_environment,
         timeout,
     )
+    if completed.returncode == EXIT_NO_TREE and arguments[0] == "tree-sources":
+        raise StoredTreeMissingError(shortened_message(completed.stderr))
     if completed.returncode != 0:
         raise CalibrationTreeCommandError(
             f"The staging run files {arguments[0]} exited with "
@@ -125,7 +135,10 @@ def read_copied_runs(commands: TreeCommands, country: str) -> dict[str, dict[str
 def read_tree_sources(
     commands: TreeCommands, country: str, build_artifact_id: str
 ) -> dict[str, Any]:
-    """The source files a stored tree records, by the tree's role names."""
+    """The source files a stored tree records, by the tree's role names.
+
+    Raises ``StoredTreeMissingError`` when the store holds no index for it.
+    """
 
     answer: dict[str, Any] = _answer(
         commands,

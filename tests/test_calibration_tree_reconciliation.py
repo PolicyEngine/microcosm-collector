@@ -1954,6 +1954,27 @@ def test_a_stored_tree_that_can_t_be_read_leaves_the_run_incomplete() -> None:
     assert reconciliation.bun.steps("build") == []
 
 
+def test_a_stored_tree_whose_index_is_missing_is_refused_until_it_changes() -> None:
+    # The tree-sources action exits 2 when the store holds no index for the
+    # build: running again can't help, so the backfill's executions must not
+    # stay incomplete over it.
+    reconciliation = us_staging_reconciliation(structured_staging_run(RUN_ID))
+    stored_tree(reconciliation, RUN_ID, {"calibrationDiagnostics": DIAGNOSTICS})
+    reconciliation.bun.run_file_exits["tree-sources"] = 2
+
+    [first] = reconciliation.run(kinds=["staging"])
+
+    assert first.outcome == "refused"
+    assert first.incomplete is False
+    assert "index" in first.reason
+    assert reconciliation.bun.steps("build") == []
+
+    [second] = reconciliation.run(kinds=["staging"])
+
+    assert (second.outcome, second.reason) == ("refused", first.reason)
+    assert len(reconciliation.bun.steps("run files tree-sources")) == 1
+
+
 @pytest.mark.parametrize(
     ("exits", "expected"),
     [("worker_exits", "unbuildable"), ("publication_exits", "refused")],
@@ -2016,6 +2037,27 @@ def test_the_backfill_option_tries_a_final_refusal_again() -> None:
 
     assert outcome.outcome == "built"
     assert len(reconciliation.bun.steps("build")) == 2
+
+
+def test_older_runs_can_be_covered_while_a_final_refusal_is_repeated() -> None:
+    # The backfill's staging step: every execution and retry covers the older
+    # runs, but a refusal recorded for an unchanged folder is not built again.
+    reconciliation = us_staging_reconciliation(structured_staging_run(RUN_ID))
+    reconciliation.bun.worker_exits[RUN_ID] = 2
+    [first] = reconciliation.run(kinds=["staging"])
+    assert first.outcome == "unbuildable"
+    parameters = inspect.signature(
+        reconciliation_module().reconcile_calibration_trees
+    ).parameters
+    assert "retry_refusals" in parameters
+
+    [second] = reconciliation.run(
+        kinds=["staging"], include_older_runs=True, retry_refusals=False
+    )
+
+    assert (second.outcome, second.reason) == ("unbuildable", first.reason)
+    assert second.incomplete is False
+    assert len(reconciliation.bun.steps("build")) == 1
 
 
 def test_a_refused_replacement_is_not_reported_as_stored() -> None:

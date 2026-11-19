@@ -35,6 +35,7 @@
     "./calibration-tree-publication": "./src/calibration-tree-publication.ts",
     "./calibration-tree-releases-record": "./src/calibration-tree-releases-record.ts",
     "./calibration-tree-releases-record-copy": "./src/calibration-tree-releases-record-copy.ts",
+    "./calibration-tree-source-copies": "./src/calibration-tree-source-copies.ts",
     "./calibration-tree-source-files": "./src/calibration-tree-source-files.ts",
     "./calibration-tree-worker": "./src/calibration-tree-worker.ts",
     "./chronicle-metadata": "./src/chronicle-metadata.ts",
@@ -73,7 +74,8 @@
     "latest": "bun run src/calibration-tree-latest.ts",
     "manifest-read": "bun run src/calibration-tree-manifest-read.ts",
     "staging-run-files": "bun run src/staging-run-files-command.ts",
-    "releases-record-copy": "bun run src/calibration-tree-releases-record-copy.ts"
+    "releases-record-copy": "bun run src/calibration-tree-releases-record-copy.ts",
+    "source-copies": "bun run src/calibration-tree-source-copies.ts"
   },
   "dependencies": {
     "@vercel/blob": "^2.6.1"

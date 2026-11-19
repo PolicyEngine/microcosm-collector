@@ -28,8 +28,9 @@ Python:
   command covers, whatever their status. It covers a run that has a copy
   already, or whose folder last changed at or after ``JOB_COVERS_RUNS_FROM``,
   or a folder Hugging Face gives no last commit for; any other run is
-  ``older_run``, left to the backfill's go-aheads, which run this command with
-  ``include_older_runs``. Together they leave no run out. A folder is a run
+  ``older_run``, left to the backfill, whose staging step runs this code with
+  ``include_older_runs`` (``telemetry_collector.calibration_tree_store_backfill``).
+  Together they leave no run out. A folder is a run
   when it holds ``run_manifest.json``, or, beside
   a schema-1 ``runs.json``, when it holds ``progress.json`` or the index lists
   it; any other folder is ``not_a_run``. ``runs.json`` is read only when a
@@ -63,8 +64,11 @@ Python:
   or differ, is ``unbuildable`` on its own, and the other runs continue. A
   settled result, final refusals included, is kept in the run's record after
   each build, so the tree is looked at again only when the folder or the stored
-  build changes, or for a refusal when ``include_older_runs`` asks. A tree an
-  earlier attempt stored under the same build ID is used as it is. A run whose
+  build changes, or for a refusal when ``retry_refusals`` asks (by default with
+  ``include_older_runs``). A tree an
+  earlier attempt stored under the same build ID is used as it is. A stored
+  tree whose index the store doesn't hold is a final ``refused``, which needs
+  the stored entry repaired by hand. A run whose
   folder is gone
   from the listing is marked removed, and readers leave it out until the folder
   returns.
@@ -223,8 +227,10 @@ LatestStepSkipped = Literal["dry_run", "no_releases_record", "lock_wait_expired"
 FollowLatest = Callable[[str], FollowedLatest]
 #: What the step that stores releases.json did: what
 #: ``copy_releases_record`` answered, that it was not called, or that it raised.
+#: ``would_store`` comes only from the backfill's dry run, which calls
+#: ``copy_releases_record`` with ``dry_run``.
 ReleasesRecordStepOutcome = Literal[
-    "stored", "unchanged", "refused", "skipped", "error"
+    "stored", "unchanged", "refused", "would_store", "skipped", "error"
 ]
 #: ``calibration_trees.copy_releases_record`` for one country, with the worker
 #: job's Blob token and the Hugging Face reader.
@@ -235,7 +241,7 @@ CopyReleasesRecord = Callable[[str], CopiedReleasesRecord]
 LOCK_WAIT_SECONDS: Final = 15 * 60
 LOCK_POLL_SECONDS: Final = 5.0
 #: The webhook-queued job covers staging runs changed from this time on. Older
-#: runs reach the store through the backfill's go-aheads.
+#: runs reach the store through the backfill's staging step.
 JOB_COVERS_RUNS_FROM: Final = datetime(2026, 11, 19, tzinfo=UTC)
 #: The submissions that still build their own tree.
 IN_PROGRESS_STATUSES: Final = ("queued", "processing")
@@ -489,6 +495,8 @@ class _Reconciliation:
     time_limit_seconds: float
     #: Also cover staging runs older than ``JOB_COVERS_RUNS_FROM``.
     include_older_runs: bool = False
+    #: Look again at trees recorded as finally refused for an unchanged folder.
+    retry_refusals: bool = False
     listings: Listings = field(init=False)
     #: What became of each staging run's files in this execution.
     run_copies: dict[str, _RunCopy] = field(default_factory=dict)
@@ -1070,7 +1078,7 @@ class _Reconciliation:
             return None
         recorded = check.get("outcome")
         if recorded is not None:
-            if self.include_older_runs:
+            if self.retry_refusals:
                 return None
             return self.outcome(
                 "staging",
@@ -1441,6 +1449,20 @@ class _Reconciliation:
         if planned.stored_build is not None:
             try:
                 differs = self.tree_sources_differ(source, planned.stored_build)
+            except staging_run_files.StoredTreeMissingError as error:
+                # Running again can't help: the stored entry needs repair by
+                # hand, so the refusal is kept for this folder and stored build.
+                return self.settle_plan(
+                    planned,
+                    outcome(
+                        "refused",
+                        reason=shortened_message(
+                            "The store's manifest lists tree "
+                            f"{planned.stored_build.get('buildArtifactId')} for this "
+                            f"run, but the store holds no index for it: {error}"
+                        ),
+                    ),
+                )
             except Exception as error:
                 return outcome("error", reason=_described(error), incomplete=True)
             stored_id = planned.stored_build.get("buildArtifactId")
@@ -1556,8 +1578,15 @@ def reconcile_calibration_trees(
     clock: Callable[[], float] = time.monotonic,
     time_limit_seconds: float = BUILD_TIME_LIMIT_SECONDS,
     include_older_runs: bool = False,
+    retry_refusals: bool | None = None,
 ) -> Iterator[ReconcileOutcome | LatestStep | ReleasesRecordStep]:
     """Reconcile ``country``'s ``kinds``, in that order, yielding each outcome.
+
+    ``include_older_runs`` also covers staging runs older than
+    ``JOB_COVERS_RUNS_FROM``. ``retry_refusals`` looks again at trees recorded
+    as finally refused while their folder is unchanged; by default it follows
+    ``include_older_runs``, as ``--include-older-runs`` asks. The backfill's
+    staging step passes ``False``, so its retries don't build them again.
 
     The release kind starts with its ``ReleasesRecordStep``: ``copy_record``
     for the country, called before the release lock is waited for. It ends
@@ -1588,6 +1617,9 @@ def reconcile_calibration_trees(
         started=clock(),
         time_limit_seconds=time_limit_seconds,
         include_older_runs=include_older_runs,
+        retry_refusals=(
+            include_older_runs if retry_refusals is None else retry_refusals
+        ),
     )
     for kind in kinds:
         if kind == "release":
