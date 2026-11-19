@@ -1954,6 +1954,27 @@ def test_a_stored_tree_that_can_t_be_read_leaves_the_run_incomplete() -> None:
     assert reconciliation.bun.steps("build") == []
 
 
+def test_a_stored_tree_whose_index_is_missing_is_refused_until_it_changes() -> None:
+    # The tree-sources action exits 2 when the store holds no index for the
+    # build: running again can't help, so the backfill's executions must not
+    # stay incomplete over it.
+    reconciliation = us_staging_reconciliation(structured_staging_run(RUN_ID))
+    stored_tree(reconciliation, RUN_ID, {"calibrationDiagnostics": DIAGNOSTICS})
+    reconciliation.bun.run_file_exits["tree-sources"] = 2
+
+    [first] = reconciliation.run(kinds=["staging"])
+
+    assert first.outcome == "refused"
+    assert first.incomplete is False
+    assert "index" in first.reason
+    assert reconciliation.bun.steps("build") == []
+
+    [second] = reconciliation.run(kinds=["staging"])
+
+    assert (second.outcome, second.reason) == ("refused", first.reason)
+    assert len(reconciliation.bun.steps("run files tree-sources")) == 1
+
+
 @pytest.mark.parametrize(
     ("exits", "expected"),
     [("worker_exits", "unbuildable"), ("publication_exits", "refused")],
