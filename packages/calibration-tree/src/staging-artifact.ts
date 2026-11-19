@@ -418,7 +418,7 @@ export function stagingTargetChangeCacheTtlSeconds(status: unknown): number {
     : TARGET_CHANGE_MUTABLE_CACHE_SECONDS;
 }
 
-function summaryFromProgress(runId: string, progress: JsonObject | null): StagingRunSummary {
+export function summaryFromProgress(runId: string, progress: JsonObject | null): StagingRunSummary {
   const candidate = stringValue(progress?.candidate_release_id);
   return {
     run_id: runId,
@@ -437,7 +437,7 @@ function summaryFromProgress(runId: string, progress: JsonObject | null): Stagin
   };
 }
 
-function summaryFromManifest(
+export function summaryFromManifest(
   runId: string,
   manifest: JsonObject,
 ): StagingRunSummary {
@@ -458,7 +458,7 @@ function summaryFromManifest(
   };
 }
 
-function sortRuns(a: StagingRunSummary, b: StagingRunSummary): number {
+export function sortRuns(a: StagingRunSummary, b: StagingRunSummary): number {
   return (
     compareTimestampsDescending(a.updated_at, b.updated_at) ||
     compareTimestampsDescending(a.started_at, b.started_at) ||

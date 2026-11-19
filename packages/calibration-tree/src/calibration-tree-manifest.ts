@@ -258,6 +258,10 @@ export function withCalibrationTreeManifestEntry(
   country: MicrocosmCountry,
   entry: CalibrationTreeManifestEntry,
   makeLatest = false,
+  options: {
+    /** A staged run's entry takes the place of the run's earlier tree. */
+    replaceStagingRun?: boolean;
+  } = {},
 ): CalibrationTreeManifest {
   parseEntry(entry, country);
   const current = manifest.countries[country] ?? {
@@ -274,11 +278,17 @@ export function withCalibrationTreeManifestEntry(
       ? build.releaseId === entry.releaseId
       : build.stagingRunId === entry.stagingRunId)
   );
-  if (aliasConflict) {
+  const replacesEarlierTree = aliasConflict != null &&
+    entry.kind === "staging" &&
+    options.replaceStagingRun === true;
+  if (aliasConflict && !replacesEarlierTree) {
     throw new Error(
       `Calibration source ${entry.sourceId} already resolves to build ${aliasConflict.buildArtifactId}.`,
     );
   }
+  const keptBuilds = replacesEarlierTree
+    ? current.builds.filter((build) => build !== aliasConflict)
+    : current.builds;
   if (previous) {
     const immutableFields: Array<keyof CalibrationTreeManifestEntry> = [
       "buildArtifactId",
@@ -301,10 +311,10 @@ export function withCalibrationTreeManifestEntry(
   // publication timestamps) is replaced, so a reconciliation can correct a
   // stored timestamp without re-publishing the bundle.
   const builds = previous
-    ? current.builds.map((build) =>
+    ? keptBuilds.map((build) =>
         build.buildArtifactId === entry.buildArtifactId ? entry : build,
       )
-    : [...current.builds, entry];
+    : [...keptBuilds, entry];
   const latestReleaseBuildArtifactId = makeLatest
     ? entry.buildArtifactId
     : current.latestReleaseBuildArtifactId;

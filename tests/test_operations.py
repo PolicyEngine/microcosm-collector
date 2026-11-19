@@ -693,6 +693,38 @@ def test_the_reconcile_command_passes_its_country_kind_and_dry_run(
     assert given["disposed"] is True
 
 
+def test_the_reconcile_command_leaves_older_runs_out_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    given = stand_in_reconciliation(monkeypatch, [])
+
+    operations.main([RECONCILE_COMMAND, "--country", "uk", "--kind", "staging"])
+
+    assert given.get("include_older_runs") is False
+
+
+def test_the_reconcile_command_can_include_older_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    given = stand_in_reconciliation(monkeypatch, [])
+
+    try:
+        operations.main(
+            [
+                RECONCILE_COMMAND,
+                "--country",
+                "uk",
+                "--kind",
+                "staging",
+                "--include-older-runs",
+            ]
+        )
+    except SystemExit:
+        pytest.fail("The command has no --include-older-runs yet.")
+
+    assert given.get("include_older_runs") is True
+
+
 @pytest.mark.parametrize(
     ("country", "kinds"),
     [
@@ -746,6 +778,15 @@ def test_without_a_kind_the_command_reconciles_every_kind_the_country_has(
             REQUEST_ID,
             "--dry-run",
         ],
+        [
+            "--country",
+            "uk",
+            "--kind",
+            "staging",
+            "--request-id",
+            REQUEST_ID,
+            "--include-older-runs",
+        ],
     ],
     ids=[
         "no-country",
@@ -757,6 +798,7 @@ def test_without_a_kind_the_command_reconciles_every_kind_the_country_has(
         "request-id-of-another-country",
         "request-id-without-kind",
         "request-id-in-a-dry-run",
+        "request-id-with-older-runs",
     ],
 )
 def test_the_reconcile_command_exits_2_for_an_argument_error(

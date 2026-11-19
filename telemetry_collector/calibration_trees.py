@@ -489,7 +489,7 @@ class TreeUnbuildableError(Exception):
 
 
 class TreeRefusedError(Exception):
-    """The publication command refused the build (exit 2); another run cannot help.
+    """The publication command refused the build (exit 2) for these files.
 
     ``source_file_conflicts`` names the copies of original files it found
     stored with other bytes before the refusal.
@@ -665,6 +665,9 @@ class PublishedTree:
     source_file_conflicts: tuple[str, ...]
     made_latest: bool
     latest_decision: LatestDecision
+    #: What a stored tree used instead of this build's records: its
+    #: ``hfCommitSha``, ``createdAt`` and ``label``.
+    restored_tree: Mapping[str, Any] | None = None
 
 
 def build_and_publish(
@@ -674,6 +677,8 @@ def build_and_publish(
     directory: Path,
     commands: TreeCommands,
     decide_latest: Callable[[], LatestDecision] | None = None,
+    replace_staged_run: bool = False,
+    reuse_stored_tree: bool = False,
 ) -> PublishedTree:
     """Build ``plan``'s tree from ``files`` (role to local copy) and publish it.
 
@@ -684,7 +689,10 @@ def build_and_publish(
     country's latest, and the publication, which runs with the token. That
     decision is ``plan.make_latest``, or, given ``decide_latest``, what it
     returns: the handler passes ``release_latest``, which reads
-    releases.json, and the backfill passes nothing. Worker exit 2 raises
+    releases.json, and the backfill passes nothing. ``replace_staged_run``
+    makes the tree take the place of the staged run's earlier tree in the
+    manifest, and ``reuse_stored_tree`` uses a tree already stored under the
+    build ID, as an earlier attempt may have left it. Worker exit 2 raises
     ``TreeUnbuildableError`` and publication exit 2 ``TreeRefusedError``;
     any other failure raises ``CalibrationTreeCommandError``, and a timeout
     ``subprocess.TimeoutExpired``. Whatever ``decide_latest`` raises is
@@ -734,6 +742,8 @@ def build_and_publish(
                     "bundleDirectory": str(bundle_directory),
                     "worker": worker_answer,
                     "makeLatest": latest.make_latest,
+                    **({"reuseStoredTree": True} if reuse_stored_tree else {}),
+                    **({"replaceStagingRun": True} if replace_staged_run else {}),
                 }
             ),
             encoding="utf-8",
@@ -775,6 +785,7 @@ def build_and_publish(
         source_file_conflicts=tuple(answer["sourceFileConflicts"]),
         made_latest=answer["madeLatest"],
         latest_decision=latest,
+        restored_tree=answer.get("restoredTree"),
     )
 
 

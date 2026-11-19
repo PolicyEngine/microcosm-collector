@@ -43,11 +43,15 @@ limit, a country's manifest could not be used, or a country's latest build
 was not made the store's latest; and 2 for an argument error.
 
 ``reconcile-calibration-trees --country <cc> [--kind release|staging]
-[--request-id <task ID>] [--dry-run]`` builds the country's calibration trees
+[--request-id <task ID>] [--dry-run] [--include-older-runs]`` builds the
+country's calibration trees
 that its Hugging Face repos hold and the store lacks
 (``telemetry_collector.calibration_tree_reconciliation``): every build its
-release repo's ``releases.json`` lists, and every finalized run of its staging
-repo, each read at the repo's head. Without ``--kind`` it covers both kinds,
+release repo's ``releases.json`` lists, and every staging run it covers that has
+calibration diagnostics, each read at the repo's head. It also keeps copies of
+the files the dashboard reads for those runs. It covers staging runs changed
+from ``JOB_COVERS_RUNS_FROM`` on and runs already copied; the backfill's
+``--include-older-runs`` covers the rest. Without ``--kind`` it covers both kinds,
 or only releases for a country without a staging repo. The Cloud Task that
 ``POST /v1/calibration-tree-builds`` queues runs it in the worker job with
 ``--request-id``, the task's ID: the run records its start, attempts, finish
@@ -301,6 +305,15 @@ def _argument_parser() -> argparse.ArgumentParser:
             "nothing and taking no lock."
         ),
     )
+    reconcile.add_argument(
+        "--include-older-runs",
+        action="store_true",
+        help=(
+            "Also cover staging runs last changed before the webhook-queued "
+            "job's start date, as the backfill does, and try again the trees "
+            "recorded as finally refused."
+        ),
+    )
     return parser
 
 
@@ -315,6 +328,8 @@ def _reconcile_argument_error(options: argparse.Namespace) -> str | None:
         return None
     if options.dry_run:
         return "--request-id can't be used with --dry-run."
+    if options.include_older_runs:
+        return "--request-id can't be used with --include-older-runs."
     if options.kind is None:
         return "--request-id needs --kind."
     if not calibration_tree_builds.is_request_id(
@@ -551,6 +566,7 @@ def _reconcile_calibration_trees(database_url: str, options: argparse.Namespace)
                     reader=reader,
                 ),
                 dry_run=options.dry_run,
+                include_older_runs=options.include_older_runs,
             )
             if request_id is not None:
                 request_rows.record_start(

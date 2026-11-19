@@ -43,8 +43,9 @@ class FakeDataset:
     reported_lfs_sha256: dict[str, str] = field(default_factory=dict)
     #: The last commit (ID and date) of each file or folder, by path, for
     #: listings with expand=true; ``None`` leaves ``lastCommit`` out. A path
-    #: not listed gets the head commit and ``DEFAULT_COMMIT_DATE``.
+    #: not listed gets the head commit and ``default_commit_date``.
     last_commits: dict[str, tuple[str, str] | None] = field(default_factory=dict)
+    default_commit_date: str = DEFAULT_COMMIT_DATE
     #: The files at other commits, by commit. ``main`` and the head commit
     #: hold ``files``.
     revisions: dict[str, dict[str, bytes]] = field(default_factory=dict)
@@ -233,7 +234,7 @@ class FakeHuggingFace:
                     "path": child_path,
                 }
             last_commit = dataset.last_commits.get(
-                child_path, (dataset.head_commit, DEFAULT_COMMIT_DATE)
+                child_path, (dataset.head_commit, dataset.default_commit_date)
             )
             if expand and last_commit is not None:
                 commit, date = last_commit
