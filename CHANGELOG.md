@@ -1,3 +1,10 @@
+## [0.27.0] - 2026-11-19
+
+### Added
+
+- The `reconcile-calibration-trees` job now covers staging runs changed from 2026-11-19 on, whatever their status, and `--include-older-runs` lets the backfill cover the older ones: it keeps private gzip copies of the run files the dashboard reads, reads a run again when its folder or stored tree changes, treats a folder with no run documents as not a run, builds a tree for any run with calibration diagnostics, and replaces that tree when the diagnostics or manifests it was built from change. `@policyengine/calibration-tree` 0.1.4 has readers for the copies.
+
+
 ## [0.26.0] - 2026-11-18
 
 ### Added
