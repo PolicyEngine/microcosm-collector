@@ -52,7 +52,7 @@ the run incomplete, so it runs again.
 
 A dry run reads the store's manifest, its copy listing, the Hugging Face
 listings, the small documents a staging run's files are found by and the
-tree's index, and reads a tree file only when Hugging Face gives no SHA-256
+index of each tree missing a copy, and reads a tree file only when Hugging Face gives no SHA-256
 for it (one stored without LFS); it stores nothing, takes no lock and has no
 time limit. A file it does not read is compared by the SHA-256 Hugging Face
 gives for its bytes, so one whose recorded digest is of other text, such as a
@@ -462,11 +462,11 @@ class _SourceCopies:
     ) -> dict[str, str]:
         """The SHA-256 the stored tree's index records for each missing tree file.
 
-        The index is read only when a file it records is missing a copy.
+        The index is read whenever a copy is missing, so that a build whose
+        tree is not stored is found (``SourceCopiesRefusedError``) before
+        anything is downloaded, in a dry run as in a real one.
         """
 
-        if not any(role in TREE_ROLES for role in missing):
-            return {}
         recorded = read_recorded_sources(self.commands, country, build_artifact_id)
         expected: dict[str, str] = {}
         for role in TREE_ROLES & set(missing):

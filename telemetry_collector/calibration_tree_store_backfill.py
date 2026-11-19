@@ -26,11 +26,13 @@ these steps, in this order, for the selected countries and kinds:
    (``calibration_tree_source_copies``).
 
 Steps 2 to 4 share the execution's time limit: each is given what is left of
-it, and no build, copy or download starts after it, so a Cloud Run retry
-carries on past what is stored. Once no time is left, a staging country is
-``deferred`` without waiting for its lock or reading Hugging Face, and the
-copy step defers each build before looking for its files. A dry run has no
-time limit, as each step's dry run has none. A step that fails for one country is reported
+it, and works only while some is left, so a Cloud Run retry carries on past
+what is stored. A staging country is ``deferred``, without waiting for its
+lock or reading Hugging Face, unless at least the reconcile lock's 15-minute
+wait and 5 more minutes are left (``STAGING_COUNTRY_MINIMUM_SECONDS``), and the
+copy step defers each build before looking for its files once none is left.
+A build or download already started runs to its end. A dry run has no time
+limit, as each step's dry run has none. A step that fails for one country is reported
 and the rest go on. Nothing here asks to move a country's latest, except the
 builds of step 2, as that step always has.
 """
@@ -39,7 +41,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from typing import Any, Protocol
+from typing import Any, Final, Protocol
 
 import httpx
 
@@ -70,6 +72,13 @@ from telemetry_collector.calibration_trees import (
 )
 from telemetry_collector.huggingface_read import HuggingFaceReader
 
+#: A staging country starts only with this much of the execution's time left:
+#: the reconcile code may wait this long for its lock before it looks at the
+#: time, and the rest is for its work, so the execution ends within the worker
+#: job's one-hour task.
+STAGING_COUNTRY_MINIMUM_SECONDS: Final = (
+    calibration_tree_reconciliation.LOCK_WAIT_SECONDS + 5 * 60
+)
 #: An outcome of any step.
 StepOutcome = (
     ReleasesRecordStep | BackfillOutcome | ReconcileOutcome | SourceFilesOutcome
@@ -150,14 +159,14 @@ def backfill_calibration_tree_store(
         for country in countries:
             if country not in STAGING_REPOS:
                 continue
-            if not dry_run and time_left() <= 0:
+            if not dry_run and time_left() < STAGING_COUNTRY_MINIMUM_SECONDS:
                 yield ReconcileOutcome(
                     country=country,
                     kind="staging",
                     outcome="deferred",
                     reason=(
-                        "No staging country starts after the execution's time "
-                        "limit; run again."
+                        "A staging country starts only with time left for the "
+                        "reconcile lock's wait and some work; run again."
                     ),
                     incomplete=True,
                 )

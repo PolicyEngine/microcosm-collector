@@ -77,10 +77,14 @@ copy. `readCalibrationTreeSourceFile` returns the original bytes instead.
 
 For builds the store held before it kept copies, the collector's backfill adds
 them with `src/calibration-tree-source-copies.ts`. Its `list <country>` prints
-the copies stored for each build, and its `store REQUEST.json` stores the
-copies a build lacks: one of the four files a tree is built from only when the
-tree's index records it with the same SHA-256, and the other two as given. The
-first copy of a file stands, whichever writer stored it.
+the copies stored for each build, its `sources <country> <build ID>` the files
+a stored tree's index records it was built from, and its `store REQUEST.json`
+stores the copies a build lacks: one of the four files a tree is built from
+only when the tree's index records it with the same SHA-256, and the other two
+as given. The index's digest is over the file's text as `TextDecoder` decodes
+it (a leading byte-order mark dropped), so a file matches by its bytes or that
+text, and its copy is of its bytes. The first copy of a file stands, whichever
+writer stored it.
 
 ## Copies of staging run files
 

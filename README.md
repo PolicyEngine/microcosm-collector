@@ -1907,11 +1907,13 @@ and `--kind release|staging` limit every step.
    below).
 
 Steps 2 to 4 share the execution's 40-minute limit on starting work: each is
-given what is left of it. Once none is left, a staging country is `deferred`
-without waiting for its lock or reading Hugging Face, and step 4 defers each
-build before looking for its files, so an execution prints its summary well
-within the worker job's one-hour task timeout. A dry run has no time limit. A
-step that fails for one country is reported and the others go on.
+given what is left of it. A staging country is `deferred`, without waiting for
+its lock or reading Hugging Face, unless at least the reconcile lock's
+15-minute wait and 5 more minutes are left, and step 4 defers each build
+before looking for its files once none is left, so an execution prints its
+summary within the worker job's one-hour task timeout as long as a build
+started before the limit ends in time. A dry run has no time limit. A step
+that fails for one country is reported and the others go on.
 
 **Production's manifest.** The rest of this part, up to "Original files of
 stored builds", describes step 2
@@ -2083,7 +2085,9 @@ has no copy of a file the submission did not carry, such as
   checked against its listing, then
   `packages/calibration-tree/src/calibration-tree-source-copies.ts store`
   checks the index's record again and stores each copy the store still lacks.
-  The index is read with the same command's `sources`.
+  The index is read with the same command's `sources` whenever a copy is
+  missing, so a build whose tree is not stored is `not_copied` before anything
+  is downloaded.
   A copy already stored stays as it is, whatever it holds. Nothing else is
   written: no tree part, index or manifest, and no lock is taken.
 
