@@ -2195,8 +2195,9 @@ and an older image has no `reconcile-calibration-trees` command.
 
 **The command.** `python -m telemetry_collector.operations
 reconcile-calibration-trees --country <cc> [--kind release|staging]
-[--request-id <task ID>] [--dry-run]` reads the country's repos at their
-head commit with the GitHub Actions publisher's listing rules ported to
+[--request-id <task ID>] [--dry-run] [--include-older-runs]` reads the
+country's repos at their head commit with the GitHub Actions publisher's
+listing rules ported to
 Python. Without `--kind` it covers both kinds, or only releases for BE.
 
 - **Release:** every build the release repo's `releases.json` lists,
@@ -2209,20 +2210,42 @@ Python. Without `--kind` it covers both kinds, or only releases for BE.
   its `release_manifest.json` must name the same release and build. Its tree
   records the record's `published_at` as `toISOString` writes it. The current
   default build is built first.
-- **Staging:** the runs in the staging repo's `runs/<id>/` folders. A run the
-  store holds is `already_stored`, and its files are not read. Of the
-  others, a structured run's status is its run manifest's, and a schema-1
-  run's is the one a schema-1 `runs.json` records, else its
-  `progress.json`'s. A folder without a run manifest of its own is a
-  schema-1 run when `runs.json` is schema 1, which is read whenever a run
-  the store lacks has a schema-1 manifest or none. A `runs.json` that isn't
-  JSON, or isn't a JSON object, counts as no `runs.json`, as it does for the
-  publisher. If `runs.json` can't be read, each run the store lacks with a
-  schema-1 manifest or none is an incomplete `error`, so the command exits
-  1; the structured runs are still built. Only `passed`, `published` and
-  `completed` runs are built, the newest first. Its label is its candidate
-  release, else its run ID, and its time its progress's `updated_at`, else
-  its run manifest's.
+- **Staging:** the runs in the staging repo's `runs/<id>/` folders that the
+  command covers, whatever their status. The webhook-queued job covers a run
+  that already has a copy or whose folder last changed on or after 2026-11-19
+  (`JOB_COVERS_RUNS_FROM`). Any other run is `older_run` and is left to the
+  backfill's go-aheads, which pass `--include-older-runs`, so the two together
+  leave no run out. `--include-older-runs` can't be used with `--request-id`.
+  A folder is a run when it holds `run_manifest.json`, or, beside
+  a schema-1 `runs.json`, when it holds `progress.json` or that file lists it.
+  Any other folder is `not_a_run`, and nothing is read from it. `runs.json` is
+  read only when a folder has no run manifest. One that isn't JSON, or isn't a
+  JSON object, counts as none; one that can't be read makes each folder without
+  a run manifest an incomplete `error`.
+- **Copies of run files.** For each run the command first keeps private gzip
+  copies of `run_manifest.json`, `progress.json`, `events.ndjson`,
+  `calibration_progress.json`, `reform_validation.json` and
+  `artifacts/staged_dataset.json`, read at the head commit. They are stored in
+  the tree store at `staging-run-files/<country>/runs/<run ID>/<SHA-256>.gz`,
+  and `staging-run-files/<country>/index.json` says which versions are current,
+  with each run's list entry, so a reader never sees part of an update. A run's
+  folder is compared by a fingerprint of its files' paths and git blob IDs from
+  the listing the command already reads, so an unchanged run costs no Hugging
+  Face request. Runs are stored ten at a time, and no batch starts after 40
+  minutes, so a later execution carries on from what is stored. A run whose
+  folder has gone from the listing is marked removed, and the package's readers
+  leave it out until the folder returns. A file over 64 MiB is named in the run's
+  record instead of being copied. The copies hold what the files say. The job works out no status of its own: an unfinished
+  run's status comes from telemetry when a page is requested.
+- **Trees of staging runs.** A run with calibration diagnostics has a tree,
+  whatever its status, built the newest first. Its label is its candidate
+  release, else its run ID, and its time its progress's `updated_at`, else its
+  run manifest's. A stored tree stays while the diagnostics and manifests the
+  run has now match the SHA-256 values its index records. When one differs or
+  is new, the tree is built again and replaces the stored one in the manifest;
+  the old parts stay stored. If the files return to a state that already has a
+  stored tree, that tree comes back as it was. A file only the stored tree has
+  does not count.
 - A build whose folder (`releases/<release>/<build>` or `staged/<run>`) a
   `queued` or `processing` `calibration-diagnostics` submission holds is
   `submission_in_progress`: the submission builds it. A submission that
@@ -2276,20 +2299,27 @@ table below: each build's, and each outcome for a whole kind
 whole kind. The summary's `latest` and `releases_record` repeat those steps'
 documents, or are `null` for a run without releases. Neither step is counted
 in `outcomes`, and a step that failed and may be tried again makes
-`incomplete` true without adding an entry to `incomplete_sources`.
+`incomplete` true without adding an entry to `incomplete_sources`. A staging
+run's document also has `run_files`, what became of its copies (`copied`,
+`unchanged`, `would_copy`, `deferred` or `error`, the last two leaving the run
+incomplete), `copied_run_files` and `run_files_reason`, and the summary's
+`run_files` counts those results. `replaced_build_artifact_id` names the stored
+tree a new one replaced.
 
 Each build's outcome:
 
 | Outcome | Means | Final |
 |---|---|---|
 | `would_build` | a dry run would build it | |
-| `built` | built and published, never as the latest | yes |
+| `built` | built and published, never as the latest; a tree already stored under its build ID is used instead, and the outcome reports that tree's commit, time and label | yes |
 | `already_stored` | the store holds it, or gained a tree for it while it was built (a release build's with the same build ID, or any of the same staged run), so its publication was refused | yes |
 | `submission_in_progress` | a `queued` or `processing` submission of its folder builds it | yes |
-| `ineligible` | a release folder without diagnostics, or whose release manifest is absent or names another build; a staging run that isn't final; a final staging run without calibration diagnostics, as the publisher reports one: a schema-1 folder without `calibration_diagnostics.json`, a structured run that declares neither diagnostics nor a staged dataset, a staged-dataset receipt of a skipped, failed or disabled staging, or a bundle that records no diagnostics file with a SHA-256 | yes |
+| `not_a_run` | a folder under `runs/` with no run documents | yes |
+| `older_run` | a run without a copy whose folder last changed before the job's start date, left to the backfill | yes |
+| `ineligible` | a release folder without diagnostics, or whose release manifest is absent or names another build; a staging run without calibration diagnostics: a schema-1 folder without `calibration_diagnostics.json`, a structured run that declares neither diagnostics nor a staged dataset, a staged-dataset receipt of a skipped, failed or disabled staging, or a bundle that records no diagnostics file with a SHA-256 | yes |
 | `unbuildable` | the worker refused the files (exit 2), or a staging run's documents are incompatible: a run manifest that isn't a JSON object, names another run or has an unsupported schema, and the backfill's own checks of a run's files, such as declared or recorded diagnostics that are absent or differ from their SHA-256 | yes |
 | `too_large` | a file is over 256 MiB | yes |
-| `refused` | the publication refused the build (exit 2), and the store holds no tree for it as `already_stored` describes | yes |
+| `refused` | the publication refused the build (exit 2), and the store holds no tree for it as `already_stored` describes, or the tree could not replace the run's stored one | yes |
 | `no_releases_record` | the release repo has no `releases.json`; nothing is built | yes |
 | `releases_record_refused` | `releases.json` breaks the record's rules; nothing is built | yes |
 | `error` | a Hugging Face failure, the store's manifest could not be read, a Bun exit 1 or 3, or a timeout | no |
@@ -2324,8 +2354,10 @@ the worker job has, and stops with a message naming a missing one.
 
 **Running it by hand.** As an execution of the worker job, by someone who
 may run it with overridden arguments. First the dry run, which reads the
-Hugging Face listings and the store's manifest, downloads no diagnostics,
-builds nothing and takes no lock:
+Hugging Face listings, the run documents it needs to plan, the store's manifest,
+the index of copied run files and the indexes of stored staging trees. It copies
+and builds nothing and takes no lock. It downloads no diagnostics stored with
+LFS or declared with a digest:
 
 ```bash
 gcloud run jobs execute <worker job> --project <project> --region <region> \
@@ -2356,28 +2388,24 @@ past builds again".
 - A repo without `releases.json` builds nothing: its tags and pointer files
   are not read. BE is to publish with `releases.json` before the
   switch-over.
-- A staging run reads the manifests of every run the store lacks, including
-  runs that will never be final.
-- The publisher reads `runs.json` only when a listed run's manifest is
-  schema 1. This command never reads a stored run's manifest, so it reads
-  `runs.json` whenever a run the store lacks has a schema-1 manifest or
-  none. In a staging repo with a schema-1 `runs.json` and no schema-1 run
-  manifest, a folder without a manifest is therefore a run here and not for
-  the publisher.
-- If `runs.json` can't be read, only the runs that depend on it are an
-  `error`: each run the store lacks with a schema-1 manifest or none, whose
-  status, or for a folder without a run manifest whether it is a run, may
-  come from `runs.json`. The structured runs are still built. Where the
-  publisher reads `runs.json`, an error answer other than 404 stops its
-  whole staging listing, and a request that gets no answer counts as no
-  `runs.json`. A `runs.json` that isn't JSON, or isn't a JSON object, is no
-  `runs.json` for both.
-- A schema-1 `runs.json` that the publisher's `parseStagingRunIndex`
-  refuses, one with a `schema_name` or whose `runs` isn't a list, is taken
-  here as no `runs.json`, and a malformed row of one is skipped. The
-  publisher's staging listing stops at either.
-- The command reads the `progress.json` of every schema-1 run that
-  `runs.json` doesn't list. The publisher reads at most 50 of them.
+- A staging run whose tree ended `ineligible`, `unbuildable`, `too_large` or
+  `refused` is not tried again until its folder or stored build changes, or
+  `--include-older-runs` is passed. One left at `submission_in_progress`, in an
+  `error` or `deferred` is looked at again on each execution.
+- A copied run's list entry is worked out when its files are copied, so a later
+  change to the package's parsers reaches it when its folder next changes.
+- The original-file copies a tree stores are those present when it was built. A
+  later `reform_validation.json` or `parent_build_manifest.json` does not
+  rebuild the tree; `staging-run-files/` keeps `reform_validation.json` current.
+- `runs.json` is read only when some folder has no run manifest. It decides
+  whether such a folder is a run. When it has been read, a schema-1 run's row
+  gives that run's list entry before `progress.json`; otherwise the entry comes
+  from `progress.json`. If it can't be read, only the folders without a run
+  manifest are an `error`, and every other run continues.
+- A recorded refusal is matched to the whole run folder, so a run that keeps
+  committing while its tree is refused is built again after each change.
+- A schema-1 `runs.json` with a `schema_name`, or whose `runs` isn't a list, is
+  taken as no `runs.json`, and a malformed row of one is skipped.
 - A build skipped as `submission_in_progress` is not built later if that
   submission then fails or is rejected: the outcome is final, so it waits
   for the next request for its country and kind, or for the submission to
@@ -2385,14 +2413,11 @@ past builds again".
 - An execution stopped by the worker job's one-hour task timeout leaves its
   request row without `finished_at` or `summary`.
 - A publication that fails or runs out of time after uploading a tree's
-  index but before writing the manifest leaves that index without a
-  manifest entry. Another writer of the same build ID whose index differs is
-  then refused at that part while the manifest shows no tree for it, so a
-  submission in that position is rejected. A release build's or a
-  submission's own retry builds the same index and stores the tree. A staging
-  build of this command doesn't: its index records the staging repo's head,
-  so once that moves, the run is `refused` on every later execution, until a
-  submission with another build ID stores a tree for it.
+  index but before writing the manifest leaves that index without a manifest
+  entry. A staging build of this command then uses the stored tree under the
+  same build ID. Another writer of the same build ID whose index differs is
+  refused at that part, so a submission in that position is rejected. A release
+  build's or a submission's own retry builds the same index and stores the tree.
 - Builds are ordered by the time they are published with (the progress's
   `updated_at`, else the run manifest's), then by run ID. The publisher
   orders its staging listing by each run's summary `updated_at`, then

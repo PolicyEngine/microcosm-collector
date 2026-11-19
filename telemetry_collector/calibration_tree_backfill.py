@@ -971,9 +971,18 @@ def staging_source(
 
 
 def build_and_publish_source(
-    source: BuildSource, reader: HuggingFaceReader, commands: TreeCommands
+    source: BuildSource,
+    reader: HuggingFaceReader,
+    commands: TreeCommands,
+    *,
+    replace_staged_run: bool = False,
+    reuse_stored_tree: bool = False,
 ) -> PublishedTree:
-    """Download the build's files into a new directory, then build and publish it."""
+    """Download the build's files into a new directory, then build and publish it.
+
+    ``replace_staged_run`` makes the tree replace its staged run's earlier one,
+    and ``reuse_stored_tree`` uses a tree already stored under its build ID.
+    """
 
     with tempfile.TemporaryDirectory(prefix="calibration-tree-backfill-") as directory:
         build_directory = Path(directory)
@@ -998,7 +1007,12 @@ def build_and_publish_source(
                 )
             local_files[role] = downloaded.path
         return build_and_publish(
-            source.plan, local_files, directory=build_directory, commands=commands
+            source.plan,
+            local_files,
+            directory=build_directory,
+            commands=commands,
+            replace_staged_run=replace_staged_run,
+            reuse_stored_tree=reuse_stored_tree,
         )
 
 

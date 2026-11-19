@@ -12,8 +12,19 @@
 //   {
 //     "bundleDirectory": "<the worker's output directory>",
 //     "worker": <the worker's printed result>,
-//     "makeLatest": false
+//     "makeLatest": false,
+//     "reuseStoredTree": true,
+//     "replaceStagingRun": true
 //   }
+//
+// The last two are optional, and only for a staging build. With
+// reuseStoredTree, a build ID that already has a stored index is that same set
+// of files, so its stored tree is used as it is, with its own commit and time,
+// and no part is uploaded; the answer's restoredTree says what it records. This
+// recovers a tree an earlier attempt stored without its manifest entry.
+// replaceStagingRun also implies it, and makes the build's entry take the place
+// of the run's earlier tree in the manifest, whose parts stay stored. Without
+// replaceStagingRun another tree of the same run is refused.
 //
 // Each copy and part is read from disk and checked against the worker's record
 // of its raw bytes before anything is uploaded. One already stored with the
@@ -52,7 +63,11 @@ import { join } from "node:path";
 import { gunzipSync } from "node:zlib";
 import { get, put } from "@vercel/blob";
 
-import { calibrationTreePartPath, type CalibrationTreePart } from "./calibration-tree-artifact";
+import {
+  calibrationTreePartPath,
+  parseCalibrationTreeIndex,
+  type CalibrationTreePart,
+} from "./calibration-tree-artifact";
 import {
   calibrationTreeBlobText,
   getCalibrationTreeBlob,
@@ -139,6 +154,8 @@ export interface CalibrationTreePublicationRequest {
   sourceFiles: CalibrationTreePublicationSourceFile[];
   manifestEntry: CalibrationTreeManifestEntry;
   makeLatest: boolean;
+  reuseStoredTree: boolean;
+  replaceStagingRun: boolean;
 }
 
 export interface CalibrationTreePublicationResult {
@@ -152,6 +169,8 @@ export interface CalibrationTreePublicationResult {
   /** Copies left as stored, because they hold other bytes. */
   sourceFileConflicts: CalibrationTreeSourceFile[];
   madeLatest: boolean;
+  /** What the stored tree records, when one was used instead of this build's. */
+  restoredTree?: Pick<CalibrationTreeManifestEntry, "hfCommitSha" | "createdAt" | "label">;
 }
 
 type JsonObject = Record<string, unknown>;
@@ -238,12 +257,22 @@ function publicationSourceFiles(
 /** Checks a publication request read from JSON. */
 export function parseCalibrationTreePublicationRequest(value: unknown): CalibrationTreePublicationRequest {
   const request = requestObject(value, "The request");
-  const unknown = Object.keys(request).filter((field) => !["bundleDirectory", "worker", "makeLatest"].includes(field));
+  const unknown = Object.keys(request).filter(
+    (field) => !["bundleDirectory", "worker", "makeLatest", "reuseStoredTree", "replaceStagingRun"].includes(field),
+  );
   if (unknown.length > 0) {
     throw new CalibrationTreePublicationRequestError(`The request has unknown fields: ${unknown.join(", ")}.`);
   }
   if (typeof request.makeLatest !== "boolean") {
     throw new CalibrationTreePublicationRequestError("makeLatest must be true or false.");
+  }
+  const replaceStagingRun = request.replaceStagingRun ?? false;
+  if (typeof replaceStagingRun !== "boolean") {
+    throw new CalibrationTreePublicationRequestError("replaceStagingRun must be true or false.");
+  }
+  const reuseStoredTree = request.reuseStoredTree ?? false;
+  if (typeof reuseStoredTree !== "boolean") {
+    throw new CalibrationTreePublicationRequestError("reuseStoredTree must be true or false.");
   }
   const bundleDirectory = requestString(request, "bundleDirectory", "bundleDirectory");
   const worker = requestObject(request.worker, "worker");
@@ -284,6 +313,12 @@ export function parseCalibrationTreePublicationRequest(value: unknown): Calibrat
   ) {
     throw new CalibrationTreePublicationRequestError("worker.manifestEntry does not describe the tree's index.");
   }
+  if (replaceStagingRun && manifestEntry.kind !== "staging") {
+    throw new CalibrationTreePublicationRequestError("Only a staging build can replace a run's tree.");
+  }
+  if (reuseStoredTree && manifestEntry.kind !== "staging") {
+    throw new CalibrationTreePublicationRequestError("Only a staging build can set reuseStoredTree.");
+  }
   return {
     bundleDirectory,
     country,
@@ -292,6 +327,8 @@ export function parseCalibrationTreePublicationRequest(value: unknown): Calibrat
     sourceFiles,
     manifestEntry,
     makeLatest: request.makeLatest,
+    reuseStoredTree,
+    replaceStagingRun,
   };
 }
 
@@ -466,7 +503,9 @@ async function addManifestEntry(
       isAtLeastAsNewAsLatest(current.manifest, request.country, request.manifestEntry));
   let updated;
   try {
-    updated = withCalibrationTreeManifestEntry(current.manifest, request.country, request.manifestEntry, makeLatest);
+    updated = withCalibrationTreeManifestEntry(current.manifest, request.country, request.manifestEntry, makeLatest, {
+      replaceStagingRun: request.replaceStagingRun,
+    });
   } catch (error) {
     throw new CalibrationTreeEntryRefusedError(error instanceof Error ? error.message : String(error));
   }
@@ -501,6 +540,39 @@ async function addManifestEntry(
 
 const DEFAULT_CLIENT: CalibrationTreeBlobClient = { get, put };
 
+// The manifest entry of the tree already stored under this build ID, if any.
+// The index goes last, so a stored index means every part is stored.
+async function storedTreeEntry(
+  request: CalibrationTreePublicationRequest,
+  token: string,
+  client: CalibrationTreeBlobClient,
+): Promise<CalibrationTreeManifestEntry | null> {
+  const stored = await getCalibrationTreeBlob({
+    country: request.country,
+    buildArtifactId: request.buildArtifactId,
+    part: "index",
+    token,
+    consistent: true,
+    client,
+  });
+  if (!stored) return null;
+  const text = await calibrationTreeBlobText(stored.stream);
+  const { build, buildArtifactId } = parseCalibrationTreeIndex(JSON.parse(text));
+  if (buildArtifactId !== request.buildArtifactId) {
+    throw new Error(`The index stored for build ${request.buildArtifactId} names build ${buildArtifactId}.`);
+  }
+  return {
+    ...request.manifestEntry,
+    label: build.label,
+    hfRepo: build.hfRepo ?? request.manifestEntry.hfRepo,
+    hfCommitSha: build.hfCommitSha ?? request.manifestEntry.hfCommitSha,
+    createdAt: build.createdAt,
+    updatedAt: build.createdAt,
+    indexSha256: createHash("sha256").update(text).digest("hex"),
+    indexBytes: Buffer.byteLength(text),
+  };
+}
+
 /** Uploads a build's file copies and tree, then records it in the manifest. */
 export async function publishBuiltCalibrationTree(options: {
   request: CalibrationTreePublicationRequest;
@@ -522,11 +594,21 @@ export async function publishBuiltCalibrationTree(options: {
   }
   let uploadedParts = 0;
   let madeLatest: boolean;
+  let storedEntry: CalibrationTreeManifestEntry | null = null;
   try {
-    for (const part of ordered) {
-      if (await uploadPart(part, request, token, client)) uploadedParts += 1;
+    if (request.reuseStoredTree || request.replaceStagingRun) {
+      storedEntry = await storedTreeEntry(request, token, client);
     }
-    madeLatest = await addManifestEntry(request, token, client);
+    if (!storedEntry) {
+      for (const part of ordered) {
+        if (await uploadPart(part, request, token, client)) uploadedParts += 1;
+      }
+    }
+    madeLatest = await addManifestEntry(
+      storedEntry ? { ...request, manifestEntry: storedEntry } : request,
+      token,
+      client,
+    );
   } catch (error) {
     if (error instanceof CalibrationTreeEntryRefusedError) error.sourceFileConflicts = sourceFileConflicts;
     throw error;
@@ -540,6 +622,15 @@ export async function publishBuiltCalibrationTree(options: {
     keptSourceFiles,
     sourceFileConflicts,
     madeLatest,
+    ...(storedEntry
+      ? {
+        restoredTree: {
+          hfCommitSha: storedEntry.hfCommitSha,
+          createdAt: storedEntry.createdAt,
+          label: storedEntry.label,
+        },
+      }
+      : {}),
   };
 }
 

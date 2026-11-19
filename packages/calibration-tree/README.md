@@ -75,6 +75,34 @@ const manifest = await readCalibrationTreeSourceJson({
 It returns the parsed `payload` and the file's `sha256`, or `null` without a
 copy. `readCalibrationTreeSourceFile` returns the original bytes instead.
 
+## Copies of staging run files
+
+The collector's webhook-queued job and backfill keep private copies of the files
+the dashboard reads for staging runs:
+
+```text
+staging-run-files/<country>/index.json
+staging-run-files/<country>/runs/<run ID>/<SHA-256 of the file>.gz
+```
+
+`src/staging-run-files.ts` reads them. `loadCopiedStagingRuns` returns the shape
+of `loadStagingRuns` from the index alone, and `loadCopiedStagingRun` returns one
+run's parsed documents, or `null` without a copy:
+
+```ts
+import {
+  loadCopiedStagingRun,
+  loadCopiedStagingRuns,
+} from "@policyengine/calibration-tree/staging-run-files";
+
+const { runs } = await loadCopiedStagingRuns({ country: "uk", token });
+const run = await loadCopiedStagingRun({ country: "uk", runId, token });
+```
+
+The copies hold what the run's files say. Read an unfinished run's current status
+from telemetry. `src/staging-run-files-command.ts` is the command the collector
+runs to read the index, store copies and read a stored tree's source digests.
+
 ## A country's stored releases.json
 
 The collector keeps each country's `releases.json` at its release repo's head

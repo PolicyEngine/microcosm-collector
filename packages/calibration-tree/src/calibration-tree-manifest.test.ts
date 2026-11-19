@@ -132,6 +132,37 @@ test("manifest rejects two immutable builds for the same release or staging run"
   )).toThrow("already resolves to build");
 });
 
+const stagingEntry: CalibrationTreeManifestEntry = {
+  ...entry,
+  kind: "staging",
+  sourceId: "us-staging-run",
+  label: "us-staging-run",
+  releaseId: null,
+  stagingRunId: "us-staging-run",
+};
+
+test("a staged run's tree is replaced only when the writer asks for it", () => {
+  const manifest = withCalibrationTreeManifestEntry(emptyCalibrationTreeManifest(), "us", stagingEntry);
+  const newer = { ...stagingEntry, buildArtifactId: "d".repeat(64), indexSha256: "e".repeat(64) };
+
+  expect(() => withCalibrationTreeManifestEntry(manifest, "us", newer)).toThrow("already resolves to build");
+
+  const replaced = withCalibrationTreeManifestEntry(manifest, "us", newer, false, { replaceStagingRun: true });
+  expect(replaced.countries.us?.builds).toEqual([newer]);
+});
+
+test("asking to replace a staged run's tree never replaces a release build", () => {
+  const manifest = withCalibrationTreeManifestEntry(emptyCalibrationTreeManifest(), "us", entry);
+
+  expect(() => withCalibrationTreeManifestEntry(
+    manifest,
+    "us",
+    { ...entry, buildArtifactId: "d".repeat(64) },
+    false,
+    { replaceStagingRun: true },
+  )).toThrow("already resolves to build");
+});
+
 test("re-adding a build replaces its metadata and keeps its content identity immutable", () => {
   const placeholder = { ...entry, createdAt: null, updatedAt: "1970-01-01T00:00:00.000Z" };
   const stamped = { ...entry, createdAt: "2026-10-04T18:57:22.000Z", updatedAt: "2026-10-04T18:57:22.000Z" };
