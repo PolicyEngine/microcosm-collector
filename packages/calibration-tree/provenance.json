@@ -3,7 +3,7 @@
   "commit": "4d129fbc6931e0e6862febd4f28ca421fb94b24a",
   "directory": "frontend/packages/calibration-tree",
   "changed": {
-    "package.json": "Publishable from this repository: not private, with a license, the repository, public access, the published files, the worker's, the publication command's, the latest command's and the manifest read's exports and their scripts, the stored original files' reader's export, the exports and script of the stored staging run files, and the stored releases.json copy's reader's and command's exports and the command's script. Its version is 0.1.5.",
+    "package.json": "Publishable from this repository: not private, with a license, the repository, public access, the published files, the worker's, the publication command's, the latest command's and the manifest read's exports and their scripts, the stored original files' reader's export, the exports and script of the stored staging run files, the stored releases.json copy's reader's and command's exports and the command's script, and the export and script of the command that adds copies of original files to stored builds. Its version is 0.1.5.",
     "src/calibration-tree-blob.ts": "A consistent manifest read asks for the manifest uncompressed, so its ETag is the strong one that Vercel Blob's conditional writes compare, not the weak one a compressed response carries.",
     "src/calibration-tree-manifest.test.ts": "Two tests cover replacing a staged run's tree when asked to.",
     "src/calibration-tree-manifest.ts": "`withCalibrationTreeManifestEntry` can replace a staged run's earlier tree when asked to.",
@@ -37,6 +37,7 @@
     "src/calibration-tree-releases-record.test.ts",
     "src/calibration-tree-releases-record.ts",
     "src/calibration-tree-source-copies.test.ts",
+    "src/calibration-tree-source-copies.ts",
     "src/calibration-tree-source-files.test.ts",
     "src/calibration-tree-source-files.ts",
     "src/calibration-tree-worker.test.ts",

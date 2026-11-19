@@ -28,8 +28,9 @@ Python:
   command covers, whatever their status. It covers a run that has a copy
   already, or whose folder last changed at or after ``JOB_COVERS_RUNS_FROM``,
   or a folder Hugging Face gives no last commit for; any other run is
-  ``older_run``, left to the backfill's go-aheads, which run this command with
-  ``include_older_runs``. Together they leave no run out. A folder is a run
+  ``older_run``, left to the backfill, whose staging step runs this code with
+  ``include_older_runs`` (``telemetry_collector.calibration_tree_store_backfill``).
+  Together they leave no run out. A folder is a run
   when it holds ``run_manifest.json``, or, beside
   a schema-1 ``runs.json``, when it holds ``progress.json`` or the index lists
   it; any other folder is ``not_a_run``. ``runs.json`` is read only when a
@@ -223,8 +224,10 @@ LatestStepSkipped = Literal["dry_run", "no_releases_record", "lock_wait_expired"
 FollowLatest = Callable[[str], FollowedLatest]
 #: What the step that stores releases.json did: what
 #: ``copy_releases_record`` answered, that it was not called, or that it raised.
+#: ``would_store`` comes only from the backfill's dry run, which calls
+#: ``copy_releases_record`` with ``dry_run``.
 ReleasesRecordStepOutcome = Literal[
-    "stored", "unchanged", "refused", "skipped", "error"
+    "stored", "unchanged", "refused", "would_store", "skipped", "error"
 ]
 #: ``calibration_trees.copy_releases_record`` for one country, with the worker
 #: job's Blob token and the Hugging Face reader.
@@ -235,7 +238,7 @@ CopyReleasesRecord = Callable[[str], CopiedReleasesRecord]
 LOCK_WAIT_SECONDS: Final = 15 * 60
 LOCK_POLL_SECONDS: Final = 5.0
 #: The webhook-queued job covers staging runs changed from this time on. Older
-#: runs reach the store through the backfill's go-aheads.
+#: runs reach the store through the backfill's staging step.
 JOB_COVERS_RUNS_FROM: Final = datetime(2026, 11, 19, tzinfo=UTC)
 #: The submissions that still build their own tree.
 IN_PROGRESS_STATUSES: Final = ("queued", "processing")

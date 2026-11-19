@@ -4,8 +4,10 @@
 // private blobs at calibration-tree-sources/<country>/<build ID>/<name>.gz. The
 // folder is apart from calibration-trees/, so nothing that lists or reads the
 // trees sees the copies. A copy exists only for a file some attempt to publish
-// the build was given.
-import { get } from "@vercel/blob";
+// the build was given, or that the collector's backfill added to a build the
+// store already held (calibration-tree-source-copies.ts). Either way the first
+// copy of a file stands.
+import { get, put } from "@vercel/blob";
 import { createHash } from "node:crypto";
 import { gunzipSync } from "node:zlib";
 
@@ -89,4 +91,52 @@ export async function readCalibrationTreeSourceJson(
 ): Promise<ReturnType<typeof parseHashedJsonArtifact> | null> {
   const stored = await readCalibrationTreeSourceFile(options);
   return stored && parseHashedJsonArtifact(stored.bytes);
+}
+
+// As the package's own uploads write them.
+const IMMUTABLE_CACHE_SECONDS = 31_536_000;
+
+export type CalibrationTreeSourceFileStored = "uploaded" | "kept" | "conflict";
+
+/**
+ * Stores one gzip copy of a build's original file, unless a copy is already
+ * stored. A stored copy stays as it is, whatever it holds: `kept` when it
+ * holds the same bytes (`sha256` is theirs), `conflict` when it holds others.
+ * An uploaded copy is read back and checked.
+ */
+export async function storeCalibrationTreeSourceFile(options: {
+  country: MicrocosmCountry;
+  buildArtifactId: string;
+  file: CalibrationTreeSourceFile;
+  sha256: string;
+  compressed: Uint8Array;
+  token: string;
+  client?: Pick<CalibrationTreeBlobClient, "get" | "put">;
+}): Promise<CalibrationTreeSourceFileStored> {
+  const client = options.client ?? { get, put };
+  const path = calibrationTreeSourceFilePath(options.country, options.buildArtifactId, options.file);
+  const stored = () =>
+    readCalibrationTreeSourceFile({
+      country: options.country,
+      buildArtifactId: options.buildArtifactId,
+      file: options.file,
+      token: options.token,
+      consistent: true,
+      client,
+    });
+  const existing = await stored();
+  if (existing) return existing.sha256 === options.sha256 ? "kept" : "conflict";
+  await client.put(path, Buffer.from(options.compressed), {
+    access: "private",
+    token: options.token,
+    addRandomSuffix: false,
+    multipart: true,
+    contentType: "application/gzip",
+    cacheControlMaxAge: IMMUTABLE_CACHE_SECONDS,
+  });
+  const uploaded = await stored();
+  if (uploaded?.sha256 !== options.sha256) {
+    throw new Error(`Uploaded copy of an original file at ${path} failed verification.`);
+  }
+  return "uploaded";
 }

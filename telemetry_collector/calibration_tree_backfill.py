@@ -1,11 +1,13 @@
 """Backfill the collector's calibration tree store from production's tree manifest.
 
 Before the dashboard reads calibration trees from the collector's own store,
-that store must hold every build the dashboard lists today. The
-``backfill-calibration-trees`` operator command takes the builds from
-production's public tree manifest, ``GET <URL>?country=<cc>``, which it
-requests without any credential and never through the Hugging Face reader,
-so the read token cannot reach it.
+that store must hold every build the dashboard lists today. Given
+``--production-manifest-url``, the ``backfill-calibration-trees`` operator
+command (``telemetry_collector.calibration_tree_store_backfill``, whose second
+step this is) takes the builds from production's public tree manifest,
+``GET <URL>?country=<cc>``, which it requests without any credential and never
+through the Hugging Face reader, so the read token cannot reach it. Its other
+steps reuse this module's checks and its rules that locate a build's files.
 
 **Checks.** An answer that is not HTTP 200, is larger than
 ``MAX_PRODUCTION_MANIFEST_BYTES``, takes longer than

@@ -625,13 +625,15 @@ identity column needs no sequence privilege to insert rows.
   way, and only while the worker's account may create objects in the intake
   bucket (see "Projecting past builds again").
 - **Backfilling calibration trees** (`uv run --no-sync python -m
-  telemetry_collector.operations backfill-calibration-trees
-  --production-manifest-url <URL>`, with `--dry-run` to list first) builds
-  every calibration tree production's tree manifest lists that the
-  collector's store doesn't hold yet. It needs the database, the Hugging
-  Face read token and the calibration tree Blob token, so an operator runs
-  it as an execution of the worker job with its arguments overridden (see
-  "Backfilling calibration trees from Hugging Face").
+  telemetry_collector.operations backfill-calibration-trees`, with
+  `--dry-run` to list first) stores each country's `releases.json`, covers
+  every older staging run, and stores the original files missing for every
+  build the collector's store holds; with `--production-manifest-url <URL>`
+  it also builds every calibration tree that manifest lists and the store
+  doesn't hold yet. It needs the database, the Hugging Face read token and the
+  calibration tree Blob token, so an operator runs it as an execution of the
+  worker job with its arguments overridden (see "Backfilling calibration trees
+  from Hugging Face").
 
 None of these values is secret. Intake needs, in each environment's project
 and region, these resources, created by hand (both environments have them):
@@ -1874,20 +1876,49 @@ nothing. A country gets its first copy when a release run or a
 
 ### Backfilling calibration trees from Hugging Face
 
-Before the dashboard reads trees from the collector's store, that store must
-hold every build the dashboard lists today.
+Before the dashboard reads everything from the collector's store, that store
+must hold what the collector's jobs don't reach on their own.
 `python -m telemetry_collector.operations backfill-calibration-trees`
-(`telemetry_collector/calibration_tree_backfill.py`) builds each one the
-store doesn't hold yet, from its Hugging Face files, as the store would have
-built it from a submission.
+(`telemetry_collector/calibration_tree_store_backfill.py`) fills it in one
+execution, with these steps in this order. `--country us|uk|be` (repeatable)
+and `--kind release|staging` limit every step.
+
+1. **releases.json** (release kind): each country's `releases.json` at its
+   release repo's head, through `calibration_trees.copy_releases_record`, as
+   the reconcile command's release runs store it ("Keeping each country's
+   releases.json"). A country whose repo has none gets a copy that says so.
+2. **Production's manifest**, only with `--production-manifest-url`: every
+   build that manifest lists and the store lacks is built, as below. Since the
+   dashboard reads the collector's production store, that manifest lists the
+   production store itself, so the backfill's staging and production runs
+   leave the option out.
+3. **Older staging runs** (staging kind): for each country with a staging
+   repo, the reconcile command's staging code with `include_older_runs`
+   ("Queuing calibration tree builds"). Every run folder with
+   run documents is covered, whatever the run's status and whether or not the
+   collector has a record of it: its files the dashboard reads are copied, and
+   a run with diagnostics gets a tree. Without the backfill, the webhook-queued
+   job leaves runs whose folders last changed before 2026-11-19 as `older_run`.
+4. **Original files** of every build in the store's own manifest, read after
+   the steps above (`telemetry_collector/calibration_tree_source_copies.py`,
+   below).
+
+Steps 2 to 4 share the execution's 40-minute limit on starting work: each is
+given what is left of it. A step that fails for one country is reported and
+the others go on.
+
+**Production's manifest.** The rest of this part, up to "Original files of
+stored builds", describes step 2
+(`telemetry_collector/calibration_tree_backfill.py`), which builds each build
+the store doesn't hold yet from its Hugging Face files, as the store would
+have built it from a submission.
 
 **Which builds.** The builds come from production's public tree manifest,
 `GET <URL>?country=<cc>`, where `<URL>` is the command's
 `--production-manifest-url`, the dashboard's
 `https://<dashboard>/api/microcosm/tree-manifest`. The command sends it no
 credential, through a client of its own, never the Hugging Face reader's, and
-follows no redirect. `--country us|uk|be` (repeatable) and `--kind
-release|staging` limit what it backfills.
+follows no redirect.
 
 **Checks.** For each country:
 - An answer that isn't HTTP 200, is larger than 16 MiB, takes longer than 2
@@ -2019,42 +2050,122 @@ outcome and reason, production's build ID, the build ID built or stored,
 | `deferred` | the time limit passed before it started | no |
 
 A country whose manifest can't be used is one `error` document with no kind.
-Then it prints:
+
+**Original files of stored builds.** Builds stored before the collector kept
+copies of original files have none, and a build first built from a submission
+has no copy of a file the submission did not carry, such as
+`parent_build_manifest.json` or `reform_validation.json`. Step 4 adds them:
+
+- **Which builds.** Every build in the store's own manifest, for the selected
+  countries and kinds; production's manifest is not read here.
+- **Which files.** Each build's files are found at its stored commit, in its
+  stored repo, with the rules above (the stored entry first passes the checks
+  production's entries get): a release build's `releases/<folder>/`, a staging
+  run's `runs/<id>/` or the staged bundle its receipt names, and a staged
+  bundle's `staged/<id>/`. The copies the store holds are listed once per
+  country, and only files without a copy are read further.
+- **Which copies.** A copy of one of the four files a tree is built from (the
+  diagnostics, `build_manifest.json`, `release_manifest.json` and
+  `demographics.json`) is stored only when the stored tree's index records
+  that file with the same SHA-256, so a copy is always a file the tree was
+  built from. `parent_build_manifest.json` and `reform_validation.json` have
+  no record, so they are stored as the build's folder holds them at its
+  commit; one over 64 MiB is left out, as above. Each file is streamed to disk
+  and checked against its listing, then
+  `packages/calibration-tree/src/calibration-tree-source-copies.ts store`
+  checks the index's record again and stores each copy the store still lacks.
+  A copy already stored stays as it is, whatever it holds. Nothing else is
+  written: no tree part, index or manifest, and no lock is taken.
+
+Each build is one document, `{"source_files": {...}}`, with its country, kind,
+release ID or run, build ID, repo, commit, outcome, reason, `incomplete`, and
+`files`: each file the build's folder holds, by the name its copy is stored
+under, with what became of its copy:
+
+| File status | Means |
+|---|---|
+| `stored` | the store already listed a copy |
+| `would_copy` | a dry run would store a copy |
+| `copied` | a copy was stored |
+| `kept` | another writer stored a copy with the same bytes meanwhile |
+| `conflict` | a copy with other bytes was already stored; it stays |
+| `differs` | the tree's index records another SHA-256 for this file; no copy is stored |
+| `not_in_tree` | the tree was not built from this file; no copy is stored |
+| `too_large` | the file is over 256 MiB; it is not downloaded |
+
+| Outcome | Means | Final |
+|---|---|---|
+| `complete` | every file the build was built from or copies has a copy | yes |
+| `would_copy` | a dry run would store copies | |
+| `copied` | copies were stored | yes |
+| `not_copied` | its missing copies can't be stored: they differ or are too large, or the store holds no tree for the build | yes |
+| `invalid` | the stored entry failed the checks | yes |
+| `not_found` | its files are not at its commit, or Hugging Face no longer holds the commit | yes |
+| `error` | a Hugging Face failure, a download that differs from its listing, or a Bun exit 1 or 3; the next build still runs | no |
+| `deferred` | the time limit passed before its downloads started | no |
+
+**Output.** Every outcome is one JSON document under its step's name:
+`{"releases_record": {...}}` (the fields of the reconcile command's step),
+`{"production_build": {...}}` (the outcome above), `{"staging_run": {...}}`
+(the reconcile command's outcome of one run) and `{"source_files": {...}}`.
+Then it prints the summary, here with each part shortened:
 
 ```json
-{"summary": {"outcomes": {}, "incomplete": false, "release_builds_differing_from_production": 0, "latest": {"us": {"build": null, "made_latest": null}}}}
+{"summary": {"dry_run": false, "incomplete": false, "releases_records": {"us": {"outcome": "unchanged"}}, "production_builds": null, "staging_runs": {"us": {"outcomes": {}, "incomplete": false}}, "source_files": {"outcomes": {}, "files": {}, "incomplete": false, "incomplete_builds": []}}}
 ```
 
-- `incomplete`: true when anything ended in `error` or `deferred`, a country
-  failed, or a country's latest from production wasn't made the store's
-  latest. The command then exits 1, and Cloud Run runs the task again, up to
-  twice; each run skips what is already stored. It exits 0 otherwise, and 2
-  for an argument error, such as a missing `--production-manifest-url` or one
-  that isn't `https`.
-- `release_builds_differing_from_production`: release builds built or stored
-  whose build ID isn't production's. It should be 0.
-- `latest`: for each country, production's latest build and whether it is
-  the store's latest now (`null` when production names none, or in a dry run
-  for a latest that would be built).
+- `incomplete`: true when anything ended in `error` or `deferred`, a country's
+  manifest or the store could not be read, or a country's latest from
+  production's manifest wasn't made the store's latest. The command then exits
+  1, and Cloud Run runs the task again, up to twice; each run skips what is
+  already stored. It exits 0 otherwise, and 2 for an argument error, such as a
+  `--production-manifest-url` that isn't `https`.
+- `releases_records`: each country's `releases.json` step, as the reconcile
+  command's summary reports it; in a dry run `would_store` when the stored
+  copy is not at the head, or `unchanged`.
+- `production_builds`: `null` without `--production-manifest-url`; otherwise
+  `outcomes`, `incomplete`, `release_builds_differing_from_production` (release
+  builds built or stored whose build ID isn't production's; it should be 0) and
+  `latest` (for each country, production's latest build and whether it is the
+  store's latest now, `null` when production names none, or in a dry run for a
+  latest that would be built).
+- `staging_runs`: the reconcile command's summary for each country with a
+  staging repo.
+- `source_files`: step 4's counts by build and by file status, and the builds
+  left incomplete.
 
-**Running it.** It needs `DATABASE_URL` (for the manifest lock),
-`COLLECTOR_HF_READ_TOKEN` and `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN`, which
-the worker job has, and stops with a message naming a missing one. It needs no
-other access, except that whoever runs it may run the worker job with
-overridden arguments. First the dry run, which reads production's manifest,
-the Hugging Face listings and the store's manifest, and downloads no
-diagnostics, runs no tree worker and takes no lock:
+**Running it.** It needs `DATABASE_URL` (for its locks and the submissions the
+staging runs skip), `COLLECTOR_HF_READ_TOKEN` and
+`COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN`, which the worker job has, and stops
+with a message naming a missing one. It needs no other access, except that
+whoever runs it may run the worker job with overridden arguments
+(`run.jobs.runWithOverrides`). `<worker job>`, `<project>` and `<region>` are
+each environment's GitHub variables `TELEMETRY_WORKER_JOB`,
+`TELEMETRY_GCP_PROJECT_ID` and `TELEMETRY_GCP_REGION`. First the dry run. It
+reads the store's manifest, the stored copies' listing, tree indexes, the
+stored `releases.json` copies, the Hugging Face listings and the documents it
+needs to plan; it reads a tree file only when Hugging Face gives no SHA-256 for
+it, and stores, copies and builds nothing and takes no lock:
 
 ```bash
 gcloud run jobs execute <worker job> --project <project> --region <region> \
-  --args=run,--no-sync,python,-m,telemetry_collector.operations,backfill-calibration-trees,--production-manifest-url,https://<dashboard>/api/microcosm/tree-manifest,--dry-run \
+  --args=run,--no-sync,python,-m,telemetry_collector.operations,backfill-calibration-trees,--dry-run \
   --wait
 ```
 
 Then the real run, the same without `--dry-run`, until a summary shows
-`"incomplete": false`. Do both in staging, then in production, before the
-dashboard switches to the store. Read each attempt's summary with the logging
-query in "Projecting past builds again".
+`"incomplete": false`:
+
+```bash
+gcloud run jobs execute <worker job> --project <project> --region <region> \
+  --args=run,--no-sync,python,-m,telemetry_collector.operations,backfill-calibration-trees \
+  --wait
+```
+
+Each is its own tracker task, with the staging environment's values first:
+the staging dry run (4a · 28) and real run (4a · 29), then the production dry
+run (4a · 30) and real run (4a · 31). Read each attempt's documents and summary
+with the logging query in "Projecting past builds again".
 
 ### Queuing calibration tree builds
 
@@ -2214,7 +2325,8 @@ Python. Without `--kind` it covers both kinds, or only releases for BE.
   command covers, whatever their status. The webhook-queued job covers a run
   that already has a copy or whose folder last changed on or after 2026-11-19
   (`JOB_COVERS_RUNS_FROM`). Any other run is `older_run` and is left to the
-  backfill's go-aheads, which pass `--include-older-runs`, so the two together
+  backfill, whose staging step runs this code with `include_older_runs`
+  ("Backfilling calibration trees from Hugging Face"), so the two together
   leave no run out. `--include-older-runs` can't be used with `--request-id`.
   A folder is a run when it holds `run_manifest.json`, or, beside
   a schema-1 `runs.json`, when it holds `progress.json` or that file lists it.

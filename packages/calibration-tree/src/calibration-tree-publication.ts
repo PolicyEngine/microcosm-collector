@@ -86,8 +86,9 @@ import {
 import {
   calibrationTreeSourceFilePath,
   isCalibrationTreeSourceFile,
-  readCalibrationTreeSourceFile,
+  storeCalibrationTreeSourceFile,
   type CalibrationTreeSourceFile,
+  type CalibrationTreeSourceFileStored,
 } from "./calibration-tree-source-files";
 import { isCountry, type MicrocosmCountry } from "./countries";
 
@@ -385,37 +386,22 @@ function sourceFilesOnDisk(request: CalibrationTreePublicationRequest): SourceFi
 }
 
 // A copy already stored stays as it is, whatever it holds, and an uploaded one
-// is read back.
-async function uploadSourceFile(
+// is read back. Its path is the one the request was checked to give it.
+function uploadSourceFile(
   sourceFile: SourceFileOnDisk,
   request: CalibrationTreePublicationRequest,
   token: string,
   client: CalibrationTreeBlobClient,
-): Promise<"uploaded" | "kept" | "conflict"> {
-  const stored = () =>
-    readCalibrationTreeSourceFile({
-      country: request.country,
-      buildArtifactId: request.buildArtifactId,
-      file: sourceFile.file,
-      token,
-      consistent: true,
-      client,
-    });
-  const existing = await stored();
-  if (existing) return existing.sha256 === sourceFile.sha256 ? "kept" : "conflict";
-  await client.put(sourceFile.path, Buffer.from(sourceFile.compressed), {
-    access: "private",
+): Promise<CalibrationTreeSourceFileStored> {
+  return storeCalibrationTreeSourceFile({
+    country: request.country,
+    buildArtifactId: request.buildArtifactId,
+    file: sourceFile.file,
+    sha256: sourceFile.sha256,
+    compressed: sourceFile.compressed,
     token,
-    addRandomSuffix: false,
-    multipart: true,
-    contentType: "application/gzip",
-    cacheControlMaxAge: IMMUTABLE_CACHE_SECONDS,
+    client,
   });
-  const uploaded = await stored();
-  if (uploaded?.sha256 !== sourceFile.sha256) {
-    throw new Error(`Uploaded copy of an original file at ${sourceFile.path} failed verification.`);
-  }
-  return "uploaded";
 }
 
 // As the package's uploadCalibrationTreeFile: an existing part must hold the
