@@ -1,3 +1,10 @@
+## [0.28.0] - 2026-11-19
+
+### Added
+
+- The collector keeps each country's `releases.json` in the calibration tree store: the reconcile command's release runs and the `releases-record` handler store the release repo's head, and an older execution cannot replace a newer copy. `@policyengine/calibration-tree` 0.1.5 adds `readStoredReleasesRecord`.
+
+
 ## [0.27.0] - 2026-11-19
 
 ### Added
