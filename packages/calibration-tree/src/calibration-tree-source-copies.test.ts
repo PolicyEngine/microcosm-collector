@@ -4,13 +4,12 @@
 // Vercel Blob's rule for allowOverwrite and pages its listings.
 import { afterEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { BlobError } from "@vercel/blob";
 
-const MODULE_PATH = join(import.meta.dir, "calibration-tree-source-copies.ts");
 const TOKEN = "vercel_blob_rw_test_token";
 const TOKEN_VARIABLE = "CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN";
 const BUILD_ID = "a".repeat(64);
@@ -22,11 +21,10 @@ const DEMOGRAPHICS = new TextEncoder().encode('{"households": 1}');
 const PARENT_BUILD_MANIFEST = new TextEncoder().encode('{"build_id": "the-parent-build"}');
 const REFORM_VALIDATION = new TextEncoder().encode('{"schema_version": 1, "reforms": []}');
 
-type CopiesModule = typeof import("./calibration-tree-source-copies");
-
-async function copies(): Promise<CopiesModule> {
-  expect(existsSync(MODULE_PATH)).toBe(true);
-  return await import(MODULE_PATH) as CopiesModule;
+async function copies() {
+  const loaded = await import("./calibration-tree-source-copies").catch(() => null);
+  expect(loaded).not.toBeNull();
+  return loaded!;
 }
 
 const temporaryDirectories: string[] = [];
