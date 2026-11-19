@@ -36,6 +36,7 @@
     "src/calibration-tree-releases-record-copy.ts",
     "src/calibration-tree-releases-record.test.ts",
     "src/calibration-tree-releases-record.ts",
+    "src/calibration-tree-source-copies.test.ts",
     "src/calibration-tree-source-files.test.ts",
     "src/calibration-tree-source-files.ts",
     "src/calibration-tree-worker.test.ts",

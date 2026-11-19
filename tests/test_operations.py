@@ -9,6 +9,7 @@ from collections.abc import Iterator
 from types import ModuleType
 from typing import Any
 
+import httpx
 import pytest
 
 from telemetry_collector import calibration_trees, operations
@@ -299,6 +300,8 @@ def test_the_commands_require_the_database_and_worker_queue(
 # Backfilling calibration trees -------------------------------------------------
 
 BACKFILL_MODULE = "telemetry_collector.calibration_tree_backfill"
+STORE_BACKFILL_MODULE = "telemetry_collector.calibration_tree_store_backfill"
+SOURCE_COPIES_MODULE = "telemetry_collector.calibration_tree_source_copies"
 BACKFILL_COMMAND = "backfill-calibration-trees"
 PRODUCTION_URL = "https://dashboard.example.test/api/microcosm/tree-manifest"
 BACKFILL_ENVIRONMENT = {
@@ -316,12 +319,29 @@ def backfill_module() -> ModuleType:
     return importlib.import_module(BACKFILL_MODULE)
 
 
-def stand_in_backfill(
-    monkeypatch: pytest.MonkeyPatch, outcomes: list[dict[str, Any]]
-) -> dict[str, Any]:
-    """Replace the backfill with one that yields ``outcomes`` and records its options."""
+def store_backfill_module() -> ModuleType:
+    if importlib.util.find_spec(STORE_BACKFILL_MODULE) is None:
+        pytest.fail(f"{STORE_BACKFILL_MODULE} does not exist yet.")
+    return importlib.import_module(STORE_BACKFILL_MODULE)
 
-    module = backfill_module()
+
+def source_files_outcome(**fields: Any) -> Any:
+    if importlib.util.find_spec(SOURCE_COPIES_MODULE) is None:
+        pytest.fail(f"{SOURCE_COPIES_MODULE} does not exist yet.")
+    return importlib.import_module(SOURCE_COPIES_MODULE).SourceFilesOutcome(**fields)
+
+
+def stand_in_backfill(
+    monkeypatch: pytest.MonkeyPatch, outcomes: list[Any]
+) -> dict[str, Any]:
+    """Replace the backfill's steps with ones that yield ``outcomes`` and record
+    their options. A dictionary in ``outcomes`` is an outcome of production's
+    manifest; anything else is yielded as it is."""
+
+    module = store_backfill_module()
+    reconciliation = importlib.import_module(
+        "telemetry_collector.calibration_tree_reconciliation"
+    )
     given: dict[str, Any] = {}
 
     class StandInEngine:
@@ -331,9 +351,19 @@ def stand_in_backfill(
     def recorded_backfill(**options: Any) -> Iterator[Any]:
         given.update(options)
         for outcome in outcomes:
-            yield module.BackfillOutcome(**outcome)
+            yield (
+                backfill_module().BackfillOutcome(**outcome)
+                if isinstance(outcome, dict)
+                else outcome
+            )
 
-    monkeypatch.setattr(module, "backfill_calibration_trees", recorded_backfill)
+    monkeypatch.setattr(module, "backfill_calibration_tree_store", recorded_backfill)
+    monkeypatch.setattr(
+        reconciliation, "PostgresSubmissionsInProgress", lambda engine: "submissions"
+    )
+    monkeypatch.setattr(
+        reconciliation, "postgres_reconciliation_lock", lambda engine: "lock"
+    )
     monkeypatch.setattr(
         operations, "create_database_engine", lambda database_url: StandInEngine()
     )
@@ -364,43 +394,49 @@ ALREADY_STORED = {
 
 
 @pytest.mark.parametrize(
-    "arguments",
-    [
-        [BACKFILL_COMMAND],
-        [
-            BACKFILL_COMMAND,
-            "--production-manifest-url",
-            "http://dashboard.example.test/x",
-        ],
-        [BACKFILL_COMMAND, "--production-manifest-url", "dashboard.example.test/x"],
-    ],
-    ids=["no-url", "http", "no-scheme"],
+    "address",
+    ["http://dashboard.example.test/x", "dashboard.example.test/x"],
+    ids=["http", "no-scheme"],
 )
-def test_the_backfill_needs_an_https_production_manifest_address(
+def test_a_production_manifest_address_must_be_https(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    arguments: list[str],
+    address: str,
 ) -> None:
     for name, value in BACKFILL_ENVIRONMENT.items():
         monkeypatch.setenv(name, value)
 
     with pytest.raises(SystemExit) as exited:
-        operations.main(arguments)
+        operations.main([BACKFILL_COMMAND, "--production-manifest-url", address])
 
     assert exited.value.code == 2
     assert "--production-manifest-url" in capsys.readouterr().err
+
+
+def test_the_backfill_runs_without_a_production_manifest_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    given = stand_in_backfill(monkeypatch, [])
+
+    try:
+        exit_status = operations.main([BACKFILL_COMMAND])
+    except SystemExit:
+        pytest.fail("The backfill still requires --production-manifest-url.")
+
+    assert exit_status == 0
+    assert given["production_manifest_url"] is None
+    assert given["production_client"] is None
 
 
 def test_the_backfill_refuses_a_country_or_kind_it_does_not_know(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     stand_in_backfill(monkeypatch, [])
-    url = ["--production-manifest-url", PRODUCTION_URL]
 
     with pytest.raises(SystemExit) as unknown_country:
-        operations.main([BACKFILL_COMMAND, *url, "--country", "fr"])
+        operations.main([BACKFILL_COMMAND, "--country", "fr"])
     with pytest.raises(SystemExit) as unknown_kind:
-        operations.main([BACKFILL_COMMAND, *url, "--kind", "comparison"])
+        operations.main([BACKFILL_COMMAND, "--kind", "comparison"])
 
     assert unknown_country.value.code == 2
     assert unknown_kind.value.code == 2
@@ -431,6 +467,7 @@ def test_the_backfill_passes_its_address_countries_kind_and_dry_run(
 
     assert exit_status == 0
     assert given["production_manifest_url"] == PRODUCTION_URL
+    assert isinstance(given["production_client"], httpx.Client)
     assert list(given["countries"]) == ["uk", "us"]
     assert list(given["kinds"]) == ["staging"]
     assert given["dry_run"] is True
@@ -442,11 +479,63 @@ def test_by_default_the_backfill_covers_every_country_and_kind(
 ) -> None:
     given = stand_in_backfill(monkeypatch, [])
 
-    operations.main([BACKFILL_COMMAND, "--production-manifest-url", PRODUCTION_URL])
+    operations.main([BACKFILL_COMMAND])
 
     assert list(given["countries"]) == ["us", "uk", "be"]
     assert sorted(given["kinds"]) == ["release", "staging"]
     assert given["dry_run"] is False
+
+
+def test_the_backfill_gives_its_steps_the_reconcile_command_s_services(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    given = stand_in_backfill(monkeypatch, [])
+
+    operations.main([BACKFILL_COMMAND])
+
+    assert given["submissions"] == "submissions"
+    assert given["lock"] == "lock"
+    assert isinstance(given["reader"], HuggingFaceReader)
+    blob_token = BACKFILL_ENVIRONMENT["COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN"]
+    commands = given["commands"]
+    assert commands.publication_environment[
+        "CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN"
+    ] == (blob_token)
+    assert blob_token not in commands.build_environment.values()
+
+
+def test_the_backfill_copies_and_follows_releases_json_with_the_job_s_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    given = stand_in_backfill(monkeypatch, [])
+    copies: list[tuple[str, dict[str, Any]]] = []
+    followed: list[tuple[str, dict[str, Any]]] = []
+
+    def recorded_copy(country: str, **options: Any) -> str:
+        copies.append((country, options))
+        return "copied"
+
+    def recorded_follow(country: str, **options: Any) -> str:
+        followed.append((country, options))
+        return "followed"
+
+    monkeypatch.setattr(calibration_trees, "copy_releases_record", recorded_copy)
+    monkeypatch.setattr(calibration_trees, "follow_releases_record", recorded_follow)
+
+    operations.main([BACKFILL_COMMAND])
+
+    blob_token = BACKFILL_ENVIRONMENT["COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN"]
+    assert given["copy_record"]("uk", dry_run=True) == "copied"
+    [(country, options)] = copies
+    assert country == "uk"
+    assert options["dry_run"] is True
+    assert options["blob_token"] == blob_token
+    assert isinstance(options["reader"], HuggingFaceReader)
+    assert given["follow_latest"]("us") == "followed"
+    [(country, options)] = followed
+    assert country == "us"
+    assert options["blob_token"] == blob_token
+    assert callable(options["manifest_lock"])
 
 
 @pytest.mark.parametrize("missing_name", list(BACKFILL_ENVIRONMENT))
@@ -457,13 +546,39 @@ def test_the_backfill_names_a_missing_variable(
     monkeypatch.delenv(missing_name)
 
     with pytest.raises(RuntimeError, match=missing_name):
-        operations.main([BACKFILL_COMMAND, "--production-manifest-url", PRODUCTION_URL])
+        operations.main([BACKFILL_COMMAND])
 
 
-def test_the_backfill_prints_one_document_per_entry_then_the_summary(
+def test_the_backfill_prints_one_document_per_outcome_under_its_step_then_the_summary(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    stand_in_backfill(monkeypatch, [BUILT_LATEST, ALREADY_STORED])
+    reconciliation = importlib.import_module(
+        "telemetry_collector.calibration_tree_reconciliation"
+    )
+    record_step = reconciliation.ReleasesRecordStep(
+        country="us",
+        outcome="stored",
+        copied=calibration_trees.CopiedReleasesRecord(
+            country="us",
+            outcome="stored",
+            hf_repo="policyengine/populace-us",
+            hf_commit="c" * 40,
+            has_record=True,
+        ),
+    )
+    staging_run = reconciliation.ReconcileOutcome(
+        country="us", kind="staging", outcome="built", source_id="run-1"
+    )
+    copied = source_files_outcome(
+        country="us",
+        outcome="copied",
+        kind="release",
+        source_id="microcosm-us-2025",
+        files={"reform_validation.json": "copied"},
+    )
+    stand_in_backfill(
+        monkeypatch, [record_step, BUILT_LATEST, ALREADY_STORED, staging_run, copied]
+    )
 
     exit_status = operations.main(
         [BACKFILL_COMMAND, "--production-manifest-url", PRODUCTION_URL]
@@ -471,25 +586,43 @@ def test_the_backfill_prints_one_document_per_entry_then_the_summary(
 
     assert exit_status == 0
     printed = [json.loads(text) for text in capsys.readouterr().out.splitlines()]
-    assert len(printed) == 3
-    assert [
-        (document["source_id"], document["outcome"]) for document in printed[:2]
-    ] == [
-        ("microcosm-us-2025", "built"),
-        ("us-calibration-attempt-1", "already_stored"),
+    assert [list(document) for document in printed] == [
+        ["releases_record"],
+        ["production_build"],
+        ["production_build"],
+        ["staging_run"],
+        ["source_files"],
+        ["summary"],
     ]
-    assert printed[2] == {
-        "summary": {
-            "outcomes": {"built": 1, "already_stored": 1},
-            "incomplete": False,
-            "release_builds_differing_from_production": 0,
-            "latest": {
-                "us": {"build": LATEST_BUILD, "made_latest": True},
-                "uk": {"build": None, "made_latest": None},
-                "be": {"build": None, "made_latest": None},
-            },
-        }
+    assert printed[1]["production_build"]["outcome"] == "built"
+    assert printed[4]["source_files"]["files"] == {"reform_validation.json": "copied"}
+    summary = printed[-1]["summary"]
+    assert summary["incomplete"] is False
+    assert summary["dry_run"] is False
+    assert summary["releases_records"]["us"]["outcome"] == "stored"
+    assert summary["production_builds"] == {
+        "outcomes": {"built": 1, "already_stored": 1},
+        "incomplete": False,
+        "release_builds_differing_from_production": 0,
+        "latest": {
+            "us": {"build": LATEST_BUILD, "made_latest": True},
+            "uk": {"build": None, "made_latest": None},
+            "be": {"build": None, "made_latest": None},
+        },
     }
+    assert summary["staging_runs"]["us"]["outcomes"] == {"built": 1}
+    assert summary["source_files"]["outcomes"] == {"copied": 1}
+
+
+def test_without_a_production_manifest_address_the_summary_has_no_production_part(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stand_in_backfill(monkeypatch, [])
+
+    operations.main([BACKFILL_COMMAND])
+
+    summary = json.loads(capsys.readouterr().out.splitlines()[-1])["summary"]
+    assert summary["production_builds"] is None
 
 
 @pytest.mark.parametrize(
@@ -500,14 +633,41 @@ def test_the_backfill_prints_one_document_per_entry_then_the_summary(
         {"country": "uk", "outcome": "error", "reason": "HTTP 500", "incomplete": True},
         {**BUILT_LATEST, "outcome": "latest_not_moved", "made_latest": False},
         {**BUILT_LATEST, "outcome": "invalid", "made_latest": False},
+        "staging-run-error",
+        "source-files-deferred",
+        "releases-record-error",
     ],
-    ids=["error", "deferred", "country-failed", "latest-not-moved", "latest-invalid"],
+    ids=[
+        "error",
+        "deferred",
+        "country-failed",
+        "latest-not-moved",
+        "latest-invalid",
+        "staging-run-error",
+        "source-files-deferred",
+        "releases-record-error",
+    ],
 )
 def test_the_backfill_exits_1_when_anything_is_incomplete(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    incomplete_outcome: dict[str, Any],
+    incomplete_outcome: Any,
 ) -> None:
+    reconciliation = importlib.import_module(
+        "telemetry_collector.calibration_tree_reconciliation"
+    )
+    if incomplete_outcome == "staging-run-error":
+        incomplete_outcome = reconciliation.ReconcileOutcome(
+            country="uk", kind="staging", outcome="error", incomplete=True
+        )
+    elif incomplete_outcome == "source-files-deferred":
+        incomplete_outcome = source_files_outcome(
+            country="us", outcome="deferred", kind="release", incomplete=True
+        )
+    elif incomplete_outcome == "releases-record-error":
+        incomplete_outcome = reconciliation.ReleasesRecordStep(
+            country="be", outcome="error", reason="boom", incomplete=True
+        )
     stand_in_backfill(monkeypatch, [incomplete_outcome])
 
     exit_status = operations.main(
@@ -533,6 +693,10 @@ def test_final_refusals_alone_do_not_fail_the_backfill(
                 "invalid",
                 "mismatch",
             )
+        ]
+        + [
+            source_files_outcome(country="us", outcome=outcome, kind="release")
+            for outcome in ("not_copied", "not_found", "invalid")
         ],
     )
 
