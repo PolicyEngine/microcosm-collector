@@ -8,8 +8,9 @@ files of builds stored before the collector kept them. One execution runs
 these steps, in this order, for the selected countries and kinds:
 
 1. **releases.json** (release kind): each country's, at its release repo's head,
-   through ``calibration_trees.copy_releases_record``. A dry run reads and
-   writes nothing, and reports ``would_store`` or ``unchanged``.
+   through ``calibration_trees.copy_releases_record``. A dry run reads the
+   stored copy's version, the head and its record, writes nothing, and
+   reports ``would_store`` or ``unchanged``.
 2. **Production's manifest**, only with its address: what it lists and the
    store lacks is built (``calibration_tree_backfill``). Since the dashboard
    reads the collector's production store, production's manifest lists that
@@ -17,14 +18,19 @@ these steps, in this order, for the selected countries and kinds:
 3. **Older staging runs** (staging kind): each country with a staging repo, by
    the reconcile command's code with ``include_older_runs``, so every run on
    Hugging Face, whatever its status, gets its files copied and, with
-   diagnostics, a tree.
+   diagnostics, a tree. A refusal the reconcile code recorded for an unchanged
+   folder is repeated, not built again (``retry_refusals`` false), so a retry
+   spends its time on what is left.
 4. **Original files**: the copies missing for every build in the store's own
    manifest, read after the steps above
    (``calibration_tree_source_copies``).
 
 Steps 2 to 4 share the execution's time limit: each is given what is left of
 it, and no build, copy or download starts after it, so a Cloud Run retry
-carries on past what is stored. A step that fails for one country is reported
+carries on past what is stored. Once no time is left, a staging country is
+``deferred`` without waiting for its lock or reading Hugging Face, and the
+copy step defers each build before looking for its files. A dry run has no
+time limit, as each step's dry run has none. A step that fails for one country is reported
 and the rest go on. Nothing here asks to move a country's latest, except the
 builds of step 2, as that step always has.
 """
@@ -33,7 +39,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from typing import Any
+from typing import Any, Protocol
 
 import httpx
 
@@ -68,9 +74,14 @@ from telemetry_collector.huggingface_read import HuggingFaceReader
 StepOutcome = (
     ReleasesRecordStep | BackfillOutcome | ReconcileOutcome | SourceFilesOutcome
 )
-#: ``calibration_trees.copy_releases_record`` for one country, with the worker
-#: job's Blob token and the Hugging Face reader; called with ``dry_run``.
-CopyReleasesRecord = Callable[..., CopiedReleasesRecord]
+
+
+class CopyReleasesRecord(Protocol):
+    """``calibration_trees.copy_releases_record`` for one country, with the
+    worker job's Blob token and the Hugging Face reader."""
+
+    def __call__(self, country: str, *, dry_run: bool = False) -> CopiedReleasesRecord:
+        """Store, or in a dry run only check, ``country``'s copy."""
 
 
 def _described(error: BaseException) -> str:
@@ -137,19 +148,32 @@ def backfill_calibration_tree_store(
         )
     if "staging" in kinds:
         for country in countries:
-            if country in STAGING_REPOS:
-                yield from _older_staging_runs(
-                    country,
-                    reader=reader,
-                    commands=commands,
-                    submissions=submissions,
-                    lock=lock,
-                    follow_latest=follow_latest,
-                    copy_record=copy_record,
-                    dry_run=dry_run,
-                    clock=clock,
-                    time_limit_seconds=time_left(),
+            if country not in STAGING_REPOS:
+                continue
+            if not dry_run and time_left() <= 0:
+                yield ReconcileOutcome(
+                    country=country,
+                    kind="staging",
+                    outcome="deferred",
+                    reason=(
+                        "No staging country starts after the execution's time "
+                        "limit; run again."
+                    ),
+                    incomplete=True,
                 )
+                continue
+            yield from _older_staging_runs(
+                country,
+                reader=reader,
+                commands=commands,
+                submissions=submissions,
+                lock=lock,
+                follow_latest=follow_latest,
+                copy_record=copy_record,
+                dry_run=dry_run,
+                clock=clock,
+                time_limit_seconds=time_left(),
+            )
     yield from calibration_tree_source_copies.store_missing_source_files(
         reader=reader,
         commands=commands,
@@ -161,12 +185,36 @@ def backfill_calibration_tree_store(
     )
 
 
-def _older_staging_runs(country: str, **options: Any) -> Iterator[ReconcileOutcome]:
+def _older_staging_runs(
+    country: str,
+    *,
+    reader: HuggingFaceReader,
+    commands: TreeCommands,
+    submissions: SubmissionsInProgress,
+    lock: ReconciliationLock,
+    follow_latest: FollowLatest,
+    copy_record: CopyReleasesRecord,
+    dry_run: bool,
+    clock: Callable[[], float],
+    time_limit_seconds: float,
+) -> Iterator[ReconcileOutcome]:
     """Every staging run of ``country``, by the reconcile command's code."""
 
     try:
         for outcome in calibration_tree_reconciliation.reconcile_calibration_trees(
-            country=country, kinds=["staging"], include_older_runs=True, **options
+            country=country,
+            kinds=["staging"],
+            reader=reader,
+            commands=commands,
+            submissions=submissions,
+            lock=lock,
+            follow_latest=follow_latest,
+            copy_record=copy_record,
+            dry_run=dry_run,
+            clock=clock,
+            time_limit_seconds=time_limit_seconds,
+            include_older_runs=True,
+            retry_refusals=False,
         ):
             # A staging run yields only its runs' outcomes.
             if isinstance(outcome, ReconcileOutcome):

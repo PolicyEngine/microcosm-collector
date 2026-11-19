@@ -1899,13 +1899,19 @@ and `--kind release|staging` limit every step.
    collector has a record of it: its files the dashboard reads are copied, and
    a run with diagnostics gets a tree. Without the backfill, the webhook-queued
    job leaves runs whose folders last changed before 2026-11-19 as `older_run`.
+   Unlike `--include-older-runs`, this step repeats a final refusal recorded
+   for an unchanged folder instead of building the run again, so a retry
+   spends its time on what is left.
 4. **Original files** of every build in the store's own manifest, read after
    the steps above (`telemetry_collector/calibration_tree_source_copies.py`,
    below).
 
 Steps 2 to 4 share the execution's 40-minute limit on starting work: each is
-given what is left of it. A step that fails for one country is reported and
-the others go on.
+given what is left of it. Once none is left, a staging country is `deferred`
+without waiting for its lock or reading Hugging Face, and step 4 defers each
+build before looking for its files, so an execution prints its summary well
+within the worker job's one-hour task timeout. A dry run has no time limit. A
+step that fails for one country is reported and the others go on.
 
 **Production's manifest.** The rest of this part, up to "Original files of
 stored builds", describes step 2
@@ -2070,10 +2076,14 @@ has no copy of a file the submission did not carry, such as
   that file with the same SHA-256, so a copy is always a file the tree was
   built from. `parent_build_manifest.json` and `reform_validation.json` have
   no record, so they are stored as the build's folder holds them at its
-  commit; one over 64 MiB is left out, as above. Each file is streamed to disk
-  and checked against its listing, then
+  commit; one over 64 MiB is left out, as above. The index records a tree
+  file's SHA-256 over its decoded UTF-8 text (a leading byte-order mark
+  dropped), so a file matches when its bytes or that text have the recorded
+  digest, and the copy is of its bytes. Each file is streamed to disk and
+  checked against its listing, then
   `packages/calibration-tree/src/calibration-tree-source-copies.ts store`
   checks the index's record again and stores each copy the store still lacks.
+  The index is read with the same command's `sources`.
   A copy already stored stays as it is, whatever it holds. Nothing else is
   written: no tree part, index or manifest, and no lock is taken.
 
@@ -2095,14 +2105,14 @@ under, with what became of its copy:
 
 | Outcome | Means | Final |
 |---|---|---|
-| `complete` | every file the build was built from or copies has a copy | yes |
+| `complete` | every file the build was built from or copies has a copy, stored before or by another writer meanwhile | yes |
 | `would_copy` | a dry run would store copies | |
 | `copied` | copies were stored | yes |
 | `not_copied` | its missing copies can't be stored: they differ or are too large, or the store holds no tree for the build | yes |
 | `invalid` | the stored entry failed the checks | yes |
 | `not_found` | its files are not at its commit, or Hugging Face no longer holds the commit | yes |
 | `error` | a Hugging Face failure, a download that differs from its listing, or a Bun exit 1 or 3; the next build still runs | no |
-| `deferred` | the time limit passed before its downloads started | no |
+| `deferred` | the time limit passed before its files were looked for | no |
 
 **Output.** Every outcome is one JSON document under its step's name:
 `{"releases_record": {...}}` (the fields of the reconcile command's step),
@@ -2145,7 +2155,11 @@ each environment's GitHub variables `TELEMETRY_WORKER_JOB`,
 reads the store's manifest, the stored copies' listing, tree indexes, the
 stored `releases.json` copies, the Hugging Face listings and the documents it
 needs to plan; it reads a tree file only when Hugging Face gives no SHA-256 for
-it, and stores, copies and builds nothing and takes no lock:
+it, and stores, copies and builds nothing and takes no lock. Its step 4 counts
+builds as they are stored now, so a staging tree step 3 of a real run would
+replace is counted too, and it compares a file it doesn't read by the SHA-256
+Hugging Face gives for its bytes, so a file starting with a byte-order mark
+shows as `differs` where a real run copies it:
 
 ```bash
 gcloud run jobs execute <worker job> --project <project> --region <region> \

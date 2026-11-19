@@ -31,26 +31,34 @@ SHA-256 ``differs``. ``parent_build_manifest.json`` and
 folder holds them at its commit (over 64 MiB, the backfill leaves them out). A
 file over 256 MiB is ``too_large`` and never downloaded. Each file is streamed
 to disk and checked against its listing, then the package's command stores
-the copies the store still lacks, and checks the index's record again. A copy
-already stored stays as it is, whatever it holds: ``kept`` when it holds the
-same bytes, ``conflict`` when it holds others. Nothing else is written: no
-tree part, index or manifest.
+the copies the store still lacks, and checks the index's record again. The
+index records a tree file's SHA-256 over its decoded UTF-8 text, so a file
+matches when its bytes or that text have the recorded digest; the copy is of
+the bytes. A copy already stored stays as it is, whatever it holds: ``kept``
+when it holds the same bytes, ``conflict`` when it holds others. Nothing else
+is written: no tree part, index or manifest.
 
 **Outcomes.** Each build's ``files`` say what became of each file's copy
 (``stored`` when the store already listed it). A build is ``complete`` when
-every file it was built from or copies has a copy, ``copied`` when copies were
-stored for it, ``would_copy`` in a dry run, and ``not_copied`` when its missing
-copies can't be stored (they differ, are too large, or the command refused the
-build because the store holds no tree for it). A stored entry that fails the
-checks is ``invalid``; files that are not at its commit, or a commit Hugging
-Face no longer holds, ``not_found``. Those are final. An ``error`` (a failed
-read, download or command) and a ``deferred`` build, for which no download
-started after the time limit, leave the run incomplete, so it runs again.
+every file it was built from or copies has a copy (stored before, or by
+another writer meanwhile), ``copied`` when copies were stored for it,
+``would_copy`` in a dry run, and ``not_copied`` when its missing copies can't be
+stored (they differ or are too large, or the store holds no tree for the
+build). A stored entry that fails the checks is ``invalid``; files that are not
+at its commit, or a commit Hugging Face no longer holds, ``not_found``. Those
+are final. An ``error`` (a failed read, download or command) and a
+``deferred`` build, whose files are not looked for after the time limit, leave
+the run incomplete, so it runs again.
 
 A dry run reads the store's manifest, its copy listing, the Hugging Face
 listings, the small documents a staging run's files are found by and the
 tree's index, and reads a tree file only when Hugging Face gives no SHA-256
-for it (one stored without LFS); it stores nothing and takes no lock.
+for it (one stored without LFS); it stores nothing, takes no lock and has no
+time limit. A file it does not read is compared by the SHA-256 Hugging Face
+gives for its bytes, so one whose recorded digest is of other text, such as a
+file starting with a byte-order mark, shows as ``differs`` where a real run
+would copy it. Builds that step 3 of a real run would replace are counted as
+they are stored now.
 """
 
 from __future__ import annotations
@@ -92,7 +100,6 @@ from telemetry_collector.huggingface_read import (
     HuggingFaceReader,
     HuggingFaceReadError,
 )
-from telemetry_collector.staging_run_files import read_tree_sources
 
 COMMAND_SCRIPT: Final = PACKAGE_DIRECTORY / "src" / "calibration-tree-source-copies.ts"
 #: The command's exit when the store holds no tree for the build.
@@ -146,8 +153,6 @@ TREE_ROLES: Final = frozenset(
 _SHA256: Final = re.compile(r"[0-9a-f]{64}")
 #: Hugging Face's error code for a commit the repo does not hold.
 _REVISION_NOT_FOUND: Final = "RevisionNotFound"
-#: A copy stored or in place for the build, after which it needs nothing more.
-_IN_PLACE: Final = frozenset({"stored", "copied", "kept", "conflict"})
 #: A file whose copy this step can't store.
 _LEFT_OUT: Final = frozenset({"differs", "too_large"})
 
@@ -251,6 +256,40 @@ def store_source_copies(commands: TreeCommands, request_path: Path) -> dict[str,
     return answer
 
 
+def read_recorded_sources(
+    commands: TreeCommands, country: str, build_artifact_id: str
+) -> dict[str, Any]:
+    """The files a stored tree's index records it was built from, by the
+    package's names.
+
+    Raises ``SourceCopiesRefusedError`` when the store holds no tree for the
+    build, and ``CalibrationTreeCommandError`` for any other failure.
+    """
+
+    sources = _answer(
+        commands,
+        ["sources", country, build_artifact_id],
+        MANIFEST_READ_TIMEOUT_SECONDS,
+    ).get("sources")
+    if not isinstance(sources, dict):
+        raise CalibrationTreeCommandError(
+            "The source copies sources printed no record of the tree's files."
+        )
+    return sources
+
+
+def _matches_record(content: bytes, recorded_sha256: str) -> bool:
+    """Whether ``content`` is the file a tree's index records with
+    ``recorded_sha256``. The worker hashes a tree file's UTF-8 text as
+    ``TextDecoder`` decodes it, with a leading byte-order mark dropped and
+    invalid bytes replaced; for any other file that text is its bytes."""
+
+    if hashlib.sha256(content).hexdigest() == recorded_sha256:
+        return True
+    text = content.decode("utf-8", errors="replace").removeprefix("\ufeff")
+    return hashlib.sha256(text.encode("utf-8")).hexdigest() == recorded_sha256
+
+
 def _known_sha256(source_file: SourceFile) -> str | None:
     """The SHA-256 the run or Hugging Face's listing gives for a file, if any."""
 
@@ -301,6 +340,16 @@ class _SourceCopies:
                 reason=f"The store's entry can't be read from Hugging Face: {error}",
                 **reported,
             )
+        if not self.dry_run and self.clock() - self.started >= self.time_limit_seconds:
+            return SourceFilesOutcome(
+                outcome="deferred",
+                reason=(
+                    "No build's files are looked for after the execution's time "
+                    "limit; run again."
+                ),
+                incomplete=True,
+                **reported,
+            )
         try:
             source = (
                 release_source(entry, self.listings)
@@ -316,8 +365,8 @@ class _SourceCopies:
                 return SourceFilesOutcome(
                     outcome="not_found",
                     reason=(
-                        f"{entry.hf_repo} no longer holds commit {entry.hf_commit}: "
-                        f"{_described(error)}"
+                        "Hugging Face no longer holds a commit this build's files "
+                        f"are read at: {_described(error)}"
                     ),
                     **reported,
                 )
@@ -337,17 +386,13 @@ class _SourceCopies:
                 missing[role] = source_file
         if not missing:
             return SourceFilesOutcome(outcome="complete", files=files, **reported)
-        if not self.dry_run and self.clock() - self.started >= self.time_limit_seconds:
-            return SourceFilesOutcome(
-                outcome="deferred",
-                files=files,
-                reason="No build's copies start after the execution's time limit; run again.",
-                incomplete=True,
-                **reported,
-            )
         try:
             expected = self.recorded_sha256(
                 entry.country, entry.build_artifact_id, missing
+            )
+        except SourceCopiesRefusedError as error:
+            return SourceFilesOutcome(
+                outcome="not_copied", files=files, reason=str(error), **reported
             )
         except Exception as error:
             return SourceFilesOutcome(
@@ -365,7 +410,14 @@ class _SourceCopies:
                 files[name] = "not_in_tree"
             elif source_file.listed.size > backfill.MAX_SOURCE_FILE_BYTES:
                 files[name] = "too_large"
-            elif role in expected and known is not None and known != expected[role]:
+            elif (
+                self.dry_run
+                and role in expected
+                and known is not None
+                and known != expected[role]
+            ):
+                # A dry run downloads no file Hugging Face gives a SHA-256 for,
+                # so it can compare only that digest of its bytes.
                 files[name] = "differs"
             else:
                 storable[role] = source_file
@@ -398,10 +450,11 @@ class _SourceCopies:
         statuses = set(files.values())
         if "would_copy" in statuses:
             return "would_copy"
-        if statuses & (_IN_PLACE - {"stored"}):
+        if "copied" in statuses:
             return "copied"
         if statuses & _LEFT_OUT:
             return "not_copied"
+        # Every file has a copy: stored before, or by another writer meanwhile.
         return "complete"
 
     def recorded_sha256(
@@ -414,7 +467,7 @@ class _SourceCopies:
 
         if not any(role in TREE_ROLES for role in missing):
             return {}
-        recorded = read_tree_sources(self.commands, country, build_artifact_id)
+        recorded = read_recorded_sources(self.commands, country, build_artifact_id)
         expected: dict[str, str] = {}
         for role in TREE_ROLES & set(missing):
             record = recorded.get(PACKAGE_NAMES[role])
@@ -438,7 +491,7 @@ class _SourceCopies:
                 content = self.reader.read_file(
                     source_file.dataset, source_file.listed.path, source_file.revision
                 )
-                if hashlib.sha256(content).hexdigest() != expected[role]:
+                if not _matches_record(content, expected[role]):
                     files[name] = "differs"
                     continue
             files[name] = "would_copy"
@@ -470,7 +523,11 @@ class _SourceCopies:
                 )
                 declared = source_file.declared_sha256
                 if (declared is not None and downloaded.sha256 != declared) or (
-                    role in expected and downloaded.sha256 != expected[role]
+                    role in expected
+                    and downloaded.sha256 != expected[role]
+                    and not _matches_record(
+                        downloaded.path.read_bytes(), expected[role]
+                    )
                 ):
                     files[name] = "differs"
                     continue

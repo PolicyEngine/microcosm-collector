@@ -64,7 +64,8 @@ Python:
   or differ, is ``unbuildable`` on its own, and the other runs continue. A
   settled result, final refusals included, is kept in the run's record after
   each build, so the tree is looked at again only when the folder or the stored
-  build changes, or for a refusal when ``include_older_runs`` asks. A tree an
+  build changes, or for a refusal when ``retry_refusals`` asks (by default with
+  ``include_older_runs``). A tree an
   earlier attempt stored under the same build ID is used as it is. A run whose
   folder is gone
   from the listing is marked removed, and readers leave it out until the folder
@@ -492,6 +493,8 @@ class _Reconciliation:
     time_limit_seconds: float
     #: Also cover staging runs older than ``JOB_COVERS_RUNS_FROM``.
     include_older_runs: bool = False
+    #: Look again at trees recorded as finally refused for an unchanged folder.
+    retry_refusals: bool = False
     listings: Listings = field(init=False)
     #: What became of each staging run's files in this execution.
     run_copies: dict[str, _RunCopy] = field(default_factory=dict)
@@ -1073,7 +1076,7 @@ class _Reconciliation:
             return None
         recorded = check.get("outcome")
         if recorded is not None:
-            if self.include_older_runs:
+            if self.retry_refusals:
                 return None
             return self.outcome(
                 "staging",
@@ -1559,8 +1562,15 @@ def reconcile_calibration_trees(
     clock: Callable[[], float] = time.monotonic,
     time_limit_seconds: float = BUILD_TIME_LIMIT_SECONDS,
     include_older_runs: bool = False,
+    retry_refusals: bool | None = None,
 ) -> Iterator[ReconcileOutcome | LatestStep | ReleasesRecordStep]:
     """Reconcile ``country``'s ``kinds``, in that order, yielding each outcome.
+
+    ``include_older_runs`` also covers staging runs older than
+    ``JOB_COVERS_RUNS_FROM``. ``retry_refusals`` looks again at trees recorded
+    as finally refused while their folder is unchanged; by default it follows
+    ``include_older_runs``, as ``--include-older-runs`` asks. The backfill's
+    staging step passes ``False``, so its retries don't build them again.
 
     The release kind starts with its ``ReleasesRecordStep``: ``copy_record``
     for the country, called before the release lock is waited for. It ends
@@ -1591,6 +1601,9 @@ def reconcile_calibration_trees(
         started=clock(),
         time_limit_seconds=time_limit_seconds,
         include_older_runs=include_older_runs,
+        retry_refusals=(
+            include_older_runs if retry_refusals is None else retry_refusals
+        ),
     )
     for kind in kinds:
         if kind == "release":

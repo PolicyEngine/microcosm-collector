@@ -331,7 +331,7 @@ def _argument_parser() -> argparse.ArgumentParser:
         help=(
             "Also cover staging runs last changed before the webhook-queued "
             "job's start date, as the backfill does, and try again the trees "
-            "recorded as finally refused."
+            "recorded as finally refused, which the backfill does not."
         ),
     )
     return parser

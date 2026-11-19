@@ -3,12 +3,18 @@
 // CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN:
 //
 //   bun run src/calibration-tree-source-copies.ts list <country>
+//   bun run src/calibration-tree-source-copies.ts sources <country> <build ID>
 //   bun run src/calibration-tree-source-copies.ts store REQUEST.json
 //
 // `list` only reads. It prints the copies stored for each of the country's
 // builds, by the name each is stored under:
 //
 //   {"builds": {"<build ID>": ["calibration_diagnostics.json", ...]}}
+//
+// `sources` only reads too. It prints the files the build's stored tree index
+// records it was built from, with their paths and SHA-256:
+//
+//   {"sources": {"calibrationDiagnostics": {"path": ..., "sha256": ...}, ...}}
 //
 // `store` takes REQUEST.json:
 //
@@ -25,7 +31,11 @@
 // demographics) is stored only when the stored index records it with the same
 // SHA-256, so a copy is always a file the tree was built from; the other two
 // (parentBuildManifest, reformValidation) have no record and are stored as
-// given. A copy already stored stays as it is, whatever it holds. It prints:
+// given. The worker records a tree file's SHA-256 over its UTF-8 text as
+// TextDecoder decodes it (a leading byte-order mark dropped, invalid bytes
+// replaced), so a file matches when its bytes or that text have the recorded
+// digest; the copy is of its bytes. A copy already stored stays as it is,
+// whatever it holds. It prints:
 //
 //   {"uploaded": [...], "kept": [...], "conflicts": [...], "refused": [{"file": ..., "reason": ...}]}
 //
@@ -37,7 +47,8 @@
 //
 //   1  the request could not be followed: no token, unknown arguments, a
 //      malformed request, or a file on disk that differs from its SHA-256;
-//   2  the store holds no tree index for the build, so nothing was stored;
+//   2  the store holds no tree index for the build (for `sources` and `store`),
+//      so nothing was stored;
 //   3  anything else, including any error from the store; running again may
 //      succeed.
 import { get, list, put } from "@vercel/blob";
@@ -202,42 +213,53 @@ export async function listCalibrationTreeSourceCopies(options: {
   );
 }
 
-// The SHA-256 the stored index records for each file the tree was built from.
-async function recordedSourceDigests(
-  request: CalibrationTreeSourceCopiesRequest,
-  token: string,
-  client: CalibrationTreeBlobClient,
-): Promise<Map<string, string>> {
+/** The files a stored tree's index records it was built from, by the package's names. */
+export async function readCalibrationTreeRecordedSources(options: {
+  country: MicrocosmCountry;
+  buildArtifactId: string;
+  token: string;
+  client?: CalibrationTreeBlobClient;
+}): Promise<JsonObject> {
   const stored = await getCalibrationTreeBlob({
-    country: request.country,
-    buildArtifactId: request.buildArtifactId,
+    country: options.country,
+    buildArtifactId: options.buildArtifactId,
     part: "index",
-    token,
+    token: options.token,
     consistent: true,
-    client,
+    client: options.client ?? DEFAULT_CLIENT,
   });
   if (!stored) {
     throw new CalibrationTreeSourceCopiesRefusedError(
-      `The store holds no tree for build ${request.buildArtifactId}, so no copy of its files is stored.`,
+      `The store holds no tree for build ${options.buildArtifactId}, so no copy of its files is stored.`,
     );
   }
   const index = JSON.parse(await calibrationTreeBlobText(stored.stream)) as {
     buildArtifactId?: unknown;
     build?: { sourceArtifacts?: unknown };
   };
-  if (index.buildArtifactId !== undefined && index.buildArtifactId !== request.buildArtifactId) {
-    throw new Error(`The index stored for build ${request.buildArtifactId} names another build.`);
+  if (index.buildArtifactId !== undefined && index.buildArtifactId !== options.buildArtifactId) {
+    throw new Error(`The index stored for build ${options.buildArtifactId} names another build.`);
   }
   const sources = index.build?.sourceArtifacts;
   if (!sources || typeof sources !== "object" || Array.isArray(sources)) {
-    throw new Error(`Tree ${request.buildArtifactId} records no source files.`);
+    throw new Error(`Tree ${options.buildArtifactId} records no source files.`);
   }
+  return sources as JsonObject;
+}
+
+// The SHA-256 the stored index records for each file the tree was built from.
+function recordedDigests(sources: JsonObject): Map<string, string> {
   const digests = new Map<string, string>();
-  for (const [file, record] of Object.entries(sources as JsonObject)) {
+  for (const [file, record] of Object.entries(sources)) {
     const sha256 = record && typeof record === "object" ? (record as JsonObject).sha256 : undefined;
     if (typeof sha256 === "string" && isSha256(sha256)) digests.set(file, sha256);
   }
   return digests;
+}
+
+// As the worker hashes a tree file: its UTF-8 text as TextDecoder decodes it.
+function textSha256(bytes: Uint8Array): string {
+  return createHash("sha256").update(new TextDecoder("utf-8").decode(bytes), "utf8").digest("hex");
 }
 
 interface FileOnDisk extends CalibrationTreeSourceCopyFile {
@@ -271,12 +293,19 @@ export async function storeCalibrationTreeSourceCopies(options: {
 }): Promise<CalibrationTreeSourceCopiesResult> {
   const { request, token, client = DEFAULT_CLIENT } = options;
   const files = filesOnDisk(request);
-  const recorded = await recordedSourceDigests(request, token, client);
+  const recorded = recordedDigests(
+    await readCalibrationTreeRecordedSources({
+      country: request.country,
+      buildArtifactId: request.buildArtifactId,
+      token,
+      client,
+    }),
+  );
   const result: CalibrationTreeSourceCopiesResult = { uploaded: [], kept: [], conflicts: [], refused: [] };
   for (const file of files) {
     if (CALIBRATION_TREE_INDEXED_SOURCE_FILES.has(file.file)) {
       const digest = recorded.get(file.file);
-      if (digest !== file.sha256) {
+      if (digest === undefined || (digest !== file.sha256 && digest !== textSha256(file.bytes))) {
         result.refused.push({
           file: file.file,
           reason: digest === undefined
@@ -302,7 +331,8 @@ export async function storeCalibrationTreeSourceCopies(options: {
   return result;
 }
 
-const USAGE = "Usage: bun run src/calibration-tree-source-copies.ts list <country> | store REQUEST.json";
+const USAGE =
+  "Usage: bun run src/calibration-tree-source-copies.ts list <country> | sources <country> <build ID> | store REQUEST.json";
 
 function requestFromFile(path: string): CalibrationTreeSourceCopiesRequest {
   let parsed: unknown;
@@ -320,6 +350,11 @@ async function commandAnswer(argv: string[], token: string, client: CalibrationT
   const [action, ...operands] = argv;
   if (action === "list" && operands.length === 1) {
     return { builds: await listCalibrationTreeSourceCopies({ country: countryArgument(operands[0]), token, client }) };
+  }
+  if (action === "sources" && operands.length === 2) {
+    const country = countryArgument(operands[0]);
+    if (!isSha256(operands[1])) throw new CalibrationTreeSourceCopiesRequestError("The build ID is not a SHA-256.");
+    return { sources: await readCalibrationTreeRecordedSources({ country, buildArtifactId: operands[1], token, client }) };
   }
   if (action === "store" && operands.length === 1) {
     return storeCalibrationTreeSourceCopies({ request: requestFromFile(operands[0]), token, client });
