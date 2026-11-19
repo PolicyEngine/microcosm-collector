@@ -1871,8 +1871,9 @@ writer stored it. This relies on Hugging Face's head reads not going backward, a
 A newer head replaces the copy even when `releases.json` did not change, so the
 copy's commit is the newest head an execution found, and `copiedAt` is when that
 execution wrote it. An execution that finds the copy already at the head writes
-nothing. A country gets its first copy when a release run or a
-`releases-record` submission next runs for it.
+nothing. A country gets its first copy when a release run, a
+`releases-record` submission or the backfill's first step ("Backfilling
+calibration trees from Hugging Face") next runs for it.
 
 ### Backfilling calibration trees from Hugging Face
 
@@ -1910,9 +1911,13 @@ Steps 2 to 4 share the execution's 40-minute limit on starting work: each is
 given what is left of it. A staging country is `deferred`, without waiting for
 its lock or reading Hugging Face, unless at least the reconcile lock's
 15-minute wait and 5 more minutes are left, and step 4 defers each build
-before looking for its files once none is left, so an execution prints its
-summary within the worker job's one-hour task timeout as long as a build
-started before the limit ends in time. A dry run has no time limit. A step
+before looking for its files once none is left. Work already running when the
+limit passes runs to its end: a build and its publication, a batch of copied
+run files, the reads of a staging country's run documents, and step 4's
+manifest read, copy listings and a build's copies. So an execution prints its
+summary within the worker job's one-hour task timeout as long as that work
+ends in time. A dry run has no time limit: one that ran past the hour would be
+stopped by Cloud Run before its summary and run again, up to twice. A step
 that fails for one country is reported and the others go on.
 
 **Production's manifest.** The rest of this part, up to "Original files of
@@ -2449,7 +2454,7 @@ Each build's outcome:
 | `ineligible` | a release folder without diagnostics, or whose release manifest is absent or names another build; a staging run without calibration diagnostics: a schema-1 folder without `calibration_diagnostics.json`, a structured run that declares neither diagnostics nor a staged dataset, a staged-dataset receipt of a skipped, failed or disabled staging, or a bundle that records no diagnostics file with a SHA-256 | yes |
 | `unbuildable` | the worker refused the files (exit 2), or a staging run's documents are incompatible: a run manifest that isn't a JSON object, names another run or has an unsupported schema, and the backfill's own checks of a run's files, such as declared or recorded diagnostics that are absent or differ from their SHA-256 | yes |
 | `too_large` | a file is over 256 MiB | yes |
-| `refused` | the publication refused the build (exit 2), and the store holds no tree for it as `already_stored` describes, or the tree could not replace the run's stored one | yes |
+| `refused` | the publication refused the build (exit 2), and the store holds no tree for it as `already_stored` describes, or the tree could not replace the run's stored one; or the store's manifest lists a tree for the run whose index the store doesn't hold (the staging run files command's `tree-sources` exits 2), which needs repair by hand | yes |
 | `no_releases_record` | the release repo has no `releases.json`; nothing is built | yes |
 | `releases_record_refused` | `releases.json` breaks the record's rules; nothing is built | yes |
 | `error` | a Hugging Face failure, the store's manifest could not be read, a Bun exit 1 or 3, or a timeout | no |

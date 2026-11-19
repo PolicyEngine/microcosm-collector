@@ -16,6 +16,8 @@
 //
 //   1  the request could not be followed: no token, unknown arguments or a
 //      malformed request;
+//   2  `tree-sources` only: the store holds no index for the tree, so running
+//      again can't help;
 //   3  anything else, including an index another writer changed and any error
 //      from the store; running again may succeed.
 import { get, put } from "@vercel/blob";
@@ -60,6 +62,7 @@ import {
 } from "./staging-run-files";
 
 export const STAGING_RUN_FILES_EXIT_REQUEST_ERROR = 1;
+export const STAGING_RUN_FILES_EXIT_NO_TREE = 2;
 export const STAGING_RUN_FILES_EXIT_STORE_ERROR = 3;
 
 const IMMUTABLE_CACHE_SECONDS = 31_536_000;
@@ -68,6 +71,9 @@ const HF_COMMIT = /^[0-9a-f]{40}$/;
 
 /** The request could not be followed; nothing was stored. */
 export class StagingRunFilesRequestError extends Error {}
+
+/** The store holds no index for the tree asked about. */
+export class StagingRunFilesNoTreeError extends Error {}
 
 export interface StagingRunFilesPublicationFile {
   name: StagingRunFileName;
@@ -381,7 +387,7 @@ export async function readStoredTreeSources(options: {
     consistent: true,
     client: options.client ?? DEFAULT_CLIENT,
   });
-  if (!blob) throw new Error(`The store holds no index for tree ${options.buildArtifactId}.`);
+  if (!blob) throw new StagingRunFilesNoTreeError(`The store holds no index for tree ${options.buildArtifactId}.`);
   const index = JSON.parse(await calibrationTreeBlobText(blob.stream)) as { build?: { sourceArtifacts?: unknown } };
   const sources = index.build?.sourceArtifacts;
   if (!sources || typeof sources !== "object" || Array.isArray(sources)) {
@@ -449,9 +455,9 @@ export async function stagingRunFilesCommandMain(
     return 0;
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
-    return error instanceof StagingRunFilesRequestError
-      ? STAGING_RUN_FILES_EXIT_REQUEST_ERROR
-      : STAGING_RUN_FILES_EXIT_STORE_ERROR;
+    if (error instanceof StagingRunFilesRequestError) return STAGING_RUN_FILES_EXIT_REQUEST_ERROR;
+    if (error instanceof StagingRunFilesNoTreeError) return STAGING_RUN_FILES_EXIT_NO_TREE;
+    return STAGING_RUN_FILES_EXIT_STORE_ERROR;
   }
 }
 

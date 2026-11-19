@@ -66,7 +66,9 @@ Python:
   each build, so the tree is looked at again only when the folder or the stored
   build changes, or for a refusal when ``retry_refusals`` asks (by default with
   ``include_older_runs``). A tree an
-  earlier attempt stored under the same build ID is used as it is. A run whose
+  earlier attempt stored under the same build ID is used as it is. A stored
+  tree whose index the store doesn't hold is a final ``refused``, which needs
+  the stored entry repaired by hand. A run whose
   folder is gone
   from the listing is marked removed, and readers leave it out until the folder
   returns.
@@ -1447,6 +1449,20 @@ class _Reconciliation:
         if planned.stored_build is not None:
             try:
                 differs = self.tree_sources_differ(source, planned.stored_build)
+            except staging_run_files.StoredTreeMissingError as error:
+                # Running again can't help: the stored entry needs repair by
+                # hand, so the refusal is kept for this folder and stored build.
+                return self.settle_plan(
+                    planned,
+                    outcome(
+                        "refused",
+                        reason=shortened_message(
+                            "The store's manifest lists tree "
+                            f"{planned.stored_build.get('buildArtifactId')} for this "
+                            f"run, but the store holds no index for it: {error}"
+                        ),
+                    ),
+                )
             except Exception as error:
                 return outcome("error", reason=_described(error), incomplete=True)
             stored_id = planned.stored_build.get("buildArtifactId")
