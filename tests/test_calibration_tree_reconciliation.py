@@ -2018,6 +2018,27 @@ def test_the_backfill_option_tries_a_final_refusal_again() -> None:
     assert len(reconciliation.bun.steps("build")) == 2
 
 
+def test_older_runs_can_be_covered_while_a_final_refusal_is_repeated() -> None:
+    # The backfill's staging step: every execution and retry covers the older
+    # runs, but a refusal recorded for an unchanged folder is not built again.
+    reconciliation = us_staging_reconciliation(structured_staging_run(RUN_ID))
+    reconciliation.bun.worker_exits[RUN_ID] = 2
+    [first] = reconciliation.run(kinds=["staging"])
+    assert first.outcome == "unbuildable"
+    parameters = inspect.signature(
+        reconciliation_module().reconcile_calibration_trees
+    ).parameters
+    assert "retry_refusals" in parameters
+
+    [second] = reconciliation.run(
+        kinds=["staging"], include_older_runs=True, retry_refusals=False
+    )
+
+    assert (second.outcome, second.reason) == ("unbuildable", first.reason)
+    assert second.incomplete is False
+    assert len(reconciliation.bun.steps("build")) == 1
+
+
 def test_a_refused_replacement_is_not_reported_as_stored() -> None:
     reconciliation = us_staging_reconciliation(structured_staging_run(RUN_ID))
     stored_tree(reconciliation, RUN_ID, {"calibrationDiagnostics": b"older"})

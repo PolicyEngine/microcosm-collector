@@ -133,6 +133,10 @@ class SourceCopyBun(StandInBun):
 
     copies: dict[tuple[str, str], dict[str, bytes]] = field(default_factory=dict)
     unlisted: set[tuple[str, str, str]] = field(default_factory=set)
+    #: Files the store command refuses, by the package's name.
+    refused: set[str] = field(default_factory=set)
+    #: Builds whose tree index the store does not hold.
+    without_index: set[str] = field(default_factory=set)
     copy_exits: dict[str, int] = field(default_factory=dict)
     manifest_read_exit: int = 0
     seconds_per_store: float = 0.0
@@ -164,6 +168,23 @@ class SourceCopyBun(StandInBun):
         if exit_code != 0:
             return subprocess.CompletedProcess(
                 argv, exit_code, "", f"The copies {action} failed."
+            )
+        if action == "sources":
+            build = argv[5]
+            if build in self.without_index:
+                return subprocess.CompletedProcess(
+                    argv, 2, "", f"The store holds no tree for build {build}."
+                )
+            answer = self.tree_sources.get(
+                build,
+                {
+                    "calibrationDiagnostics": {"sha256": sha256(DIAGNOSTICS)},
+                    "buildManifest": {"sha256": sha256(BUILD_MANIFEST)},
+                    "releaseManifest": {"sha256": sha256(RELEASE_MANIFEST)},
+                },
+            )
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"sources": answer}), ""
             )
         if action == "list":
             country = argv[4]
@@ -199,7 +220,11 @@ class SourceCopyBun(StandInBun):
         for file in request["files"]:
             name = STORED_NAMES[file["file"]]
             content = call["contents"][file["file"]]
-            if name in stored:
+            if file["file"] in self.refused:
+                answer["refused"].append(
+                    {"file": file["file"], "reason": "Another version."}
+                )
+            elif name in stored:
                 answer["kept" if stored[name] == content else "conflicts"].append(
                     file["file"]
                 )
@@ -324,7 +349,7 @@ def test_a_build_with_only_its_other_copies_gets_the_two_copied_files() -> None:
         "reformValidation": REFORM_VALIDATION,
     }
     # The two copied files have no record in the tree, so it is not read.
-    assert copies.bun.steps("run files tree-sources") == []
+    assert copies.bun.steps("copies sources") == []
     assert sorted(copies.hugging_face.downloaded_paths()) == [
         f"releases/{US_TAG}/{name}" for name in COPIED_FILES
     ]
@@ -339,7 +364,7 @@ def test_a_build_with_every_copy_is_complete_and_downloads_nothing() -> None:
     assert outcome.files == {name: "stored" for name in STORED_NAMES.values()}
     assert copies.hugging_face.downloaded_paths() == []
     assert copies.bun.steps("copies store") == []
-    assert copies.bun.steps("run files tree-sources") == []
+    assert copies.bun.steps("copies sources") == []
 
 
 def test_a_tree_file_that_differs_from_the_tree_s_record_is_not_stored() -> None:
@@ -384,6 +409,45 @@ def test_a_build_whose_only_missing_file_differs_is_not_copied() -> None:
     assert outcome.files["build_manifest.json"] == "differs"
     assert outcome.incomplete is False
     assert copies.bun.steps("copies store") == []
+
+
+#: The worker records a tree file's SHA-256 over its UTF-8 text, with a leading
+#: byte-order mark dropped, so this file's record is DIAGNOSTICS's digest.
+DIAGNOSTICS_WITH_MARK = b"\xef\xbb\xbf" + DIAGNOSTICS
+
+
+def release_copies_with_marked_diagnostics() -> tuple[Copies, dict[str, Any]]:
+    files = full_release_folder() | {
+        f"releases/{US_TAG}/calibration_diagnostics.json": DIAGNOSTICS_WITH_MARK
+    }
+    stored = stored_copies(
+        [
+            name
+            for name in STORED_NAMES.values()
+            if name != "calibration_diagnostics.json"
+        ]
+    )
+    return release_copies(files, stored=stored)
+
+
+def test_a_tree_file_recorded_by_its_decoded_text_is_copied_as_its_bytes() -> None:
+    copies, _ = release_copies_with_marked_diagnostics()
+
+    [outcome] = copies.run()
+
+    assert outcome.outcome == "copied"
+    assert outcome.files["calibration_diagnostics.json"] == "copied"
+    [store] = copies.bun.steps("copies store")
+    assert store["contents"] == {"calibrationDiagnostics": DIAGNOSTICS_WITH_MARK}
+
+
+def test_a_dry_run_compares_a_file_by_its_decoded_text_too() -> None:
+    copies, _ = release_copies_with_marked_diagnostics()
+
+    [outcome] = copies.run(dry_run=True)
+
+    assert outcome.outcome == "would_copy"
+    assert outcome.files["calibration_diagnostics.json"] == "would_copy"
 
 
 def test_a_tree_file_the_tree_was_not_built_from_is_left_out() -> None:
@@ -439,7 +503,8 @@ def test_a_copy_another_writer_stored_meanwhile_is_kept_and_named_if_it_differs(
 
     [outcome] = copies.run()
 
-    assert outcome.outcome == "copied"
+    # Every file now has a copy, so nothing more is to be done for it.
+    assert outcome.outcome == "complete"
     assert outcome.files["parent_build_manifest.json"] == "conflict"
     assert outcome.files["reform_validation.json"] == "kept"
     assert copies.bun.copies[("us", build)]["parent_build_manifest.json"] == (
@@ -737,6 +802,47 @@ def test_a_build_the_copy_command_refuses_is_not_copied_and_final() -> None:
     assert outcome.incomplete is False
 
 
+def test_a_build_whose_tree_the_store_does_not_hold_is_not_copied_and_final() -> None:
+    copies, entry = release_copies()
+    copies.bun.without_index.add(entry["buildArtifactId"])
+
+    [outcome] = copies.run()
+
+    assert outcome.outcome == "not_copied"
+    assert outcome.reason
+    assert outcome.incomplete is False
+    assert copies.bun.steps("copies store") == []
+
+
+def test_a_file_the_copy_command_refuses_is_reported_as_differing() -> None:
+    copies, _ = release_copies()
+    copies.bun.refused.add("buildManifest")
+
+    [outcome] = copies.run()
+
+    assert outcome.outcome == "copied"
+    assert outcome.files["build_manifest.json"] == "differs"
+    assert outcome.files["release_manifest.json"] == "copied"
+
+
+def test_the_tree_s_record_is_read_once_through_the_copy_command() -> None:
+    copies, entry = release_copies()
+
+    copies.run()
+
+    [sources] = copies.bun.steps("copies sources")
+    script = str(copies_module().COMMAND_SCRIPT)
+    assert sources["argv"] == [
+        "/usr/local/bin/bun",
+        "run",
+        script,
+        "sources",
+        "us",
+        entry["buildArtifactId"],
+    ]
+    assert copies.bun.steps("run files tree-sources") == []
+
+
 def test_a_copy_command_that_fails_otherwise_is_an_error() -> None:
     copies, _ = release_copies()
     copies.bun.copy_exits["store"] = 3
@@ -792,7 +898,18 @@ def test_the_time_limit_is_the_one_it_is_given() -> None:
     [outcome] = copies.run(time_limit_seconds=0)
 
     assert outcome.outcome == "deferred"
-    assert copies.hugging_face.downloaded_paths() == []
+    assert outcome.incomplete is True
+    # Past the limit, a build's files are not even looked for.
+    assert copies.hugging_face.requests == []
+    assert copies.bun.steps("copies sources") == []
+
+
+def test_a_dry_run_has_no_time_limit() -> None:
+    copies, _ = release_copies()
+
+    [outcome] = copies.run(dry_run=True, time_limit_seconds=0)
+
+    assert outcome.outcome == "would_copy"
 
 
 def test_only_the_store_s_commands_get_the_blob_token() -> None:
@@ -804,7 +921,11 @@ def test_only_the_store_s_commands_get_the_blob_token() -> None:
     copy_calls = [
         call for call in copies.bun.calls if call["step"].startswith("copies")
     ]
-    assert [call["step"] for call in copy_calls] == ["copies list", "copies store"]
+    assert [call["step"] for call in copy_calls] == [
+        "copies list",
+        "copies sources",
+        "copies store",
+    ]
     assert copy_calls[0]["argv"] == ["/usr/local/bin/bun", "run", script, "list", "us"]
     for call in copy_calls:
         assert call["env"]["CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN"] == BLOB_TOKEN

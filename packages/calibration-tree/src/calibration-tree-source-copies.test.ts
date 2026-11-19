@@ -208,6 +208,31 @@ test("list prints no builds for a country with no copies", async () => {
   expect(printed).toEqual([{ builds: {} }]);
 });
 
+test("sources prints the files a stored tree records it was built from", async () => {
+  const store = new InMemoryBlobStore();
+  store.storeIndex("us", BUILD_ID, { ...RECORDED_SOURCES, demographics: null });
+
+  const { exitCode, printed } = await runCommand(["sources", "us", BUILD_ID], store);
+
+  expect(exitCode).toBe(0);
+  expect(printed).toEqual([{ sources: { ...RECORDED_SOURCES, demographics: null } }]);
+  expect(store.puts).toEqual([]);
+});
+
+test("sources exits 2 for a build whose tree the store does not hold", async () => {
+  const { exitCode, errors } = await runCommand(["sources", "us", BUILD_ID], new InMemoryBlobStore());
+
+  expect(exitCode).toBe(2);
+  expect(errors.join("\n")).toContain(BUILD_ID);
+});
+
+test("sources needs a known country and a build ID", async () => {
+  const store = new InMemoryBlobStore();
+
+  expect((await runCommand(["sources", "fr", BUILD_ID], store)).exitCode).toBe(1);
+  expect((await runCommand(["sources", "us", "../manifest"], store)).exitCode).toBe(1);
+});
+
 // Storing ------------------------------------------------------------------------
 
 test("store uploads a gzip copy of each file the store lacks, under the stored build", async () => {
@@ -300,6 +325,23 @@ test("a tree file is stored only when the tree's index records it with the same 
   expect(store.copy("us", BUILD_ID, "build_manifest.json")).toBeNull();
   expect(store.copy("us", BUILD_ID, "release_manifest.json")).toBeNull();
   expect(store.copy("us", BUILD_ID, "demographics.json")).toBeNull();
+});
+
+test("a tree file whose index records the SHA-256 of its decoded text is stored as its bytes", async () => {
+  // The worker records a tree file's SHA-256 over its UTF-8 text, with a
+  // leading byte-order mark dropped.
+  const store = new InMemoryBlobStore();
+  store.storeIndex("us", BUILD_ID, RECORDED_SOURCES);
+  const withMark = new Uint8Array([0xef, 0xbb, 0xbf, ...DIAGNOSTICS]);
+
+  const { exitCode, printed } = await runCommand(
+    ["store", requestWith([["calibrationDiagnostics", withMark]])],
+    store,
+  );
+
+  expect(exitCode).toBe(0);
+  expect(printed).toEqual([{ uploaded: ["calibrationDiagnostics"], kept: [], conflicts: [], refused: [] }]);
+  expect(store.copy("us", BUILD_ID, "calibration_diagnostics.json")).toEqual(withMark);
 });
 
 test("a build whose tree the store lacks is refused with exit 2 and nothing is stored", async () => {

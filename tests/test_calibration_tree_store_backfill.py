@@ -208,6 +208,9 @@ def test_older_staging_runs_are_covered_by_the_reconcile_code_per_country(
     for options in given:
         assert list(options["kinds"]) == ["staging"]
         assert options["include_older_runs"] is True
+        # Each execution and retry repeats a refusal recorded for an unchanged
+        # folder instead of building it again.
+        assert options.get("retry_refusals") is False
         assert options["dry_run"] is False
         for name, value in SHARED.items():
             assert options[name] is value
@@ -303,6 +306,34 @@ def test_the_time_left_is_never_below_zero(
     run(monkeypatch, steps)
 
     assert steps.given["source_files"][0]["time_limit_seconds"] == 0
+
+
+def test_no_staging_country_starts_after_the_time_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    steps = StandInSteps(minutes={"staging": 45})
+
+    outcomes = run(monkeypatch, steps)
+
+    assert [options["country"] for options in steps.given["staging"]] == ["us"]
+    staging = [outcome for outcome in outcomes if isinstance(outcome, ReconcileOutcome)]
+    assert [(outcome.country, outcome.outcome) for outcome in staging] == [
+        ("uk", "deferred")
+    ]
+    assert staging[0].incomplete is True
+    assert staging[0].reason
+    # The copy step still runs, and defers each build itself.
+    assert steps.given["source_files"][0]["time_limit_seconds"] == 0
+
+
+def test_a_dry_run_covers_every_staging_country_whatever_the_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    steps = StandInSteps(minutes={"staging": 45})
+
+    run(monkeypatch, steps, dry_run=True)
+
+    assert [options["country"] for options in steps.given["staging"]] == ["us", "uk"]
 
 
 # Failures -----------------------------------------------------------------------
