@@ -1598,9 +1598,15 @@ CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN=... \
   bun run src/calibration-tree-latest.ts LATEST.json
 CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN=... \
   bun run src/calibration-tree-manifest-read.ts
+CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN=... \
+  bun run src/calibration-tree-releases-record-copy.ts read COUNTRY
+CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN=... \
+  bun run src/calibration-tree-releases-record-copy.ts write COPY.json
 ```
 
-`src/calibration-tree-manifest-read.ts` only reads: it prints the store's
+`src/calibration-tree-releases-record-copy.ts` reads and replaces the stored
+copy of a country's `releases.json` (see "Keeping each country's
+releases.json"). `src/calibration-tree-manifest-read.ts` only reads: it prints the store's
 manifest as one JSON line, read without the cache and checked with the
 manifest's own rules (an empty manifest while the store has none), for the
 backfill to compare with production's, the reconcile command to see what the
@@ -1761,8 +1767,8 @@ reconcile command's `already_stored`.
 The image holds Bun 1.4.2, copied from the official image by digest, and the
 package's production install, without its tests, fixtures and test support.
 CI checks the built image with `tools/check-calibration-tree-image.sh`, which
-builds a small staged run's tree inside it and runs the publication and latest
-commands without a token, which must each refuse to run.
+builds a small staged run's tree inside it and runs the publication, latest and
+`releases.json` copy commands without a token, which must each refuse to run.
 
 ### Moving the latest when releases.json changes
 
@@ -1791,14 +1797,22 @@ for every country the collector lists:
    It writes only the manifest, with the same compare-and-swap as the
    publication command, and runs with only `PATH`, `LANG` and the Blob token.
 3. **Results.** `current_build`, `build_artifact_id`, `made_latest` (the
-   country's latest is that build's tree) and `latest_moved` (this
-   submission changed it). The latest is left as it is, and `latest_unchanged`
+   country's latest is that build's tree) and `latest_moved` (this attempt
+   changed it, so an attempt repeated after an earlier one moved the latest
+   reports `false`).
+   The latest is left as it is, and `latest_unchanged`
    says why, when the head has no `releases.json` (`no_releases_record`), one
    the rules refuse (`releases_record_refused`, with
    `latest_unchanged_reason`), no current build of its default release
    (`no_current_build`), or a current build the manifest records no tree for
    (`no_recorded_tree`). A failed read or any other failure of the latest
    command fails the attempt, so it runs again.
+4. **The stored copy.** Whether or not step 2 succeeded, it stores the
+   `releases.json` at the repo's head ("Keeping each country's releases.json").
+   The result's `releases_record` says what that did (`outcome`, `hf_repo`,
+   `hf_commit`, `has_record`, and `reason` for a refused record). A failure
+   fails the attempt, so it runs again. When steps 2 and 4 both fail, the
+   attempt reports step 2's failure.
 
 Step 2 is `calibration_trees.follow_releases_record(country, ...)`, which
 builds nothing and takes the lock itself, so another collector job can call
@@ -1817,6 +1831,46 @@ latest either way: its publication reads the change, or the change's handler
 finds its tree. A tree whose publication comes after a rollback to it isn't
 made the latest by that publication, which takes the latest only from an older
 build; reprocessing the change's `releases-record` submission moves it.
+
+### Keeping each country's releases.json
+
+The collector keeps each country's `releases.json` in the calibration tree
+store, so that readers need not fetch it from Hugging Face. There is one private
+object per country, replaced in place, at
+`calibration-tree-sources/<country>/releases-record.json`. It holds the file's
+exact text, its SHA-256 and size, the release repo and head commit it was read
+from, and when it was copied. `@policyengine/calibration-tree` reads it with
+`readStoredReleasesRecord`.
+
+`calibration_trees.copy_releases_record` stores it. A release run of the
+`reconcile-calibration-trees` command does so first, and the `releases-record`
+handler does so after it has tried to move the latest, so a change Microcosm
+submits reaches the copy without waiting for the 10-minute window. A change that
+leaves its release without a current build sends no submission, so it reaches
+the copy through the next release run. A failure leaves the run incomplete or
+fails the handler's attempt, and either runs again.
+
+| The release repo at its head | The stored copy | Result |
+|---|---|---|
+| A valid `releases.json` | Replaced, unless already at that commit | `stored` or `unchanged` |
+| No `releases.json` (Hugging Face's `EntryNotFound`) | Replaced by one with `record` null, so a reader can tell the repo has none | `stored` or `unchanged` |
+| A `releases.json` the record's rules refuse | The last accepted copy stays | `refused` |
+| A read that fails | Stays as it is | a failure, which runs again |
+
+**An older execution cannot replace a newer copy.** No lock is held. Each attempt
+reads the stored object's ETag, then the repo's head, and its write succeeds
+only while the object still has that ETag, or, for a first copy, while there is
+still none. A write that succeeds therefore saw the previous write's version
+before it read its head. An execution whose write is refused starts again, for
+at most three attempts in all, and finds the head already stored if the other
+writer stored it. This relies on Hugging Face's head reads not going backward, as following
+`releases.json` does.
+
+A newer head replaces the copy even when `releases.json` did not change, so the
+copy's commit is the newest head an execution found, and `copiedAt` is when that
+execution wrote it. An execution that finds the copy already at the head writes
+nothing. A country gets its first copy when a release run or a
+`releases-record` submission next runs for it.
 
 ### Backfilling calibration trees from Hugging Face
 
@@ -2207,6 +2261,13 @@ Python. Without `--kind` it covers both kinds, or only releases for BE.
   `lock_wait_expired` and exits 1, so Cloud Run tries again. The store's
   manifest is read once for each kind, inside its lock.
 - Nothing it publishes asks to become the country's latest.
+- **The stored `releases.json`.** A release run starts by storing the release
+  repo's `releases.json` at its head: `calibration_trees.copy_releases_record`
+  ("Keeping each country's releases.json"). The step comes before the run waits
+  for its lock, so a run that builds nothing or cannot get the lock still
+  stores it, and a run that is building does not hold back a change. A failure
+  leaves the run incomplete, so Cloud Run tries again, and the builds go on. A
+  dry run skips it.
 - **The latest.** A release run ends by making the country's latest follow
   the current build of `releases.json` at the release repo's head, newer or
   older than the current latest, without building anything:
@@ -2224,24 +2285,26 @@ Python. Without `--kind` it covers both kinds, or only releases for BE.
   Run tries again, except for a country the collector doesn't list, which no
   attempt gets past.
 
-It prints one JSON document for each build, then, for a run that covers
+For a run that covers releases it first prints the copy step's document,
+`{"releases_record": {"country", "outcome", ..., "incomplete"}}`. It then
+prints one JSON document for each build, then, for a run that covers
 releases, the latest step's, `{"latest": {"country", "outcome", ...,
 "incomplete"}}`, then `{"summary": {"country", "kinds", "request_id",
-"dry_run", "outcomes", "incomplete", "incomplete_sources", "latest"}}`. The
-summary's `outcomes` counts every outcome in the table below: each build's,
-and each outcome for a whole kind (`no_releases_record`,
-`releases_record_refused`, `lock_wait_expired`, or an `error` when a repo
-or the store's manifest could not be read). `incomplete_sources` lists the
-incomplete ones, with `source_id` `null` for a whole kind. The summary's
-`latest` repeats the latest step's document, or is `null` for a run without
-releases. The latest step is not counted in `outcomes`, and a latest step
-that failed and may be tried again makes `incomplete` true without adding
-an entry to `incomplete_sources`. A staging run's document also has
-`run_files`, what became of its copies (`copied`, `unchanged`, `would_copy`,
-`deferred` or `error`, the last two leaving the run incomplete),
-`copied_run_files` and `run_files_reason`, and the summary's `run_files` counts
-those results. `replaced_build_artifact_id` names the stored tree a new one
-replaced.
+"dry_run", "outcomes", "incomplete", "incomplete_sources", "latest",
+"releases_record"}}`. The summary's `outcomes` counts every outcome in the
+table below: each build's, and each outcome for a whole kind
+(`no_releases_record`, `releases_record_refused`, `lock_wait_expired`, or an
+`error` when a repo or the store's manifest could not be read).
+`incomplete_sources` lists the incomplete ones, with `source_id` `null` for a
+whole kind. The summary's `latest` and `releases_record` repeat those steps'
+documents, or are `null` for a run without releases. Neither step is counted
+in `outcomes`, and a step that failed and may be tried again makes
+`incomplete` true without adding an entry to `incomplete_sources`. A staging
+run's document also has `run_files`, what became of its copies (`copied`,
+`unchanged`, `would_copy`, `deferred` or `error`, the last two leaving the run
+incomplete), `copied_run_files` and `run_files_reason`, and the summary's
+`run_files` counts those results. `replaced_build_artifact_id` names the stored
+tree a new one replaced.
 
 Each build's outcome:
 
@@ -2271,9 +2334,19 @@ The latest step's `outcome`:
 | `skipped` | the step didn't run | `skipped` (`dry_run`, `no_releases_record` or `lock_wait_expired`) and `reason` |
 | `error` | the step failed | `reason`; `incomplete` is true unless the country isn't one the collector lists |
 
+The copy step's `outcome`:
+
+| `outcome` | Means | Fields |
+|---|---|---|
+| `stored` | the store now holds the release repo's head | `hf_repo`, `hf_commit`, `has_record` |
+| `unchanged` | the stored copy was already at the head | `hf_repo`, `hf_commit`, `has_record` |
+| `refused` | the head's `releases.json` breaks the record's rules, so the last accepted copy stays | `hf_repo`, `hf_commit`, `has_record` (`null`), `reason` |
+| `skipped` | a dry run | `skipped` (`dry_run`) and `reason` |
+| `error` | the step failed; `incomplete` is true | `reason` |
+
 The command exits 0 when the run is complete, 1 when anything ended in
-`error`, `deferred` or `lock_wait_expired`, or the latest step failed and
-may be tried again, and 2 for an argument error,
+`error`, `deferred` or `lock_wait_expired`, or the latest step or the copy
+step failed and may be tried again, and 2 for an argument error,
 such as `--kind staging` for BE, a `--request-id` of another country or
 kind, or `--request-id` beside `--dry-run`. It needs `DATABASE_URL`,
 `COLLECTOR_HF_READ_TOKEN` and `COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN`, which

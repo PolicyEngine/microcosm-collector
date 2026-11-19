@@ -5,7 +5,8 @@ set -euo pipefail
 # and the tree package's production install: its tree worker must build a
 # small staged run's tree, its publication command must start and, given no
 # Blob token, refuse to run as a request error (exit 1), and so must its latest
-# command, with its token message, which shows the command ships in the image.
+# and releases.json copy commands, with their token message, which shows they
+# ship in the image.
 # Run from the repo root by ci.yml after the image build:
 #
 #   bash tools/check-calibration-tree-image.sh IMAGE
@@ -50,6 +51,9 @@ docker run --rm "$image" \
 latest=0
 latest_refusal=$(docker run --rm "$image" \
   bun run "$package/src/calibration-tree-latest.ts" /work/latest.json 2>&1 >/dev/null) || latest=$?
+record_copy=0
+record_copy_refusal=$(docker run --rm "$image" \
+  bun run "$package/src/calibration-tree-releases-record-copy.ts" read us 2>&1 >/dev/null) || record_copy=$?
 
 if (( built != 0 )); then
   echo "The image did not build a calibration tree (exit $built)." >&2
@@ -69,6 +73,10 @@ if (( published != 1 )); then
 fi
 if (( latest != 1 )) || [[ "$latest_refusal" != *"CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN is required."* ]]; then
   echo "The image's latest command did not refuse to run without a token (exit $latest, expected 1 with its token message)." >&2
+  exit 1
+fi
+if (( record_copy != 1 )) || [[ "$record_copy_refusal" != *"CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN is required."* ]]; then
+  echo "The image's releases.json copy command did not refuse to run without a token (exit $record_copy, expected 1 with its token message)." >&2
   exit 1
 fi
 echo "The image builds calibration trees."

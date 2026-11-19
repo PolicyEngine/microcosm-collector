@@ -309,6 +309,10 @@ class Reconciliation:
     latest: StandInLatestCommand = field(default_factory=StandInLatestCommand)
     #: What the last run's release kind reported of its latest step.
     latest_steps: list[Any] = field(default_factory=list)
+    #: What the last run's release kind reported of copying releases.json.
+    record_steps: list[Any] = field(default_factory=list)
+    #: Everything the last run yielded, in order.
+    produced: list[Any] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         for dataset in (US_STAGING, UK_STAGING):
@@ -364,6 +368,8 @@ class Reconciliation:
                 bun="/usr/local/bin/bun",
                 run_command=run_latest_command,
             )
+        # A test of the copy step passes its own; the others don't watch it.
+        options.setdefault("copy_record", lambda _country: copied_record())
         produced = list(
             module.reconcile_calibration_trees(
                 country=country,
@@ -376,8 +382,12 @@ class Reconciliation:
                 **options,
             )
         )
+        self.produced = produced
         self.latest_steps = [
-            item for item in produced if not isinstance(item, module.ReconcileOutcome)
+            item for item in produced if isinstance(item, module.LatestStep)
+        ]
+        self.record_steps = [
+            item for item in produced if type(item).__name__ == "ReleasesRecordStep"
         ]
         return [item for item in produced if isinstance(item, module.ReconcileOutcome)]
 
@@ -716,7 +726,219 @@ def test_a_release_run_s_summary_reports_its_latest_step() -> None:
         "incomplete": False,
         "incomplete_sources": [],
         "latest": step.to_json()["latest"],
+        "releases_record": None,
     }
+
+
+# The copy of releases.json --------------------------------------------------------
+
+
+@dataclass
+class RecordCopies:
+    """Stands in for ``copy_releases_record``, noting each call in the run's events."""
+
+    events: list[str]
+    copied: Any = None
+    raises: BaseException | None = None
+    asked: list[str] = field(default_factory=list)
+
+    def __call__(self, country: str) -> Any:
+        self.asked.append(country)
+        self.events.append(f"record copy {country}")
+        if self.raises is not None:
+            raise self.raises
+        return self.copied
+
+
+def copied_record(outcome: str = "stored", **fields: Any) -> Any:
+    trees = importlib.import_module("telemetry_collector.calibration_trees")
+    assert hasattr(trees, "CopiedReleasesRecord")
+    settings = {
+        "country": "us",
+        "outcome": outcome,
+        "hf_repo": US_RELEASES,
+        "hf_commit": "c" * 40,
+        "has_record": True,
+        **fields,
+    }
+    return trees.CopiedReleasesRecord(**settings)
+
+
+def record_copies(reconciliation: Reconciliation, **settings: Any) -> RecordCopies:
+    parameters = inspect.signature(
+        reconciliation_module().reconcile_calibration_trees
+    ).parameters
+    assert "copy_record" in parameters
+    settings.setdefault("copied", copied_record())
+    return RecordCopies(reconciliation.bun.events, **settings)
+
+
+def test_a_release_run_copies_releases_json_before_it_waits_for_its_lock() -> None:
+    reconciliation = us_release_reconciliation()
+    copies = record_copies(reconciliation)
+
+    reconciliation.run(copy_record=copies)
+
+    assert copies.asked == ["us"]
+    assert reconciliation.bun.events[:2] == ["record copy us", "release lock taken"]
+    assert reconciliation.produced[0] is reconciliation.record_steps[0]
+    [step] = reconciliation.record_steps
+    assert step.to_json() == {
+        "releases_record": {
+            "country": "us",
+            "outcome": "stored",
+            "hf_repo": US_RELEASES,
+            "hf_commit": "c" * 40,
+            "has_record": True,
+            "incomplete": False,
+        }
+    }
+    assert step.incomplete is False
+
+
+@pytest.mark.parametrize(
+    ("record", "expected"),
+    [
+        (None, "no_releases_record"),
+        (
+            releases_json(TWO_BUILDS, current="us-calibration-attempt-unlisted"),
+            "releases_record_refused",
+        ),
+    ],
+    ids=["no-releases-json", "refused-releases-json"],
+)
+def test_a_release_run_that_builds_nothing_still_copies(
+    record: bytes | None, expected: str
+) -> None:
+    reconciliation = Reconciliation()
+    if record is not None:
+        at_head(reconciliation.hugging_face, US_RELEASES, {"releases.json": record})
+    copies = record_copies(reconciliation)
+
+    outcomes = reconciliation.run(copy_record=copies)
+
+    assert reconciliation.bun.steps("build") == []
+    assert [outcome.outcome for outcome in outcomes] == [expected]
+    assert copies.asked == ["us"]
+    assert len(reconciliation.record_steps) == 1
+
+
+def test_a_release_run_whose_builds_are_all_stored_still_copies() -> None:
+    reconciliation = us_release_reconciliation()
+    reconciliation.bun.store = store_manifest(
+        "us",
+        [
+            {
+                "buildArtifactId": build_id("us", "release", release_id),
+                "kind": "release",
+                "releaseId": release_id,
+                "stagingRunId": None,
+                "hfRepo": US_RELEASES,
+                "hfCommitSha": "9" * 40,
+                "createdAt": "2026-10-19T08:33:23.000Z",
+            }
+            for release_id in (CURRENT_ID, OLDER_ID)
+        ],
+    )
+    copies = record_copies(reconciliation)
+
+    outcomes = reconciliation.run(copy_record=copies)
+
+    assert {outcome.outcome for outcome in outcomes} == {"already_stored"}
+    assert copies.asked == ["us"]
+
+
+def test_a_run_that_cannot_get_its_lock_still_copies() -> None:
+    reconciliation = us_release_reconciliation()
+    reconciliation.held_locks.add(("us", "release"))
+    copies = record_copies(reconciliation)
+
+    outcomes = reconciliation.run(copy_record=copies)
+
+    assert [outcome.outcome for outcome in outcomes] == ["lock_wait_expired"]
+    assert copies.asked == ["us"]
+    assert reconciliation.record_steps[0].outcome == "stored"
+
+
+def test_a_dry_run_copies_nothing() -> None:
+    reconciliation = us_release_reconciliation()
+    copies = record_copies(reconciliation)
+
+    reconciliation.run(copy_record=copies, dry_run=True)
+
+    assert copies.asked == []
+    [step] = reconciliation.record_steps
+    fields = step.to_json()["releases_record"]
+    assert "dry run" in fields.pop("reason")
+    assert fields == {
+        "country": "us",
+        "outcome": "skipped",
+        "skipped": "dry_run",
+        "incomplete": False,
+    }
+
+
+def test_a_staging_run_does_not_copy_releases_json() -> None:
+    reconciliation = both_kinds()
+    copies = record_copies(reconciliation)
+
+    reconciliation.run(kinds=["staging"], copy_record=copies)
+
+    assert copies.asked == []
+    assert reconciliation.record_steps == []
+
+
+def test_a_run_of_both_kinds_copies_once() -> None:
+    reconciliation = both_kinds()
+    copies = record_copies(reconciliation)
+
+    reconciliation.run(kinds=["release", "staging"], copy_record=copies)
+
+    assert copies.asked == ["us"]
+
+
+def test_a_refused_record_does_not_leave_the_run_incomplete() -> None:
+    reconciliation = us_release_reconciliation()
+    copies = record_copies(
+        reconciliation,
+        copied=copied_record("refused", has_record=None, reason="not listed"),
+    )
+
+    reconciliation.run(copy_record=copies)
+
+    [step] = reconciliation.record_steps
+    fields = step.to_json()["releases_record"]
+    assert fields["outcome"] == "refused"
+    assert fields["reason"] == "not listed"
+    assert fields["incomplete"] is False
+
+
+def test_a_failed_copy_leaves_the_run_incomplete_and_its_builds_go_on() -> None:
+    reconciliation = us_release_reconciliation()
+    copies = record_copies(reconciliation, raises=RuntimeError("the store is down"))
+
+    outcomes = reconciliation.run(copy_record=copies)
+
+    assert outcomes_by_source(outcomes) == [
+        (CURRENT_ID, "built"),
+        (OLDER_ID, "built"),
+    ]
+    [step] = reconciliation.record_steps
+    fields = step.to_json()["releases_record"]
+    assert fields["outcome"] == "error"
+    assert "the store is down" in fields["reason"]
+    assert fields["incomplete"] is True
+    summary = reconciliation_attribute("summarize")(
+        reconciliation.produced,
+        country="us",
+        kinds=["release"],
+        request_id=None,
+        dry_run=False,
+    )
+    assert summary["incomplete"] is True
+    assert summary["incomplete_sources"] == []
+    assert summary["releases_record"] == fields
+    assert summary["outcomes"] == {"built": 2}
 
 
 # The latest step ------------------------------------------------------------------

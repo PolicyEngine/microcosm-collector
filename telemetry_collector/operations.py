@@ -69,9 +69,14 @@ release run ends by making the country's latest follow ``releases.json``
 (``calibration_trees.follow_releases_record``), which builds nothing: it
 prints that step's document, ``{"latest": {...}}``, which the summary's
 ``latest`` repeats, and exits 1 when the step failed in a way another
-attempt may get past. With ``--dry-run`` it lists what it would build, from
-the Hugging Face listings and the store's manifest: it downloads no
-diagnostics, builds nothing, takes no lock and leaves the latest as it is.
+attempt may get past. A release run starts by storing the release repo's
+``releases.json`` in the tree store
+(``calibration_trees.copy_releases_record``): it prints that step's document,
+``{"releases_record": {...}}``, which the summary's ``releases_record``
+repeats, and exits 1 when the step failed. With ``--dry-run`` it lists what it
+would build, from the Hugging Face listings and the store's manifest: it
+downloads no diagnostics, builds nothing, takes no lock, stores no copy of
+``releases.json`` and leaves the latest as it is.
 
 Run them with ``python -m telemetry_collector.operations recover``,
 ``python -m telemetry_collector.operations reprocess``,
@@ -528,6 +533,7 @@ def _reconcile_calibration_trees(database_url: str, options: argparse.Namespace)
     outcomes: list[
         calibration_tree_reconciliation.ReconcileOutcome
         | calibration_tree_reconciliation.LatestStep
+        | calibration_tree_reconciliation.ReleasesRecordStep
     ] = []
 
     def summary_of_outcomes() -> dict[str, Any]:
@@ -563,6 +569,12 @@ def _reconcile_calibration_trees(database_url: str, options: argparse.Namespace)
                     calibration_trees.follow_releases_record,
                     blob_token=blob_token,
                     manifest_lock=manifest_lock,
+                    reader=reader,
+                ),
+                # A release run's first step: the store keeps releases.json.
+                copy_record=functools.partial(
+                    calibration_trees.copy_releases_record,
+                    blob_token=blob_token,
                     reader=reader,
                 ),
                 dry_run=options.dry_run,
