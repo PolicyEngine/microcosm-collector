@@ -544,6 +544,23 @@ test("the command prints the source files a stored tree was built from", async (
   expect(JSON.parse(printed[0])).toEqual(sources);
 });
 
+test("the command exits 2 for the sources of a tree the store holds no index for", async () => {
+  const { stagingRunFilesCommandMain } = await command();
+  const store = new InMemoryBlobStore();
+  const error = console.error;
+  console.error = () => undefined;
+  try {
+    const exitCode = await stagingRunFilesCommandMain(
+      ["tree-sources", "uk", BUILD_ID],
+      { [TOKEN_VARIABLE]: TOKEN },
+      store.client(),
+    );
+    expect(exitCode).toBe(2);
+  } finally {
+    console.error = error;
+  }
+});
+
 test("the command exits 1 for a request it cannot follow and 3 when the store fails", async () => {
   const { stagingRunFilesCommandMain } = await command();
   const failing = { get: async () => { throw new Error("The store is unavailable."); } } as never;

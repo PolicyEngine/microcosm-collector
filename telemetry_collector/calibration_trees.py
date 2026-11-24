@@ -1174,7 +1174,7 @@ def follow_releases_record(
 
 # Keeping a copy of releases.json --------------------------------------------------
 
-ReleasesRecordCopyOutcome = Literal["stored", "unchanged", "refused"]
+ReleasesRecordCopyOutcome = Literal["stored", "unchanged", "refused", "would_store"]
 
 
 @dataclass(frozen=True)
@@ -1184,6 +1184,7 @@ class CopiedReleasesRecord:
     country: str
     #: ``stored``: the copy now holds the head. ``unchanged``: it already did.
     #: ``refused``: the head's record breaks the rules, so the copy stayed.
+    #: ``would_store``: a dry run found a head the copy does not hold yet.
     outcome: ReleasesRecordCopyOutcome
     hf_repo: str
     #: The release repo's head commit that was read.
@@ -1234,6 +1235,7 @@ def copy_releases_record(
     reader: HuggingFaceReader,
     bun: str = "bun",
     run_command: CommandRunner = run_bun,
+    dry_run: bool = False,
 ) -> CopiedReleasesRecord:
     """Store ``country``'s ``releases.json`` at its release repo's head.
 
@@ -1249,6 +1251,10 @@ def copy_releases_record(
     ``EntryNotFound`` says that, because such a copy stays until the next
     commit. A record the rules refuse leaves the last accepted copy in place
     (``refused``).
+
+    A dry run reads the stored version, the head and its record as a real run
+    does, and writes nothing: a head the copy does not hold yet is
+    ``would_store``.
 
     Raises ``ValueError`` for a country the collector does not list, before
     reading anything. Any other exception is a failure calling again may get
@@ -1322,6 +1328,8 @@ def copy_releases_record(
                 except ReleasesRecordRefusedError as error:
                     return copied("refused", head, None, shortened_message(str(error)))
                 record_path.write_bytes(content)
+            if dry_run:
+                return copied("would_store", head, content is not None)
             request_path.write_text(
                 json.dumps(
                     {

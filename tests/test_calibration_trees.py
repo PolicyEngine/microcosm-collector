@@ -1874,12 +1874,18 @@ class StoredRecordCopy:
 
 
 def copy_with(
-    store: StoredRecordCopy, hugging_face: FakeHuggingFace, country: str = "uk"
+    store: StoredRecordCopy,
+    hugging_face: FakeHuggingFace,
+    country: str = "uk",
+    **options: Any,
 ) -> Any:
     """``copy_releases_record`` for ``country``, against the stand-ins."""
 
     module = trees()
     assert hasattr(module, "copy_releases_record")
+    assert set(options) <= set(
+        inspect.signature(module.copy_releases_record).parameters
+    )
     return module.copy_releases_record(
         country,
         blob_token=BLOB_TOKEN,
@@ -1888,6 +1894,7 @@ def copy_with(
         ),
         bun="/usr/local/bin/bun",
         run_command=store,
+        **options,
     )
 
 
@@ -2000,6 +2007,54 @@ def test_a_record_the_package_refuses_leaves_the_last_accepted_copy() -> None:
     assert copied.outcome == "refused"
     assert copied.reason == "write failed"
     assert store.commit == NEWER_HEAD
+
+
+def test_a_dry_run_says_a_newer_head_would_be_stored_and_writes_nothing() -> None:
+    store = StoredRecordCopy(commit=NEWER_HEAD, etag=STORED_ETAG, has_record=True)
+
+    copied = copy_with(store, uk_release_repo(releases_record()), dry_run=True)
+
+    assert copied.result() == {**STORED_UK_RECORD, "outcome": "would_store"}
+    assert store.writes == []
+    assert [call["argv"][3] for call in store.calls] == ["read"]
+    assert (store.commit, store.etag) == (NEWER_HEAD, STORED_ETAG)
+
+
+def test_a_dry_run_finds_a_copy_already_at_the_head_unchanged() -> None:
+    store = StoredRecordCopy(commit=HEAD, etag=STORED_ETAG, has_record=True)
+
+    copied = copy_with(store, uk_release_repo(releases_record()), dry_run=True)
+
+    assert copied.result() == {**STORED_UK_RECORD, "outcome": "unchanged"}
+    assert store.writes == []
+
+
+def test_a_dry_run_reports_a_record_the_rules_refuse_and_writes_nothing() -> None:
+    store = StoredRecordCopy(commit=NEWER_HEAD, etag=STORED_ETAG, has_record=True)
+    refused = releases_record(withdrawn=(RUN_ID,))
+
+    copied = copy_with(store, uk_release_repo(refused), dry_run=True)
+
+    assert copied.outcome == "refused"
+    assert "withdrawn" in copied.reason
+    assert store.writes == []
+
+
+def test_a_dry_run_of_a_repo_without_releases_json_would_store_a_copy_saying_so() -> (
+    None
+):
+    store = StoredRecordCopy()
+
+    copied = copy_with(store, release_repo(BE_RELEASE_REPO, None), "be", dry_run=True)
+
+    assert copied.result() == {
+        "outcome": "would_store",
+        "hf_repo": BE_RELEASE_REPO,
+        "hf_commit": HEAD,
+        "has_record": False,
+    }
+    assert store.writes == []
+    assert [call["argv"][3] for call in store.calls] == ["read"]
 
 
 def test_an_older_execution_cannot_replace_a_newer_copy() -> None:

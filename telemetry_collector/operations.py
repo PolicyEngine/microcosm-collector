@@ -26,21 +26,28 @@ answering before it was classed. With ``--dry-run`` it only lists what it would
 project, from Hugging Face's listings: it downloads no build's graph inputs
 and writes nothing.
 
-``backfill-calibration-trees --production-manifest-url URL`` fills the
-collector's calibration tree store with every build production's public tree
-manifest lists (``telemetry_collector.calibration_tree_backfill``), building
-each missing one from its Hugging Face files. ``URL`` is the dashboard's
+``backfill-calibration-trees [--production-manifest-url URL]`` fills the
+collector's calibration tree store in one execution
+(``telemetry_collector.calibration_tree_store_backfill``): it stores each
+country's ``releases.json``, covers every older staging run with the reconcile
+command's code, and stores the original files missing for every build in the
+store's own manifest (``telemetry_collector.calibration_tree_source_copies``).
+Given ``URL``, the dashboard's
 ``https://<dashboard>/api/microcosm/tree-manifest``, which it requests for
-each country without any credential. ``--country`` (repeatable) and
-``--kind`` limit it, and ``--dry-run`` lists what it would build, from
-Hugging Face's listings and the store's manifest, downloading no diagnostics
-and building nothing. It needs ``DATABASE_URL`` (for the manifest lock),
-``COLLECTOR_HF_READ_TOKEN`` and ``COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN``, so
-it runs as an execution of the worker job with its arguments overridden. It
-prints one document for each entry, then a summary, and exits 1 when the run
-is incomplete: an entry ended in an error or was deferred past the time
-limit, a country's manifest could not be used, or a country's latest build
-was not made the store's latest; and 2 for an argument error.
+each country without any credential, it also builds every build that manifest
+lists and the store lacks (``telemetry_collector.calibration_tree_backfill``).
+``--country`` (repeatable) and ``--kind`` limit it, and ``--dry-run`` lists
+what it would store and build, from Hugging Face's listings and documents and
+the store's manifest, index and copies: it downloads no diagnostics Hugging
+Face gives a SHA-256 for, stores and builds nothing and takes no lock. It
+needs ``DATABASE_URL`` (for its locks and the submissions the staging runs
+skip), ``COLLECTOR_HF_READ_TOKEN`` and ``COLLECTOR_CALIBRATION_TREE_BLOB_TOKEN``,
+so it runs as an execution of the worker job with its arguments overridden. It
+prints one document for each outcome, under its step's name, then a summary,
+and exits 1 when the run is incomplete: anything ended in an error or was
+deferred past the time limit, a country's manifest or the store could not be
+read, or a country's latest build from production's manifest was not made the
+store's latest; and 2 for an argument error.
 
 ``reconcile-calibration-trees --country <cc> [--kind release|staging]
 [--request-id <task ID>] [--dry-run] [--include-older-runs]`` builds the
@@ -50,9 +57,10 @@ that its Hugging Face repos hold and the store lacks
 release repo's ``releases.json`` lists, and every staging run it covers that has
 calibration diagnostics, each read at the repo's head. It also keeps copies of
 the files the dashboard reads for those runs. It covers staging runs changed
-from ``JOB_COVERS_RUNS_FROM`` on and runs already copied; the backfill's
-``--include-older-runs`` covers the rest. Without ``--kind`` it covers both kinds,
-or only releases for a country without a staging repo. The Cloud Task that
+from ``JOB_COVERS_RUNS_FROM`` on and runs already copied;
+``--include-older-runs`` covers the rest, as the backfill's staging step
+does. Without ``--kind`` it covers both kinds, or only releases for a country
+without a staging repo. The Cloud Task that
 ``POST /v1/calibration-tree-builds`` queues runs it in the worker job with
 ``--request-id``, the task's ID: the run records its start, attempts, finish
 and summary on that request's row of ``calibration_tree_build_requests``.
@@ -89,6 +97,7 @@ Run them with ``python -m telemetry_collector.operations recover``,
 from __future__ import annotations
 
 import argparse
+import contextlib
 import functools
 import json
 import os
@@ -106,6 +115,7 @@ from telemetry_collector import (
     calibration_tree_backfill,
     calibration_tree_builds,
     calibration_tree_reconciliation,
+    calibration_tree_store_backfill,
     calibration_trees,
     past_builds,
 )
@@ -254,13 +264,18 @@ def _argument_parser() -> argparse.ArgumentParser:
     )
     backfill = commands.add_parser(
         BACKFILL_COMMAND,
-        help="Build every calibration tree production's tree manifest lists.",
+        help=(
+            "Fill the calibration tree store: each releases.json, every older "
+            "staging run and every stored build's original files."
+        ),
     )
     backfill.add_argument(
         "--production-manifest-url",
-        required=True,
         metavar="URL",
-        help="Production's tree manifest, https://<dashboard>/api/microcosm/tree-manifest.",
+        help=(
+            "Also build what this tree manifest lists and the store lacks, "
+            "https://<dashboard>/api/microcosm/tree-manifest."
+        ),
     )
     backfill.add_argument(
         "--country",
@@ -278,7 +293,7 @@ def _argument_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help=(
-            "List what would be built, downloading no diagnostics, building "
+            "List what would be stored and built, storing and building "
             "nothing and taking no lock."
         ),
     )
@@ -316,7 +331,7 @@ def _argument_parser() -> argparse.ArgumentParser:
         help=(
             "Also cover staging runs last changed before the webhook-queued "
             "job's start date, as the backfill does, and try again the trees "
-            "recorded as finally refused."
+            "recorded as finally refused, which the backfill does not."
         ),
     )
     return parser
@@ -475,37 +490,65 @@ def _backfill_calibration_trees(database_url: str, options: argparse.Namespace) 
     kinds = (
         [options.kind] if options.kind else list(calibration_tree_backfill.BUILD_KINDS)
     )
-    outcomes = []
-    with (
-        HuggingFaceReader.from_environment() as reader,
+    production_manifest_url: str | None = options.production_manifest_url
+    store_backfill = calibration_tree_store_backfill
+    outcomes: list[calibration_tree_store_backfill.StepOutcome] = []
+    with contextlib.ExitStack() as stack:
+        reader = stack.enter_context(HuggingFaceReader.from_environment())
         # Production's manifest is public: this client sends no credential.
-        httpx.Client(
-            timeout=calibration_tree_backfill.PRODUCTION_MANIFEST_TIMEOUT_SECONDS
-        ) as production_client,
-    ):
-        engine = create_database_engine(database_url)
-        try:
-            commands = calibration_trees.tree_commands(
-                blob_token=blob_token,
-                manifest_lock=calibration_trees.postgres_manifest_lock(engine),
-                size_limits=calibration_trees.size_limits_from(os.environ),
+        production_client = (
+            None
+            if production_manifest_url is None
+            else stack.enter_context(
+                httpx.Client(
+                    timeout=calibration_tree_backfill.PRODUCTION_MANIFEST_TIMEOUT_SECONDS
+                )
             )
-            # Each outcome is printed as it is produced, so a run that stops
-            # early still logs every entry it finished.
-            for outcome in calibration_tree_backfill.backfill_calibration_trees(
-                production_manifest_url=options.production_manifest_url,
+        )
+        engine = create_database_engine(database_url)
+        stack.callback(engine.dispose)
+        manifest_lock = calibration_trees.postgres_manifest_lock(engine)
+        # Each outcome is printed as it is produced, so a run that stops early
+        # still logs every outcome it finished.
+        for outcome in store_backfill.backfill_calibration_tree_store(
+            reader=reader,
+            commands=calibration_trees.tree_commands(
+                blob_token=blob_token,
+                manifest_lock=manifest_lock,
+                size_limits=calibration_trees.size_limits_from(os.environ),
+            ),
+            # The first step: the store keeps each releases.json.
+            copy_record=functools.partial(
+                calibration_trees.copy_releases_record,
+                blob_token=blob_token,
                 reader=reader,
-                production_client=production_client,
-                commands=commands,
-                countries=countries,
-                kinds=kinds,
-                dry_run=options.dry_run,
-            ):
-                _print_json(outcome.to_json())
-                outcomes.append(outcome)
-        finally:
-            engine.dispose()
-    summary = calibration_tree_backfill.summarize(outcomes, countries)
+            ),
+            # The reconcile command's services, for the older staging runs.
+            submissions=calibration_tree_reconciliation.PostgresSubmissionsInProgress(
+                engine
+            ),
+            lock=calibration_tree_reconciliation.postgres_reconciliation_lock(engine),
+            follow_latest=functools.partial(
+                calibration_trees.follow_releases_record,
+                blob_token=blob_token,
+                manifest_lock=manifest_lock,
+                reader=reader,
+            ),
+            countries=countries,
+            kinds=kinds,
+            dry_run=options.dry_run,
+            production_manifest_url=production_manifest_url,
+            production_client=production_client,
+        ):
+            _print_json(store_backfill.document(outcome))
+            outcomes.append(outcome)
+    summary = store_backfill.summarize(
+        outcomes,
+        countries=countries,
+        kinds=kinds,
+        dry_run=options.dry_run,
+        production_builds=production_manifest_url is not None,
+    )
     _print_json({"summary": summary})
     return 1 if summary["incomplete"] else 0
 
@@ -627,8 +670,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
 
     parser = _argument_parser()
     options = parser.parse_args(arguments)
-    if options.command == BACKFILL_COMMAND and not _is_https_address(
-        options.production_manifest_url
+    if (
+        options.command == BACKFILL_COMMAND
+        and options.production_manifest_url is not None
+        and not _is_https_address(options.production_manifest_url)
     ):
         parser.error("--production-manifest-url must be an https:// address.")
     if options.command == RECONCILE_COMMAND:
