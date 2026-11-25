@@ -395,14 +395,54 @@ def test_requires_exactly_one_calibration_diagnostics_file() -> None:
         SubmissionRequest.model_validate(submission)
 
 
-def test_requires_one_schema_and_one_execution_overlay() -> None:
+def validation_messages(submission: dict[str, Any]) -> list[str]:
+    """What intake's request model says is wrong with a submission; empty
+    when it accepts it."""
+
+    try:
+        SubmissionRequest.model_validate(submission)
+    except ValidationError as error:
+        return [detail["msg"] for detail in error.errors()]
+    return []
+
+
+def without_role(submission: dict[str, Any], role: str) -> dict[str, Any]:
+    submission["files"] = [file for file in submission["files"] if file["role"] != role]
+    return submission
+
+
+def test_an_orrery_submission_may_leave_out_the_execution_overlay() -> None:
+    # Microcosm's reconstruction command rebuilds only a schema for a UK build
+    # made before microcosm#1144; the Orrery graph handler decides whether a
+    # schema may come without an overlay.
+    submission = without_role(orrery_submission(), "execution_overlay")
+
+    assert validation_messages(submission) == []
+    assert submission["provenance"]["huggingface"] is None
+
+
+def test_an_orrery_submission_holds_at_most_one_execution_overlay() -> None:
     submission = orrery_submission()
-    submission["files"] = [
-        file for file in submission["files"] if file["role"] != "execution_overlay"
+    submission["files"].append(
+        {
+            "name": "graph.execution.second.json",
+            "role": "execution_overlay",
+            "size": 200,
+            "sha256": "f" * 64,
+        }
+    )
+
+    assert validation_messages(submission) == [
+        "Value error, orrery-inputs needs at most 1 execution_overlay file(s), not 2"
     ]
 
-    with pytest.raises(ValidationError, match="execution_overlay"):
-        SubmissionRequest.model_validate(submission)
+
+def test_an_orrery_submission_needs_exactly_one_schema() -> None:
+    submission = without_role(orrery_submission(), "schema")
+
+    assert validation_messages(submission) == [
+        "Value error, orrery-inputs needs exactly 1 schema file(s), not 0"
+    ]
 
 
 def test_refuses_duplicate_file_names() -> None:

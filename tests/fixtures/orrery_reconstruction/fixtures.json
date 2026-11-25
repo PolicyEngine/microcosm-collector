@@ -1,0 +1,14 @@
+{
+  "cases": [
+    {
+      "command_title": "UK \u00b7 reconstructed declaration (4bf7af406a1b)",
+      "description": "The schema Microcosm's reconstruction command rebuilds from a replica of a UK dense build made before microcosm#1144, holding the maintained UK dense graph declaration, and Microcosm's projection of it with no title and no overlay.",
+      "expected": "uk-dense-pre-1144/graph.orrery.json.gz",
+      "name": "uk-dense-pre-1144",
+      "operations": 101,
+      "schema": "uk-dense-pre-1144/graph.schema.json.gz"
+    }
+  ],
+  "microcosm_commit": "8c51b6eff7b23e1ff1509cd926fa750ae945a647",
+  "microcosm_repo": "PolicyEngine/microcosm"
+}
