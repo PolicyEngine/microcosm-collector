@@ -1350,6 +1350,60 @@ def test_a_marker_that_fails_microcosm_s_checks_rejects_the_submission(
     assert publishing.records.records == {}
 
 
+def test_a_build_s_unusable_schema_and_overlay_get_the_overlay_s_rejection() -> None:
+    # As before reconstructed schemas: a schema without the marker that comes
+    # with an overlay has the overlay read first, and the projection checks
+    # the schema afterwards.
+    inputs = schema_whose_sources_are_an_object()
+    inputs[OVERLAY] = ("execution_overlay", b"\xff")
+    submission = accepted(inputs)
+    publishing = Publishing()
+
+    outcome = submission.run(publishing)
+
+    assert outcome is JobOutcome.FINISHED
+    assert submission.record().rejection == {
+        "code": "orrery_inputs_unusable",
+        "message": "The execution overlay is not UTF-8.",
+    }
+    assert publishing.bucket.stored == {}
+
+
+def set_source_revision_origin(marker: dict) -> dict:
+    marker["source_revision"]["origin"] = ["recorded"]
+    return marker
+
+
+def set_an_input_verification(marker: dict) -> dict:
+    marker["inputs"][0]["verification"] = {"state": "recorded_digest_matched"}
+    return marker
+
+
+@pytest.mark.parametrize(
+    "change",
+    [set_source_revision_origin, set_an_input_verification],
+    ids=["origin-array", "verification-object"],
+)
+def test_a_marker_value_of_the_wrong_json_type_is_rejected_as_the_marker_s_fault(
+    change: Callable[[dict], dict],
+) -> None:
+    schema = reconstructed_schema()
+    extensions = schema["extensions"]
+    extensions[RECONSTRUCTION_EXTENSION] = change(extensions[RECONSTRUCTION_EXTENSION])
+    submission = accepted(reconstructed_inputs(json_bytes(schema)))
+    publishing = Publishing()
+
+    outcome = submission.run(publishing)
+
+    assert outcome is JobOutcome.FINISHED
+    rejection = submission.record().rejection
+    assert rejection["code"] == "orrery_inputs_unusable"
+    assert rejection["message"].startswith(
+        "Graph reconstruction: a marker value has the wrong JSON type ("
+    )
+    assert publishing.bucket.stored == {}
+
+
 def test_the_collector_version_is_the_installed_package_s() -> None:
     assert graphs().installed_collector_version() == importlib.metadata.version(
         "microcosm-collector"

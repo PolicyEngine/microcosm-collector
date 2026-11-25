@@ -70,6 +70,19 @@ def copied_unchanged_package_files() -> set[Path]:
     }
 
 
+def copied_unchanged_projection_modules() -> set[Path]:
+    """The Orrery projection's modules that its provenance module records as
+    copied unchanged from Microcosm; their blob ID tests require Microcosm's
+    exact bytes."""
+
+    from telemetry_collector.orrery.projection import provenance
+
+    projection_directory = ROOT / "telemetry_collector" / "orrery" / "projection"
+    unchanged = set(provenance.SOURCE_BLOBS) - set(provenance.CHANGED_MODULES)
+    unchanged |= set(getattr(provenance, "RECONSTRUCTION_SOURCE_BLOBS", {}))
+    return {projection_directory / module for module in unchanged}
+
+
 def authenticates_to_google_cloud(job: dict) -> bool:
     return any(
         step.get("uses", "").startswith("google-github-actions/auth@")
@@ -590,7 +603,11 @@ def test_collector_uses_store_vocabulary() -> None:
     # copied unchanged from calibration-diagnostics keep that repo's words:
     # src/provenance.test.ts requires their recorded blob IDs, and a fixture
     # generator writes the word as a key of the fixture it reproduces.
-    copied_unchanged = copied_unchanged_package_files()
+    # Likewise the Orrery projection's modules copied unchanged from
+    # Microcosm, such as reconstruction.py's git docstrings.
+    copied_unchanged = (
+        copied_unchanged_package_files() | copied_unchanged_projection_modules()
+    )
     source_files = [
         source_path
         for source_path in ROOT.rglob("*")
