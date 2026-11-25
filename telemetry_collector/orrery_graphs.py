@@ -2,11 +2,19 @@
 
 Each attempt first checks that every upstream file is named
 ``upstream-<its SHA-256>.json``, as Microcosm names the producing run's files
-it copies, and then downloads the submission's schema and execution overlay
-into a new temporary directory. It projects them with the collector's copy of
-Microcosm's projection (``orrery_json_from_schema(schema, execution=overlay)``)
-and then removes every link the published document could not resolve, which
-needs only the upstream files' names, from the submission's file list:
+it copies, and then downloads the submission's schema into a new temporary
+directory and checks it as the projection does. A schema whose extensions
+carry Microcosm's reconstruction marker (``microcosm.reconstruction``) was
+rebuilt after the build from its recorded graph declaration alone, by
+Microcosm's reconstruction command for a UK build made before
+microcosm#1144; the marker must pass Microcosm's own checks
+(``validate_reconstruction``, copied unchanged), and such a submission has no
+execution overlay. Any other schema needs one, which is then downloaded too.
+The attempt projects them with the collector's copy of Microcosm's projection
+(``orrery_json_from_schema(schema, execution=overlay)``, with no overlay for a
+reconstructed schema) and then removes every link the published document
+could not resolve, which needs only the upstream files' names, from the
+submission's file list:
 
 - Evidence files stay in private intake storage, so each evidence reference
   keeps its label and SHA-256 but loses its link, whatever the link's scheme.
@@ -33,9 +41,10 @@ with the same code, writes the same objects, and a reprocessing after the
 projection changes writes a new folder. Writes only ever create objects; an
 existing object with the same SHA-256 is kept. Each document is recorded in
 ``orrery_graph_files`` with its run and build, the projection's source, the
-collector's and Orrery's versions, whether it was reconstructed (true only for
-a submission the collector made for a past build, ``COLLECTOR_OWNER_HF_ID``),
-and its visibility: ``private`` for a
+collector's and Orrery's versions, whether it was reconstructed (true for a
+submission the collector made for a past build, ``COLLECTOR_OWNER_HF_ID``,
+and for a schema carrying the reconstruction marker), and its visibility:
+``private`` for a
 licensed build and ``public`` otherwise. The Orrery read service, a separate
 Cloud Run service whose IAM policy grants the Cloud Run Invoker role only to
 microcosm-runs' service account, serves both to microcosm-runs
@@ -78,6 +87,11 @@ from telemetry_collector.orrery.projection.orrery import (
     _revision as projection_revision,
 )
 from telemetry_collector.orrery.projection.provenance import MICROCOSM_COMMIT
+from telemetry_collector.orrery.projection.reconstruction import (
+    RECONSTRUCTION_EXTENSION,
+    validate_reconstruction,
+)
+from telemetry_collector.orrery.projection.schema import validate_graph_schema
 from telemetry_collector.orrery.validation import (
     OrreryDocumentRefusedError,
     OrreryValidation,
@@ -100,6 +114,14 @@ COLLECTOR_DISTRIBUTION = "microcosm-collector"
 MAX_MESSAGE_CHARACTERS = 500
 UNUSABLE_INPUTS = "orrery_inputs_unusable"
 DOCUMENT_REFUSED = "orrery_document_refused"
+NO_OVERLAY_MESSAGE = (
+    "The schema carries no reconstruction marker "
+    f"({RECONSTRUCTION_EXTENSION}), so it needs an execution overlay."
+)
+RECONSTRUCTED_WITH_OVERLAY_MESSAGE = (
+    "The schema is marked as reconstructed from its declaration alone "
+    f"({RECONSTRUCTION_EXTENSION}), so it cannot come with an execution overlay."
+)
 
 #: The errors from the projection that reject the submission. Microcosm's
 #: command (``orrery.main`` at ``MICROCOSM_COMMIT``) treats ``OSError``,
@@ -394,6 +416,20 @@ def _refusal_message(refusal: OrreryDocumentRefusedError) -> str:
     return _shortened(message)
 
 
+def reconstruction_marker(schema: object) -> dict[str, object] | None:
+    """The schema's reconstruction marker, checked as Microcosm checks it, or
+    ``None`` for a schema without one.
+
+    The schema is first checked as the projection checks it
+    (``validate_graph_schema``), so the projection's input errors reject a
+    schema it would refuse, whether or not it is marked. A marker that fails
+    Microcosm's checks raises a ``ValueError`` naming the check, among them
+    that its declaration input's SHA-256 is the schema's ``graph_sha256``.
+    """
+
+    return validate_reconstruction(validate_graph_schema(schema))
+
+
 def check_upstream_file_names(upstream_files: Mapping[str, Mapping[str, Any]]) -> None:
     """Reject the submission unless each upstream file, by name, is named
     ``upstream-<its SHA-256>.json``, with the SHA-256 the worker verified.
@@ -456,7 +492,8 @@ def orrery_graph_handler(
         submission = context.submission
         visibility = context.output_visibility("orrery_artifact")
         [schema_file] = context.files("schema")
-        [overlay_file] = context.files("execution_overlay")
+        # Intake allows at most one.
+        overlay_files = context.files("execution_overlay")
         upstream_files = {file["name"]: file for file in context.files("upstream")}
         check_upstream_file_names(upstream_files)
         with tempfile.TemporaryDirectory(prefix="orrery-graph-") as directory:
@@ -466,12 +503,28 @@ def orrery_graph_handler(
             schema_path = context.download(
                 schema_file["name"], inputs / schema_file["name"]
             )
-            overlay_path = context.download(
-                overlay_file["name"], inputs / overlay_file["name"]
-            )
             schema = read_input(schema_path, "schema")
-            overlay = read_input(overlay_path, "execution overlay")
             try:
+                marker = reconstruction_marker(schema)
+            except PROJECTION_INPUT_ERRORS as error:
+                raise SubmissionRejectedError(
+                    UNUSABLE_INPUTS, _shortened(str(error))
+                ) from error
+            if marker is None and not overlay_files:
+                raise SubmissionRejectedError(UNUSABLE_INPUTS, NO_OVERLAY_MESSAGE)
+            if marker is not None and overlay_files:
+                raise SubmissionRejectedError(
+                    UNUSABLE_INPUTS, RECONSTRUCTED_WITH_OVERLAY_MESSAGE
+                )
+            overlay: object | None = None
+            for overlay_file in overlay_files:
+                overlay_path = context.download(
+                    overlay_file["name"], inputs / overlay_file["name"]
+                )
+                overlay = read_input(overlay_path, "execution overlay")
+            try:
+                # A reconstructed schema is projected with the projection's
+                # default title, as any other schema is.
                 projected = orrery_json_from_schema(schema, execution=overlay)
             except PROJECTION_INPUT_ERRORS as error:
                 raise SubmissionRejectedError(
@@ -524,8 +577,12 @@ def orrery_graph_handler(
                 orrery_version=validation.orrery_version,
                 projection_source=MICROCOSM_COMMIT,
                 collector_version=version,
-                # Rebuilt from a past build's staged inputs by the collector.
-                reconstructed=submission.owner_hf_id == COLLECTOR_OWNER_HF_ID,
+                # Rebuilt by the collector from a past build's staged inputs,
+                # or by Microcosm from a build's recorded declaration alone.
+                reconstructed=(
+                    submission.owner_hf_id == COLLECTOR_OWNER_HF_ID
+                    or marker is not None
+                ),
                 visibility=visibility,
             )
         )

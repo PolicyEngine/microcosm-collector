@@ -10,9 +10,13 @@ The modules keep their Microcosm names and contents, so a copy from a later
 Microcosm commit can be compared file by file. ``orrery.py`` leaves out
 Microcosm's command-line entry point, whose overlay option reads Microcosm's
 content store, and the two functions that compile a ``Graph`` object before
-projecting it; every other module is unchanged. ``provenance.py`` records the
-Microcosm commit and each source file. The modules need only the standard
-library: not the content store, numpy, pandas or microcosm-frame.
+projecting it; every other module is unchanged. ``reconstruction.py``, copied
+from a later Microcosm commit, checks the marker Microcosm writes into a graph
+schema it rebuilt from a build's recorded declaration alone
+(:func:`reconstruction.validate_reconstruction`); the Orrery graph handler
+uses only that function. ``provenance.py`` records the Microcosm commits and
+each source file. The modules need only the standard library: not the content
+store, numpy, pandas or microcosm-frame.
 """
 
 from .execution_overlay import (

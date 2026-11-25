@@ -1,10 +1,12 @@
-"""The Microcosm commit and files this package's modules were copied from.
+"""The Microcosm commits and files this package's modules were copied from.
 
 Each copied module keeps its Microcosm file name. ``SOURCE_BLOBS`` holds the
 git blob ID of each source file at ``MICROCOSM_COMMIT``, so a test can confirm
 that an unchanged module still has its source's exact contents, and a later
-copy can be compared with ``git rev-parse <commit>:<directory>/<module>``. The
-README's "Orrery projection" section describes how to copy a later version.
+copy can be compared with ``git rev-parse <commit>:<directory>/<module>``.
+``reconstruction.py`` came later, from ``RECONSTRUCTION_COMMIT``; its blob ID
+there is in ``RECONSTRUCTION_SOURCE_BLOBS``. The README's "Orrery projection"
+section describes how to copy a later version.
 """
 
 MICROCOSM_REPO = "PolicyEngine/microcosm"
@@ -40,4 +42,26 @@ CHANGED_MODULES = {
         "The module docstring says so. orrery_document_from_schema, "
         "orrery_json_from_schema and the helpers they call are unchanged."
     ),
+}
+
+#: The head of PolicyEngine/microcosm ``main`` when ``reconstruction.py`` was
+#: copied. It checks the ``microcosm.reconstruction`` marker that Microcosm's
+#: reconstruction command (microcosm#1297) writes into the graph schema it
+#: rebuilds for a UK build made before microcosm#1144. Its directory is
+#: ``MICROCOSM_SOURCE_DIRECTORY``.
+RECONSTRUCTION_COMMIT = "8c51b6eff7b23e1ff1509cd926fa750ae945a647"
+
+#: Each module copied unchanged from RECONSTRUCTION_COMMIT, and its source
+#: file's git blob ID there.
+RECONSTRUCTION_SOURCE_BLOBS = {
+    "reconstruction.py": "40db0f6f6032d944afe1faa9557763a065b0ef56",
+}
+
+#: The git blob IDs at RECONSTRUCTION_COMMIT of the modules
+#: ``reconstruction.py`` imports. They equal those in SOURCE_BLOBS, so it runs
+#: on the copies taken from MICROCOSM_COMMIT exactly as in Microcosm.
+RECONSTRUCTION_IMPORT_BLOBS = {
+    "decl.py": "5d2bf5cfed4d7081dbaf9c61b74c717ee8c6dc28",
+    "schema.py": "c71004dffc6fc80ee76f9c99edb6865010e2d831",
+    "serialize.py": "501d6e37da426c964579b7ac5a918ec19ef2b1a0",
 }
