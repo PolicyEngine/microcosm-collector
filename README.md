@@ -793,7 +793,8 @@ modules named in `provenance.py`, in
    ```
 
 3. Run `uv run pytest tests/test_orrery_projection.py
-   tests/test_orrery_projection_provenance.py`.
+   tests/test_orrery_projection_provenance.py
+   tests/test_orrery_reconstruction.py`.
 
 Once Microcosm hands its Orrery inputs to the collector and removes its copy,
 this copy is the only one, and changes to the projection are made here.
@@ -897,17 +898,18 @@ calibration tree handler.
 
 - **Inputs.** Each attempt downloads the schema, and the execution overlay
   when it has one, into a new temporary directory. Intake allows at most one
-  overlay. A schema whose extensions carry Microcosm's reconstruction marker,
-  `microcosm.reconstruction`, comes without one: Microcosm's reconstruction
-  command rebuilt it, for a UK build made before microcosm#1144, from the
-  build's recorded graph declaration alone ("Orrery projection"). Any
-  other schema needs an overlay. A submission with an overlay is read as
-  before, the schema and then the overlay, unless its schema's extensions
-  name the marker, which rejects it before the overlay is downloaded. A
-  submission without one has its schema checked as the projection does and
-  then its marker with Microcosm's own `validate_reconstruction`, and a
-  marked schema is projected with no overlay. Upstream files are downloaded
-  only after
+  overlay. A schema whose extensions carry a reconstruction marker,
+  `microcosm.reconstruction`, that passes Microcosm's own
+  `validate_reconstruction` comes without one. Microcosm's reconstruction
+  command writes such a schema for a UK build made before microcosm#1144,
+  from the build's recorded graph declaration alone ("Orrery projection");
+  the handler checks the marker, not the country or the build's date. Any
+  other schema needs an overlay. A submission with an overlay is downloaded
+  and read as before, the schema and then the overlay, unless its schema's
+  extensions name the marker, which rejects it before the overlay is read.
+  A submission without one has its schema checked as the projection does
+  and then its marker, and a marked schema is projected with no overlay.
+  Upstream files are downloaded only after
   links are removed, and only those the document still links to: removing
   links needs only their names, from the submission's file list, and the
   projection doesn't read them. Evidence files are never downloaded. The
@@ -926,8 +928,9 @@ calibration tree handler.
   - a schema or overlay that fails those reading rules. A schema over
     32 MiB is rejected here, although intake accepts schemas up to 64 MiB;
   - a schema without the reconstruction marker that comes without an
-    overlay: a build that stopped before recording any execution gets no
-    document;
+    overlay, or with an overlay file holding JSON `null`, which the
+    projection would skip: a build that stopped before recording any
+    execution gets no document;
   - a schema whose extensions name the marker that comes with an overlay,
     since the marker says that nothing was observed running, whether or not
     the marker would pass its checks;

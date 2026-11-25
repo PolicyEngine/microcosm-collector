@@ -550,9 +550,11 @@ For a submission without an execution overlay, the Orrery graph handler
 checks the schema as the projection does and then the reconstruction marker
 in its extensions with Microcosm's own checks (`validate_reconstruction`,
 copied unchanged into
-`telemetry_collector/orrery/projection/reconstruction.py`). A submission
-with an overlay is handled as before, unless its schema's extensions name
-the marker. The handler projects the schema and execution overlay with
+`telemetry_collector/orrery/projection/reconstruction.py`); it checks the
+marker, not the build's country or date. A submission with an overlay is
+handled as before, unless its schema's extensions name the marker or its
+overlay holds JSON `null`. The handler projects the schema and execution
+overlay with
 `orrery_json_from_schema(schema, execution=overlay)`, or a reconstructed
 schema with no overlay, with no title of its own; a schema Microcosm's
 reconstruction command wrote has no presentation contract, so its document
@@ -609,9 +611,10 @@ written.
     - the projection raises a `TypeError`, `ValueError` or `RecursionError`
       for it (its message, shortened to 500 characters);
     - the schema has no reconstruction marker and the submission no
-      execution overlay;
+      execution overlay, or an overlay holding JSON `null`, which the
+      projection would skip;
     - the schema's extensions name the marker and the submission has an
-      execution overlay, which is never downloaded;
+      execution overlay, which is downloaded, as before, but never read;
     - the marker fails Microcosm's checks, such as a protocol other than
       `microcosm.graph.reconstruction.v1`, a basis other than
       `declaration_only`, a field added or missing, a JSON array or object

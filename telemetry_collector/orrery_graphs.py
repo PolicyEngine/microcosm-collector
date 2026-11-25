@@ -2,17 +2,18 @@
 
 Each attempt first checks that every upstream file is named
 ``upstream-<its SHA-256>.json``, as Microcosm names the producing run's files
-it copies, and then downloads the submission's schema into a new temporary
-directory. A schema whose extensions carry Microcosm's reconstruction marker
-(``microcosm.reconstruction``) was rebuilt after the build from its recorded
-graph declaration alone, by Microcosm's reconstruction command for a UK
-build made before microcosm#1144, and comes without an execution overlay.
-Any other schema needs one. A submission with an overlay has it downloaded
-too, unless its schema names the marker, which rejects it. A submission
-without one has its schema checked as the projection does and then its
-marker with Microcosm's own checks (``validate_reconstruction``, copied
-unchanged). The attempt projects them with the collector's copy of
-Microcosm's projection
+it copies, and then downloads the submission's schema and its execution
+overlay, when it has one, into a new temporary directory. A schema whose
+extensions carry a reconstruction marker (``microcosm.reconstruction``) that
+passes Microcosm's own checks (``validate_reconstruction``, copied
+unchanged) comes without an overlay: Microcosm's reconstruction command
+writes such a schema for a UK build made before microcosm#1144, from the
+build's recorded graph declaration alone. Any other schema needs an overlay.
+A submission with an overlay is read as before, the schema and then the
+overlay, unless its schema names the marker, which rejects it; an overlay
+holding JSON ``null`` rejects it too. A submission without one has its
+schema checked as the projection does and then its marker. The attempt
+projects them with the collector's copy of Microcosm's projection
 (``orrery_json_from_schema(schema, execution=overlay)``, with no overlay for a
 reconstructed schema) and then removes every link the published document
 could not resolve, which needs only the upstream files' names, from the
@@ -116,6 +117,7 @@ COLLECTOR_DISTRIBUTION = "microcosm-collector"
 MAX_MESSAGE_CHARACTERS = 500
 UNUSABLE_INPUTS = "orrery_inputs_unusable"
 DOCUMENT_REFUSED = "orrery_document_refused"
+NULL_OVERLAY_MESSAGE = "The execution overlay is null."
 NO_OVERLAY_MESSAGE = (
     "The schema carries no reconstruction marker "
     f"({RECONSTRUCTION_EXTENSION}), so it needs an execution overlay."
@@ -521,21 +523,29 @@ def orrery_graph_handler(
             schema_path = context.download(
                 schema_file["name"], inputs / schema_file["name"]
             )
-            schema = read_input(schema_path, "schema")
-            overlay: object | None = None
+            overlay_path: Path | None = None
             if overlay_files:
-                # A build's schema and overlay, read in the order they were
-                # before reconstructed schemas, and checked by the projection.
-                if names_reconstruction_marker(schema):
-                    raise SubmissionRejectedError(
-                        UNUSABLE_INPUTS, RECONSTRUCTED_WITH_OVERLAY_MESSAGE
-                    )
                 # Intake allows at most one.
                 [overlay_file] = overlay_files
                 overlay_path = context.download(
                     overlay_file["name"], inputs / overlay_file["name"]
                 )
+            schema = read_input(schema_path, "schema")
+            overlay: object | None = None
+            marker: dict[str, object] | None = None
+            if overlay_path is not None:
+                # A build's schema and overlay, downloaded and read in the
+                # order they were before reconstructed schemas, and checked by
+                # the projection.
+                if names_reconstruction_marker(schema):
+                    raise SubmissionRejectedError(
+                        UNUSABLE_INPUTS, RECONSTRUCTED_WITH_OVERLAY_MESSAGE
+                    )
                 overlay = read_input(overlay_path, "execution overlay")
+                if overlay is None:
+                    # The projection would skip the overlay and publish a
+                    # document with no execution.
+                    raise SubmissionRejectedError(UNUSABLE_INPUTS, NULL_OVERLAY_MESSAGE)
             else:
                 try:
                     marker = checked_reconstruction_marker(schema)
@@ -601,11 +611,11 @@ def orrery_graph_handler(
                 projection_source=MICROCOSM_COMMIT,
                 collector_version=version,
                 # Rebuilt by the collector from a past build's staged inputs,
-                # or by Microcosm from a build's recorded declaration alone: a
-                # submission without an overlay gets here only with a checked
-                # marker.
+                # or from a build's recorded declaration alone, as a checked
+                # marker says.
                 reconstructed=(
-                    submission.owner_hf_id == COLLECTOR_OWNER_HF_ID or not overlay_files
+                    submission.owner_hf_id == COLLECTOR_OWNER_HF_ID
+                    or marker is not None
                 ),
                 visibility=visibility,
             )
