@@ -804,10 +804,12 @@ marker that Microcosm's reconstruction command (`python -m
 microcosm.build.uk_runtime.orrery_reconstruction`, microcosm#1297) writes into
 the graph schema it rebuilds for a UK build made before microcosm#1144, from
 the build's recorded graph declaration alone. The Orrery graph handler uses
-only its `validate_reconstruction`. It imports `decl.py`, `schema.py` and
-`serialize.py`, whose blob IDs at that commit, recorded in
+only its `validate_reconstruction`. It runs `decl.py`, `schema.py` and
+`serialize.py`, which it imports, and `canonical.py` and `expansion.py`,
+which they import. Their blob IDs at that commit, recorded in
 `RECONSTRUCTION_IMPORT_BLOBS`, equal those in `SOURCE_BLOBS`, so it runs on
-the copies from `MICROCOSM_COMMIT` as it runs in Microcosm.
+the copies from `MICROCOSM_COMMIT` as it runs in Microcosm; a later copy of
+any of them needs a copy of `reconstruction.py` from the same commit.
 `tests/test_orrery_reconstruction.py` checks both, and that the copy accepts
 the marker of a schema the command rebuilt. That schema, and Microcosm's
 projection of it with no title and no overlay, are saved under
@@ -898,11 +900,14 @@ calibration tree handler.
   overlay. A schema whose extensions carry Microcosm's reconstruction marker,
   `microcosm.reconstruction`, comes without one: Microcosm's reconstruction
   command rebuilt it, for a UK build made before microcosm#1144, from the
-  build's recorded graph declaration alone ("Orrery projection"). The
-  handler checks the schema as the projection does and then the marker with
-  Microcosm's own `validate_reconstruction`, before it downloads the
-  overlay, and projects a marked schema with no overlay. Any other schema
-  needs an overlay. Upstream files are downloaded only after
+  build's recorded graph declaration alone ("Orrery projection"). Any
+  other schema needs an overlay. A submission with an overlay is read as
+  before, the schema and then the overlay, unless its schema's extensions
+  name the marker, which rejects it before the overlay is downloaded. A
+  submission without one has its schema checked as the projection does and
+  then its marker with Microcosm's own `validate_reconstruction`, and a
+  marked schema is projected with no overlay. Upstream files are downloaded
+  only after
   links are removed, and only those the document still links to: removing
   links needs only their names, from the submission's file list, and the
   projection doesn't read them. Evidence files are never downloaded. The
@@ -911,22 +916,28 @@ calibration tree handler.
   strict JSON in UTF-8, no key repeated within an object, no `NaN` or
   infinity, and nested no deeper than Python's JSON decoder can parse. The
   projection, `orrery_json_from_schema(schema, execution=overlay)`, builds
-  the document. A reconstructed schema has no presentation contract, so its
-  document gets the projection's default title for such a schema,
-  `<COUNTRY> graph schema` (`UK graph schema`). These reject the submission
-  with `orrery_inputs_unusable`:
+  the document, with no title of its own. Microcosm's reconstruction
+  command writes no presentation contract into the schema it rebuilds, so
+  that document gets the projection's default title for such a schema,
+  `<COUNTRY> graph schema` (`UK graph schema`), and links to no upstream
+  file. The handler doesn't require that: a marked schema that carried a
+  contract would be projected with it. These reject the submission with
+  `orrery_inputs_unusable`:
   - a schema or overlay that fails those reading rules. A schema over
     32 MiB is rejected here, although intake accepts schemas up to 64 MiB;
   - a schema without the reconstruction marker that comes without an
     overlay: a build that stopped before recording any execution gets no
     document;
-  - a schema with the marker that comes with an overlay, since the marker
-    says that nothing was observed running;
+  - a schema whose extensions name the marker that comes with an overlay,
+    since the marker says that nothing was observed running, whether or not
+    the marker would pass its checks;
   - a marker that fails Microcosm's checks, such as a protocol other than
     `microcosm.graph.reconstruction.v1`, a basis other than
     `declaration_only`, a field added or missing, or a declaration input
     whose SHA-256 is not the schema's `graph_sha256`, with the check's
-    message (`Graph reconstruction: ...`);
+    message (`Graph reconstruction: ...`). A marker value that is a JSON
+    array or object where Microcosm expects one of a set of strings gets
+    `Graph reconstruction: a marker value has the wrong JSON type (...)`;
   - a `TypeError`, `ValueError` or `RecursionError` from the projection, with
     its message shortened to 500 characters. Microcosm's command treats these
     as input errors, and also `OSError` and `GraphRuntimeError`, which the

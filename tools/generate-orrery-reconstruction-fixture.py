@@ -17,10 +17,11 @@ builds it. It saves the ``graph.schema.json`` the command wrote, and the
 document Microcosm's projection makes from that schema with no title and no
 overlay, which is what the handler must publish. It checks that the saved
 document differs from the command's own ``graph.orrery.json`` only in its
-title. ``tests/test_orrery_graphs.py`` submits the saved schema;
-``tests/test_orrery_projection.py`` and
-``tests/test_orrery_projection_provenance.py`` check it against the
-collector's copies.
+title. ``tests/test_orrery_graphs.py`` submits the saved schema and requires
+the saved document; ``tests/test_orrery_reconstruction.py`` checks the
+schema's marker with the collector's copy of ``reconstruction.py``, that the
+index names the commit that copy came from, and that the collector's
+projection reproduces the saved document.
 
 Run it from the root of a PolicyEngine/microcosm checkout with no uncommitted
 changes to tracked files, using that checkout's Python environment, at a

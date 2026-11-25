@@ -58,10 +58,14 @@ RECONSTRUCTION_SOURCE_BLOBS = {
 }
 
 #: The git blob IDs at RECONSTRUCTION_COMMIT of the modules
-#: ``reconstruction.py`` imports. They equal those in SOURCE_BLOBS, so it runs
-#: on the copies taken from MICROCOSM_COMMIT exactly as in Microcosm.
+#: ``reconstruction.py`` runs: those it imports and those they import. They
+#: equal those in SOURCE_BLOBS, so it runs on the copies taken from
+#: MICROCOSM_COMMIT exactly as in Microcosm. A later copy of any of them
+#: needs a copy of ``reconstruction.py`` from the same commit.
 RECONSTRUCTION_IMPORT_BLOBS = {
+    "canonical.py": "a9e80411af4ad317c94d2eacffe0fa0160a8bad3",
     "decl.py": "5d2bf5cfed4d7081dbaf9c61b74c717ee8c6dc28",
+    "expansion.py": "cb613916d48d5f0ddaabcf69ccaf3e7f8b46b9ed",
     "schema.py": "c71004dffc6fc80ee76f9c99edb6865010e2d831",
     "serialize.py": "501d6e37da426c964579b7ac5a918ec19ef2b1a0",
 }

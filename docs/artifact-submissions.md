@@ -201,8 +201,9 @@ Such a schema is submitted as an `orrery-inputs` submission with one
   build had licensed data (see "Disclosure"), and a build this old may have
   none.
 - `upstream` and `evidence` files are allowed, as for any `orrery-inputs`
-  submission. A reconstructed schema has no presentation contract, so its
-  document links to no upstream file and none is published.
+  submission. Microcosm's command writes no presentation contract into the
+  schema it rebuilds, so that schema's document links to no upstream file
+  and none is published.
 
 The Orrery graph handler checks the marker with Microcosm's own code and
 records the document as reconstructed (see "Orrery graph files"). The
@@ -545,15 +546,17 @@ one the collector lists.
 
 ### Orrery graph files
 
-The Orrery graph handler checks the schema as the projection does, and the
-reconstruction marker in its extensions, when it has one, with Microcosm's
-own checks (`validate_reconstruction`, copied unchanged into
-`telemetry_collector/orrery/projection/reconstruction.py`). It then projects
-the schema and execution overlay with
+For a submission without an execution overlay, the Orrery graph handler
+checks the schema as the projection does and then the reconstruction marker
+in its extensions with Microcosm's own checks (`validate_reconstruction`,
+copied unchanged into
+`telemetry_collector/orrery/projection/reconstruction.py`). A submission
+with an overlay is handled as before, unless its schema's extensions name
+the marker. The handler projects the schema and execution overlay with
 `orrery_json_from_schema(schema, execution=overlay)`, or a reconstructed
-schema with no overlay, with the projection's default title in both cases
-(`UK graph schema` for a UK schema without a presentation contract, as a
-reconstructed one is). It removes the links a
+schema with no overlay, with no title of its own; a schema Microcosm's
+reconstruction command wrote has no presentation contract, so its document
+gets the default title, `UK graph schema` for a UK one. It removes the links a
 published document could not resolve, validates the document with the
 collector's pinned Orrery validator, and writes it, with the upstream files it
 links to, to `graphs/<submission_id>/<document sha256>/` in the collector's
@@ -607,12 +610,13 @@ written.
       for it (its message, shortened to 500 characters);
     - the schema has no reconstruction marker and the submission no
       execution overlay;
-    - the schema has the marker and the submission has an execution
-      overlay, which is never downloaded;
+    - the schema's extensions name the marker and the submission has an
+      execution overlay, which is never downloaded;
     - the marker fails Microcosm's checks, such as a protocol other than
       `microcosm.graph.reconstruction.v1`, a basis other than
-      `declaration_only`, a field added or missing, or a declaration input
-      whose SHA-256 is not the schema's `graph_sha256` (the check's message,
+      `declaration_only`, a field added or missing, a JSON array or object
+      where one of a set of strings belongs, or a declaration input whose
+      SHA-256 is not the schema's `graph_sha256` (the check's message,
       which starts `Graph reconstruction:`);
     - or an `upstream` file's name is not `upstream-<sha256>.json`, where
       `<sha256>` is 64 lowercase hex characters and is the file's own
