@@ -79,7 +79,7 @@ def copied_unchanged_projection_modules() -> set[Path]:
 
     projection_directory = ROOT / "telemetry_collector" / "orrery" / "projection"
     unchanged = set(provenance.SOURCE_BLOBS) - set(provenance.CHANGED_MODULES)
-    unchanged |= set(getattr(provenance, "RECONSTRUCTION_SOURCE_BLOBS", {}))
+    unchanged |= set(provenance.RECONSTRUCTION_SOURCE_BLOBS)
     return {projection_directory / module for module in unchanged}
 
 

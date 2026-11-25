@@ -264,11 +264,15 @@ class ReadCountingIntakeStore(FakeIntakeObjectStore):
     def __init__(self) -> None:
         super().__init__()
         self.reads: dict[str, int] = {}
+        #: Objects whose reads fail once the worker has checked their bytes.
+        self.unavailable_after_check: set[str] = set()
 
     def read_chunks(
         self, object_name: str, generation: str, *, chunk_size: int = 1 << 16
     ) -> Iterator[bytes]:
         self.reads[object_name] = self.reads.get(object_name, 0) + 1
+        if object_name in self.unavailable_after_check and self.reads[object_name] > 1:
+            raise ConnectionError("Intake storage is unavailable.")
         return super().read_chunks(object_name, generation, chunk_size=chunk_size)
 
 
@@ -1281,11 +1285,30 @@ def test_a_reconstructed_schema_submitted_with_an_execution_overlay_is_rejected(
             "overlay."
         ),
     }
-    # The worker framework reads the overlay once to check its SHA-256; the
-    # handler never downloads it.
-    assert submission.reads(OVERLAY) == 1
     assert publishing.bucket.stored == {}
     assert publishing.records.records == {}
+
+
+def test_a_marked_schema_with_an_overlay_is_rejected_before_the_schema_is_checked() -> (
+    None
+):
+    schema = reconstructed_schema()
+    # A schema the projection would refuse; the marker's presence decides.
+    schema["graph_sha256"] = "0" * 64
+    submission = accepted(
+        {
+            **reconstructed_inputs(json_bytes(schema)),
+            OVERLAY: ("execution_overlay", fixture_bytes(EVIDENCE_CASE, OVERLAY)),
+        }
+    )
+
+    submission.run(Publishing())
+
+    assert (
+        submission.record()
+        .rejection["message"]
+        .startswith("The schema is marked as reconstructed from its declaration alone")
+    )
 
 
 def set_marker_field(field_name: str, value: object) -> Callable[[dict], object]:
@@ -1367,6 +1390,45 @@ def test_a_build_s_unusable_schema_and_overlay_get_the_overlay_s_rejection() -> 
         "message": "The execution overlay is not UTF-8.",
     }
     assert publishing.bucket.stored == {}
+
+
+def test_a_build_s_overlay_is_downloaded_before_its_schema_is_read() -> None:
+    # As before reconstructed schemas: both inputs are downloaded before
+    # either is read, so an overlay that can't be downloaded returns the job
+    # for another attempt even when the schema is unusable.
+    inputs = fixture_inputs(EVIDENCE_CASE)
+    inputs[SCHEMA] = ("schema", b"\xff")
+    submission = accepted(inputs)
+    submission.objects.unavailable_after_check.add(
+        intake_object_name(submission.submission_id, OVERLAY)
+    )
+    publishing = Publishing()
+
+    outcome = submission.run(publishing)
+
+    assert outcome is JobOutcome.RETRY
+    assert submission.record().status == "queued"
+    assert submission.record().rejection is None
+
+
+def test_an_overlay_holding_null_is_no_overlay() -> None:
+    submission = accepted(
+        {
+            SCHEMA: ("schema", fixture_bytes(EVIDENCE_CASE, SCHEMA)),
+            OVERLAY: ("execution_overlay", b"null"),
+        }
+    )
+    publishing = Publishing()
+
+    outcome = submission.run(publishing)
+
+    assert outcome is JobOutcome.FINISHED
+    assert submission.record().rejection == {
+        "code": "orrery_inputs_unusable",
+        "message": "The execution overlay is null.",
+    }
+    assert publishing.bucket.stored == {}
+    assert publishing.records.records == {}
 
 
 def set_source_revision_origin(marker: dict) -> dict:

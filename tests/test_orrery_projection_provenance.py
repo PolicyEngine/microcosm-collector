@@ -42,7 +42,7 @@ def test_provenance_names_the_microcosm_commit_and_directory_copied_from() -> No
 def test_every_module_is_either_copied_from_microcosm_or_the_collectors_own() -> None:
     present_modules = {source.name for source in PROJECTION_DIRECTORY.glob("*.py")}
     # Copied unchanged from a later Microcosm commit (test_orrery_reconstruction).
-    later_copies = set(getattr(provenance, "RECONSTRUCTION_SOURCE_BLOBS", {}))
+    later_copies = set(provenance.RECONSTRUCTION_SOURCE_BLOBS)
 
     assert present_modules == set(SOURCE_BLOBS) | later_copies | COLLECTOR_MODULES
     assert not later_copies & set(SOURCE_BLOBS)

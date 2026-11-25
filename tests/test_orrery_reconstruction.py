@@ -52,7 +52,7 @@ def reconstruction() -> ModuleType:
 
 
 def test_the_marker_checks_are_microcosm_s_module_unchanged() -> None:
-    copied_sources = getattr(provenance, "RECONSTRUCTION_SOURCE_BLOBS", {})
+    copied_sources = provenance.RECONSTRUCTION_SOURCE_BLOBS
     copied_file = PROJECTION_DIRECTORY / "reconstruction.py"
 
     assert set(copied_sources) == {"reconstruction.py"}
@@ -88,7 +88,7 @@ def modules_run_by(module: str) -> set[str]:
 def test_the_modules_it_runs_are_the_copies_taken_from_the_earlier_commit() -> None:
     assert (PROJECTION_DIRECTORY / "reconstruction.py").is_file()
     imported_modules = modules_run_by("reconstruction.py")
-    import_blobs = getattr(provenance, "RECONSTRUCTION_IMPORT_BLOBS", {})
+    import_blobs = provenance.RECONSTRUCTION_IMPORT_BLOBS
 
     assert imported_modules == {
         "canonical.py",
@@ -107,9 +107,7 @@ def test_the_modules_it_runs_are_the_copies_taken_from_the_earlier_commit() -> N
 
 def test_the_fixture_was_saved_from_the_commit_the_checks_were_copied_from() -> None:
     assert FIXTURE_INDEX["microcosm_repo"] == provenance.MICROCOSM_REPO
-    assert FIXTURE_INDEX["microcosm_commit"] == getattr(
-        provenance, "RECONSTRUCTION_COMMIT", None
-    )
+    assert FIXTURE_INDEX["microcosm_commit"] == provenance.RECONSTRUCTION_COMMIT
 
 
 def test_the_copied_checks_accept_the_marker_microcosm_s_command_wrote() -> None:
