@@ -268,7 +268,8 @@ That path has no execution overlay role: before microcosm#1295, the overlay
 existed only inside `graph.orrery.json`. A queued upload can therefore become
 an `orrery-inputs` submission only once its overlay exists as
 `graph.execution.json`. How the emitter obtains the overlay is decided in
-that change.
+that change. The only schema submitted without an overlay is a reconstructed
+one (see "Reconstructed schemas"), which that path never queued.
 
 ## Limits
 
@@ -601,7 +602,8 @@ written.
   the same build sit side by side, and the newest is current, whether
   reconstructed or not.
 - **Rejections:** the handler treats the schema and overlay as Microcosm's
-  own command treats its input at the projection's source commit.
+  own command treats its input at the projection's source commit, and adds
+  its own rules for the overlay's presence and the reconstruction marker.
   - `orrery_inputs_unusable` when:
     - the schema or overlay is over 32 MiB, Microcosm's reader's limit (so a
       schema intake accepts, up to 64 MiB, can still be rejected here);

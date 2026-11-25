@@ -809,8 +809,10 @@ only its `validate_reconstruction`. It runs `decl.py`, `schema.py` and
 `serialize.py`, which it imports, and `canonical.py` and `expansion.py`,
 which they import. Their blob IDs at that commit, recorded in
 `RECONSTRUCTION_IMPORT_BLOBS`, equal those in `SOURCE_BLOBS`, so it runs on
-the copies from `MICROCOSM_COMMIT` as it runs in Microcosm; a later copy of
-any of them needs a copy of `reconstruction.py` from the same commit.
+the copies from `MICROCOSM_COMMIT` as it runs in Microcosm. A later copy of
+any of them, or of a projection module that changes the reconstructed
+document, needs a copy of `reconstruction.py` and a new fixture from the
+same commit.
 `tests/test_orrery_reconstruction.py` checks both, and that the copy accepts
 the marker of a schema the command rebuilt. That schema, and Microcosm's
 projection of it with no title and no overlay, are saved under
@@ -828,7 +830,12 @@ uv sync --all-packages --locked
 
 To take a later `reconstruction.py`, copy it from a commit whose
 reconstruction command still writes `graph.orrery.json`, record the commit
-and the blob IDs, and run the script there.
+and the blob IDs, and run the script there. The script needs Microcosm's own
+projection, so once Microcosm removes it, it works only at an earlier
+commit, and a later fixture needs another source for the expected document.
+The script replaces the fixture folder, so a run that stops partway leaves
+none; and the compressed files' bytes can differ with another zlib build
+while their contents stay the same.
 
 ### Orrery validation
 
