@@ -1230,7 +1230,7 @@ test("loads a US version 2 run's reform validation from its declared path", asyn
   expect(detail).toMatchObject({
     run_id: US_VERSION_2_RUN_ID,
     country_code: "US",
-    schema_version: 2,
+    schema_version: 3,
     has_calibration: true,
   });
   expect(detail.reform_validation).toMatchObject({

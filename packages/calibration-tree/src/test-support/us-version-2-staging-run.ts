@@ -1,8 +1,9 @@
 // A US fiscal refresh build's staging run as the version 2 writer stages it
-// (PolicyEngine/microcosm#1135): its documents at the run folder's top level,
-// and each result file at `artifacts/<logical name>.json`, declared in the run
-// manifest with its SHA-256. Version 1 runs put `build_manifest.json`,
-// `release_manifest.json` and `reform_validation.json` at the top level.
+// (PolicyEngine/microcosm#1135), which writes schema 3 documents: its documents
+// at the run folder's top level, and each result file at
+// `artifacts/<logical name>.json`, declared in the run manifest with its
+// SHA-256. Version 1 runs put `build_manifest.json`, `release_manifest.json`
+// and `reform_validation.json` at the top level.
 import { createHash } from "node:crypto";
 
 export const US_VERSION_2_RUN_ID = "us-fiscal-refresh-20261127T090000Z-1a2b3c4d";
@@ -124,7 +125,7 @@ export function usVersion2RunFolder(
   const declared = options.declared ?? resultFiles;
   const manifest = {
     schema_name: "microcosm.staging.run-manifest",
-    schema_version: 2,
+    schema_version: 3,
     ...identity(runId),
     sample: { mode: "full" },
     delivery: delivery(runId),
@@ -137,6 +138,7 @@ export function usVersion2RunFolder(
       classification: ARTIFACT_REVIEW[name]?.classification ?? "aggregate",
     })),
     failure: null,
+    block: null,
     paths: {
       progress: `runs/${runId}/progress.json`,
       events: `runs/${runId}/events.ndjson`,
@@ -145,13 +147,14 @@ export function usVersion2RunFolder(
   };
   const progress = {
     schema_name: "microcosm.staging.progress",
-    schema_version: 2,
+    schema_version: 3,
     ...identity(runId),
     sample: { mode: "full" },
     delivery: delivery(runId),
     message: "Staging run completed.",
     details: {},
     failure: null,
+    block: null,
   };
   const events = [
     ["created", "started", "Staging run created.", STARTED_AT],
@@ -161,7 +164,7 @@ export function usVersion2RunFolder(
   ].map(([stage, status, message, timestamp], index) =>
     JSON.stringify({
       schema_name: "microcosm.staging.event",
-      schema_version: 2,
+      schema_version: 3,
       sequence: index + 1,
       timestamp,
       event_type: "stage",

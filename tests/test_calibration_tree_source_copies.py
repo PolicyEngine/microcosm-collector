@@ -556,21 +556,32 @@ def test_a_stored_staging_run_s_files_follow_the_staging_readers_rules() -> None
     }
 
 
-def test_a_stored_version_2_run_s_reform_validation_that_differs_from_its_declaration_is_not_copied() -> (
-    None
-):
-    entry = staging_entry(RUN_ID)
-    run_folder = us_version_2_run(
-        RUN_ID,
-        declared={
-            **US_VERSION_2_RESULT_FILES,
-            "reform_validation": b'{"reforms": ["another"]}',
-        },
-    )
+def version_2_run_with_another_reform_validation() -> Copies:
+    """A stored US version 2 run whose run manifest declares a reform
+    validation with another SHA-256 than its folder's file, with a top-level
+    copy beside it that the run does not declare."""
+
+    run_folder = {
+        **us_version_2_run(
+            RUN_ID,
+            declared={
+                **US_VERSION_2_RESULT_FILES,
+                "reform_validation": b'{"reforms": ["another"]}',
+            },
+        ),
+        f"runs/{RUN_ID}/reform_validation.json": REFORM_VALIDATION,
+    }
     copies = Copies(
         hugging_face=hugging_face_with({(US_STAGING, STAGING_COMMIT): run_folder})
     )
-    copies.bun.store = store_manifest("us", [entry])
+    copies.bun.store = store_manifest("us", [staging_entry(RUN_ID)])
+    return copies
+
+
+def test_a_stored_version_2_run_s_reform_validation_that_differs_from_its_declaration_is_not_copied() -> (
+    None
+):
+    copies = version_2_run_with_another_reform_validation()
 
     [outcome] = copies.run()
 
@@ -578,6 +589,18 @@ def test_a_stored_version_2_run_s_reform_validation_that_differs_from_its_declar
     assert outcome.files["build_manifest.json"] == "copied"
     stored = [step["contents"] for step in copies.bun.steps("copies store")]
     assert all("reformValidation" not in contents for contents in stored)
+
+
+def test_a_dry_run_reports_a_declared_copied_file_that_differs_from_its_declaration() -> (
+    None
+):
+    copies = version_2_run_with_another_reform_validation()
+
+    [outcome] = copies.run(dry_run=True)
+
+    assert outcome.files["reform_validation.json"] == "differs"
+    assert outcome.files["build_manifest.json"] == "would_copy"
+    assert copies.bun.steps("copies store") == []
 
 
 def test_a_stored_staged_bundle_gets_a_copy_of_its_diagnostics() -> None:

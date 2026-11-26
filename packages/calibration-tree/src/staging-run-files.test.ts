@@ -600,7 +600,7 @@ test("a US version 2 run's reform validation is copied under its artifacts path 
   expect(record.summary).toMatchObject({
     run_id: US_VERSION_2_RUN_ID,
     country_code: "US",
-    schema_version: 2,
+    schema_version: 3,
     status: "completed",
   });
   expect(Object.keys(record.files).sort()).toEqual([...names].sort());

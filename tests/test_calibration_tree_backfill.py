@@ -592,13 +592,16 @@ def us_version_2_run(
     declared: Mapping[str, bytes] | None = None,
 ) -> dict[str, bytes]:
     """A US fiscal refresh build's run as the version 2 writer stages it
-    (microcosm#1135): each result file at ``artifacts/<name>.json``, declared
-    with its SHA-256 (``declared`` unless given), and none at the folder's top
-    level, where version 1 runs put the manifests and the reform validation."""
+    (microcosm#1135), with schema 3 documents: each result file at
+    ``artifacts/<name>.json``, declared with its SHA-256 (``declared`` unless
+    given), and none at the folder's top level, where version 1 runs put the
+    manifests and the reform validation."""
 
     folder = f"runs/{run_id}"
     files = structured_run(run_id, artifacts, declared=declared)
     identity = {
+        "schema_version": 3,
+        "block": None,
         "country_code": "US",
         "operation_id": "us_fiscal_refresh_build",
         "pipeline": {"id": "us_fiscal_refresh", "version": "0.40.0"},
@@ -1371,13 +1374,17 @@ def test_a_us_version_2_run_s_reform_validation_that_differs_from_its_digest_is_
     backfill = us_backfill(
         [staging_entry(RUN_ID)],
         files={
-            (US_STAGING, STAGING_COMMIT): us_version_2_run(
-                RUN_ID,
-                declared={
-                    **US_VERSION_2_RESULT_FILES,
-                    "reform_validation": b'{"reforms": ["another"]}',
-                },
-            )
+            (US_STAGING, STAGING_COMMIT): {
+                **us_version_2_run(
+                    RUN_ID,
+                    declared={
+                        **US_VERSION_2_RESULT_FILES,
+                        "reform_validation": b'{"reforms": ["another"]}',
+                    },
+                ),
+                # Not the file the run declares.
+                f"runs/{RUN_ID}/reform_validation.json": REFORM_VALIDATION,
+            }
         },
     )
 
