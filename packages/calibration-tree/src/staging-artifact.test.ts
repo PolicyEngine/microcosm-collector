@@ -1242,3 +1242,17 @@ test("loads a US version 2 run's reform validation from its declared path", asyn
     requested.some((url) => url.endsWith(`/runs/${US_VERSION_2_RUN_ID}/reform_validation.json`)),
   ).toBe(false);
 });
+
+test("reads a US version 2 run's declared reform validation that differs from its digest as absent", async () => {
+  const resultFiles = usVersion2ResultFiles();
+  const folder = usVersion2RunFolder({
+    resultFiles,
+    declared: { ...resultFiles, reform_validation: JSON.stringify({ reforms: ["another"] }) },
+  });
+  serveRunFolder(US_VERSION_2_RUN_ID, folder, []);
+
+  const detail = await loadStagingRun(US_VERSION_2_RUN_ID, 0, "us");
+
+  expect(detail.has_calibration).toBe(true);
+  expect(detail.reform_validation).toBeNull();
+});

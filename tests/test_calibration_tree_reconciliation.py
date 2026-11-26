@@ -54,6 +54,7 @@ from tests.test_calibration_tree_backfill import (
     MINUTE,
     READ_TOKEN,
     RECORD_REPO_KEY,
+    REFORM_VALIDATION,
     ManualClock,
     StandInBun,
     build_id,
@@ -62,6 +63,7 @@ from tests.test_calibration_tree_backfill import (
     sha256,
     store_manifest,
     structured_run,
+    us_version_2_run,
 )
 from tests.test_submissions import calibration_submission
 
@@ -1705,6 +1707,23 @@ def test_the_files_the_dashboard_reads_are_copied_for_every_status() -> None:
         path.endswith(("fit_summary.json", "stored_inputs.json"))
         for path in reconciliation.hugging_face.downloaded_paths()
     )
+
+
+def test_a_us_version_2_run_s_reform_validation_is_copied_from_its_artifacts_folder() -> (
+    None
+):
+    reconciliation = us_staging_reconciliation(us_version_2_run(RUN_ID))
+
+    [outcome] = reconciliation.run(kinds=["staging"])
+
+    assert field_of(outcome, "run_files") == "copied"
+    [published] = copied_contents(reconciliation)
+    assert sorted(published[RUN_ID]) == [
+        "artifacts/reform_validation.json",
+        "progress.json",
+        "run_manifest.json",
+    ]
+    assert published[RUN_ID]["artifacts/reform_validation.json"] == REFORM_VALIDATION
 
 
 def test_a_copy_records_the_head_commit_and_is_read_at_it() -> None:
