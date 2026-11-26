@@ -2028,9 +2028,10 @@ follows no redirect.
   `release_manifest.json` and `demographics.json` when the folder lists them
   (null otherwise, as the GitHub Actions publisher's optional reads are).
   `parent_build_manifest.json` and `reform_validation.json` are read when a
-  release or run folder lists them, and only stored as copies. That includes
-  the run folder of a run whose tree comes from its staged bundle. One over 64
-  MiB is left out, and the tree is still built.
+  release or run folder lists them, or from the paths a structured run
+  declares for them (below), and only stored as copies. That includes the run
+  folder of a run whose tree comes from its staged bundle. One over 64 MiB is
+  left out, and the tree is still built.
 - A staging build, by the rules of the tree package's staging readers that
   locate its files, and only those:
   - in the staging repo, `runs/<id>/run_manifest.json` and `progress.json`,
@@ -2043,8 +2044,10 @@ follows no redirect.
     version 2 writer does under `runs/<id>/artifacts/` (microcosm#1135), has
     those read from their declared paths instead of the folder's top level. A
     declared manifest's SHA-256 is checked, and one the folder lacks makes the
-    run `unbuildable`; a declared file that is only copied and that the folder
-    lacks is left out, and its SHA-256 is not checked;
+    run `unbuildable`; a declared file that is only copied is left out when
+    the folder lacks it or it has another digest, and the tree is still built.
+    A run whose diagnostics come from its `staged_dataset` receipt takes only
+    the copied files from its run folder, declared or not;
   - a run manifest that declares a `staged_dataset` receipt instead leads,
     after the receipt's SHA-256 is checked, to the staged bundle the receipt
     names in the country's release repo at its revision, with the
@@ -2613,7 +2616,8 @@ past builds again".
   change to the package's parsers reaches it when its folder next changes.
 - The original-file copies a tree stores are those present when it was built. A
   later `reform_validation.json` or `parent_build_manifest.json` does not
-  rebuild the tree; `staging-run-files/` keeps `reform_validation.json` current.
+  rebuild the tree; `staging-run-files/` keeps `reform_validation.json` and
+  `artifacts/reform_validation.json` current.
 - `runs.json` is read only when some folder has no run manifest. It decides
   whether such a folder is a run. When it has been read, a schema-1 run's row
   gives that run's list entry before `progress.json`; otherwise the entry comes

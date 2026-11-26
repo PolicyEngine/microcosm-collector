@@ -1221,12 +1221,6 @@ export async function loadStagingRun(
   const progress = progressRaw == null ? null : parseStagingProgress(progressRaw);
   const runManifest =
     runManifestRaw == null ? null : parseStagingManifest(runManifestRaw);
-  const reformValidationRaw = await stagingReformValidationOrNull(
-    runId,
-    runManifest,
-    revalidate,
-    country,
-  );
   const calibrationProgress =
     calibrationProgressRaw == null
       ? null
@@ -1238,6 +1232,13 @@ export async function loadStagingRun(
     calibrationProgress,
     events,
   });
+  // Read only once the manifest is known to be this run's: it names the path.
+  const reformValidationRaw = await stagingReformValidationOrNull(
+    runId,
+    runManifest,
+    revalidate,
+    country,
+  );
   const candidateReleaseId =
     stringValue(progress?.candidate_release_id) ??
     stringValue(runManifest?.candidate_release_id) ??
@@ -1326,6 +1327,8 @@ export async function loadStagingReformValidationRaw(
   );
   const runManifest =
     runManifestRaw == null ? null : parseStagingManifest(runManifestRaw);
+  // The manifest names the path to read, so it must be this run's.
+  validateStagingRunConsistency(runId, { runManifest });
   return stagingReformValidationOrNull(runId, runManifest, revalidate, country);
 }
 

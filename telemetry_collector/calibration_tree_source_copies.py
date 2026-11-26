@@ -28,7 +28,9 @@ file with the same SHA-256, so a copy is always a file the tree was built from;
 a file the index does not record is ``not_in_tree``, and one with another
 SHA-256 ``differs``. ``parent_build_manifest.json`` and
 ``reform_validation.json`` have no record, so they are stored as the build's
-folder holds them at its commit (over 64 MiB, the backfill leaves them out). A
+folder holds them at its commit (over 64 MiB, the backfill leaves them out),
+unless a structured run declares one with another SHA-256, which is
+``differs``. A
 file over 256 MiB is ``too_large`` and never downloaded. Each file is streamed
 to disk and checked against its listing, then the package's command stores
 the copies the store still lacks, and checks the index's record again. The

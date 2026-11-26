@@ -44,10 +44,11 @@ package's staging readers that locate its files:
   that declares a ``build_manifest``, ``release_manifest``,
   ``parent_build_manifest`` or ``reform_validation`` artifact, as Microcosm's
   version 2 writer does under ``artifacts/`` (microcosm#1135), has that file
-  read from its declared path instead of the folder's top level: a declared
-  manifest is checked against its declared SHA-256, and one the folder lacks
-  makes the run unbuildable, while a declared file that is only copied and
-  that the folder lacks is left out;
+  read from its declared path instead of the folder's top level, and checked
+  against its declared SHA-256: a declared manifest that the folder lacks, or
+  that has another digest, makes the run unbuildable, while a declared file
+  that is only copied is left out when the folder lacks it or it has another
+  digest;
 - a run whose manifest declares a ``staged_dataset`` receipt instead is
   read from the staged bundle the receipt names, in the country's release
   repo at the receipt's revision, with the receipt's SHA-256 checked;
@@ -764,10 +765,11 @@ def _run_source_files(
     """Each named file of a staging run, by role, without an oversized copy.
 
     A file the run manifest declares under its role's name is read from its
-    declared path; a file the tree is built from then carries its declared
-    SHA-256, and is ``SourceUnbuildableError`` when the folder lacks it, while a
-    copied file the folder lacks is left out. Any other file is read from the
-    run folder's top level, when it is there.
+    declared path and carries its declared SHA-256. One the tree is built from
+    is ``SourceUnbuildableError`` when the folder lacks it, while a copied file
+    the folder lacks is left out (and one with another digest is left out when
+    downloaded). Any other file is read from the run folder's top level, when
+    it is there.
     """
 
     top_level = listings.folder(entry.hf_repo, entry.hf_commit, run_folder)
@@ -786,8 +788,7 @@ def _run_source_files(
                     f"{path} is declared but not in {entry.hf_repo} at "
                     f"{entry.hf_commit}."
                 )
-            if not copied:
-                declared_sha256 = digest
+            declared_sha256 = digest
         else:
             listed = top_level.get(name)
         if listed is None or (copied and listed.size > MAX_COPIED_FILE_BYTES):
@@ -1056,6 +1057,12 @@ def build_and_publish_source(
                 source_file.declared_sha256 is not None
                 and downloaded.sha256 != source_file.declared_sha256
             ):
+                if role in _COPIED_ROLES:
+                    # A file the tree only copies never stops its build: one
+                    # that is not the file its run declares is left out, as
+                    # the staging readers take it as absent.
+                    downloaded.path.unlink()
+                    continue
                 raise SourceUnbuildableError(
                     f"{source_file.listed.path} does not match the digest its run "
                     "recorded."
