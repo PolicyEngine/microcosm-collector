@@ -1,3 +1,10 @@
+## [0.30.0] - 2026-11-26
+
+### Added
+
+- An `orrery-inputs` submission may now leave out the execution overlay when its schema is one that Microcosm's reconstruction command (`python -m microcosm.build.uk_runtime.orrery_reconstruction`, microcosm#1297) rebuilt for a UK build made before microcosm#1144. Intake accepts at most one `execution_overlay` instead of exactly one. The Orrery graph handler checks the schema's `microcosm.reconstruction` marker with an unchanged copy of Microcosm's `reconstruction.py` (`telemetry_collector/orrery/projection/reconstruction.py`, copied at Microcosm `8c51b6e`), projects the schema with no overlay and no title, and records the document with `reconstructed: true`. A schema without the marker still needs an overlay, and an overlay file holding JSON `null`, which the projection used to skip, no longer counts as one; a marked schema may not come with an overlay; and a marker that fails Microcosm's checks rejects the submission. Each is rejected with `orrery_inputs_unusable`. `tools/generate-orrery-reconstruction-fixture.py` saves the reconstructed schema the tests submit.
+
+
 ## [0.29.0] - 2026-11-24
 
 ### Added
