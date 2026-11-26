@@ -19,6 +19,12 @@ import {
   stagingTargetChangeCacheTtlSeconds,
   stagingUnavailableReason,
 } from "./staging-artifact";
+import {
+  US_VERSION_2_CANDIDATE,
+  US_VERSION_2_RUN_ID,
+  usVersion2ResultFiles,
+  usVersion2RunFolder,
+} from "./test-support/us-version-2-staging-run";
 
 test("resolves staging repositories from each country registration", () => {
   expect(stagingRepository("us")).toEqual({
@@ -1143,4 +1149,96 @@ test("a receipt with one valid stem file and one stem name containing a path has
     "../other.diagnostics.json": file,
     [LOCAL_DIAGNOSTICS]: file,
   })).toBeNull();
+});
+
+// A US version 2 run (PolicyEngine/microcosm#1135) stages its result files
+// under artifacts/ and declares each one with its SHA-256; version 1 runs put
+// the build and release manifests and the reform validation at the top level.
+function serveRunFolder(runId: string, folder: Record<string, string>, requested: string[]) {
+  globalThis.fetch = (async (input) => {
+    const url = String(input);
+    requested.push(url);
+    const marker = `/resolve/main/runs/${runId}/`;
+    const relative = url.includes(marker) ? url.split(marker, 2)[1] : null;
+    const text = relative == null ? undefined : folder[relative];
+    return text === undefined
+      ? new Response(null, { status: 404 })
+      : new Response(text, { headers: { "Content-Type": "application/json" } });
+  }) as typeof fetch;
+}
+
+test("builds a US version 2 run's calibration with the manifests its run manifest declares", async () => {
+  const folder = usVersion2RunFolder();
+  const requested: string[] = [];
+  serveRunFolder(US_VERSION_2_RUN_ID, folder, requested);
+
+  const source = await resolveStagingCalibrationSource(US_VERSION_2_RUN_ID, 0, "us");
+
+  const sha256Of = (text: string) => createHash("sha256").update(text).digest("hex");
+  expect(source?.sourceArtifacts.buildManifest).toMatchObject({
+    path: `runs/${US_VERSION_2_RUN_ID}/artifacts/build_manifest.json`,
+    sha256: sha256Of(folder["artifacts/build_manifest.json"]!),
+  });
+  expect(source?.sourceArtifacts.releaseManifest).toMatchObject({
+    path: `runs/${US_VERSION_2_RUN_ID}/artifacts/release_manifest.json`,
+    sha256: sha256Of(folder["artifacts/release_manifest.json"]!),
+  });
+  expect(source?.calibration.build_manifest).toEqual(
+    JSON.parse(folder["artifacts/build_manifest.json"]!),
+  );
+  expect(source?.calibration.rows).toHaveLength(1);
+  expect(
+    requested.some((url) =>
+      url.endsWith(`/runs/${US_VERSION_2_RUN_ID}/build_manifest.json`) ||
+      url.endsWith(`/runs/${US_VERSION_2_RUN_ID}/release_manifest.json`),
+    ),
+  ).toBe(false);
+});
+
+test("rejects a US version 2 run's declared manifest whose bytes do not match its digest", async () => {
+  const resultFiles = usVersion2ResultFiles();
+  const folder = usVersion2RunFolder({
+    resultFiles,
+    declared: { ...resultFiles, release_manifest: JSON.stringify({ release_id: "another" }) },
+  });
+  serveRunFolder(US_VERSION_2_RUN_ID, folder, []);
+
+  await expect(
+    resolveStagingCalibrationSource(US_VERSION_2_RUN_ID, 0, "us"),
+  ).rejects.toThrow("artifact release_manifest digest does not match");
+});
+
+test("rejects a US version 2 run's declared manifest that its folder lacks", async () => {
+  const resultFiles = usVersion2ResultFiles();
+  const { build_manifest: _buildManifest, ...staged } = resultFiles;
+  const folder = usVersion2RunFolder({ resultFiles: staged, declared: resultFiles });
+  serveRunFolder(US_VERSION_2_RUN_ID, folder, []);
+
+  await expect(
+    resolveStagingCalibrationSource(US_VERSION_2_RUN_ID, 0, "us"),
+  ).rejects.toThrow("artifact build_manifest is declared but absent");
+});
+
+test("loads a US version 2 run's reform validation from its declared path", async () => {
+  const folder = usVersion2RunFolder();
+  const requested: string[] = [];
+  serveRunFolder(US_VERSION_2_RUN_ID, folder, requested);
+
+  const detail = await loadStagingRun(US_VERSION_2_RUN_ID, 0, "us");
+
+  expect(detail).toMatchObject({
+    run_id: US_VERSION_2_RUN_ID,
+    country_code: "US",
+    schema_version: 2,
+    has_calibration: true,
+  });
+  expect(detail.reform_validation).toMatchObject({
+    release_id: US_VERSION_2_CANDIDATE,
+    schema_version: 1,
+    baseline_period: 2025,
+  });
+  expect(detail.build_manifest).toEqual(JSON.parse(folder["artifacts/build_manifest.json"]!));
+  expect(
+    requested.some((url) => url.endsWith(`/runs/${US_VERSION_2_RUN_ID}/reform_validation.json`)),
+  ).toBe(false);
 });

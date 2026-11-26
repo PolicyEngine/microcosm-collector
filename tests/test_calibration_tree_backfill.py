@@ -575,6 +575,46 @@ def structured_run(
     return files
 
 
+#: The result files a US version 2 run stages that its tree is built from or
+#: copies, by logical name.
+US_VERSION_2_RESULT_FILES: Mapping[str, bytes] = {
+    "calibration_diagnostics": DIAGNOSTICS,
+    "build_manifest": BUILD_MANIFEST,
+    "release_manifest": RELEASE_MANIFEST,
+    "reform_validation": REFORM_VALIDATION,
+}
+
+
+def us_version_2_run(
+    run_id: str,
+    artifacts: Mapping[str, bytes] = US_VERSION_2_RESULT_FILES,
+    *,
+    declared: Mapping[str, bytes] | None = None,
+) -> dict[str, bytes]:
+    """A US fiscal refresh build's run as the version 2 writer stages it
+    (microcosm#1135): each result file at ``artifacts/<name>.json``, declared
+    with its SHA-256 (``declared`` unless given), and none at the folder's top
+    level, where version 1 runs put the manifests and the reform validation."""
+
+    folder = f"runs/{run_id}"
+    files = structured_run(run_id, artifacts, declared=declared)
+    identity = {
+        "country_code": "US",
+        "operation_id": "us_fiscal_refresh_build",
+        "pipeline": {"id": "us_fiscal_refresh", "version": "0.40.0"},
+        "candidate_id": US_RELEASE,
+        "release_id": US_RELEASE,
+        "run_kind": "release",
+        "non_release": False,
+        "status": "completed",
+        "updated_at": "2026-11-27T11:00:00+00:00",
+    }
+    for name in ("run_manifest.json", "progress.json"):
+        document = json.loads(files[f"{folder}/{name}"])
+        files[f"{folder}/{name}"] = json.dumps({**document, **identity}).encode()
+    return files
+
+
 @dataclass
 class Backfill:
     production: Production
@@ -1223,6 +1263,147 @@ def test_a_run_with_a_staged_dataset_copies_the_files_in_its_run_folder() -> Non
     assert build["request"]["artifacts"]["reformValidation"]["path"] == (
         f"{folder}/reform_validation.json"
     )
+
+
+def test_a_us_version_2_run_s_tree_is_built_with_its_declared_manifests() -> None:
+    folder = f"runs/{RUN_ID}"
+    backfill = us_backfill(
+        [staging_entry(RUN_ID)],
+        files={(US_STAGING, STAGING_COMMIT): us_version_2_run(RUN_ID)},
+    )
+
+    [outcome] = backfill.run()
+
+    assert outcome.outcome == "built"
+    build = backfill.bun.build_of(RUN_ID)
+    assert {
+        role: artifact and artifact["path"]
+        for role, artifact in build["request"]["artifacts"].items()
+    } == {
+        "calibrationDiagnostics": f"{folder}/artifacts/calibration_diagnostics.json",
+        "buildManifest": f"{folder}/artifacts/build_manifest.json",
+        "releaseManifest": f"{folder}/artifacts/release_manifest.json",
+        "demographics": None,
+        "reformValidation": f"{folder}/artifacts/reform_validation.json",
+    }
+    assert build["inputs"].get("buildManifest") == BUILD_MANIFEST
+    assert build["inputs"].get("releaseManifest") == RELEASE_MANIFEST
+    assert build["inputs"].get("reformValidation") == REFORM_VALIDATION
+
+
+def test_a_us_version_2_run_s_manifest_that_differs_from_its_declared_digest_is_unbuildable() -> (
+    None
+):
+    backfill = us_backfill(
+        [staging_entry(RUN_ID)],
+        files={
+            (US_STAGING, STAGING_COMMIT): us_version_2_run(
+                RUN_ID,
+                declared={
+                    **US_VERSION_2_RESULT_FILES,
+                    "build_manifest": b'{"build": "another build"}',
+                },
+            )
+        },
+    )
+
+    [outcome] = backfill.run()
+
+    assert outcome.outcome == "unbuildable"
+    assert f"runs/{RUN_ID}/artifacts/build_manifest.json" in outcome.reason
+    assert outcome.incomplete is False
+    assert backfill.bun.steps("build") == []
+
+
+def test_a_us_version_2_run_s_declared_manifest_its_folder_lacks_is_unbuildable() -> (
+    None
+):
+    staged = {
+        name: content
+        for name, content in US_VERSION_2_RESULT_FILES.items()
+        if name != "release_manifest"
+    }
+    backfill = us_backfill(
+        [staging_entry(RUN_ID)],
+        files={
+            (US_STAGING, STAGING_COMMIT): us_version_2_run(
+                RUN_ID, staged, declared=US_VERSION_2_RESULT_FILES
+            )
+        },
+    )
+
+    [outcome] = backfill.run()
+
+    assert outcome.outcome == "unbuildable"
+    assert f"runs/{RUN_ID}/artifacts/release_manifest.json" in outcome.reason
+    assert outcome.incomplete is False
+    assert backfill.bun.steps("build") == []
+
+
+def test_a_us_version_2_run_s_declared_reform_validation_its_folder_lacks_is_left_out() -> (
+    None
+):
+    staged = {
+        name: content
+        for name, content in US_VERSION_2_RESULT_FILES.items()
+        if name != "reform_validation"
+    }
+    backfill = us_backfill(
+        [staging_entry(RUN_ID)],
+        files={
+            (US_STAGING, STAGING_COMMIT): us_version_2_run(
+                RUN_ID, staged, declared=US_VERSION_2_RESULT_FILES
+            )
+        },
+    )
+
+    [outcome] = backfill.run()
+
+    assert outcome.outcome == "built"
+    assert "reformValidation" not in backfill.bun.build_of(RUN_ID)["inputs"]
+
+
+def test_a_version_2_run_with_a_staged_dataset_copies_its_declared_reform_validation() -> (
+    None
+):
+    diagnostics_name = "microcosm_us_2025.diagnostics.json"
+    receipt = json.dumps(
+        {
+            "status": "uploaded",
+            "run_id": RUN_ID,
+            RECORD_REPO_KEY: US_RELEASES,
+            "prefix": f"staged/{RUN_ID}",
+            "revision": BUNDLE_COMMIT,
+            "files": {diagnostics_name: {"sha256": sha256(DIAGNOSTICS)}},
+        }
+    ).encode()
+    folder = f"runs/{RUN_ID}"
+    backfill = us_backfill(
+        [staging_entry(RUN_ID)],
+        files={
+            (US_STAGING, STAGING_COMMIT): us_version_2_run(
+                RUN_ID,
+                {
+                    "staged_dataset": receipt,
+                    "reform_validation": REFORM_VALIDATION,
+                    # Not a file this run's tree is built from.
+                    "build_manifest": BUILD_MANIFEST,
+                },
+            ),
+            (US_RELEASES, BUNDLE_COMMIT): {
+                f"staged/{RUN_ID}/{diagnostics_name}": DIAGNOSTICS,
+            },
+        },
+    )
+
+    [outcome] = backfill.run()
+
+    assert outcome.outcome == "built"
+    build = backfill.bun.build_of(RUN_ID)
+    assert build["inputs"].get("reformValidation") == REFORM_VALIDATION
+    assert "buildManifest" not in build["inputs"]
+    reform_validation = build["request"]["artifacts"].get("reformValidation") or {}
+    assert reform_validation.get("path") == f"{folder}/artifacts/reform_validation.json"
 
 
 def test_a_staged_bundle_a_run_s_receipt_names_is_read_from_the_release_repo() -> None:
