@@ -2139,7 +2139,7 @@ outcome and reason, production's build ID, the build ID built or stored,
 | `mismatch` | the store holds it with another commit or time | yes |
 | `invalid` | the entry failed the checks, or, for production's latest that the store holds but not as its latest, the stored entry did | yes |
 | `too_large` | a file is over 256 MiB | yes |
-| `unbuildable` | the worker refused the files (exit 2); a release folder's `calibration_diagnostics.json`, or a run's diagnostics, is not at the entry's commit; a run's `run_manifest.json` or `progress.json` isn't a valid JSON object, the two mix document versions, or one names another run; a structured run manifest's artifacts aren't a list, one isn't an object, has no safe name, path or SHA-256, or is listed twice, or they declare neither diagnostics nor a `staged_dataset` receipt; the receipt is absent, isn't a valid JSON object, differs from its declared SHA-256, records no landed bundle, or names another run, repo or folder, a revision that isn't a commit, or no diagnostics with a SHA-256; a staged bundle's folder holds no diagnostics; or a downloaded file differs from the SHA-256 its run or receipt declared | yes |
+| `unbuildable` | the worker refused the files (exit 2); a release folder's `calibration_diagnostics.json`, or a run's diagnostics, is not at the entry's commit; a run's `run_manifest.json` or `progress.json` isn't a valid JSON object, the two mix document versions, or one names another run; a structured run manifest's artifacts aren't a list, one isn't an object, has no safe name, path or SHA-256, or is listed twice, or they declare neither diagnostics nor a `staged_dataset` receipt; the receipt is absent, isn't a valid JSON object, differs from its declared SHA-256, records no landed bundle, or names another run, repo or folder, a revision that isn't a commit, or no diagnostics with a SHA-256; a staged bundle's folder holds no diagnostics; a manifest a structured run declares is not in its folder; or a downloaded file the tree is built from differs from the SHA-256 its run or receipt declared (a copied file that does is left out, and the tree is still built) | yes |
 | `refused` | the publication refused the build (exit 2) | yes |
 | `latest_not_moved` | published, but the store's latest is at least as new | yes |
 | `error` | a Bun exit 1 or 3, a timeout, a Hugging Face failure or a download that differs from its listing; the next build still runs | no |
@@ -2166,7 +2166,8 @@ has no copy of a file the submission did not carry, such as
   that file with the same SHA-256, so a copy is always a file the tree was
   built from. `parent_build_manifest.json` and `reform_validation.json` have
   no record, so they are stored as the build's folder holds them at its
-  commit; one over 64 MiB is left out, as above. The index records a tree
+  commit; one over 64 MiB is left out, as above, and one a structured run
+  declares with another SHA-256 is `differs`, in a dry run as in a real one. The index records a tree
   file's SHA-256 over its decoded UTF-8 text (a leading byte-order mark
   dropped), so a file matches when its bytes or that text have the recorded
   digest, and the copy is of its bytes. Each file is streamed to disk and
@@ -2191,7 +2192,7 @@ under, with what became of its copy:
 | `copied` | a copy was stored |
 | `kept` | another writer stored a copy with the same bytes meanwhile |
 | `conflict` | a copy with other bytes was already stored; it stays |
-| `differs` | the tree's index records another SHA-256 for this file; no copy is stored |
+| `differs` | the tree's index records another SHA-256 for this file, or a structured run declares this copied file with another SHA-256; no copy is stored |
 | `not_in_tree` | the tree was not built from this file; no copy is stored |
 | `too_large` | the file is over 256 MiB; it is not downloaded |
 
@@ -2537,7 +2538,7 @@ Each build's outcome:
 | `not_a_run` | a folder under `runs/` with no run documents | yes |
 | `older_run` | a run without a copy whose folder last changed before the job's start date, left to the backfill | yes |
 | `ineligible` | a release folder without diagnostics, or whose release manifest is absent or names another build; a staging run without calibration diagnostics: a schema-1 folder without `calibration_diagnostics.json`, a structured run that declares neither diagnostics nor a staged dataset, a staged-dataset receipt of a skipped, failed or disabled staging, or a bundle that records no diagnostics file with a SHA-256 | yes |
-| `unbuildable` | the worker refused the files (exit 2), or a staging run's documents are incompatible: a run manifest that isn't a JSON object, names another run or has an unsupported schema, and the backfill's own checks of a run's files, such as declared or recorded diagnostics that are absent or differ from their SHA-256 | yes |
+| `unbuildable` | the worker refused the files (exit 2), or a staging run's documents are incompatible: a run manifest that isn't a JSON object, names another run or has an unsupported schema, and the backfill's own checks of a run's files, such as declared or recorded diagnostics, or declared manifests, that are absent or differ from their SHA-256 | yes |
 | `too_large` | a file is over 256 MiB | yes |
 | `refused` | the publication refused the build (exit 2), and the store holds no tree for it as `already_stored` describes, or the tree could not replace the run's stored one; or the store's manifest lists a tree for the run whose index the store doesn't hold (the staging run files command's `tree-sources` exits 2), which needs repair by hand | yes |
 | `no_releases_record` | the release repo has no `releases.json`; nothing is built | yes |
