@@ -156,7 +156,7 @@ recorded something it ignored.
 | | `parent_build_manifest` | 0 or 1 | 64 MiB | stored as a copy; no tree is built from it |
 | | `reform_validation` | 0 or 1 | 64 MiB | stored as a copy; no tree is built from it |
 | `orrery-inputs` | `schema` | exactly 1 | 64 MiB | Orrery graph handler (see "Orrery graph files") |
-| | `execution_overlay` | exactly 1 | 32 MiB | |
+| | `execution_overlay` | 0 or 1; 0 only for a reconstructed schema (see "Reconstructed schemas") | 32 MiB | |
 | | `upstream` | 0 or more | 64 MiB | |
 | | `evidence` | 0 or more | 2 GiB | kept private, never published |
 | `releases-record` | `releases_record` | exactly 1 | 4 MiB | `releases-record` handler (the README's "Moving the latest when releases.json changes") |
@@ -166,9 +166,48 @@ build today, and `parent_build_manifest` and `reform_validation`, which are only
 stored as copies. The Orrery roles are the inputs the projection needs
 (`orrery_json_from_schema(schema, execution=overlay)`), plus the native evidence
 files that stay in private intake storage. Intake checks each file's role,
-count and size, not its name; the Orrery graph handler rejects a submission
-whose files it cannot use, including a schema over 32 MiB and an `upstream`
-file not named `upstream-<its SHA-256>.json` (see "Orrery graph files").
+count and size, not its name, and never reads a file, so it accepts an
+`orrery-inputs` submission without an overlay whatever its schema holds. The
+Orrery graph handler rejects a submission whose files it cannot use,
+including a schema over 32 MiB, an `upstream` file not named
+`upstream-<its SHA-256>.json`, and an overlay that is missing or present
+against what the schema says (see "Orrery graph files").
+
+### Reconstructed schemas
+
+UK builds made before microcosm#1144 recorded their graph declaration
+(`graph.json`) but no execution evidence, so they have no execution overlay.
+Microcosm's reconstruction command (`python -m
+microcosm.build.uk_runtime.orrery_reconstruction`, microcosm#1297) rebuilds
+such a build's `graph.schema.json` from that declaration alone and marks it
+with the `microcosm.reconstruction` extension: the marker binds the
+declaration and the build's other files it read by SHA-256, names the code
+revision that declared the graph and the one that rebuilt the schema, and
+says that nothing was observed running. Only the machine that holds the
+build's output directory can run it, since staged bundles never carried
+`graph.json`.
+
+Such a schema is submitted as an `orrery-inputs` submission with one
+`schema` file and no `execution_overlay`:
+
+- `provenance.huggingface` may be `null`, as for any `orrery-inputs`
+  submission of a build that exists only on the build machine; the run in
+  `provenance.run_id` need not be registered with the collector. A client
+  sends the build's own run ID when it has one, so that the document is
+  listed with that run.
+- `licensed_data` is the build's, as for any submission. A licensed UK
+  build must say `true` itself: the Orrery read service makes a document
+  recorded `public` private only when another submission of the same run or
+  build had licensed data (see "Disclosure"), and a build this old may have
+  none.
+- `upstream` and `evidence` files are allowed, as for any `orrery-inputs`
+  submission. Microcosm's command writes no presentation contract into the
+  schema it rebuilds, so that schema's document links to no upstream file
+  and none is published.
+
+The Orrery graph handler checks the marker with Microcosm's own code and
+records the document as reconstructed (see "Orrery graph files"). The
+emitter doesn't send such submissions yet.
 
 A `releases-record` submission is what Microcosm sends after a change to a
 release repo's `releases.json` made a published build current without a new
@@ -201,7 +240,8 @@ file has a role in the bundle hand-over, named in emitter#27's
 
 A bundle gives a `calibration-diagnostics` submission when it has a
 `calibration_diagnostics` file, and an `orrery-inputs` submission when it has
-both an `orrery_schema` and an `execution_overlay` file. Its other files, such
+both an `orrery_schema` and an `execution_overlay` file. No bundle holds a
+reconstructed schema (see "Reconstructed schemas"). Its other files, such
 as the dataset and its sidecars, are not submitted. The contract accepts
 `parent_build_manifest` and `reform_validation` files, which the emitter does
 not send yet.
@@ -228,7 +268,8 @@ That path has no execution overlay role: before microcosm#1295, the overlay
 existed only inside `graph.orrery.json`. A queued upload can therefore become
 an `orrery-inputs` submission only once its overlay exists as
 `graph.execution.json`. How the emitter obtains the overlay is decided in
-that change.
+that change. The only schema submitted without an overlay is a reconstructed
+one (see "Reconstructed schemas"), which that path never queued.
 
 ## Limits
 
@@ -506,8 +547,19 @@ one the collector lists.
 
 ### Orrery graph files
 
-The Orrery graph handler projects the schema and execution overlay with
-`orrery_json_from_schema(schema, execution=overlay)`, removes the links a
+For a submission without an execution overlay, the Orrery graph handler
+checks the schema as the projection does and then the reconstruction marker
+in its extensions with Microcosm's own checks (`validate_reconstruction`,
+copied unchanged into
+`telemetry_collector/orrery/projection/reconstruction.py`); it checks the
+marker, not the build's country or date. A submission with an overlay is
+handled as before, unless its schema's extensions name the marker or its
+overlay holds JSON `null`. The handler projects the schema and execution
+overlay with
+`orrery_json_from_schema(schema, execution=overlay)`, or a reconstructed
+schema with no overlay, with no title of its own; a schema Microcosm's
+reconstruction command wrote has no presentation contract, so its document
+gets the default title, `UK graph schema` for a UK one. It removes the links a
 published document could not resolve, validates the document with the
 collector's pinned Orrery validator, and writes it, with the upstream files it
 links to, to `graphs/<submission_id>/<document sha256>/` in the collector's
@@ -542,8 +594,16 @@ written.
   `orrery_version` is the Orrery version that validated it, `visibility` is
   `private` or `public` (see "Disclosure"), and `removed_links` counts the
   removed `url` and `uri` keys.
+- **Reconstructed:** the document's row in `orrery_graph_files`, and its
+  entry in the Orrery read service's listings, say `reconstructed: true`
+  when the schema carries the reconstruction marker, as they do for a
+  document the collector rebuilt from a past build's staged inputs. The
+  document keeps the marker at `metadata.microcosm.extensions`. Documents of
+  the same build sit side by side, and the newest is current, whether
+  reconstructed or not.
 - **Rejections:** the handler treats the schema and overlay as Microcosm's
-  own command treats its input at the projection's source commit.
+  own command treats its input at the projection's source commit, and adds
+  its own rules for the overlay's presence and the reconstruction marker.
   - `orrery_inputs_unusable` when:
     - the schema or overlay is over 32 MiB, Microcosm's reader's limit (so a
       schema intake accepts, up to 64 MiB, can still be rejected here);
@@ -552,6 +612,17 @@ written.
     - it is nested too deeply for Python's JSON decoder to parse;
     - the projection raises a `TypeError`, `ValueError` or `RecursionError`
       for it (its message, shortened to 500 characters);
+    - the schema has no reconstruction marker and the submission no
+      execution overlay, or an overlay holding JSON `null`, which the
+      projection would skip;
+    - the schema's extensions name the marker and the submission has an
+      execution overlay, which is downloaded, as before, but never read;
+    - the marker fails Microcosm's checks, such as a protocol other than
+      `microcosm.graph.reconstruction.v1`, a basis other than
+      `declaration_only`, a field added or missing, a JSON array or object
+      where one of a set of strings belongs, or a declaration input whose
+      SHA-256 is not the schema's `graph_sha256` (the check's message,
+      which starts `Graph reconstruction:`);
     - or an `upstream` file's name is not `upstream-<sha256>.json`, where
       `<sha256>` is 64 lowercase hex characters and is the file's own
       SHA-256, the one in its `files[]` entry. Microcosm names each

@@ -103,7 +103,9 @@ ROLE_RULES: dict[str, dict[str, RoleRule]] = {
     },
     "orrery-inputs": {
         "schema": RoleRule(1, 1, 64 * MEBIBYTE),
-        "execution_overlay": RoleRule(1, 1, 32 * MEBIBYTE),
+        # None only for a schema Microcosm rebuilt from a build's recorded
+        # declaration alone; the Orrery graph handler checks which it is.
+        "execution_overlay": RoleRule(0, 1, 32 * MEBIBYTE),
         "upstream": RoleRule(0, None, 64 * MEBIBYTE),
         "evidence": RoleRule(0, None, 2 * GIBIBYTE),
     },

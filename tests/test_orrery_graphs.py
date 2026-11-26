@@ -14,6 +14,7 @@ rejected, or returned for another attempt.
 from __future__ import annotations
 
 import functools
+import gzip
 import hashlib
 import importlib
 import importlib.metadata
@@ -29,6 +30,7 @@ from typing import Any
 import pytest
 import sqlalchemy as sa
 from google.api_core.exceptions import PreconditionFailed
+from pydantic import ValidationError
 
 from telemetry_collector.auth import HuggingFacePrincipal
 from telemetry_collector.database import create_database_engine
@@ -53,6 +55,12 @@ from tests.test_submissions import orrery_submission
 GRAPHS_MODULE = "telemetry_collector.orrery_graphs"
 HANDLERS_MODULE = "telemetry_collector.handlers"
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "orrery_projection"
+# The schema Microcosm's reconstruction command rebuilt from a replica of a UK
+# build made before microcosm#1144, and Microcosm's projection of it
+# (tools/generate-orrery-reconstruction-fixture.py).
+RECONSTRUCTION_ROOT = Path(__file__).parent / "fixtures" / "orrery_reconstruction"
+RECONSTRUCTION_CASE = "uk-dense-pre-1144"
+RECONSTRUCTION_EXTENSION = "microcosm.reconstruction"
 # The fixture whose overlay records evidence references, and one whose
 # projected document has no link at all.
 EVIDENCE_CASE = "toy-recorded-execution"
@@ -256,11 +264,15 @@ class ReadCountingIntakeStore(FakeIntakeObjectStore):
     def __init__(self) -> None:
         super().__init__()
         self.reads: dict[str, int] = {}
+        #: Objects whose reads fail once the worker has checked their bytes.
+        self.unavailable_after_check: set[str] = set()
 
     def read_chunks(
         self, object_name: str, generation: str, *, chunk_size: int = 1 << 16
     ) -> Iterator[bytes]:
         self.reads[object_name] = self.reads.get(object_name, 0) + 1
+        if object_name in self.unavailable_after_check and self.reads[object_name] > 1:
+            raise ConnectionError("Intake storage is unavailable.")
         return super().read_chunks(object_name, generation, chunk_size=chunk_size)
 
 
@@ -408,9 +420,11 @@ def accepted(inputs: Inputs, *, licensed_data: bool = True) -> Accepted:
     ]
     submissions = FakeSubmissionStore(clock=SteppingClock())
     objects = ReadCountingIntakeStore()
-    record, _ = submissions.create_submission(
-        SubmissionRequest.model_validate(submission), PRINCIPAL
-    )
+    try:
+        request = SubmissionRequest.model_validate(submission)
+    except ValidationError as error:
+        pytest.fail(f"Intake refused the submission: {error}")
+    record, _ = submissions.create_submission(request, PRINCIPAL)
     generations = {
         file["name"]: objects.upload(
             intake_object_name(record.submission_id, file["name"]),
@@ -1171,6 +1185,285 @@ def test_the_record_and_the_result_name_the_build_and_the_versions() -> None:
         reconstructed=False,
         visibility="private",
     )
+
+
+@functools.cache
+def reconstruction_fixture(key: str) -> bytes:
+    """One of the reconstruction fixture's saved files, decompressed."""
+
+    index = json.loads((RECONSTRUCTION_ROOT / "fixtures.json").read_text())
+    [case] = [case for case in index["cases"] if case["name"] == RECONSTRUCTION_CASE]
+    stored = (RECONSTRUCTION_ROOT / case[key]).read_bytes()
+    return gzip.decompress(stored) if case[key].endswith(".gz") else stored
+
+
+def reconstructed_schema() -> dict[str, Any]:
+    return json.loads(reconstruction_fixture("schema"))
+
+
+def reconstructed_inputs(schema: bytes | None = None) -> Inputs:
+    """The reconstructed schema alone, as a submission of it holds it."""
+
+    return {
+        SCHEMA: (
+            "schema",
+            reconstruction_fixture("schema") if schema is None else schema,
+        )
+    }
+
+
+def test_a_reconstructed_schema_without_an_overlay_publishes_a_reconstructed_document() -> (
+    None
+):
+    submission, publishing, result = published_run(reconstructed_inputs())
+
+    published = publishing.published(result)
+    # Microcosm's own projection of the schema, with no title and no overlay.
+    assert published == reconstruction_fixture("expected")
+    document = json.loads(published)
+    assert document["title"] == "UK graph schema"
+    marker = document["metadata"]["microcosm"]["extensions"][RECONSTRUCTION_EXTENSION]
+    assert marker["reconstructed"] is True
+    assert marker["basis"] == "declaration_only"
+    assert "execution" not in document["metadata"]
+    digest = hashlib.sha256(published).hexdigest()
+    assert result == {
+        "processed_by": "orrery-graph",
+        "object_prefix": f"graphs/{submission.submission_id}/{digest}/",
+        "document_sha256": digest,
+        "document_bytes": len(published),
+        "upstream_files": 0,
+        "orrery_version": ORRERY_VERSION,
+        "visibility": "private",
+        "removed_links": 0,
+    }
+    [record] = publishing.records.records.values()
+    assert record.reconstructed is True
+    assert record.visibility == "private"
+    assert record.document_sha256 == digest
+
+
+def test_a_schema_without_a_reconstruction_marker_needs_an_execution_overlay() -> None:
+    submission = accepted({SCHEMA: ("schema", fixture_bytes(EVIDENCE_CASE, SCHEMA))})
+    publishing = Publishing()
+
+    outcome = submission.run(publishing)
+
+    assert outcome is JobOutcome.FINISHED
+    assert submission.record().status == "rejected"
+    assert submission.record().rejection == {
+        "code": "orrery_inputs_unusable",
+        "message": (
+            "The schema carries no reconstruction marker "
+            "(microcosm.reconstruction), so it needs an execution overlay."
+        ),
+    }
+    assert publishing.bucket.stored == {}
+    assert publishing.records.records == {}
+
+
+def test_a_reconstructed_schema_submitted_with_an_execution_overlay_is_rejected() -> (
+    None
+):
+    submission = accepted(
+        {
+            **reconstructed_inputs(),
+            OVERLAY: ("execution_overlay", fixture_bytes(EVIDENCE_CASE, OVERLAY)),
+        }
+    )
+    publishing = Publishing()
+
+    outcome = submission.run(publishing)
+
+    assert outcome is JobOutcome.FINISHED
+    assert submission.record().status == "rejected"
+    assert submission.record().rejection == {
+        "code": "orrery_inputs_unusable",
+        "message": (
+            "The schema is marked as reconstructed from its declaration alone "
+            "(microcosm.reconstruction), so it cannot come with an execution "
+            "overlay."
+        ),
+    }
+    assert publishing.bucket.stored == {}
+    assert publishing.records.records == {}
+
+
+def test_a_marked_schema_with_an_overlay_is_rejected_before_the_schema_is_checked() -> (
+    None
+):
+    schema = reconstructed_schema()
+    # A schema the projection would refuse; the marker's presence decides.
+    schema["graph_sha256"] = "0" * 64
+    submission = accepted(
+        {
+            **reconstructed_inputs(json_bytes(schema)),
+            OVERLAY: ("execution_overlay", fixture_bytes(EVIDENCE_CASE, OVERLAY)),
+        }
+    )
+
+    submission.run(Publishing())
+
+    assert (
+        submission.record()
+        .rejection["message"]
+        .startswith("The schema is marked as reconstructed from its declaration alone")
+    )
+
+
+def set_marker_field(field_name: str, value: object) -> Callable[[dict], object]:
+    def change(marker: dict) -> object:
+        marker[field_name] = value
+        return marker
+
+    return change
+
+
+def misname_the_declaration(marker: dict) -> dict:
+    [declaration] = [item for item in marker["inputs"] if item["role"] == "declaration"]
+    declaration["sha256"] = "0" * 64
+    return marker
+
+
+def add_a_field(marker: dict) -> dict:
+    marker["observed"] = True
+    return marker
+
+
+@pytest.mark.parametrize(
+    ("change", "refusal"),
+    [
+        (set_marker_field("basis", "recorded_execution"), "marker basis"),
+        (
+            set_marker_field("protocol", "microcosm.graph.reconstruction.v2"),
+            "marker protocol",
+        ),
+        (set_marker_field("reconstructed", False), "marker must say reconstructed"),
+        (misname_the_declaration, "marker does not name this declaration"),
+        (add_a_field, "marker fields"),
+        (lambda marker: "reconstructed", "marker must be an object"),
+    ],
+    ids=[
+        "another-basis",
+        "another-protocol",
+        "not-reconstructed",
+        "another-declaration",
+        "extra-field",
+        "not-an-object",
+    ],
+)
+def test_a_marker_that_fails_microcosm_s_checks_rejects_the_submission(
+    change: Callable[[dict], object], refusal: str
+) -> None:
+    schema = reconstructed_schema()
+    extensions = schema["extensions"]
+    extensions[RECONSTRUCTION_EXTENSION] = change(extensions[RECONSTRUCTION_EXTENSION])
+    submission = accepted(reconstructed_inputs(json_bytes(schema)))
+    publishing = Publishing()
+
+    outcome = submission.run(publishing)
+
+    assert outcome is JobOutcome.FINISHED
+    assert submission.record().status == "rejected"
+    assert submission.record().rejection == {
+        "code": "orrery_inputs_unusable",
+        "message": f"Graph reconstruction: {refusal}.",
+    }
+    assert publishing.bucket.stored == {}
+    assert publishing.records.records == {}
+
+
+def test_a_build_s_unusable_schema_and_overlay_get_the_overlay_s_rejection() -> None:
+    # As before reconstructed schemas: a schema without the marker that comes
+    # with an overlay has the overlay read first, and the projection checks
+    # the schema afterwards.
+    inputs = schema_whose_sources_are_an_object()
+    inputs[OVERLAY] = ("execution_overlay", b"\xff")
+    submission = accepted(inputs)
+    publishing = Publishing()
+
+    outcome = submission.run(publishing)
+
+    assert outcome is JobOutcome.FINISHED
+    assert submission.record().rejection == {
+        "code": "orrery_inputs_unusable",
+        "message": "The execution overlay is not UTF-8.",
+    }
+    assert publishing.bucket.stored == {}
+
+
+def test_a_build_s_overlay_is_downloaded_before_its_schema_is_read() -> None:
+    # As before reconstructed schemas: both inputs are downloaded before
+    # either is read, so an overlay that can't be downloaded returns the job
+    # for another attempt even when the schema is unusable.
+    inputs = fixture_inputs(EVIDENCE_CASE)
+    inputs[SCHEMA] = ("schema", b"\xff")
+    submission = accepted(inputs)
+    submission.objects.unavailable_after_check.add(
+        intake_object_name(submission.submission_id, OVERLAY)
+    )
+    publishing = Publishing()
+
+    outcome = submission.run(publishing)
+
+    assert outcome is JobOutcome.RETRY
+    assert submission.record().status == "queued"
+    assert submission.record().rejection is None
+
+
+def test_an_overlay_holding_null_is_no_overlay() -> None:
+    submission = accepted(
+        {
+            SCHEMA: ("schema", fixture_bytes(EVIDENCE_CASE, SCHEMA)),
+            OVERLAY: ("execution_overlay", b"null"),
+        }
+    )
+    publishing = Publishing()
+
+    outcome = submission.run(publishing)
+
+    assert outcome is JobOutcome.FINISHED
+    assert submission.record().rejection == {
+        "code": "orrery_inputs_unusable",
+        "message": "The execution overlay is null.",
+    }
+    assert publishing.bucket.stored == {}
+    assert publishing.records.records == {}
+
+
+def set_source_revision_origin(marker: dict) -> dict:
+    marker["source_revision"]["origin"] = ["recorded"]
+    return marker
+
+
+def set_an_input_verification(marker: dict) -> dict:
+    marker["inputs"][0]["verification"] = {"state": "recorded_digest_matched"}
+    return marker
+
+
+@pytest.mark.parametrize(
+    "change",
+    [set_source_revision_origin, set_an_input_verification],
+    ids=["origin-array", "verification-object"],
+)
+def test_a_marker_value_of_the_wrong_json_type_is_rejected_as_the_marker_s_fault(
+    change: Callable[[dict], dict],
+) -> None:
+    schema = reconstructed_schema()
+    extensions = schema["extensions"]
+    extensions[RECONSTRUCTION_EXTENSION] = change(extensions[RECONSTRUCTION_EXTENSION])
+    submission = accepted(reconstructed_inputs(json_bytes(schema)))
+    publishing = Publishing()
+
+    outcome = submission.run(publishing)
+
+    assert outcome is JobOutcome.FINISHED
+    rejection = submission.record().rejection
+    assert rejection["code"] == "orrery_inputs_unusable"
+    assert rejection["message"].startswith(
+        "Graph reconstruction: a marker value has the wrong JSON type ("
+    )
+    assert publishing.bucket.stored == {}
 
 
 def test_the_collector_version_is_the_installed_package_s() -> None:

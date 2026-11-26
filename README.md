@@ -793,10 +793,49 @@ modules named in `provenance.py`, in
    ```
 
 3. Run `uv run pytest tests/test_orrery_projection.py
-   tests/test_orrery_projection_provenance.py`.
+   tests/test_orrery_projection_provenance.py
+   tests/test_orrery_reconstruction.py`.
 
 Once Microcosm hands its Orrery inputs to the collector and removes its copy,
 this copy is the only one, and changes to the projection are made here.
+
+`reconstruction.py` was copied later, unchanged, from Microcosm `main` at
+`provenance.RECONSTRUCTION_COMMIT`. It defines the `microcosm.reconstruction`
+marker that Microcosm's reconstruction command (`python -m
+microcosm.build.uk_runtime.orrery_reconstruction`, microcosm#1297) writes into
+the graph schema it rebuilds for a UK build made before microcosm#1144, from
+the build's recorded graph declaration alone. The Orrery graph handler uses
+only its `validate_reconstruction`. It runs `decl.py`, `schema.py` and
+`serialize.py`, which it imports, and `canonical.py` and `expansion.py`,
+which they import. Their blob IDs at that commit, recorded in
+`RECONSTRUCTION_IMPORT_BLOBS`, equal those in `SOURCE_BLOBS`, so it runs on
+the copies from `MICROCOSM_COMMIT` as it runs in Microcosm. A later copy of
+any of them, or of a projection module that changes the reconstructed
+document, needs a copy of `reconstruction.py` and a new fixture from the
+same commit.
+`tests/test_orrery_reconstruction.py` checks both, and that the copy accepts
+the marker of a schema the command rebuilt. That schema, and Microcosm's
+projection of it with no title and no overlay, are saved under
+`tests/fixtures/orrery_reconstruction` by
+`tools/generate-orrery-reconstruction-fixture.py`, run from a Microcosm
+checkout at `RECONSTRUCTION_COMMIT` on Microcosm's own replica of such a
+build's output directory, which holds no build data:
+
+```bash
+cd ../microcosm
+uv sync --all-packages --locked
+.venv/bin/python ../microcosm-collector/tools/generate-orrery-reconstruction-fixture.py \
+  ../microcosm-collector/tests/fixtures/orrery_reconstruction
+```
+
+To take a later `reconstruction.py`, copy it from a commit whose
+reconstruction command still writes `graph.orrery.json`, record the commit
+and the blob IDs, and run the script there. The script needs Microcosm's own
+projection, so once Microcosm removes it, it works only at an earlier
+commit, and a later fixture needs another source for the expected document.
+The script replaces the fixture folder, so a run that stops partway leaves
+none; and the compressed files' bytes can differ with another zlib build
+while their contents stay the same.
 
 ### Orrery validation
 
@@ -864,8 +903,20 @@ submissions stay in intake storage and can be reprocessed later (`reprocess
 `telemetry_collector/handlers.py`, the worker's one registry, beside the
 calibration tree handler.
 
-- **Inputs.** Each attempt downloads the schema and the execution overlay
-  into a new temporary directory. Upstream files are downloaded only after
+- **Inputs.** Each attempt downloads the schema, and the execution overlay
+  when it has one, into a new temporary directory. Intake allows at most one
+  overlay. A schema whose extensions carry a reconstruction marker,
+  `microcosm.reconstruction`, that passes Microcosm's own
+  `validate_reconstruction` comes without one. Microcosm's reconstruction
+  command writes such a schema for a UK build made before microcosm#1144,
+  from the build's recorded graph declaration alone ("Orrery projection");
+  the handler checks the marker, not the country or the build's date. Any
+  other schema needs an overlay. A submission with an overlay is downloaded
+  and read as before, the schema and then the overlay, unless its schema's
+  extensions name the marker, which rejects it before the overlay is read.
+  A submission without one has its schema checked as the projection does
+  and then its marker, and a marked schema is projected with no overlay.
+  Upstream files are downloaded only after
   links are removed, and only those the document still links to: removing
   links needs only their names, from the submission's file list, and the
   projection doesn't read them. Evidence files are never downloaded. The
@@ -874,9 +925,29 @@ calibration tree handler.
   strict JSON in UTF-8, no key repeated within an object, no `NaN` or
   infinity, and nested no deeper than Python's JSON decoder can parse. The
   projection, `orrery_json_from_schema(schema, execution=overlay)`, builds
-  the document. These reject the submission with `orrery_inputs_unusable`:
+  the document, with no title of its own. Microcosm's reconstruction
+  command writes no presentation contract into the schema it rebuilds, so
+  that document gets the projection's default title for such a schema,
+  `<COUNTRY> graph schema` (`UK graph schema`), and links to no upstream
+  file. The handler doesn't require that: a marked schema that carried a
+  contract would be projected with it. These reject the submission with
+  `orrery_inputs_unusable`:
   - a schema or overlay that fails those reading rules. A schema over
     32 MiB is rejected here, although intake accepts schemas up to 64 MiB;
+  - a schema without the reconstruction marker that comes without an
+    overlay, or with an overlay file holding JSON `null`, which the
+    projection would skip: a build that stopped before recording any
+    execution gets no document;
+  - a schema whose extensions name the marker that comes with an overlay,
+    since the marker says that nothing was observed running, whether or not
+    the marker would pass its checks;
+  - a marker that fails Microcosm's checks, such as a protocol other than
+    `microcosm.graph.reconstruction.v1`, a basis other than
+    `declaration_only`, a field added or missing, or a declaration input
+    whose SHA-256 is not the schema's `graph_sha256`, with the check's
+    message (`Graph reconstruction: ...`). A marker value that is a JSON
+    array or object where Microcosm expects one of a set of strings gets
+    `Graph reconstruction: a marker value has the wrong JSON type (...)`;
   - a `TypeError`, `ValueError` or `RecursionError` from the projection, with
     its message shortened to 500 characters. Microcosm's command treats these
     as input errors, and also `OSError` and `GraphRuntimeError`, which the
@@ -936,10 +1007,12 @@ calibration tree handler.
   SHA-256 and size, how many upstream files it links to, the Orrery version
   that validated it, the Microcosm commit the projection was copied from
   (`projection_source`), the collector's version, whether it was
-  reconstructed (true only for a document the collector rebuilt from a past
-  build's staged inputs, whose submission `microcosm-collector` owns; see
-  "Projecting past builds again"), and its visibility. A document already
-  recorded for the submission keeps its first row.
+  reconstructed, and its visibility. A document is reconstructed when the
+  collector rebuilt it from a past build's staged inputs, whose submission
+  `microcosm-collector` owns ("Projecting past builds again"), or when its
+  schema carries the reconstruction marker; the document of a marked schema
+  also keeps the marker at `metadata.microcosm.extensions`. A document
+  already recorded for the submission keeps its first row.
 - **Visibility.** A licensed build's graph file is recorded `private`: it
   stays in the private bucket, and no clearance step makes it public. Any
   other build's is recorded `public`. The Orrery read service serves both

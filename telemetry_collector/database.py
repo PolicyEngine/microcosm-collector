@@ -292,7 +292,9 @@ class OrreryGraphFile(Base):
     # The Microcosm commit the collector's projection was copied from.
     projection_source: Mapped[str] = mapped_column(Text, nullable=False)
     collector_version: Mapped[str] = mapped_column(Text, nullable=False)
-    # False for a document published from a submission's own inputs.
+    # True when the collector rebuilt the submission from a past build's
+    # staged inputs, or when its schema carries a checked reconstruction
+    # marker; false for a build's own schema and overlay.
     reconstructed: Mapped[bool] = mapped_column(Boolean, nullable=False)
     visibility: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
