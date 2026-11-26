@@ -2247,9 +2247,9 @@ each environment's GitHub variables `TELEMETRY_WORKER_JOB`,
 `TELEMETRY_GCP_PROJECT_ID` and `TELEMETRY_GCP_REGION`. First the dry run. It
 reads the store's manifest, the stored copies' listing, tree indexes, the
 stored `releases.json` copies, the Hugging Face listings and the documents it
-needs to plan; it reads a tree file only when Hugging Face gives no SHA-256 for
-it, and stores, copies and builds nothing and takes no lock. Its step 4 counts
-builds as they are stored now, so a staging tree step 3 of a real run would
+needs to plan; it reads a tree file, or a copied file a structured run declares,
+only when Hugging Face gives no SHA-256 for it, and stores, copies and builds
+nothing and takes no lock. Its step 4 counts builds as they are stored now, so a staging tree step 3 of a real run would
 replace is counted too, and it compares a file it doesn't read by the SHA-256
 Hugging Face gives for its bytes, so a file starting with a byte-order mark
 shows as `differs` where a real run copies it:
