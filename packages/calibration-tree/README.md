@@ -110,6 +110,13 @@ const { runs } = await loadCopiedStagingRuns({ country: "uk", token });
 const run = await loadCopiedStagingRun({ country: "uk", runId, token });
 ```
 
+The index names each copy by its path in the run folder (`STAGING_RUN_FILE_NAMES`).
+A version 1 run's reform validation is `reform_validation.json`; a version 2 run's,
+as Microcosm's version 2 writer stages it, is `artifacts/reform_validation.json`.
+`stagingReformValidationFileName(runManifest)` names the one a run's parsed manifest
+declares, and `loadCopiedStagingRun` reads that one. A reader that knows fewer names
+reads an index that lists more, without those files.
+
 The copies hold what the run's files say. Read an unfinished run's current status
 from telemetry. `src/staging-run-files-command.ts` is the command the collector
 runs to read the index, store copies and read a stored tree's source digests.

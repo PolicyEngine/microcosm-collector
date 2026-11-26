@@ -24,6 +24,7 @@ import {
   type StagingRunSummary,
 } from "./staging-artifact";
 import {
+  isStructuredStagingDocument,
   parseStagingCalibrationProgress,
   parseStagingEvents,
   parseStagingManifest,
@@ -34,7 +35,12 @@ import {
 
 export const STAGING_RUN_FILES_SCHEMA_VERSION = 1;
 
-/** The files of a run folder that are copied, by their path inside it. */
+/**
+ * The files of a run folder that are copied, by their path inside it. A
+ * version 1 run's reform validation is at the folder's top level; Microcosm's
+ * version 2 writer puts it under artifacts/ (microcosm#1135). A reader that
+ * knows fewer names reads an index that lists more, without those files.
+ */
 export const STAGING_RUN_FILE_NAMES = [
   "run_manifest.json",
   "progress.json",
@@ -42,6 +48,7 @@ export const STAGING_RUN_FILE_NAMES = [
   "calibration_progress.json",
   "reform_validation.json",
   "artifacts/staged_dataset.json",
+  "artifacts/reform_validation.json",
 ] as const;
 
 export type StagingRunFileName = (typeof STAGING_RUN_FILE_NAMES)[number];
@@ -50,6 +57,40 @@ export const STAGING_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 export function isStagingRunFileName(value: unknown): value is StagingRunFileName {
   return typeof value === "string" && (STAGING_RUN_FILE_NAMES as readonly string[]).includes(value);
+}
+
+// The reform validation a structured run manifest declares, if it declares one.
+function declaredReformValidation(runManifest: JsonObject | null): JsonObject | null {
+  const artifacts = isStructuredStagingDocument(runManifest) ? runManifest?.artifacts : null;
+  const declared =
+    artifacts && typeof artifacts === "object" && !Array.isArray(artifacts)
+      ? (artifacts as JsonObject).reform_validation
+      : null;
+  return declared && typeof declared === "object" && !Array.isArray(declared) ? (declared as JsonObject) : null;
+}
+
+/**
+ * The copy that holds a run's reform validation: the one its structured run
+ * manifest declares under artifacts/, else the folder's top-level file, as
+ * the Hugging Face reader reads it. `runManifest` is the parsed manifest. A
+ * declared copy counts only when its digest is the declared SHA-256, as
+ * `loadCopiedStagingRun` reads it.
+ */
+export function stagingReformValidationFileName(runManifest: JsonObject | null): StagingRunFileName {
+  return declaredReformValidation(runManifest) ? "artifacts/reform_validation.json" : "reform_validation.json";
+}
+
+// The copied bytes of the run's reform validation: the declared copy only
+// when it has the declared SHA-256, else the top-level copy.
+function copiedReformValidation(
+  record: StagingRunRecord,
+  runManifest: JsonObject | null,
+  topLevel: Uint8Array | null,
+  declaredCopy: Uint8Array | null,
+): Uint8Array | null {
+  const declared = declaredReformValidation(runManifest);
+  if (!declared) return topLevel;
+  return record.files["artifacts/reform_validation.json"]?.sha256 === declared.sha256 ? declaredCopy : null;
 }
 
 export interface StagingRunFileRecord {
@@ -274,9 +315,8 @@ export async function loadCopiedStagingRun(options: {
     const file = record.files[name];
     return file ? readStagingRunFile({ record: file, token: options.token, client: options.client }) : null;
   };
-  const [manifest, progress, events, calibration, reformValidation, stagedDataset] = await Promise.all(
-    STAGING_RUN_FILE_NAMES.map(read),
-  );
+  const [manifest, progress, events, calibration, topLevelReformValidation, stagedDataset, declaredReformValidationCopy] =
+    await Promise.all(STAGING_RUN_FILE_NAMES.map(read));
   const manifestDocument = stagingJsonObjectOrNull(manifest);
   const progressDocument = stagingJsonObjectOrNull(progress);
   const calibrationDocument = stagingJsonObjectOrNull(calibration);
@@ -301,7 +341,9 @@ export async function loadCopiedStagingRun(options: {
     run_manifest: runManifest,
     calibration_progress: calibrationProgress,
     events: parsedEvents,
-    reform_validation: stagingJsonObjectOrNull(reformValidation),
+    reform_validation: stagingJsonObjectOrNull(
+      copiedReformValidation(record, runManifest, topLevelReformValidation, declaredReformValidationCopy),
+    ),
     staged_dataset: receipt && {
       payload: receipt,
       sha256: record.files["artifacts/staged_dataset.json"]!.sha256,

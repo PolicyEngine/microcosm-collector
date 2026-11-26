@@ -856,6 +856,89 @@ async function loadStagingCalibrationUncached(
   return source?.calibration ?? null;
 }
 
+// A structured run declares each result file it stages, as Microcosm's
+// version 2 writer does under artifacts/ (microcosm#1135); version 1 runs put
+// the build and release manifests and the reform validation at the run
+// folder's top level. `artifacts` is a structured manifest's parsed
+// declarations, or null for any other run.
+function declaredStagingArtifact(
+  artifacts: JsonObject | null,
+  name: string,
+): JsonObject | null {
+  return objectOrNull(artifacts?.[name]);
+}
+
+function declaredRunFilePath(
+  runId: string,
+  artifacts: JsonObject | null,
+  name: string,
+): string {
+  return (
+    stringValue(declaredStagingArtifact(artifacts, name)?.staging_path) ??
+    `runs/${runId}/${name}.json`
+  );
+}
+
+// A run file the tree is built from: a declared one is read from its declared
+// path and must be there with its declared SHA-256.
+async function stagingRunSourceFile(
+  runId: string,
+  artifacts: JsonObject | null,
+  name: string,
+  revalidate: number,
+  country: MicrocosmCountry,
+  revision: string,
+): Promise<HashedStagingJson | null> {
+  const declared = declaredStagingArtifact(artifacts, name);
+  const document = await stagingHashedJsonOrNull(
+    declaredRunFilePath(runId, artifacts, name),
+    revalidate,
+    country,
+    revision,
+  );
+  if (!declared) return document;
+  if (!document) {
+    throw new IncompatibleStagingDataError(`artifact ${name} is declared but absent.`);
+  }
+  if (document.sha256 !== stringValue(declared.sha256)) {
+    throw new IncompatibleStagingDataError(
+      `artifact ${name} digest does not match its run manifest declaration.`,
+    );
+  }
+  return document;
+}
+
+function structuredArtifacts(runManifest: JsonObject | null): JsonObject | null {
+  return isStructuredStagingDocument(runManifest)
+    ? objectOrNull(runManifest?.artifacts)
+    : null;
+}
+
+// A run's reform validation, which no tree is built from: a declared one is
+// read from its declared path and reads as absent unless it has its declared
+// SHA-256 and is a JSON object.
+async function stagingReformValidationOrNull(
+  runId: string,
+  runManifest: JsonObject | null,
+  revalidate: number,
+  country: MicrocosmCountry,
+): Promise<JsonObject | null> {
+  const artifacts = structuredArtifacts(runManifest);
+  const declared = declaredStagingArtifact(artifacts, "reform_validation");
+  const path = declaredRunFilePath(runId, artifacts, "reform_validation");
+  if (!declared) return stagingJsonOrNull(path, revalidate, country);
+  let document: HashedStagingJson | null;
+  try {
+    document = await stagingHashedJsonOrNull(path, revalidate, country);
+  } catch (error) {
+    if (error instanceof IncompatibleStagingDataError) return null;
+    throw error;
+  }
+  return document && document.sha256 === stringValue(declared.sha256)
+    ? document.payload
+    : null;
+}
+
 export async function resolveStagingCalibrationSource(
   runId: string,
   revalidate: number,
@@ -932,15 +1015,20 @@ export async function resolveStagingCalibrationSource(
       `artifact calibration_diagnostics digest does not match its run manifest declaration.`,
     );
   }
+  const declared = structured ? artifacts : null;
   const [buildManifest, releaseManifest] = await Promise.all([
-    stagingHashedJsonOrNull(
-      `runs/${runId}/build_manifest.json`,
+    stagingRunSourceFile(
+      runId,
+      declared,
+      "build_manifest",
       revalidate,
       country,
       staging.revision,
     ),
-    stagingHashedJsonOrNull(
-      `runs/${runId}/release_manifest.json`,
+    stagingRunSourceFile(
+      runId,
+      declared,
+      "release_manifest",
       revalidate,
       country,
       staging.revision,
@@ -1119,7 +1207,6 @@ export async function loadStagingRun(
     calibrationProgressRaw,
     eventsText,
     cal,
-    reformValidationRaw,
   ] = await Promise.all([
     stagingJsonOrNull(`runs/${runId}/progress.json`, revalidate, country),
     stagingJsonOrNull(`runs/${runId}/run_manifest.json`, revalidate, country),
@@ -1130,11 +1217,16 @@ export async function loadStagingRun(
     ),
     stagingTextOrNull(`runs/${runId}/events.ndjson`, revalidate, country),
     loadStagingCalibration(runId, revalidate, country),
-    stagingJsonOrNull(`runs/${runId}/reform_validation.json`, revalidate, country),
   ]);
   const progress = progressRaw == null ? null : parseStagingProgress(progressRaw);
   const runManifest =
     runManifestRaw == null ? null : parseStagingManifest(runManifestRaw);
+  const reformValidationRaw = await stagingReformValidationOrNull(
+    runId,
+    runManifest,
+    revalidate,
+    country,
+  );
   const calibrationProgress =
     calibrationProgressRaw == null
       ? null
@@ -1227,11 +1319,14 @@ export async function loadStagingReformValidationRaw(
 ): Promise<JsonObject | null> {
   if (stagingUnavailableReason(country)) return null;
   assertSafeReleaseId(runId, "run");
-  return stagingJsonOrNull(
-    `runs/${runId}/reform_validation.json`,
+  const runManifestRaw = await stagingJsonOrNull(
+    `runs/${runId}/run_manifest.json`,
     revalidate,
     country,
   );
+  const runManifest =
+    runManifestRaw == null ? null : parseStagingManifest(runManifestRaw);
+  return stagingReformValidationOrNull(runId, runManifest, revalidate, country);
 }
 
 export async function loadStagingTargetDiagnostics(

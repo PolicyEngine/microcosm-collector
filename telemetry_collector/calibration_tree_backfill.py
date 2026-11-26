@@ -40,7 +40,14 @@ package's staging readers that locate its files:
   diagnostics are: at the run manifest's declared
   ``calibration_diagnostics`` path, with the declared SHA-256 checked, or,
   for a schema-1 run, ``runs/<id>/calibration_diagnostics.json``; with its
-  ``build_manifest.json`` and ``release_manifest.json``;
+  ``build_manifest.json`` and ``release_manifest.json``. A structured run
+  that declares a ``build_manifest``, ``release_manifest``,
+  ``parent_build_manifest`` or ``reform_validation`` artifact, as Microcosm's
+  version 2 writer does under ``artifacts/`` (microcosm#1135), has that file
+  read from its declared path instead of the folder's top level: a declared
+  manifest is checked against its declared SHA-256, and one the folder lacks
+  makes the run unbuildable, while a declared file that is only copied and
+  that the folder lacks is left out;
 - a run whose manifest declares a ``staged_dataset`` receipt instead is
   read from the staged bundle the receipt names, in the country's release
   repo at the receipt's revision, with the receipt's SHA-256 checked;
@@ -195,7 +202,9 @@ _RELEASE_FILES: Final = (
     ("demographics", "demographics.json"),
     *_COPIED_FILES,
 )
-# A staging run's other files, in its run folder.
+# A staging run's other files, in its run folder or at the paths its run
+# manifest declares for them, by the worker's role names, which are the logical
+# names Microcosm's version 2 writer declares them under.
 _STAGING_RUN_FILES: Final = (
     ("build_manifest", "build_manifest.json"),
     ("release_manifest", "release_manifest.json"),
@@ -745,6 +754,50 @@ def _declared_artifacts(
     return declared
 
 
+def _run_source_files(
+    entry: ProductionEntry,
+    listings: Listings,
+    run_folder: str,
+    declared: Mapping[str, tuple[str, str]],
+    named_files: Iterable[tuple[str, str]],
+) -> dict[str, SourceFile]:
+    """Each named file of a staging run, by role, without an oversized copy.
+
+    A file the run manifest declares under its role's name is read from its
+    declared path; a file the tree is built from then carries its declared
+    SHA-256, and is ``SourceUnbuildableError`` when the folder lacks it, while a
+    copied file the folder lacks is left out. Any other file is read from the
+    run folder's top level, when it is there.
+    """
+
+    top_level = listings.folder(entry.hf_repo, entry.hf_commit, run_folder)
+    files: dict[str, SourceFile] = {}
+    for role, name in named_files:
+        copied = role in _COPIED_ROLES
+        declared_sha256: str | None = None
+        if role in declared:
+            path, digest = declared[role]
+            folder, _, file_name = path.rpartition("/")
+            listed = listings.folder(entry.hf_repo, entry.hf_commit, folder).get(
+                file_name
+            )
+            if listed is None and not copied:
+                raise SourceUnbuildableError(
+                    f"{path} is declared but not in {entry.hf_repo} at "
+                    f"{entry.hf_commit}."
+                )
+            if not copied:
+                declared_sha256 = digest
+        else:
+            listed = top_level.get(name)
+        if listed is None or (copied and listed.size > MAX_COPIED_FILE_BYTES):
+            continue
+        files[role] = SourceFile(
+            entry.hf_repo, entry.hf_commit, listed, declared_sha256
+        )
+    return files
+
+
 def _staged_bundle_diagnostics_file(files: Mapping[str, Any] | None) -> str | None:
     """A staged bundle's diagnostics file among ``files``, as the staging reader picks it.
 
@@ -897,6 +950,7 @@ def staging_source(
     progress = None if progress_read is None else progress_read[0]
     _check_run_documents(run_id, run_manifest, progress)
     diagnostics_sha256: str | None = None
+    artifacts: dict[str, tuple[str, str]] = {}
     structured = _is_structured(run_manifest)
     if structured:
         assert run_manifest is not None
@@ -913,10 +967,8 @@ def staging_source(
             )
             # The tree comes from the bundle, so only the copied files are
             # taken from the run folder: others would change its build ID.
-            copied = _listed_source_files(
-                entry,
-                listings.folder(entry.hf_repo, entry.hf_commit, run_folder),
-                _COPIED_FILES,
+            copied = _run_source_files(
+                entry, listings, run_folder, artifacts, _COPIED_FILES
             )
             return BuildSource(
                 plan=replace(
@@ -949,8 +1001,9 @@ def staging_source(
             entry.hf_repo, entry.hf_commit, listed_diagnostics, diagnostics_sha256
         )
     }
-    run_files = listings.folder(entry.hf_repo, entry.hf_commit, run_folder)
-    files |= _listed_source_files(entry, run_files, _STAGING_RUN_FILES)
+    files |= _run_source_files(
+        entry, listings, run_folder, artifacts, _STAGING_RUN_FILES
+    )
     return BuildSource(
         plan=TreeBuildPlan(
             kind="staging",

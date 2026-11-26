@@ -2037,7 +2037,14 @@ follows no redirect.
     read to plan, say where the diagnostics are: at the run manifest's
     declared `calibration_diagnostics` path, whose SHA-256 is checked, or,
     for a schema-1 run, `runs/<id>/calibration_diagnostics.json`; with
-    `runs/<id>/build_manifest.json` and `release_manifest.json`;
+    `runs/<id>/build_manifest.json` and `release_manifest.json`. A structured
+    run that declares `build_manifest`, `release_manifest`,
+    `parent_build_manifest` or `reform_validation` artifacts, as Microcosm's
+    version 2 writer does under `runs/<id>/artifacts/` (microcosm#1135), has
+    those read from their declared paths instead of the folder's top level. A
+    declared manifest's SHA-256 is checked, and one the folder lacks makes the
+    run `unbuildable`; a declared file that is only copied and that the folder
+    lacks is left out, and its SHA-256 is not checked;
   - a run manifest that declares a `staged_dataset` receipt instead leads,
     after the receipt's SHA-256 is checked, to the staged bundle the receipt
     names in the country's release repo at its revision, with the
@@ -2432,8 +2439,10 @@ Python. Without `--kind` it covers both kinds, or only releases for BE.
   a run manifest an incomplete `error`.
 - **Copies of run files.** For each run the command first keeps private gzip
   copies of `run_manifest.json`, `progress.json`, `events.ndjson`,
-  `calibration_progress.json`, `reform_validation.json` and
-  `artifacts/staged_dataset.json`, read at the head commit. They are stored in
+  `calibration_progress.json`, `reform_validation.json`,
+  `artifacts/staged_dataset.json` and `artifacts/reform_validation.json` (where
+  Microcosm's version 2 writer puts the reform validation), read at the head
+  commit, each named in the index by its path in the run folder. They are stored in
   the tree store at `staging-run-files/<country>/runs/<run ID>/<SHA-256>.gz`,
   and `staging-run-files/<country>/index.json` says which versions are current,
   with each run's list entry, so a reader never sees part of an update. A run's

@@ -3,7 +3,7 @@
   "commit": "4d129fbc6931e0e6862febd4f28ca421fb94b24a",
   "directory": "frontend/packages/calibration-tree",
   "changed": {
-    "package.json": "Publishable from this repository: not private, with a license, the repository, public access, the published files, the worker's, the publication command's, the latest command's and the manifest read's exports and their scripts, the stored original files' reader's export, the exports and script of the stored staging run files, the stored releases.json copy's reader's and command's exports and the command's script, and the export and script of the command that adds copies of original files to stored builds. Its version is 0.1.5.",
+    "package.json": "Publishable from this repository: not private, with a license, the repository, public access, the published files, the worker's, the publication command's, the latest command's and the manifest read's exports and their scripts, the stored original files' reader's export, the exports and script of the stored staging run files, the stored releases.json copy's reader's and command's exports and the command's script, and the export and script of the command that adds copies of original files to stored builds. Its version is 0.1.6.",
     "src/calibration-tree-blob.ts": "A consistent manifest read asks for the manifest uncompressed, so its ETag is the strong one that Vercel Blob's conditional writes compare, not the weak one a compressed response carries.",
     "src/calibration-tree-manifest.test.ts": "Two tests cover replacing a staged run's tree when asked to.",
     "src/calibration-tree-manifest.ts": "`withCalibrationTreeManifestEntry` can replace a staged run's earlier tree when asked to.",
@@ -15,7 +15,7 @@
     "src/reforms.test.ts": "Two test names drop the microdata stack's former product name; their fixtures keep the legacy calculation key.",
     "src/release-record.ts": "Adds `buildNameOf`, the build name a release id or build folder id ends in.",
     "src/staging-artifact.test.ts": "Five tests read a US version 2 run's declared build and release manifests and reform validation, from the run in `src/test-support/us-version-2-staging-run.ts`.",
-    "src/staging-artifact.ts": "Exports `summaryFromProgress`, `summaryFromManifest` and `sortRuns` for the reader of copied run files.",
+    "src/staging-artifact.ts": "Exports `summaryFromProgress`, `summaryFromManifest` and `sortRuns` for the reader of copied run files. A structured run's build and release manifests and reform validation are read from the paths its run manifest declares, the manifests checked against their declared SHA-256 and a reform validation with another digest read as absent.",
     "src/target-loss-attribution-manifest.ts": "Adds `historicalAttributionSupportFor`, which finds a pinned recipe by the release's build name.",
     "src/target-loss-attribution.test.ts": "One test finds the September local-area recipe by its build folder.",
     "src/target-loss-attribution.ts": "Finds the pinned recipe for a release by its build name.",
