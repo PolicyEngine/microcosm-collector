@@ -20,6 +20,7 @@ import importlib
 import importlib.util
 import inspect
 import json
+import re
 import subprocess
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -1724,6 +1725,19 @@ def test_a_us_version_2_run_s_reform_validation_is_copied_from_its_artifacts_fol
         "run_manifest.json",
     ]
     assert published[RUN_ID]["artifacts/reform_validation.json"] == REFORM_VALIDATION
+
+
+def test_the_copied_run_files_are_the_package_s_staging_run_file_names() -> None:
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "packages/calibration-tree/src/staging-run-files.ts"
+    ).read_text(encoding="utf-8")
+    listed = source.split("export const STAGING_RUN_FILE_NAMES = [", 1)[1]
+    names = re.findall(r'"([^"]+)"', listed.split("] as const;", 1)[0])
+
+    module = importlib.import_module(RUN_FILES_MODULE)
+
+    assert names == list(module.COPIED_RUN_FILES)
 
 
 def test_a_copy_records_the_head_commit_and_is_read_at_it() -> None:

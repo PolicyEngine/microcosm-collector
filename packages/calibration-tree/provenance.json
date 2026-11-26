@@ -14,7 +14,7 @@
     "src/latest-artifact.ts": "One comment drops the microdata stack's former product name.",
     "src/reforms.test.ts": "Two test names drop the microdata stack's former product name; their fixtures keep the legacy calculation key.",
     "src/release-record.ts": "Adds `buildNameOf`, the build name a release id or build folder id ends in.",
-    "src/staging-artifact.test.ts": "Five tests read a US version 2 run's declared build and release manifests and reform validation, from the run in `src/test-support/us-version-2-staging-run.ts`.",
+    "src/staging-artifact.test.ts": "Six tests read a US version 2 run's declared build and release manifests and reform validation, from the run in `src/test-support/us-version-2-staging-run.ts`.",
     "src/staging-artifact.ts": "Exports `summaryFromProgress`, `summaryFromManifest` and `sortRuns` for the reader of copied run files. A structured run's build and release manifests and reform validation are read from the paths its run manifest declares, the manifests checked against their declared SHA-256 and a reform validation with another digest read as absent.",
     "src/target-loss-attribution-manifest.ts": "Adds `historicalAttributionSupportFor`, which finds a pinned recipe by the release's build name.",
     "src/target-loss-attribution.test.ts": "One test finds the September local-area recipe by its build folder.",

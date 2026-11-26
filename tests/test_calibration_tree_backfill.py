@@ -1351,9 +1351,11 @@ def test_a_us_version_2_run_s_declared_reform_validation_its_folder_lacks_is_lef
     backfill = us_backfill(
         [staging_entry(RUN_ID)],
         files={
-            (US_STAGING, STAGING_COMMIT): us_version_2_run(
-                RUN_ID, staged, declared=US_VERSION_2_RESULT_FILES
-            )
+            (US_STAGING, STAGING_COMMIT): {
+                **us_version_2_run(RUN_ID, staged, declared=US_VERSION_2_RESULT_FILES),
+                # Not the file the run declares.
+                f"runs/{RUN_ID}/reform_validation.json": REFORM_VALIDATION,
+            }
         },
     )
 
@@ -1361,6 +1363,30 @@ def test_a_us_version_2_run_s_declared_reform_validation_its_folder_lacks_is_lef
 
     assert outcome.outcome == "built"
     assert "reformValidation" not in backfill.bun.build_of(RUN_ID)["inputs"]
+
+
+def test_a_us_version_2_run_s_reform_validation_that_differs_from_its_digest_is_left_out() -> (
+    None
+):
+    backfill = us_backfill(
+        [staging_entry(RUN_ID)],
+        files={
+            (US_STAGING, STAGING_COMMIT): us_version_2_run(
+                RUN_ID,
+                declared={
+                    **US_VERSION_2_RESULT_FILES,
+                    "reform_validation": b'{"reforms": ["another"]}',
+                },
+            )
+        },
+    )
+
+    [outcome] = backfill.run()
+
+    assert outcome.outcome == "built"
+    inputs = backfill.bun.build_of(RUN_ID)["inputs"]
+    assert "reformValidation" not in inputs
+    assert inputs.get("buildManifest") == BUILD_MANIFEST
 
 
 def test_a_version_2_run_with_a_staged_dataset_copies_its_declared_reform_validation() -> (

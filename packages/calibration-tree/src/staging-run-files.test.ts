@@ -9,7 +9,8 @@ import { join } from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { BlobPreconditionFailedError } from "@vercel/blob";
 
-import { US_VERSION_2_RUN_ID, usVersion2RunFolder } from "./test-support/us-version-2-staging-run";
+import { parseStagingManifest } from "./staging-contract";
+import { US_VERSION_2_RUN_ID, usVersion2ResultFiles, usVersion2RunFolder } from "./test-support/us-version-2-staging-run";
 
 const TOKEN = "vercel_blob_rw_test_token";
 const TOKEN_VARIABLE = "CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN";
@@ -659,4 +660,17 @@ test("an index naming files this version does not copy is still read, without th
   const copied = await loadCopiedStagingRun({ ...request, runId: STRUCTURED_RUN });
   expect(copied?.progress).not.toBeNull();
   expect(copied?.reform_validation).toBeNull();
+});
+
+test("a run's reform validation copy is the one its structured manifest declares, else the top-level one", async () => {
+  const { stagingReformValidationFileName } = await runFiles();
+  const { reform_validation: _reformValidation, ...undeclared } = usVersion2ResultFiles();
+  const manifest = (folder: Record<string, string>) => parseStagingManifest(JSON.parse(folder["run_manifest.json"]!));
+
+  expect(stagingReformValidationFileName(manifest(usVersion2RunFolder()))).toBe("artifacts/reform_validation.json");
+  expect(stagingReformValidationFileName(manifest(usVersion2RunFolder({ resultFiles: undeclared })))).toBe(
+    "reform_validation.json",
+  );
+  expect(stagingReformValidationFileName({ schema_version: 1, run_id: SCHEMA_1_RUN })).toBe("reform_validation.json");
+  expect(stagingReformValidationFileName(null)).toBe("reform_validation.json");
 });

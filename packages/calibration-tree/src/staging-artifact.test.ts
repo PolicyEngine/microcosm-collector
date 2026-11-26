@@ -7,6 +7,7 @@ import { afterEach, expect, test } from "bun:test";
 import {
   loadStagingCalibration,
   loadStagingComparison,
+  loadStagingReformValidationRaw,
   loadStagingRun,
   loadStagingRuns,
   loadStagingTargetDiagnostics,
@@ -1245,14 +1246,37 @@ test("loads a US version 2 run's reform validation from its declared path", asyn
 
 test("reads a US version 2 run's declared reform validation that differs from its digest as absent", async () => {
   const resultFiles = usVersion2ResultFiles();
-  const folder = usVersion2RunFolder({
-    resultFiles,
-    declared: { ...resultFiles, reform_validation: JSON.stringify({ reforms: ["another"] }) },
-  });
+  const folder = {
+    ...usVersion2RunFolder({
+      resultFiles,
+      declared: { ...resultFiles, reform_validation: JSON.stringify({ reforms: ["another"] }) },
+    }),
+    // Not the file the run declares.
+    "reform_validation.json": resultFiles.reform_validation!,
+  };
   serveRunFolder(US_VERSION_2_RUN_ID, folder, []);
 
   const detail = await loadStagingRun(US_VERSION_2_RUN_ID, 0, "us");
 
   expect(detail.has_calibration).toBe(true);
   expect(detail.reform_validation).toBeNull();
+});
+
+test("refuses a reform validation read whose run manifest names another run", async () => {
+  const otherRunId = "us-fiscal-refresh-20261127T120000Z-5e6f7a8b";
+  const otherFolder = usVersion2RunFolder({ runId: otherRunId });
+  globalThis.fetch = (async (input) => {
+    const url = String(input);
+    // The requested run's folder holds the other run's manifest.
+    for (const runId of [US_VERSION_2_RUN_ID, otherRunId]) {
+      const marker = `/resolve/main/runs/${runId}/`;
+      const text = url.includes(marker) ? otherFolder[url.split(marker, 2)[1]!] : undefined;
+      if (text !== undefined) return new Response(text, { headers: { "Content-Type": "application/json" } });
+    }
+    return new Response(null, { status: 404 });
+  }) as typeof fetch;
+
+  await expect(loadStagingReformValidationRaw(US_VERSION_2_RUN_ID, 0, "us")).rejects.toThrow(
+    `run manifest identifies run ${otherRunId}`,
+  );
 });

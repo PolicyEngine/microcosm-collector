@@ -49,6 +49,7 @@ from tests.test_calibration_tree_backfill import (
     US_RELEASES,
     US_STAGING,
     US_TAG,
+    US_VERSION_2_RESULT_FILES,
     ManualClock,
     StandInBun,
     backfill_module,
@@ -59,6 +60,7 @@ from tests.test_calibration_tree_backfill import (
     sha256,
     staging_entry,
     store_manifest,
+    us_version_2_run,
 )
 
 SOURCE_COPIES_MODULE = "telemetry_collector.calibration_tree_source_copies"
@@ -552,6 +554,30 @@ def test_a_stored_staging_run_s_files_follow_the_staging_readers_rules() -> None
         "releaseManifest": RELEASE_MANIFEST,
         "reformValidation": REFORM_VALIDATION,
     }
+
+
+def test_a_stored_version_2_run_s_reform_validation_that_differs_from_its_declaration_is_not_copied() -> (
+    None
+):
+    entry = staging_entry(RUN_ID)
+    run_folder = us_version_2_run(
+        RUN_ID,
+        declared={
+            **US_VERSION_2_RESULT_FILES,
+            "reform_validation": b'{"reforms": ["another"]}',
+        },
+    )
+    copies = Copies(
+        hugging_face=hugging_face_with({(US_STAGING, STAGING_COMMIT): run_folder})
+    )
+    copies.bun.store = store_manifest("us", [entry])
+
+    [outcome] = copies.run()
+
+    assert outcome.files["reform_validation.json"] == "differs"
+    assert outcome.files["build_manifest.json"] == "copied"
+    stored = [step["contents"] for step in copies.bun.steps("copies store")]
+    assert all("reformValidation" not in contents for contents in stored)
 
 
 def test_a_stored_staged_bundle_gets_a_copy_of_its_diagnostics() -> None:
