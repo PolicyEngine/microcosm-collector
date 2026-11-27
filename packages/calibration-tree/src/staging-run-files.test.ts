@@ -699,3 +699,28 @@ test("a structured run that declares no reform validation reads its top-level co
   expect(copied?.progress).not.toBeNull();
   expect(copied?.reform_validation).toBeNull();
 });
+
+test("a run without a run manifest copy whose progress is structured reads its top-level copy as absent", async () => {
+  const { loadCopiedStagingRun } = await runFiles();
+  const folder = usVersion2RunFolder();
+
+  const store = new InMemoryBlobStore();
+  await publish(store, "us", [{
+    runId: US_VERSION_2_RUN_ID,
+    folderFingerprint: FINGERPRINT,
+    indexRow: null,
+    files: [
+      localFile("progress.json", folder["progress.json"]!),
+      localFile("reform_validation.json", folder["artifacts/reform_validation.json"]!),
+    ],
+  }]);
+
+  const copied = await loadCopiedStagingRun({
+    country: "us",
+    runId: US_VERSION_2_RUN_ID,
+    token: TOKEN,
+    client: store.client(),
+  });
+  expect(copied?.progress).not.toBeNull();
+  expect(copied?.reform_validation).toBeNull();
+});

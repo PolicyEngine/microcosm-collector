@@ -1062,6 +1062,7 @@ def test_a_staging_run_folder_s_reform_validation_reaches_the_worker() -> None:
             (US_STAGING, STAGING_COMMIT): {
                 **schema_1_run(RUN_ID),
                 f"runs/{RUN_ID}/reform_validation.json": REFORM_VALIDATION,
+                f"runs/{RUN_ID}/parent_build_manifest.json": PARENT_BUILD_MANIFEST,
             }
         },
     )
@@ -1071,6 +1072,42 @@ def test_a_staging_run_folder_s_reform_validation_reaches_the_worker() -> None:
     assert outcome.outcome == "built"
     inputs = backfill.bun.build_of(RUN_ID)["inputs"]
     assert inputs.get("reformValidation") == REFORM_VALIDATION
+    assert inputs.get("parentBuildManifest") == PARENT_BUILD_MANIFEST
+
+
+def test_a_run_without_a_manifest_whose_progress_is_structured_takes_no_top_level_copy() -> (
+    None
+):
+    # Its progress is version 3, so it is a structured run that declares nothing.
+    folder = f"runs/{RUN_ID}"
+    run_folder = us_version_2_run(RUN_ID, {})
+    del run_folder[f"{folder}/run_manifest.json"]
+    backfill = us_backfill(
+        [staging_entry(RUN_ID)],
+        files={
+            (US_STAGING, STAGING_COMMIT): {
+                **run_folder,
+                f"{folder}/calibration_diagnostics.json": DIAGNOSTICS,
+                f"{folder}/build_manifest.json": BUILD_MANIFEST,
+                f"{folder}/release_manifest.json": RELEASE_MANIFEST,
+                f"{folder}/reform_validation.json": REFORM_VALIDATION,
+            }
+        },
+    )
+
+    [outcome] = backfill.run()
+
+    assert outcome.outcome == "built"
+    request = backfill.bun.build_of(RUN_ID)["request"]
+    assert {
+        role: artifact and artifact["path"]
+        for role, artifact in request["artifacts"].items()
+    } == {
+        "calibrationDiagnostics": f"{folder}/calibration_diagnostics.json",
+        "buildManifest": None,
+        "releaseManifest": None,
+        "demographics": None,
+    }
 
 
 def test_the_request_is_the_one_worker_request_makes_for_the_same_plan() -> None:

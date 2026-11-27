@@ -1308,3 +1308,25 @@ test("a US version 2 run that declares no manifests or reform validation reads n
     ),
   ).toEqual([]);
 });
+
+test("a run without a run manifest whose progress is structured reads no top-level manifest or reform validation", async () => {
+  // Its progress is version 3, so it is a structured run that declares nothing.
+  const { "run_manifest.json": _manifest, ...folder } = usVersion2RunFolder({ resultFiles: {} });
+  const resultFiles = usVersion2ResultFiles();
+  const served = {
+    ...folder,
+    "calibration_diagnostics.json": resultFiles.calibration_diagnostics!,
+    "build_manifest.json": resultFiles.build_manifest!,
+    "reform_validation.json": resultFiles.reform_validation!,
+  };
+  serveRunFolder(US_VERSION_2_RUN_ID, served, []);
+
+  const source = await resolveStagingCalibrationSource(US_VERSION_2_RUN_ID, 0, "us");
+  const detail = await loadStagingRun(US_VERSION_2_RUN_ID, 0, "us");
+  const reformValidation = await loadStagingReformValidationRaw(US_VERSION_2_RUN_ID, 0, "us");
+
+  expect(source?.calibration.rows).toHaveLength(1);
+  expect(source?.sourceArtifacts.buildManifest).toBeNull();
+  expect(detail.reform_validation).toBeNull();
+  expect(reformValidation).toBeNull();
+});

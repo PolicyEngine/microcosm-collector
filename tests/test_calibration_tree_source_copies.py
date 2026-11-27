@@ -604,9 +604,11 @@ def test_a_stored_version_2_run_s_undeclared_top_level_files_are_not_copied() ->
     )
     copies.bun.store = store_manifest("us", [staging_entry(RUN_ID)])
 
+    [dry_run_outcome] = copies.run(dry_run=True)
     [outcome] = copies.run()
 
     assert set(outcome.files) == {"calibration_diagnostics.json"}
+    assert set(dry_run_outcome.files) == {"calibration_diagnostics.json"}
 
 
 def test_a_dry_run_reports_a_declared_copied_file_that_differs_from_its_declaration() -> (
