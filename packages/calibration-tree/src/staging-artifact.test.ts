@@ -1280,3 +1280,31 @@ test("refuses a reform validation read whose run manifest names another run", as
     `run manifest identifies run ${otherRunId}`,
   );
 });
+
+test("a US version 2 run that declares no manifests or reform validation reads none from its folder's top level", async () => {
+  const { calibration_diagnostics: diagnostics } = usVersion2ResultFiles();
+  const folder = {
+    ...usVersion2RunFolder({ resultFiles: { calibration_diagnostics: diagnostics! } }),
+    "build_manifest.json": JSON.stringify({ build_id: "undeclared" }),
+    "release_manifest.json": JSON.stringify({ release_id: "undeclared" }),
+    "reform_validation.json": JSON.stringify({ schema_version: 1, reforms: [] }),
+  };
+  const requested: string[] = [];
+  serveRunFolder(US_VERSION_2_RUN_ID, folder, requested);
+
+  const source = await resolveStagingCalibrationSource(US_VERSION_2_RUN_ID, 0, "us");
+  const detail = await loadStagingRun(US_VERSION_2_RUN_ID, 0, "us");
+
+  expect(source?.calibration.rows).toHaveLength(1);
+  expect(source?.sourceArtifacts.buildManifest).toBeNull();
+  expect(source?.sourceArtifacts.releaseManifest).toBeNull();
+  expect(detail.has_calibration).toBe(true);
+  expect(detail.reform_validation).toBeNull();
+  expect(
+    requested.filter((url) =>
+      ["build_manifest.json", "release_manifest.json", "reform_validation.json"].some((name) =>
+        url.endsWith(`/runs/${US_VERSION_2_RUN_ID}/${name}`)
+      )
+    ),
+  ).toEqual([]);
+});

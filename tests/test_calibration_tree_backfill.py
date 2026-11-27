@@ -1227,7 +1227,9 @@ def test_a_staged_bundle_recorded_in_the_release_repo_is_read_from_its_folder() 
     ]
 
 
-def test_a_run_with_a_staged_dataset_copies_the_files_in_its_run_folder() -> None:
+def test_a_run_with_a_staged_dataset_takes_no_undeclared_file_from_its_run_folder() -> (
+    None
+):
     diagnostics_name = "microcosm_us_2025.diagnostics.json"
     receipt = json.dumps(
         {
@@ -1245,9 +1247,9 @@ def test_a_run_with_a_staged_dataset_copies_the_files_in_its_run_folder() -> Non
         files={
             (US_STAGING, STAGING_COMMIT): {
                 **structured_run(RUN_ID, {"staged_dataset": receipt}),
+                # A structured run takes only the files it declares.
                 f"{folder}/parent_build_manifest.json": PARENT_BUILD_MANIFEST,
                 f"{folder}/reform_validation.json": REFORM_VALIDATION,
-                # Not a file this run's tree is built from.
                 f"{folder}/build_manifest.json": BUILD_MANIFEST,
             },
             (US_RELEASES, BUNDLE_COMMIT): {
@@ -1260,12 +1262,42 @@ def test_a_run_with_a_staged_dataset_copies_the_files_in_its_run_folder() -> Non
 
     assert outcome.outcome == "built"
     build = backfill.bun.build_of(RUN_ID)
-    assert build["inputs"].get("parentBuildManifest") == PARENT_BUILD_MANIFEST
-    assert build["inputs"].get("reformValidation") == REFORM_VALIDATION
-    assert "buildManifest" not in build["inputs"]
-    assert build["request"]["artifacts"]["reformValidation"]["path"] == (
-        f"{folder}/reform_validation.json"
+    assert set(build["inputs"]) == {"calibrationDiagnostics"}
+    downloaded = backfill.hugging_face.downloaded_paths()
+    assert not {
+        f"{folder}/{name}.json"
+        for name in ("parent_build_manifest", "reform_validation", "build_manifest")
+    } & set(downloaded)
+
+
+def test_a_version_2_run_takes_no_undeclared_file_from_its_folder_s_top_level() -> None:
+    folder = f"runs/{RUN_ID}"
+    backfill = us_backfill(
+        [staging_entry(RUN_ID)],
+        files={
+            (US_STAGING, STAGING_COMMIT): {
+                **us_version_2_run(RUN_ID, {"calibration_diagnostics": DIAGNOSTICS}),
+                f"{folder}/build_manifest.json": BUILD_MANIFEST,
+                f"{folder}/release_manifest.json": RELEASE_MANIFEST,
+                f"{folder}/parent_build_manifest.json": PARENT_BUILD_MANIFEST,
+                f"{folder}/reform_validation.json": REFORM_VALIDATION,
+            }
+        },
     )
+
+    [outcome] = backfill.run()
+
+    assert outcome.outcome == "built"
+    build = backfill.bun.build_of(RUN_ID)
+    assert {
+        role: artifact and artifact["path"]
+        for role, artifact in build["request"]["artifacts"].items()
+    } == {
+        "calibrationDiagnostics": f"{folder}/artifacts/calibration_diagnostics.json",
+        "buildManifest": None,
+        "releaseManifest": None,
+        "demographics": None,
+    }
 
 
 def test_a_us_version_2_run_s_tree_is_built_with_its_declared_manifests() -> None:

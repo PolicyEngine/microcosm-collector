@@ -591,6 +591,24 @@ def test_a_stored_version_2_run_s_reform_validation_that_differs_from_its_declar
     assert all("reformValidation" not in contents for contents in stored)
 
 
+def test_a_stored_version_2_run_s_undeclared_top_level_files_are_not_copied() -> None:
+    folder = f"runs/{RUN_ID}"
+    run_folder = {
+        **us_version_2_run(RUN_ID, {"calibration_diagnostics": DIAGNOSTICS}),
+        f"{folder}/build_manifest.json": BUILD_MANIFEST,
+        f"{folder}/reform_validation.json": REFORM_VALIDATION,
+        f"{folder}/parent_build_manifest.json": PARENT_BUILD_MANIFEST,
+    }
+    copies = Copies(
+        hugging_face=hugging_face_with({(US_STAGING, STAGING_COMMIT): run_folder})
+    )
+    copies.bun.store = store_manifest("us", [staging_entry(RUN_ID)])
+
+    [outcome] = copies.run()
+
+    assert set(outcome.files) == {"calibration_diagnostics.json"}
+
+
 def test_a_dry_run_reports_a_declared_copied_file_that_differs_from_its_declaration() -> (
     None
 ):

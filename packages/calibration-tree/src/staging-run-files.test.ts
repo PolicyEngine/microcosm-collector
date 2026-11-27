@@ -662,15 +662,40 @@ test("an index naming files this version does not copy is still read, without th
   expect(copied?.reform_validation).toBeNull();
 });
 
-test("a run's reform validation copy is the one its structured manifest declares, else the top-level one", async () => {
+test("a run's reform validation copy is the one its structured manifest declares, or a version 1 run's top-level one", async () => {
   const { stagingReformValidationFileName } = await runFiles();
   const { reform_validation: _reformValidation, ...undeclared } = usVersion2ResultFiles();
   const manifest = (folder: Record<string, string>) => parseStagingManifest(JSON.parse(folder["run_manifest.json"]!));
 
   expect(stagingReformValidationFileName(manifest(usVersion2RunFolder()))).toBe("artifacts/reform_validation.json");
-  expect(stagingReformValidationFileName(manifest(usVersion2RunFolder({ resultFiles: undeclared })))).toBe(
-    "reform_validation.json",
-  );
+  // A structured run that declares none has no reform validation copy to read.
+  expect(stagingReformValidationFileName(manifest(usVersion2RunFolder({ resultFiles: undeclared })))).toBeNull();
   expect(stagingReformValidationFileName({ schema_version: 1, run_id: SCHEMA_1_RUN })).toBe("reform_validation.json");
   expect(stagingReformValidationFileName(null)).toBe("reform_validation.json");
+});
+
+test("a structured run that declares no reform validation reads its top-level copy as absent", async () => {
+  const { loadCopiedStagingRun } = await runFiles();
+  const { reform_validation: reformValidation, ...undeclared } = usVersion2ResultFiles();
+  const folder = usVersion2RunFolder({ resultFiles: undeclared });
+  const store = new InMemoryBlobStore();
+
+  await publish(store, "us", [{
+    runId: US_VERSION_2_RUN_ID,
+    folderFingerprint: FINGERPRINT,
+    indexRow: null,
+    files: [
+      ...["run_manifest.json", "progress.json"].map((name) => localFile(name, folder[name]!)),
+      localFile("reform_validation.json", reformValidation!),
+    ],
+  }]);
+
+  const copied = await loadCopiedStagingRun({
+    country: "us",
+    runId: US_VERSION_2_RUN_ID,
+    token: TOKEN,
+    client: store.client(),
+  });
+  expect(copied?.progress).not.toBeNull();
+  expect(copied?.reform_validation).toBeNull();
 });
