@@ -1265,12 +1265,16 @@ test("reads a US version 2 run's declared reform validation that differs from it
 test("refuses a reform validation read whose run manifest names another run", async () => {
   const otherRunId = "us-fiscal-refresh-20261127T120000Z-5e6f7a8b";
   const otherFolder = usVersion2RunFolder({ runId: otherRunId });
+  // The requested run's folder holds only the other run's manifest.
+  const folders: Record<string, Record<string, string>> = {
+    [US_VERSION_2_RUN_ID]: { "run_manifest.json": otherFolder["run_manifest.json"]! },
+    [otherRunId]: otherFolder,
+  };
   globalThis.fetch = (async (input) => {
     const url = String(input);
-    // The requested run's folder holds the other run's manifest.
-    for (const runId of [US_VERSION_2_RUN_ID, otherRunId]) {
+    for (const [runId, folder] of Object.entries(folders)) {
       const marker = `/resolve/main/runs/${runId}/`;
-      const text = url.includes(marker) ? otherFolder[url.split(marker, 2)[1]!] : undefined;
+      const text = url.includes(marker) ? folder[url.split(marker, 2)[1]!] : undefined;
       if (text !== undefined) return new Response(text, { headers: { "Content-Type": "application/json" } });
     }
     return new Response(null, { status: 404 });
