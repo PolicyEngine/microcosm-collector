@@ -910,10 +910,17 @@ async function stagingRunSourceFile(
   return document;
 }
 
-function structuredArtifacts(runManifest: JsonObject | null): JsonObject | null {
-  return isStructuredStagingDocument(runManifest)
-    ? objectOrNull(runManifest?.artifacts)
-    : null;
+// A structured run's declarations, or null for a version 1 run. A run is
+// structured when its run manifest, or its progress when it has no run
+// manifest, is version 2 or later; one without a run manifest declares nothing.
+function structuredArtifacts(
+  runManifest: JsonObject | null,
+  progress: JsonObject | null = null,
+): JsonObject | null {
+  if (isStructuredStagingDocument(runManifest)) {
+    return objectOrNull(runManifest?.artifacts) ?? {};
+  }
+  return runManifest == null && isStructuredStagingDocument(progress) ? {} : null;
 }
 
 // A run's reform validation, which no tree is built from: a declared one is
@@ -922,10 +929,11 @@ function structuredArtifacts(runManifest: JsonObject | null): JsonObject | null 
 async function stagingReformValidationOrNull(
   runId: string,
   runManifest: JsonObject | null,
+  progress: JsonObject | null,
   revalidate: number,
   country: MicrocosmCountry,
 ): Promise<JsonObject | null> {
-  const artifacts = structuredArtifacts(runManifest);
+  const artifacts = structuredArtifacts(runManifest, progress);
   const declared = declaredStagingArtifact(artifacts, "reform_validation");
   const path = declaredRunFilePath(runId, artifacts, "reform_validation");
   if (!path) return null;
@@ -1018,7 +1026,7 @@ export async function resolveStagingCalibrationSource(
       `artifact calibration_diagnostics digest does not match its run manifest declaration.`,
     );
   }
-  const declared = structured ? artifacts : null;
+  const declared = structuredArtifacts(runManifest, progress);
   const [buildManifest, releaseManifest] = await Promise.all([
     stagingRunSourceFile(
       runId,
@@ -1239,6 +1247,7 @@ export async function loadStagingRun(
   const reformValidationRaw = await stagingReformValidationOrNull(
     runId,
     runManifest,
+    progress,
     revalidate,
     country,
   );
@@ -1323,16 +1332,22 @@ export async function loadStagingReformValidationRaw(
 ): Promise<JsonObject | null> {
   if (stagingUnavailableReason(country)) return null;
   assertSafeReleaseId(runId, "run");
-  const runManifestRaw = await stagingJsonOrNull(
-    `runs/${runId}/run_manifest.json`,
+  const [runManifestRaw, progressRaw] = await Promise.all([
+    stagingJsonOrNull(`runs/${runId}/run_manifest.json`, revalidate, country),
+    stagingJsonOrNull(`runs/${runId}/progress.json`, revalidate, country),
+  ]);
+  const runManifest =
+    runManifestRaw == null ? null : parseStagingManifest(runManifestRaw);
+  const progress = progressRaw == null ? null : parseStagingProgress(progressRaw);
+  // The manifest names the path to read, so it must be this run's.
+  validateStagingRunConsistency(runId, { runManifest, progress });
+  return stagingReformValidationOrNull(
+    runId,
+    runManifest,
+    progress,
     revalidate,
     country,
   );
-  const runManifest =
-    runManifestRaw == null ? null : parseStagingManifest(runManifestRaw);
-  // The manifest names the path to read, so it must be this run's.
-  validateStagingRunConsistency(runId, { runManifest });
-  return stagingReformValidationOrNull(runId, runManifest, revalidate, country);
 }
 
 export async function loadStagingTargetDiagnostics(

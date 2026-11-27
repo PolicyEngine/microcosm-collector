@@ -69,16 +69,25 @@ function declaredReformValidation(runManifest: JsonObject | null): JsonObject | 
   return declared && typeof declared === "object" && !Array.isArray(declared) ? (declared as JsonObject) : null;
 }
 
+// Whether a run is structured: its run manifest, or its progress when it has
+// no run manifest, is version 2 or later, as the Hugging Face reader takes it.
+function isStructuredRun(runManifest: JsonObject | null, progress: JsonObject | null): boolean {
+  return isStructuredStagingDocument(runManifest) || (runManifest == null && isStructuredStagingDocument(progress));
+}
+
 /**
  * The copy that holds a run's reform validation, as the Hugging Face reader
  * reads it: the one a structured run manifest declares under artifacts/, none
- * for a structured run that declares none, and the folder's top-level file for
- * a version 1 run. `runManifest` is the parsed manifest. A declared copy counts
- * only when its digest is the declared SHA-256, as `loadCopiedStagingRun` reads
- * it.
+ * for a structured run that declares none (or has no run manifest), and the
+ * folder's top-level file for a version 1 run. `runManifest` and `progress`
+ * are the parsed documents. A declared copy counts only when its digest is the
+ * declared SHA-256, as `loadCopiedStagingRun` reads it.
  */
-export function stagingReformValidationFileName(runManifest: JsonObject | null): StagingRunFileName | null {
-  if (!isStructuredStagingDocument(runManifest)) return "reform_validation.json";
+export function stagingReformValidationFileName(
+  runManifest: JsonObject | null,
+  progress: JsonObject | null = null,
+): StagingRunFileName | null {
+  if (!isStructuredRun(runManifest, progress)) return "reform_validation.json";
   return declaredReformValidation(runManifest) ? "artifacts/reform_validation.json" : null;
 }
 
@@ -87,10 +96,11 @@ export function stagingReformValidationFileName(runManifest: JsonObject | null):
 function copiedReformValidation(
   record: StagingRunRecord,
   runManifest: JsonObject | null,
+  progress: JsonObject | null,
   topLevel: Uint8Array | null,
   declaredCopy: Uint8Array | null,
 ): Uint8Array | null {
-  if (!isStructuredStagingDocument(runManifest)) return topLevel;
+  if (!isStructuredRun(runManifest, progress)) return topLevel;
   const declared = declaredReformValidation(runManifest);
   return declared && record.files["artifacts/reform_validation.json"]?.sha256 === declared.sha256
     ? declaredCopy
@@ -346,7 +356,7 @@ export async function loadCopiedStagingRun(options: {
     calibration_progress: calibrationProgress,
     events: parsedEvents,
     reform_validation: stagingJsonObjectOrNull(
-      copiedReformValidation(record, runManifest, topLevelReformValidation, declaredReformValidationCopy),
+      copiedReformValidation(record, runManifest, parsedProgress, topLevelReformValidation, declaredReformValidationCopy),
     ),
     staged_dataset: receipt && {
       payload: receipt,

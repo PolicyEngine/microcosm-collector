@@ -2042,7 +2042,10 @@ follows no redirect.
     run takes `build_manifest`, `release_manifest`, `parent_build_manifest`
     and `reform_validation` only from the paths its run manifest declares, as
     Microcosm's version 2 writer declares them under `runs/<id>/artifacts/`
-    (microcosm#1135), and never from its folder's top level. A declared
+    (microcosm#1135), and never from its folder's top level; a run is
+    structured when its run manifest, or its progress when it has no run
+    manifest, is schema 2 or later, and one without a run manifest declares
+    nothing. A declared
     manifest's SHA-256 is checked, and one the folder lacks makes the run
     `unbuildable`; a declared file that is only copied is left out when the
     folder lacks it or it has another digest, and the tree is still built. A

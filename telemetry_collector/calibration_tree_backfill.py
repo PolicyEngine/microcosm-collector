@@ -31,9 +31,10 @@ when the folder lists them (null otherwise, as the GitHub Actions
 publisher's optional reads are). ``parent_build_manifest.json`` and
 ``reform_validation.json`` are read too when a release folder or a schema-1
 run's folder lists them, or a structured run declares them, unless one is over
-``MAX_COPIED_FILE_BYTES``, including the run folder of
-a run whose diagnostics come from its staged bundle; the tree worker only stores
-copies of those two. A staging build follows only the rules of the tree
+``MAX_COPIED_FILE_BYTES``, including a run whose
+diagnostics come from its staged bundle; the tree worker only stores copies of
+those two. A run is structured when its run manifest, or its progress when it
+has no run manifest, is schema 2 or later. A staging build follows only the rules of the tree
 package's staging readers that locate its files:
 
 - in the staging repo, its ``runs/<id>/run_manifest.json`` and
@@ -765,17 +766,16 @@ def _run_source_files(
 ) -> dict[str, SourceFile]:
     """Each named file of a staging run, by role, without an oversized copy.
 
-    ``declared`` is a structured run's declared artifacts, or ``None`` for a
-    schema-1 run. A structured run's file is the one its run manifest declares
-    under its role's name, read from its declared path with its declared
-    SHA-256, and it has no other: one the tree is built from is
-    ``SourceUnbuildableError`` when the folder lacks it, while a copied file the
-    folder lacks is left out (and one with another digest is left out when
-    downloaded). A schema-1 run's file is read from the run folder's top level,
-    when it is there.
+    ``declared`` is a structured run's declared artifacts (none for a structured
+    run without a run manifest), or ``None`` for a schema-1 run. A structured
+    run's file is the one its run manifest declares under its role's name, read
+    from its declared path with its declared SHA-256, and it has no other: one
+    the tree is built from is ``SourceUnbuildableError`` when the folder lacks
+    it, while a copied file the folder lacks is left out (and one with another
+    digest is left out when downloaded). A schema-1 run's file is read from the
+    run folder's top level, when it is there.
     """
 
-    top_level = listings.folder(entry.hf_repo, entry.hf_commit, run_folder)
     files: dict[str, SourceFile] = {}
     for role, name in named_files:
         copied = role in _COPIED_ROLES
@@ -795,7 +795,9 @@ def _run_source_files(
                 )
             declared_sha256 = digest
         else:
-            listed = top_level.get(name)
+            listed = listings.folder(entry.hf_repo, entry.hf_commit, run_folder).get(
+                name
+            )
         if listed is None or (copied and listed.size > MAX_COPIED_FILE_BYTES):
             continue
         files[role] = SourceFile(
@@ -971,8 +973,8 @@ def staging_source(
             bundle = _receipt_source(
                 entry, reader, listings, artifacts["staged_dataset"]
             )
-            # The tree comes from the bundle, so only the copied files are
-            # taken from the run folder: others would change its build ID.
+            # The tree comes from the bundle, so only the copied files the run
+            # declares are taken: others would change its build ID.
             copied = _run_source_files(
                 entry, listings, run_folder, artifacts, _COPIED_FILES
             )
@@ -989,6 +991,11 @@ def staging_source(
         diagnostics_path, diagnostics_sha256 = artifacts["calibration_diagnostics"]
     else:
         diagnostics_path = f"{run_folder}/calibration_diagnostics.json"
+        if run_manifest is None and _is_structured(progress):
+            # A structured run without a run manifest declares nothing, so it
+            # takes no other file; its diagnostics are found as a schema-1
+            # run's are, as the staging readers find them.
+            artifacts = {}
     diagnostics_folder, _, diagnostics_name = diagnostics_path.rpartition("/")
     listed_diagnostics = listings.folder(
         entry.hf_repo, entry.hf_commit, diagnostics_folder
