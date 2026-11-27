@@ -2028,26 +2028,26 @@ follows no redirect.
   `release_manifest.json` and `demographics.json` when the folder lists them
   (null otherwise, as the GitHub Actions publisher's optional reads are).
   `parent_build_manifest.json` and `reform_validation.json` are read when a
-  release or run folder lists them, or from the paths a structured run
-  declares for them (below), and only stored as copies. That includes the run
-  folder of a run whose tree comes from its staged bundle. One over 64 MiB is
+  release folder or a schema-1 run's folder lists them, or from the paths a
+  structured run declares for them (below), and only stored as copies. That
+  includes a run whose tree comes from its staged bundle. One over 64 MiB is
   left out, and the tree is still built.
 - A staging build, by the rules of the tree package's staging readers that
   locate its files, and only those:
   - in the staging repo, `runs/<id>/run_manifest.json` and `progress.json`,
     read to plan, say where the diagnostics are: at the run manifest's
     declared `calibration_diagnostics` path, whose SHA-256 is checked, or,
-    for a schema-1 run, `runs/<id>/calibration_diagnostics.json`; with
+    for a schema-1 run, `runs/<id>/calibration_diagnostics.json`, with
     `runs/<id>/build_manifest.json` and `release_manifest.json`. A structured
-    run that declares `build_manifest`, `release_manifest`,
-    `parent_build_manifest` or `reform_validation` artifacts, as Microcosm's
-    version 2 writer does under `runs/<id>/artifacts/` (microcosm#1135), has
-    those read from their declared paths instead of the folder's top level. A
-    declared manifest's SHA-256 is checked, and one the folder lacks makes the
-    run `unbuildable`; a declared file that is only copied is left out when
-    the folder lacks it or it has another digest, and the tree is still built.
-    A run whose diagnostics come from its `staged_dataset` receipt takes only
-    the copied files from its run folder, declared or not;
+    run takes `build_manifest`, `release_manifest`, `parent_build_manifest`
+    and `reform_validation` only from the paths its run manifest declares, as
+    Microcosm's version 2 writer declares them under `runs/<id>/artifacts/`
+    (microcosm#1135), and never from its folder's top level. A declared
+    manifest's SHA-256 is checked, and one the folder lacks makes the run
+    `unbuildable`; a declared file that is only copied is left out when the
+    folder lacks it or it has another digest, and the tree is still built. A
+    run whose diagnostics come from its `staged_dataset` receipt takes only the
+    copied files it declares;
   - a run manifest that declares a `staged_dataset` receipt instead leads,
     after the receipt's SHA-256 is checked, to the staged bundle the receipt
     names in the country's release repo at its revision, with the

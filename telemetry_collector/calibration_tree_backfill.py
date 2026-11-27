@@ -29,8 +29,9 @@ releaseId>/`` at its commit: ``calibration_diagnostics.json``, and
 ``build_manifest.json``, ``release_manifest.json`` and ``demographics.json``
 when the folder lists them (null otherwise, as the GitHub Actions
 publisher's optional reads are). ``parent_build_manifest.json`` and
-``reform_validation.json`` are read too when a release or run folder lists
-them, unless one is over ``MAX_COPIED_FILE_BYTES``, including the run folder of
+``reform_validation.json`` are read too when a release folder or a schema-1
+run's folder lists them, or a structured run declares them, unless one is over
+``MAX_COPIED_FILE_BYTES``, including the run folder of
 a run whose diagnostics come from its staged bundle; the tree worker only stores
 copies of those two. A staging build follows only the rules of the tree
 package's staging readers that locate its files:
@@ -40,15 +41,15 @@ package's staging readers that locate its files:
   diagnostics are: at the run manifest's declared
   ``calibration_diagnostics`` path, with the declared SHA-256 checked, or,
   for a schema-1 run, ``runs/<id>/calibration_diagnostics.json``; with its
-  ``build_manifest.json`` and ``release_manifest.json``. A structured run
-  that declares a ``build_manifest``, ``release_manifest``,
-  ``parent_build_manifest`` or ``reform_validation`` artifact, as Microcosm's
-  version 2 writer does under ``artifacts/`` (microcosm#1135), has that file
-  read from its declared path instead of the folder's top level, and checked
-  against its declared SHA-256: a declared manifest that the folder lacks, or
-  that has another digest, makes the run unbuildable, while a declared file
-  that is only copied is left out when the folder lacks it or it has another
-  digest;
+  ``build_manifest.json`` and ``release_manifest.json`` for a schema-1 run.
+  A structured run takes its ``build_manifest``, ``release_manifest``,
+  ``parent_build_manifest`` and ``reform_validation`` only from the paths its
+  run manifest declares, as Microcosm's version 2 writer declares them under
+  ``artifacts/`` (microcosm#1135), never from its folder's top level, and each
+  is checked against its declared SHA-256: a declared manifest that the folder
+  lacks, or that has another digest, makes the run unbuildable, while a
+  declared file that is only copied is left out when the folder lacks it or it
+  has another digest;
 - a run whose manifest declares a ``staged_dataset`` receipt instead is
   read from the staged bundle the receipt names, in the country's release
   repo at the receipt's revision, with the receipt's SHA-256 checked;
@@ -759,17 +760,19 @@ def _run_source_files(
     entry: ProductionEntry,
     listings: Listings,
     run_folder: str,
-    declared: Mapping[str, tuple[str, str]],
+    declared: Mapping[str, tuple[str, str]] | None,
     named_files: Iterable[tuple[str, str]],
 ) -> dict[str, SourceFile]:
     """Each named file of a staging run, by role, without an oversized copy.
 
-    A file the run manifest declares under its role's name is read from its
-    declared path and carries its declared SHA-256. One the tree is built from
-    is ``SourceUnbuildableError`` when the folder lacks it, while a copied file
-    the folder lacks is left out (and one with another digest is left out when
-    downloaded). Any other file is read from the run folder's top level, when
-    it is there.
+    ``declared`` is a structured run's declared artifacts, or ``None`` for a
+    schema-1 run. A structured run's file is the one its run manifest declares
+    under its role's name, read from its declared path with its declared
+    SHA-256, and it has no other: one the tree is built from is
+    ``SourceUnbuildableError`` when the folder lacks it, while a copied file the
+    folder lacks is left out (and one with another digest is left out when
+    downloaded). A schema-1 run's file is read from the run folder's top level,
+    when it is there.
     """
 
     top_level = listings.folder(entry.hf_repo, entry.hf_commit, run_folder)
@@ -777,7 +780,9 @@ def _run_source_files(
     for role, name in named_files:
         copied = role in _COPIED_ROLES
         declared_sha256: str | None = None
-        if role in declared:
+        if declared is not None:
+            if role not in declared:
+                continue
             path, digest = declared[role]
             folder, _, file_name = path.rpartition("/")
             listed = listings.folder(entry.hf_repo, entry.hf_commit, folder).get(
@@ -951,7 +956,7 @@ def staging_source(
     progress = None if progress_read is None else progress_read[0]
     _check_run_documents(run_id, run_manifest, progress)
     diagnostics_sha256: str | None = None
-    artifacts: dict[str, tuple[str, str]] = {}
+    artifacts: dict[str, tuple[str, str]] | None = None
     structured = _is_structured(run_manifest)
     if structured:
         assert run_manifest is not None

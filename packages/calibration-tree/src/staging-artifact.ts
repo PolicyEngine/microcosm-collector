@@ -857,10 +857,10 @@ async function loadStagingCalibrationUncached(
 }
 
 // A structured run declares each result file it stages, as Microcosm's
-// version 2 writer does under artifacts/ (microcosm#1135); version 1 runs put
-// the build and release manifests and the reform validation at the run
-// folder's top level. `artifacts` is a structured manifest's parsed
-// declarations, or null for any other run.
+// version 2 writer does under artifacts/ (microcosm#1135), and has no other;
+// version 1 runs put the build and release manifests and the reform
+// validation at the run folder's top level. `artifacts` is a structured
+// manifest's parsed declarations, or null for any other run.
 function declaredStagingArtifact(
   artifacts: JsonObject | null,
   name: string,
@@ -868,15 +868,15 @@ function declaredStagingArtifact(
   return objectOrNull(artifacts?.[name]);
 }
 
+// Where a run's file is: its declared path, the top level of a version 1
+// run's folder, or nowhere for a structured run that does not declare it.
 function declaredRunFilePath(
   runId: string,
   artifacts: JsonObject | null,
   name: string,
-): string {
-  return (
-    stringValue(declaredStagingArtifact(artifacts, name)?.staging_path) ??
-    `runs/${runId}/${name}.json`
-  );
+): string | null {
+  if (!artifacts) return `runs/${runId}/${name}.json`;
+  return stringValue(declaredStagingArtifact(artifacts, name)?.staging_path);
 }
 
 // A run file the tree is built from: a declared one is read from its declared
@@ -890,8 +890,10 @@ async function stagingRunSourceFile(
   revision: string,
 ): Promise<HashedStagingJson | null> {
   const declared = declaredStagingArtifact(artifacts, name);
+  const path = declaredRunFilePath(runId, artifacts, name);
+  if (!path) return null;
   const document = await stagingHashedJsonOrNull(
-    declaredRunFilePath(runId, artifacts, name),
+    path,
     revalidate,
     country,
     revision,
@@ -916,7 +918,7 @@ function structuredArtifacts(runManifest: JsonObject | null): JsonObject | null 
 
 // A run's reform validation, which no tree is built from: a declared one is
 // read from its declared path and reads as absent unless it has its declared
-// SHA-256 and is a JSON object.
+// SHA-256 and is a JSON object; a structured run that declares none has none.
 async function stagingReformValidationOrNull(
   runId: string,
   runManifest: JsonObject | null,
@@ -926,6 +928,7 @@ async function stagingReformValidationOrNull(
   const artifacts = structuredArtifacts(runManifest);
   const declared = declaredStagingArtifact(artifacts, "reform_validation");
   const path = declaredRunFilePath(runId, artifacts, "reform_validation");
+  if (!path) return null;
   if (!declared) return stagingJsonOrNull(path, revalidate, country);
   let document: HashedStagingJson | null;
   try {

@@ -70,27 +70,31 @@ function declaredReformValidation(runManifest: JsonObject | null): JsonObject | 
 }
 
 /**
- * The copy that holds a run's reform validation: the one its structured run
- * manifest declares under artifacts/, else the folder's top-level file, as
- * the Hugging Face reader reads it. `runManifest` is the parsed manifest. A
- * declared copy counts only when its digest is the declared SHA-256, as
- * `loadCopiedStagingRun` reads it.
+ * The copy that holds a run's reform validation, as the Hugging Face reader
+ * reads it: the one a structured run manifest declares under artifacts/, none
+ * for a structured run that declares none, and the folder's top-level file for
+ * a version 1 run. `runManifest` is the parsed manifest. A declared copy counts
+ * only when its digest is the declared SHA-256, as `loadCopiedStagingRun` reads
+ * it.
  */
-export function stagingReformValidationFileName(runManifest: JsonObject | null): StagingRunFileName {
-  return declaredReformValidation(runManifest) ? "artifacts/reform_validation.json" : "reform_validation.json";
+export function stagingReformValidationFileName(runManifest: JsonObject | null): StagingRunFileName | null {
+  if (!isStructuredStagingDocument(runManifest)) return "reform_validation.json";
+  return declaredReformValidation(runManifest) ? "artifacts/reform_validation.json" : null;
 }
 
-// The copied bytes of the run's reform validation: the declared copy only
-// when it has the declared SHA-256, else the top-level copy.
+// The copied bytes of the run's reform validation: a structured run's declared
+// copy only when it has the declared SHA-256, a version 1 run's top-level copy.
 function copiedReformValidation(
   record: StagingRunRecord,
   runManifest: JsonObject | null,
   topLevel: Uint8Array | null,
   declaredCopy: Uint8Array | null,
 ): Uint8Array | null {
+  if (!isStructuredStagingDocument(runManifest)) return topLevel;
   const declared = declaredReformValidation(runManifest);
-  if (!declared) return topLevel;
-  return record.files["artifacts/reform_validation.json"]?.sha256 === declared.sha256 ? declaredCopy : null;
+  return declared && record.files["artifacts/reform_validation.json"]?.sha256 === declared.sha256
+    ? declaredCopy
+    : null;
 }
 
 export interface StagingRunFileRecord {
