@@ -34,7 +34,9 @@ from telemetry_collector.huggingface_read import DatasetFile
 
 COMMAND_SCRIPT: Final = PACKAGE_DIRECTORY / "src" / "staging-run-files-command.ts"
 #: The files of a run folder the dashboard reads and no tree build stores:
-#: the package's STAGING_RUN_FILE_NAMES.
+#: the package's STAGING_RUN_FILE_NAMES. A version 1 run's reform validation is
+#: at the folder's top level; Microcosm's version 2 writer puts it under
+#: ``artifacts/`` (microcosm#1135).
 COPIED_RUN_FILES: Final = (
     "run_manifest.json",
     "progress.json",
@@ -42,6 +44,7 @@ COPIED_RUN_FILES: Final = (
     "calibration_progress.json",
     "reform_validation.json",
     "artifacts/staged_dataset.json",
+    "artifacts/reform_validation.json",
 )
 #: How many runs are stored between writes of the index, so that an execution
 #: that stops keeps what it copied.

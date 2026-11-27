@@ -29,10 +29,12 @@ releaseId>/`` at its commit: ``calibration_diagnostics.json``, and
 ``build_manifest.json``, ``release_manifest.json`` and ``demographics.json``
 when the folder lists them (null otherwise, as the GitHub Actions
 publisher's optional reads are). ``parent_build_manifest.json`` and
-``reform_validation.json`` are read too when a release or run folder lists
-them, unless one is over ``MAX_COPIED_FILE_BYTES``, including the run folder of
-a run whose diagnostics come from its staged bundle; the tree worker only stores
-copies of those two. A staging build follows only the rules of the tree
+``reform_validation.json`` are read too when a release folder or a schema-1
+run's folder lists them, or a structured run declares them, unless one is over
+``MAX_COPIED_FILE_BYTES``, including a run whose
+diagnostics come from its staged bundle; the tree worker only stores copies of
+those two. A run is structured when its run manifest, or its progress when it
+has no run manifest, is schema 2 or later. A staging build follows only the rules of the tree
 package's staging readers that locate its files:
 
 - in the staging repo, its ``runs/<id>/run_manifest.json`` and
@@ -40,7 +42,15 @@ package's staging readers that locate its files:
   diagnostics are: at the run manifest's declared
   ``calibration_diagnostics`` path, with the declared SHA-256 checked, or,
   for a schema-1 run, ``runs/<id>/calibration_diagnostics.json``; with its
-  ``build_manifest.json`` and ``release_manifest.json``;
+  ``build_manifest.json`` and ``release_manifest.json`` for a schema-1 run.
+  A structured run takes its ``build_manifest``, ``release_manifest``,
+  ``parent_build_manifest`` and ``reform_validation`` only from the paths its
+  run manifest declares, as Microcosm's version 2 writer declares them under
+  ``artifacts/`` (microcosm#1135), never from its folder's top level, and each
+  is checked against its declared SHA-256: a declared manifest that the folder
+  lacks, or that has another digest, makes the run unbuildable, while a
+  declared file that is only copied is left out when the folder lacks it or it
+  has another digest;
 - a run whose manifest declares a ``staged_dataset`` receipt instead is
   read from the staged bundle the receipt names, in the country's release
   repo at the receipt's revision, with the receipt's SHA-256 checked;
@@ -195,7 +205,9 @@ _RELEASE_FILES: Final = (
     ("demographics", "demographics.json"),
     *_COPIED_FILES,
 )
-# A staging run's other files, in its run folder.
+# A staging run's other files, in its run folder or at the paths its run
+# manifest declares for them, by the worker's role names, which are the logical
+# names Microcosm's version 2 writer declares them under.
 _STAGING_RUN_FILES: Final = (
     ("build_manifest", "build_manifest.json"),
     ("release_manifest", "release_manifest.json"),
@@ -745,6 +757,55 @@ def _declared_artifacts(
     return declared
 
 
+def _run_source_files(
+    entry: ProductionEntry,
+    listings: Listings,
+    run_folder: str,
+    declared: Mapping[str, tuple[str, str]] | None,
+    named_files: Iterable[tuple[str, str]],
+) -> dict[str, SourceFile]:
+    """Each named file of a staging run, by role, without an oversized copy.
+
+    ``declared`` is a structured run's declared artifacts (none for a structured
+    run without a run manifest), or ``None`` for a schema-1 run. A structured
+    run's file is the one its run manifest declares under its role's name, read
+    from its declared path with its declared SHA-256, and it has no other: one
+    the tree is built from is ``SourceUnbuildableError`` when the folder lacks
+    it, while a copied file the folder lacks is left out (and one with another
+    digest is left out when downloaded). A schema-1 run's file is read from the
+    run folder's top level, when it is there.
+    """
+
+    files: dict[str, SourceFile] = {}
+    for role, name in named_files:
+        copied = role in _COPIED_ROLES
+        declared_sha256: str | None = None
+        if declared is not None:
+            if role not in declared:
+                continue
+            path, digest = declared[role]
+            folder, _, file_name = path.rpartition("/")
+            listed = listings.folder(entry.hf_repo, entry.hf_commit, folder).get(
+                file_name
+            )
+            if listed is None and not copied:
+                raise SourceUnbuildableError(
+                    f"{path} is declared but not in {entry.hf_repo} at "
+                    f"{entry.hf_commit}."
+                )
+            declared_sha256 = digest
+        else:
+            listed = listings.folder(entry.hf_repo, entry.hf_commit, run_folder).get(
+                name
+            )
+        if listed is None or (copied and listed.size > MAX_COPIED_FILE_BYTES):
+            continue
+        files[role] = SourceFile(
+            entry.hf_repo, entry.hf_commit, listed, declared_sha256
+        )
+    return files
+
+
 def _staged_bundle_diagnostics_file(files: Mapping[str, Any] | None) -> str | None:
     """A staged bundle's diagnostics file among ``files``, as the staging reader picks it.
 
@@ -897,6 +958,7 @@ def staging_source(
     progress = None if progress_read is None else progress_read[0]
     _check_run_documents(run_id, run_manifest, progress)
     diagnostics_sha256: str | None = None
+    artifacts: dict[str, tuple[str, str]] | None = None
     structured = _is_structured(run_manifest)
     if structured:
         assert run_manifest is not None
@@ -911,12 +973,10 @@ def staging_source(
             bundle = _receipt_source(
                 entry, reader, listings, artifacts["staged_dataset"]
             )
-            # The tree comes from the bundle, so only the copied files are
-            # taken from the run folder: others would change its build ID.
-            copied = _listed_source_files(
-                entry,
-                listings.folder(entry.hf_repo, entry.hf_commit, run_folder),
-                _COPIED_FILES,
+            # The tree comes from the bundle, so only the copied files the run
+            # declares are taken: others would change its build ID.
+            copied = _run_source_files(
+                entry, listings, run_folder, artifacts, _COPIED_FILES
             )
             return BuildSource(
                 plan=replace(
@@ -931,6 +991,11 @@ def staging_source(
         diagnostics_path, diagnostics_sha256 = artifacts["calibration_diagnostics"]
     else:
         diagnostics_path = f"{run_folder}/calibration_diagnostics.json"
+        if run_manifest is None and _is_structured(progress):
+            # A structured run without a run manifest declares nothing, so it
+            # takes no other file; its diagnostics are found as a schema-1
+            # run's are, as the staging readers find them.
+            artifacts = {}
     diagnostics_folder, _, diagnostics_name = diagnostics_path.rpartition("/")
     listed_diagnostics = listings.folder(
         entry.hf_repo, entry.hf_commit, diagnostics_folder
@@ -949,8 +1014,9 @@ def staging_source(
             entry.hf_repo, entry.hf_commit, listed_diagnostics, diagnostics_sha256
         )
     }
-    run_files = listings.folder(entry.hf_repo, entry.hf_commit, run_folder)
-    files |= _listed_source_files(entry, run_files, _STAGING_RUN_FILES)
+    files |= _run_source_files(
+        entry, listings, run_folder, artifacts, _STAGING_RUN_FILES
+    )
     return BuildSource(
         plan=TreeBuildPlan(
             kind="staging",
@@ -1003,6 +1069,12 @@ def build_and_publish_source(
                 source_file.declared_sha256 is not None
                 and downloaded.sha256 != source_file.declared_sha256
             ):
+                if role in _COPIED_ROLES:
+                    # A file the tree only copies never stops its build: one
+                    # that is not the file its run declares is left out, as
+                    # the staging readers take it as absent.
+                    downloaded.path.unlink()
+                    continue
                 raise SourceUnbuildableError(
                     f"{source_file.listed.path} does not match the digest its run "
                     "recorded."

@@ -60,8 +60,8 @@ Python:
   structured run declaring neither diagnostics nor a staged dataset, a
   staged-dataset receipt of a skipped, failed or disabled staging, or a bundle
   recording no diagnostics (``SourceWithoutDiagnosticsError``). A run whose
-  documents can't be read, or whose declared or recorded diagnostics are absent
-  or differ, is ``unbuildable`` on its own, and the other runs continue. A
+  documents can't be read, or whose declared or recorded diagnostics, or
+  declared manifests, are absent or differ, is ``unbuildable`` on its own, and the other runs continue. A
   settled result, final refusals included, is kept in the run's record after
   each build, so the tree is looked at again only when the folder or the stored
   build changes, or for a refusal when ``retry_refusals`` asks (by default with

@@ -7,6 +7,7 @@ import { afterEach, expect, test } from "bun:test";
 import {
   loadStagingCalibration,
   loadStagingComparison,
+  loadStagingReformValidationRaw,
   loadStagingRun,
   loadStagingRuns,
   loadStagingTargetDiagnostics,
@@ -19,6 +20,12 @@ import {
   stagingTargetChangeCacheTtlSeconds,
   stagingUnavailableReason,
 } from "./staging-artifact";
+import {
+  US_VERSION_2_CANDIDATE,
+  US_VERSION_2_RUN_ID,
+  usVersion2ResultFiles,
+  usVersion2RunFolder,
+} from "./test-support/us-version-2-staging-run";
 
 test("resolves staging repositories from each country registration", () => {
   expect(stagingRepository("us")).toEqual({
@@ -1143,4 +1150,187 @@ test("a receipt with one valid stem file and one stem name containing a path has
     "../other.diagnostics.json": file,
     [LOCAL_DIAGNOSTICS]: file,
   })).toBeNull();
+});
+
+// A US version 2 run (PolicyEngine/microcosm#1135) stages its result files
+// under artifacts/ and declares each one with its SHA-256; version 1 runs put
+// the build and release manifests and the reform validation at the top level.
+function serveRunFolder(runId: string, folder: Record<string, string>, requested: string[]) {
+  globalThis.fetch = (async (input) => {
+    const url = String(input);
+    requested.push(url);
+    const marker = `/resolve/main/runs/${runId}/`;
+    const relative = url.includes(marker) ? url.split(marker, 2)[1] : null;
+    const text = relative == null ? undefined : folder[relative];
+    return text === undefined
+      ? new Response(null, { status: 404 })
+      : new Response(text, { headers: { "Content-Type": "application/json" } });
+  }) as typeof fetch;
+}
+
+test("builds a US version 2 run's calibration with the manifests its run manifest declares", async () => {
+  const folder = usVersion2RunFolder();
+  const requested: string[] = [];
+  serveRunFolder(US_VERSION_2_RUN_ID, folder, requested);
+
+  const source = await resolveStagingCalibrationSource(US_VERSION_2_RUN_ID, 0, "us");
+
+  const sha256Of = (text: string) => createHash("sha256").update(text).digest("hex");
+  expect(source?.sourceArtifacts.buildManifest).toMatchObject({
+    path: `runs/${US_VERSION_2_RUN_ID}/artifacts/build_manifest.json`,
+    sha256: sha256Of(folder["artifacts/build_manifest.json"]!),
+  });
+  expect(source?.sourceArtifacts.releaseManifest).toMatchObject({
+    path: `runs/${US_VERSION_2_RUN_ID}/artifacts/release_manifest.json`,
+    sha256: sha256Of(folder["artifacts/release_manifest.json"]!),
+  });
+  expect(source?.calibration.build_manifest).toEqual(
+    JSON.parse(folder["artifacts/build_manifest.json"]!),
+  );
+  expect(source?.calibration.rows).toHaveLength(1);
+  expect(
+    requested.some((url) =>
+      url.endsWith(`/runs/${US_VERSION_2_RUN_ID}/build_manifest.json`) ||
+      url.endsWith(`/runs/${US_VERSION_2_RUN_ID}/release_manifest.json`),
+    ),
+  ).toBe(false);
+});
+
+test("rejects a US version 2 run's declared manifest whose bytes do not match its digest", async () => {
+  const resultFiles = usVersion2ResultFiles();
+  const folder = usVersion2RunFolder({
+    resultFiles,
+    declared: { ...resultFiles, release_manifest: JSON.stringify({ release_id: "another" }) },
+  });
+  serveRunFolder(US_VERSION_2_RUN_ID, folder, []);
+
+  await expect(
+    resolveStagingCalibrationSource(US_VERSION_2_RUN_ID, 0, "us"),
+  ).rejects.toThrow("artifact release_manifest digest does not match");
+});
+
+test("rejects a US version 2 run's declared manifest that its folder lacks", async () => {
+  const resultFiles = usVersion2ResultFiles();
+  const { build_manifest: _buildManifest, ...staged } = resultFiles;
+  const folder = usVersion2RunFolder({ resultFiles: staged, declared: resultFiles });
+  serveRunFolder(US_VERSION_2_RUN_ID, folder, []);
+
+  await expect(
+    resolveStagingCalibrationSource(US_VERSION_2_RUN_ID, 0, "us"),
+  ).rejects.toThrow("artifact build_manifest is declared but absent");
+});
+
+test("loads a US version 2 run's reform validation from its declared path", async () => {
+  const folder = usVersion2RunFolder();
+  const requested: string[] = [];
+  serveRunFolder(US_VERSION_2_RUN_ID, folder, requested);
+
+  const detail = await loadStagingRun(US_VERSION_2_RUN_ID, 0, "us");
+
+  expect(detail).toMatchObject({
+    run_id: US_VERSION_2_RUN_ID,
+    country_code: "US",
+    schema_version: 3,
+    has_calibration: true,
+  });
+  expect(detail.reform_validation).toMatchObject({
+    release_id: US_VERSION_2_CANDIDATE,
+    schema_version: 1,
+    baseline_period: 2025,
+  });
+  expect(detail.build_manifest).toEqual(JSON.parse(folder["artifacts/build_manifest.json"]!));
+  expect(
+    requested.some((url) => url.endsWith(`/runs/${US_VERSION_2_RUN_ID}/reform_validation.json`)),
+  ).toBe(false);
+});
+
+test("reads a US version 2 run's declared reform validation that differs from its digest as absent", async () => {
+  const resultFiles = usVersion2ResultFiles();
+  const folder = {
+    ...usVersion2RunFolder({
+      resultFiles,
+      declared: { ...resultFiles, reform_validation: JSON.stringify({ reforms: ["another"] }) },
+    }),
+    // Not the file the run declares.
+    "reform_validation.json": resultFiles.reform_validation!,
+  };
+  serveRunFolder(US_VERSION_2_RUN_ID, folder, []);
+
+  const detail = await loadStagingRun(US_VERSION_2_RUN_ID, 0, "us");
+
+  expect(detail.has_calibration).toBe(true);
+  expect(detail.reform_validation).toBeNull();
+});
+
+test("refuses a reform validation read whose run manifest names another run", async () => {
+  const otherRunId = "us-fiscal-refresh-20261127T120000Z-5e6f7a8b";
+  const otherFolder = usVersion2RunFolder({ runId: otherRunId });
+  // The requested run's folder holds only the other run's manifest.
+  const folders: Record<string, Record<string, string>> = {
+    [US_VERSION_2_RUN_ID]: { "run_manifest.json": otherFolder["run_manifest.json"]! },
+    [otherRunId]: otherFolder,
+  };
+  globalThis.fetch = (async (input) => {
+    const url = String(input);
+    for (const [runId, folder] of Object.entries(folders)) {
+      const marker = `/resolve/main/runs/${runId}/`;
+      const text = url.includes(marker) ? folder[url.split(marker, 2)[1]!] : undefined;
+      if (text !== undefined) return new Response(text, { headers: { "Content-Type": "application/json" } });
+    }
+    return new Response(null, { status: 404 });
+  }) as typeof fetch;
+
+  await expect(loadStagingReformValidationRaw(US_VERSION_2_RUN_ID, 0, "us")).rejects.toThrow(
+    `run manifest identifies run ${otherRunId}`,
+  );
+});
+
+test("a US version 2 run that declares no manifests or reform validation reads none from its folder's top level", async () => {
+  const { calibration_diagnostics: diagnostics } = usVersion2ResultFiles();
+  const folder = {
+    ...usVersion2RunFolder({ resultFiles: { calibration_diagnostics: diagnostics! } }),
+    "build_manifest.json": JSON.stringify({ build_id: "undeclared" }),
+    "release_manifest.json": JSON.stringify({ release_id: "undeclared" }),
+    "reform_validation.json": JSON.stringify({ schema_version: 1, reforms: [] }),
+  };
+  const requested: string[] = [];
+  serveRunFolder(US_VERSION_2_RUN_ID, folder, requested);
+
+  const source = await resolveStagingCalibrationSource(US_VERSION_2_RUN_ID, 0, "us");
+  const detail = await loadStagingRun(US_VERSION_2_RUN_ID, 0, "us");
+
+  expect(source?.calibration.rows).toHaveLength(1);
+  expect(source?.sourceArtifacts.buildManifest).toBeNull();
+  expect(source?.sourceArtifacts.releaseManifest).toBeNull();
+  expect(detail.has_calibration).toBe(true);
+  expect(detail.reform_validation).toBeNull();
+  expect(
+    requested.filter((url) =>
+      ["build_manifest.json", "release_manifest.json", "reform_validation.json"].some((name) =>
+        url.endsWith(`/runs/${US_VERSION_2_RUN_ID}/${name}`)
+      )
+    ),
+  ).toEqual([]);
+});
+
+test("a run without a run manifest whose progress is structured reads no top-level manifest or reform validation", async () => {
+  // Its progress is version 3, so it is a structured run that declares nothing.
+  const { "run_manifest.json": _manifest, ...folder } = usVersion2RunFolder({ resultFiles: {} });
+  const resultFiles = usVersion2ResultFiles();
+  const served = {
+    ...folder,
+    "calibration_diagnostics.json": resultFiles.calibration_diagnostics!,
+    "build_manifest.json": resultFiles.build_manifest!,
+    "reform_validation.json": resultFiles.reform_validation!,
+  };
+  serveRunFolder(US_VERSION_2_RUN_ID, served, []);
+
+  const source = await resolveStagingCalibrationSource(US_VERSION_2_RUN_ID, 0, "us");
+  const detail = await loadStagingRun(US_VERSION_2_RUN_ID, 0, "us");
+  const reformValidation = await loadStagingReformValidationRaw(US_VERSION_2_RUN_ID, 0, "us");
+
+  expect(source?.calibration.rows).toHaveLength(1);
+  expect(source?.sourceArtifacts.buildManifest).toBeNull();
+  expect(detail.reform_validation).toBeNull();
+  expect(reformValidation).toBeNull();
 });

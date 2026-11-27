@@ -20,6 +20,7 @@ import importlib
 import importlib.util
 import inspect
 import json
+import re
 import subprocess
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -54,6 +55,7 @@ from tests.test_calibration_tree_backfill import (
     MINUTE,
     READ_TOKEN,
     RECORD_REPO_KEY,
+    REFORM_VALIDATION,
     ManualClock,
     StandInBun,
     build_id,
@@ -62,6 +64,7 @@ from tests.test_calibration_tree_backfill import (
     sha256,
     store_manifest,
     structured_run,
+    us_version_2_run,
 )
 from tests.test_submissions import calibration_submission
 
@@ -1705,6 +1708,36 @@ def test_the_files_the_dashboard_reads_are_copied_for_every_status() -> None:
         path.endswith(("fit_summary.json", "stored_inputs.json"))
         for path in reconciliation.hugging_face.downloaded_paths()
     )
+
+
+def test_a_us_version_2_run_s_reform_validation_is_copied_from_its_artifacts_folder() -> (
+    None
+):
+    reconciliation = us_staging_reconciliation(us_version_2_run(RUN_ID))
+
+    [outcome] = reconciliation.run(kinds=["staging"])
+
+    assert field_of(outcome, "run_files") == "copied"
+    [published] = copied_contents(reconciliation)
+    assert sorted(published[RUN_ID]) == [
+        "artifacts/reform_validation.json",
+        "progress.json",
+        "run_manifest.json",
+    ]
+    assert published[RUN_ID]["artifacts/reform_validation.json"] == REFORM_VALIDATION
+
+
+def test_the_copied_run_files_are_the_package_s_staging_run_file_names() -> None:
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "packages/calibration-tree/src/staging-run-files.ts"
+    ).read_text(encoding="utf-8")
+    listed = source.split("export const STAGING_RUN_FILE_NAMES = [", 1)[1]
+    names = re.findall(r'"([^"]+)"', listed.split("] as const;", 1)[0])
+
+    module = importlib.import_module(RUN_FILES_MODULE)
+
+    assert names == list(module.COPIED_RUN_FILES)
 
 
 def test_a_copy_records_the_head_commit_and_is_read_at_it() -> None:

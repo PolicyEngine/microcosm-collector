@@ -9,6 +9,9 @@ import { join } from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { BlobPreconditionFailedError } from "@vercel/blob";
 
+import { parseStagingManifest } from "./staging-contract";
+import { US_VERSION_2_RUN_ID, usVersion2ResultFiles, usVersion2RunFolder } from "./test-support/us-version-2-staging-run";
+
 const TOKEN = "vercel_blob_rw_test_token";
 const TOKEN_VARIABLE = "CALIBRATION_TREE_BLOB_READ_WRITE_TOKEN";
 const NOW = "2026-11-19T12:00:00.000Z";
@@ -573,4 +576,151 @@ test("the command exits 1 for a request it cannot follow and 3 when the store fa
   } finally {
     console.error = error;
   }
+});
+
+// US builds move to Microcosm's version 2 writer (microcosm#1135), which puts
+// the reform validation at artifacts/reform_validation.json; version 1 runs
+// put it at the run folder's top level.
+test("a US version 2 run's reform validation is copied under its artifacts path and read back", async () => {
+  const { isStagingRunFileName, loadCopiedStagingRun, stagingRunFilesIndexPath } = await runFiles();
+  expect(isStagingRunFileName("artifacts/reform_validation.json")).toBe(true);
+  const folder = usVersion2RunFolder();
+  const names = ["run_manifest.json", "progress.json", "events.ndjson", "artifacts/reform_validation.json"];
+  const store = new InMemoryBlobStore();
+
+  await publish(store, "us", [{
+    runId: US_VERSION_2_RUN_ID,
+    folderFingerprint: FINGERPRINT,
+    indexRow: null,
+    files: names.map((name) => localFile(name, folder[name]!)),
+  }]);
+
+  const record = store.json(stagingRunFilesIndexPath("us")).runs[US_VERSION_2_RUN_ID];
+  expect(record.problem).toBeNull();
+  expect(record.summary).toMatchObject({
+    run_id: US_VERSION_2_RUN_ID,
+    country_code: "US",
+    schema_version: 3,
+    status: "completed",
+  });
+  expect(Object.keys(record.files).sort()).toEqual([...names].sort());
+  const copied = await loadCopiedStagingRun({
+    country: "us",
+    runId: US_VERSION_2_RUN_ID,
+    token: TOKEN,
+    client: store.client(),
+  });
+  expect(copied?.reform_validation).toEqual(JSON.parse(folder["artifacts/reform_validation.json"]!));
+});
+
+test("a declared reform validation copy that differs from its declared digest reads as absent", async () => {
+  const { isStagingRunFileName, loadCopiedStagingRun } = await runFiles();
+  expect(isStagingRunFileName("artifacts/reform_validation.json")).toBe(true);
+  const folder = usVersion2RunFolder();
+  const store = new InMemoryBlobStore();
+
+  await publish(store, "us", [{
+    runId: US_VERSION_2_RUN_ID,
+    folderFingerprint: FINGERPRINT,
+    indexRow: null,
+    files: [
+      ...["run_manifest.json", "progress.json"].map((name) => localFile(name, folder[name]!)),
+      localFile("artifacts/reform_validation.json", JSON.stringify({ reforms: ["another"] })),
+      // A top-level copy beside it is not what the manifest declares.
+      localFile("reform_validation.json", folder["artifacts/reform_validation.json"]!),
+    ],
+  }]);
+
+  const copied = await loadCopiedStagingRun({
+    country: "us",
+    runId: US_VERSION_2_RUN_ID,
+    token: TOKEN,
+    client: store.client(),
+  });
+  expect(copied?.progress).not.toBeNull();
+  expect(copied?.reform_validation).toBeNull();
+});
+
+// A collector deployed before a dashboard's package update may record files
+// the dashboard's version does not know; its readers leave them out.
+test("an index naming files this version does not copy is still read, without them", async () => {
+  const { loadCopiedStagingRun, loadCopiedStagingRuns, stagingRunFilesIndexPath } = await runFiles();
+  const store = new InMemoryBlobStore();
+  await publish(store, "uk", [structuredRun()]);
+  const index = store.json(stagingRunFilesIndexPath("uk"));
+  const record = index.runs[STRUCTURED_RUN];
+  record.files["artifacts/a_later_result.json"] = { ...record.files["progress.json"] };
+  record.omittedFiles = ["artifacts/another_later_result.json"];
+  store.store(stagingRunFilesIndexPath("uk"), new TextEncoder().encode(JSON.stringify(index)));
+  const request = { country: "uk" as const, token: TOKEN, client: store.client() };
+
+  expect((await loadCopiedStagingRuns(request)).runs.map((run: { run_id: string }) => run.run_id)).toEqual([
+    STRUCTURED_RUN,
+  ]);
+  const copied = await loadCopiedStagingRun({ ...request, runId: STRUCTURED_RUN });
+  expect(copied?.progress).not.toBeNull();
+  expect(copied?.reform_validation).toBeNull();
+});
+
+test("a run's reform validation copy is the one its structured manifest declares, or a version 1 run's top-level one", async () => {
+  const { stagingReformValidationFileName } = await runFiles();
+  const { reform_validation: _reformValidation, ...undeclared } = usVersion2ResultFiles();
+  const manifest = (folder: Record<string, string>) => parseStagingManifest(JSON.parse(folder["run_manifest.json"]!));
+
+  expect(stagingReformValidationFileName(manifest(usVersion2RunFolder()))).toBe("artifacts/reform_validation.json");
+  // A structured run that declares none has no reform validation copy to read.
+  expect(stagingReformValidationFileName(manifest(usVersion2RunFolder({ resultFiles: undeclared })))).toBeNull();
+  expect(stagingReformValidationFileName({ schema_version: 1, run_id: SCHEMA_1_RUN })).toBe("reform_validation.json");
+  expect(stagingReformValidationFileName(null)).toBe("reform_validation.json");
+});
+
+test("a structured run that declares no reform validation reads its top-level copy as absent", async () => {
+  const { loadCopiedStagingRun } = await runFiles();
+  const { reform_validation: reformValidation, ...undeclared } = usVersion2ResultFiles();
+  const folder = usVersion2RunFolder({ resultFiles: undeclared });
+  const store = new InMemoryBlobStore();
+
+  await publish(store, "us", [{
+    runId: US_VERSION_2_RUN_ID,
+    folderFingerprint: FINGERPRINT,
+    indexRow: null,
+    files: [
+      ...["run_manifest.json", "progress.json"].map((name) => localFile(name, folder[name]!)),
+      localFile("reform_validation.json", reformValidation!),
+    ],
+  }]);
+
+  const copied = await loadCopiedStagingRun({
+    country: "us",
+    runId: US_VERSION_2_RUN_ID,
+    token: TOKEN,
+    client: store.client(),
+  });
+  expect(copied?.progress).not.toBeNull();
+  expect(copied?.reform_validation).toBeNull();
+});
+
+test("a run without a run manifest copy whose progress is structured reads its top-level copy as absent", async () => {
+  const { loadCopiedStagingRun } = await runFiles();
+  const folder = usVersion2RunFolder();
+
+  const store = new InMemoryBlobStore();
+  await publish(store, "us", [{
+    runId: US_VERSION_2_RUN_ID,
+    folderFingerprint: FINGERPRINT,
+    indexRow: null,
+    files: [
+      localFile("progress.json", folder["progress.json"]!),
+      localFile("reform_validation.json", folder["artifacts/reform_validation.json"]!),
+    ],
+  }]);
+
+  const copied = await loadCopiedStagingRun({
+    country: "us",
+    runId: US_VERSION_2_RUN_ID,
+    token: TOKEN,
+    client: store.client(),
+  });
+  expect(copied?.progress).not.toBeNull();
+  expect(copied?.reform_validation).toBeNull();
 });
